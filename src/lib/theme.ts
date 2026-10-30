@@ -7,8 +7,8 @@ type Resolved = "light" | "dark";
 // 首帧的 data-theme 由 index.html 里的内联脚本设置（避免深色模式下先闪一下浅色），
 // 这里接管之后的切换，并在“跟随系统”时响应系统配色的变化。
 const media = window.matchMedia("(prefers-color-scheme: dark)");
-// 顶栏背景色（--surface），同步给手机浏览器的地址栏
-const BAR_COLOR: Record<Resolved, string> = { light: "#FFFFFF", dark: "#0D0E10" };
+// 页面底色（--bg，顶栏是透明的），同步给手机浏览器的地址栏
+const BAR_COLOR: Record<Resolved, string> = { light: "#F4F6F8", dark: "#000000" };
 const ORDER: ThemePref[] = ["auto", "light", "dark"];
 
 let pref: ThemePref = parse(readString(KEYS.theme));

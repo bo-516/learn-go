@@ -169,7 +169,7 @@ export function BankPage({ hash }: { hash: string }) {
             <kbd>/</kbd>
           </label>
           <div className="tb-filters">
-            <div className="chips" role="group" aria-label="按难度筛选">
+            <div className="chips seg" role="group" aria-label="按难度筛选">
               <Chip pressed={level === "all"} onClick={() => setLevel("all")}>
                 全部
               </Chip>
