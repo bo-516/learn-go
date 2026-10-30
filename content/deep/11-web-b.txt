@@ -1,0 +1,589 @@
+=== web-12
+--- deep
+**原理展开**
+
+**W3C Trace Context** 标准定义了 `traceparent` 头：`00-<32 位 trace-id>-<16 位 parent-span-id>-<flags>`。trace-id 标识整条调用链，span-id 标识一次具体的操作（一次 HTTP 调用、一次 SQL 查询），每个 span 记录自己的父 span，最终在 Jaeger 等系统里组装成一棵调用树，能看到每一段的耗时。
+
+**OpenTelemetry 的工作方式**：
+
+- **传播器**（propagator）在发出请求时把当前 span 的上下文注入请求头，在收到请求时从请求头里提取出来；
+- **插桩**（instrumentation）为 HTTP 客户端、服务端、数据库驱动、Redis 客户端自动创建 span；
+- **导出器**（exporter）把 span 批量发送到后端（OTLP 协议），通常还要配置**采样**，只保留一部分链路以控制成本。
+
+**代码示例**
+
+```go
+// OpenTelemetry：HTTP 服务端和客户端的自动插桩
+handler := otelhttp.NewHandler(mux, "api")                       // 服务端：提取 traceparent，创建 span
+client := &http.Client{Transport: otelhttp.NewTransport(http.DefaultTransport)} // 客户端：注入 traceparent
+
+// 业务代码里创建子 span
+tracer := otel.Tracer("order")
+func (s *Service) Create(ctx context.Context, o Order) error {
+	ctx, span := tracer.Start(ctx, "Service.Create")
+	defer span.End()
+	span.SetAttributes(attribute.Int64("order.amount", o.Amount))
+	if err := s.repo.Insert(ctx, o); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+	return nil
+}
+
+// 日志中带上 trace_id 和 span_id
+sc := trace.SpanContextFromContext(ctx)
+slog.InfoContext(ctx, "created", "trace_id", sc.TraceID().String(), "span_id", sc.SpanID().String())
+```
+
+**常见追问**
+
+- 采样怎么设置？→ 常见的是“按比例采样 + 错误和慢请求全部保留”（尾部采样，在 Collector 上根据整条链路的结果决定是否保留）。
+- 日志、指标、链路之间怎么关联？→ 日志里带 trace_id；指标可以带 exemplar（某个延迟数据点对应的 trace_id）；在 Grafana 中可以互相跳转。
+- 异步消息怎么传递 trace？→ 生产者把 traceparent 放进消息头，消费者提取后创建一个“链接”到原 span 的新 span。
+
+**实战建议**
+
+- 新项目直接使用 OpenTelemetry，而不是自己实现 trace ID 的传递。
+- 每条错误日志都必须能通过 trace_id 找到完整的请求链路。
+
+=== web-13
+--- deep
+**原理展开**
+
+`multipart/form-data` 的格式：请求体被 boundary 分隔成多个 part，每个 part 有自己的头（`Content-Disposition` 里有字段名和文件名、`Content-Type`）和内容。
+
+- `r.ParseMultipartForm(maxMemory)`：一次性解析整个请求体，小于 maxMemory 的部分放内存，超出的写到临时文件，处理完要调用 `r.MultipartForm.RemoveAll()` 清理临时文件；
+- `r.MultipartReader()`：返回一个流式的 reader，逐个读取 part，读到文件 part 时可以直接把它拷贝到目标存储，内存占用固定。
+
+**预签名 URL**：服务端用对象存储的密钥对“某个 bucket 的某个 key、允许 PUT、有效期 15 分钟、限制大小和类型”这样的策略签名，生成一个 URL 给客户端。客户端直接上传到对象存储，业务服务器不经手文件数据。
+
+**代码示例**
+
+```go
+func upload(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 100<<20) // 最多 100MB
+	mr, err := r.MultipartReader()
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			http.Error(w, "upload failed", http.StatusBadRequest)
+			return
+		}
+		if part.FormName() != "file" {
+			continue
+		}
+		// 先读前 512 字节判断真实类型
+		head := make([]byte, 512)
+		n, _ := io.ReadFull(part, head)
+		if ct := http.DetectContentType(head[:n]); ct != "image/png" && ct != "image/jpeg" {
+			http.Error(w, "unsupported type", http.StatusUnsupportedMediaType)
+			return
+		}
+		key := uuid.NewString() // 不使用用户提供的文件名
+		if err := store.Put(r.Context(), key, io.MultiReader(bytes.NewReader(head[:n]), part)); err != nil {
+			http.Error(w, "store failed", http.StatusInternalServerError)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+```
+
+**常见追问**
+
+- 为什么不能信任文件扩展名和 Content-Type 头？→ 都是客户端提供的，可以随意伪造；要检查文件内容的魔数。
+- 上传后的文件直接对外提供下载有什么风险？→ 用户上传的 HTML / SVG 可能包含脚本（存储型 XSS），应该用独立的域名提供下载，并设置 `Content-Disposition: attachment` 和正确的 Content-Type。
+- 分片上传的分片大小怎么选？→ 通常 5～10MB，太小请求数多，太大失败重传的代价高。
+
+**实战建议**
+
+- 文件尽量直传对象存储，服务端只处理元数据和回调。
+- 上传接口单独限流，并设置合理的超时（大文件上传需要更长的 ReadTimeout）。
+
+=== web-14
+--- deep
+**原理展开**
+
+几种权限模型：
+
+- **ACL**：直接给用户分配对资源的权限，简单，但用户多了难以管理；
+- **RBAC**：通过角色间接分配，适合组织结构清晰的系统；RBAC1 增加角色继承，RBAC2 增加约束（互斥角色、基数限制）；
+- **ABAC**：基于属性（用户的部门、资源的所有者、时间、IP）的规则判断，最灵活，适合复杂的数据权限；
+- **ReBAC**：基于关系（Google Zanzibar：“用户是文档的编辑者”“文档属于文件夹”），适合文档协作、社交类系统。
+
+数据权限是最容易出问题的地方：功能权限可以在中间件中统一检查，但“能看到哪些数据”必须体现在每一个查询的条件里，漏掉一个就是越权漏洞（OWASP 排名第一的 Broken Access Control）。
+
+**代码示例**
+
+```go
+// 功能权限：路由声明需要的权限
+func Require(perm string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			u := UserFrom(r.Context())
+			if !u.Can(perm) {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+mux.Handle("POST /orders/{id}/refund", Require("order:refund")(http.HandlerFunc(refund)))
+
+// 数据权限：在 repository 层强制带上范围条件
+func (r *OrderRepo) Get(ctx context.Context, id int64) (*Order, error) {
+	scope := ScopeFrom(ctx) // 由中间件根据用户放入 ctx：自己的 / 本部门的 / 全部
+	q, args := "SELECT ... FROM orders WHERE id = ?", []any{id}
+	switch scope.Kind {
+	case ScopeOwn:
+		q += " AND user_id = ?"
+		args = append(args, scope.UserID)
+	case ScopeDept:
+		q += " AND dept_id = ?"
+		args = append(args, scope.DeptID)
+	}
+	// ...
+	return nil, nil
+}
+```
+
+**常见追问**
+
+- 权限数据要实时生效吗？→ 权限变更后清除相关用户的权限缓存；对安全要求高的场景（撤销管理员权限）要立即生效。
+- 越权漏洞怎么测试？→ 用 A 用户的 token 访问 B 用户的资源 ID，所有接口都应该返回 403 或 404。
+- 返回 403 还是 404？→ 对于“资源存在但无权访问”，返回 404 可以避免泄露资源是否存在。
+
+**实战建议**
+
+- 数据访问层默认带上权限范围，需要跨范围查询时显式声明（而不是反过来）。
+- 把越权测试写进集成测试，覆盖每个接受资源 ID 的接口。
+
+=== web-15
+--- deep
+**原理展开**
+
+配置热更新的三个环节：
+
+1. **发现变化**：文件用 fsnotify（注意 Kubernetes 的 ConfigMap 是通过替换符号链接实现更新的，要监听目录而不是文件）；配置中心用长轮询或 watch；
+2. **校验和应用**：解析 → 校验 → 原子替换。校验失败时保留旧配置并告警，不能让一个错误的配置把服务搞挂；
+3. **通知依赖方**：有些组件需要在配置变化时重建（比如限流器的速率、日志级别），通过回调或者订阅机制通知它们。
+
+“读取完整的配置对象”很重要：如果把配置拆成多个独立的全局变量分别更新，读取方可能读到一半新一半旧的组合（比如新的超时配合旧的重试次数）。
+
+**代码示例**
+
+```go
+type Manager struct {
+	cur  atomic.Pointer[Config]
+	mu   sync.Mutex
+	subs []func(old, new *Config)
+}
+
+func (m *Manager) Subscribe(fn func(old, new *Config)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.subs = append(m.subs, fn)
+}
+
+func (m *Manager) apply(raw []byte) error {
+	cfg, err := parse(raw)
+	if err != nil {
+		return err // 保留旧配置
+	}
+	old := m.cur.Swap(cfg)
+	m.mu.Lock()
+	subs := slices.Clone(m.subs)
+	m.mu.Unlock()
+	for _, fn := range subs {
+		fn(old, cfg) // 比如：日志级别变化时调用 levelVar.Set(...)
+	}
+	slog.Info("config reloaded", "version", cfg.Version)
+	return nil
+}
+
+// slog 的动态日志级别
+var level = new(slog.LevelVar)
+logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+level.Set(slog.LevelDebug) // 运行时修改，立即生效
+```
+
+**常见追问**
+
+- 多个实例怎么保证同时生效？→ 不能严格同时，配置中心推送有先后；需要一致性的配置（比如分片规则）要设计成支持新旧版本共存的过渡期。
+- 敏感配置（密码、密钥）怎么热更新？→ 从密钥管理系统（Vault、KMS）获取，定期刷新；数据库密码轮换时要支持新旧密码同时有效的过渡期。
+- 配置错误导致线上故障怎么办？→ 配置变更也要灰度（先推送到部分实例）、有审核、可以一键回滚。
+
+**实战建议**
+
+- 区分“可以热更新”和“需要重启”的配置，在文档和代码里都写清楚。
+- 记录每次配置变更的内容、时间、操作人，作为排查故障的重要线索。
+
+=== web-16
+--- deep
+**原理展开**
+
+分层的目的是**隔离变化**：协议（HTTP / gRPC）会变、存储（MySQL / Redis）会变，业务规则是核心。依赖方向应该是：handler → service → repository 接口，具体的 repository 实现依赖于基础设施。service 只依赖它自己定义的接口，所以单元测试时可以传入 fake 实现，不需要启动数据库。
+
+**手写依赖注入**：在 main 函数里按依赖顺序创建对象，通过构造函数传递。依赖关系一目了然，编译期就能发现缺失的依赖。依赖多到 main 函数难以维护时，wire 可以根据构造函数的签名自动生成这段组装代码（仍然是编译期、无反射）。
+
+**代码示例**
+
+```go
+// cmd/server/main.go：显式组装
+func main() {
+	cfg := config.MustLoad()
+	db := mustOpenDB(cfg.DSN)
+	defer db.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
+
+	userRepo := repository.NewUserRepo(db)
+	cache := repository.NewUserCache(rdb, userRepo) // 装饰器：带缓存的 repo
+	userSvc := service.NewUserService(cache, time.Now)
+	h := handler.New(userSvc)
+
+	srv := &http.Server{Addr: cfg.Addr, Handler: h.Routes()}
+	run(srv)
+}
+
+// service 包：接口由使用方定义，只包含需要的方法
+type UserRepo interface {
+	Get(ctx context.Context, id int64) (*model.User, error)
+	Create(ctx context.Context, u *model.User) error
+}
+```
+
+**常见追问**
+
+- `pkg` 目录有必要吗？→ 不是必须的；只有真正打算被其他项目复用的代码才放进去，否则全部放在 `internal` 下。
+- model 要不要区分数据库模型和 API 模型？→ 建议区分：数据库模型跟着表结构走，API 模型跟着接口契约走，分开后两者可以独立演进，也避免把内部字段暴露出去。
+- 全局变量（比如全局的 db）有什么问题？→ 隐藏了依赖关系，测试时难以替换，并发测试会互相干扰。
+
+**实战建议**
+
+- 小项目从扁平的结构开始，随着代码增长再拆分，不要一开始就套用复杂的模板。
+- 包按“功能”组织（user、order）比按“技术层”组织（handlers、services）更容易扩展。
+
+=== web-17
+--- deep
+**原理展开**
+
+测试金字塔：大量快速的单元测试（纯函数、service 层用 fake），适量的集成测试（真实的数据库、Redis，用 testcontainers 启动），少量的端到端测试。Go 的测试工具链让这些都很容易：
+
+- `t.Run` 子测试可以单独运行（`-run 'TestX/case_name'`），`t.Parallel()` 并行执行；
+- `t.Cleanup` 注册清理函数，比 defer 更适合测试辅助函数；
+- `t.TempDir()` 自动创建和清理临时目录；
+- `testing/synctest`（Go 1.25）：在“气泡”里运行的代码使用虚拟时钟，所有 goroutine 都阻塞时时间自动前进，测试超时、重试、定时器逻辑不需要真的等待。
+
+**代码示例**
+
+```go
+func TestRetry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		calls := 0
+		start := time.Now()
+		err := Retry(context.Background(), 3, time.Second, func() error {
+			calls++
+			return ErrUnavailable
+		})
+		if calls != 3 || !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("calls=%d err=%v", calls, err)
+		}
+		// 虚拟时间：瞬间完成，但 time.Since 反映了退避的总时长
+		if d := time.Since(start); d < 3*time.Second {
+			t.Fatalf("expected backoff, got %v", d)
+		}
+	})
+}
+
+// 集成测试：启动真实的 MySQL
+func TestRepo(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	c, err := mysql.Run(ctx, "mysql:8.0", mysql.WithDatabase("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Terminate(ctx) })
+	dsn, _ := c.ConnectionString(ctx)
+	_ = dsn // 连接、建表、测试 repository
+}
+```
+
+**常见追问**
+
+- mock 用多了有什么问题？→ 测试和实现细节耦合，重构时大量测试失败；而且 mock 的行为可能和真实依赖不一致。优先用 fake（简单的内存实现）或者真实依赖。
+- 怎么测试 HTTP handler？→ `httptest.NewRequest` + `httptest.NewRecorder`，不需要启动服务器。
+- 测试覆盖率要多高？→ 关注核心逻辑和边界情况的覆盖，而不是数字本身；`go test -coverprofile` + `go tool cover -html` 查看没有覆盖的分支。
+
+**实战建议**
+
+- CI 中跑 `go test -race -count=1 ./...`，集成测试用 build tag 或 `-short` 区分。
+- 每修复一个 bug，先写一个能复现它的测试。
+
+=== web-18
+--- deep
+**原理展开**
+
+Transport 的连接池是**按 host（scheme + host + port + 代理）分组**的。获取连接时：有空闲连接就复用；没有就新建（受 `MaxConnsPerHost` 限制，达到上限时排队等待）；请求结束、响应体被读完并关闭后，连接被放回空闲池（受 `MaxIdleConnsPerHost` 限制，超出就关闭）。
+
+HTTP/2 的情况不同：一个连接上可以并发多个请求（受服务端的 `MAX_CONCURRENT_STREAMS` 限制，通常 100～250），所以连接数少得多，`MaxIdleConnsPerHost` 的影响也小得多。
+
+**代码示例**
+
+```go
+// 诊断：统计新建连接和复用连接的比例
+var newConns, reused atomic.Int64
+
+func traced(req *http.Request) *http.Request {
+	t := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			if info.Reused {
+				reused.Add(1)
+			} else {
+				newConns.Add(1)
+			}
+		},
+	}
+	return req.WithContext(httptrace.WithClientTrace(req.Context(), t))
+}
+```
+
+```bash
+# 本机到下游的连接状态
+ss -tan state time-wait dst 10.0.0.5 | wc -l
+ss -tan state established dst 10.0.0.5 | wc -l
+```
+
+**常见追问**
+
+- `MaxConnsPerHost` 有什么用？→ 下游变慢时，请求堆积会让连接数无限增长，设置上限可以保护下游，也防止本机端口耗尽。
+- 端口耗尽是什么错误？→ `connect: cannot assign requested address`，本地临时端口（默认约 28000 个）被 TIME_WAIT 占满。
+- 为什么偶尔出现 `EOF` 或 `connection reset by peer`？→ 复用了一个已经被对端（服务端或负载均衡）关闭的空闲连接。把 `IdleConnTimeout` 设得比对端的空闲超时短；幂等请求可以重试。
+
+**实战建议**
+
+- 对每个高频调用的下游，根据压测结果设置 `MaxIdleConnsPerHost` 和 `MaxConnsPerHost`。
+- 监控本机的 TIME_WAIT 数量和新建连接速率，出现异常时首先检查连接池配置和响应体是否关闭。
+
+=== web-19
+--- deep
+**原理展开**
+
+一个 HTTP 请求在 Go 服务里的 CPU 开销通常分布在：TLS 加解密、HTTP 解析、JSON 编解码、业务逻辑、日志、GC。用 pprof 看火焰图时，常见的“意外”热点：
+
+- `encoding/json`（反射）：换用 sonic（基于 JIT 和 SIMD）、go-json，或者为热点结构生成代码；
+- `runtime.mallocgc` 和 GC 相关函数：分配太多；
+- `fmt.Sprintf`、`strconv`：日志和字符串拼接；
+- `crypto/tls`：短连接导致频繁握手；
+- `syscall.Write`：大量小块写入，没有缓冲。
+
+fasthttp 的核心手段是**复用一切**：请求和响应对象、header 的解析结果、buffer 都来自对象池，handler 返回后这些对象立即被下一个请求复用。这就是它不能在 goroutine 中持有请求对象的原因。
+
+**代码示例**
+
+```go
+// 在线上安全地抓 CPU profile 并分析
+// go tool pprof -http=:8081 'http://host:6060/debug/pprof/profile?seconds=30'
+
+// gzip writer 复用：创建 gzip.Writer 的开销很大（内部有大缓冲区）
+var gzPool = sync.Pool{New: func() any { w, _ := gzip.NewWriterLevel(nil, gzip.BestSpeed); return w }}
+
+func gzipMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		gz := gzPool.Get().(*gzip.Writer)
+		defer gzPool.Put(gz)
+		gz.Reset(w)
+		defer gz.Close()
+		w.Header().Set("Content-Encoding", "gzip")
+		next.ServeHTTP(&gzipResponseWriter{ResponseWriter: w, w: gz}, r)
+	})
+}
+
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	w io.Writer
+}
+
+func (g *gzipResponseWriter) Write(b []byte) (int, error) { return g.w.Write(b) }
+```
+
+**常见追问**
+
+- 性能优化的顺序？→ 先确定目标（QPS、P99），压测找到瓶颈，优化最大的那个，再压测验证；不要凭感觉优化。
+- PGO 有帮助吗？→ 用生产环境的 profile 编译，通常能带来 2%～14% 的 CPU 提升，几乎没有成本。
+- 什么时候考虑横向扩展而不是优化代码？→ 优化的收益不明显、或者开发成本高于加机器的成本时。
+
+**实战建议**
+
+- 建立性能基线：每次发布前跑相同的压测，对比 QPS、延迟分位数、CPU 和内存。
+- 先解决“外部等待”（数据库、下游、锁），再优化 CPU。
+
+=== web-20
+--- deep
+**原理展开**
+
+Webhook 接口面临的威胁：
+
+- **伪造**：攻击者知道回调地址后，可以发送假的“支付成功”通知——用签名防御；
+- **重放**：截获一个合法的请求后重复发送——用时间戳窗口 + 事件 ID 去重防御；
+- **篡改**：修改请求体中的金额——签名覆盖了整个请求体，任何修改都会导致验签失败。
+
+签名必须基于**原始的请求体字节**计算。如果先把 JSON 解析成结构体再重新序列化，字段顺序、空白、数字格式可能变化，签名就对不上了。所以要先读取原始字节、验签，再解析。
+
+**代码示例**
+
+```go
+func webhook(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if !verify(secret, body, r.Header.Get("X-Timestamp"), r.Header.Get("X-Signature")) {
+		http.Error(w, "invalid signature", http.StatusUnauthorized)
+		return
+	}
+	var ev Event
+	if err := json.Unmarshal(body, &ev); err != nil {
+		http.Error(w, "bad payload", http.StatusBadRequest)
+		return
+	}
+	// 先落库（事件 ID 唯一索引去重），立即返回，再异步处理
+	if err := inbox.Save(r.Context(), ev.ID, body); err != nil && !isDuplicate(err) {
+		http.Error(w, "retry later", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+```
+
+**常见追问**
+
+- 回调处理失败了怎么办？→ 返回非 2xx，发送方会按退避策略重试；所以处理必须幂等。
+- 为什么还要主动查询支付结果？→ 防止签名密钥泄露等极端情况下的伪造；也用于处理回调丢失（定时对账）。
+- 密钥轮换怎么做？→ 发送方在过渡期内用新旧两个密钥分别签名（多个 `v1=`），接收方任意一个验证通过即可。
+
+**实战建议**
+
+- 回调接口“先持久化、后处理”，处理逻辑和接收逻辑解耦。
+- 记录每一次回调的原始内容和验签结果，方便对账和排查纠纷。
+
+=== web-21
+--- deep
+**原理展开**
+
+灰度发布和功能开关解决的是同一个问题的两个层面：
+
+- **灰度发布**控制“哪些**流量**到达新版本的**代码部署**”，在基础设施层（网关、服务网格、负载均衡）实现，粒度是实例或请求；
+- **功能开关**控制“哪些**用户**能使用新**功能**”，在应用层实现，粒度可以细到单个用户，并且可以随时开关，不需要重新部署。
+
+灰度的关键是**可观测性**：新旧版本的错误率、延迟、业务指标（转化率、下单量）要能分开统计并对比，自动化的灰度系统（Argo Rollouts、Flagger）会根据这些指标自动决定继续放量还是回滚。
+
+**代码示例**
+
+```go
+// 功能开关：规则从配置中心加载，按用户稳定地分桶
+type Flag struct {
+	Name     string
+	Percent  int             // 0～100
+	Allow    map[string]bool // 白名单
+	Disabled bool            // 紧急关闭
+}
+
+func (f *Flag) On(userID string) bool {
+	if f.Disabled {
+		return false
+	}
+	if f.Allow[userID] {
+		return true
+	}
+	h := fnv.New32a()
+	h.Write([]byte(f.Name + ":" + userID))
+	return int(h.Sum32()%100) < f.Percent
+}
+
+// 使用
+if flags.Get("new-checkout").On(uid) {
+	return newCheckout(ctx, req)
+}
+return oldCheckout(ctx, req)
+```
+
+**常见追问**
+
+- 灰度期间数据库结构变化怎么办？→ 采用“扩展-迁移-收缩”的方式：先加字段（新旧版本都能工作），再迁移数据和切换读写，最后删除旧字段。
+- 有状态的功能（比如新的订单流程）灰度时要注意什么？→ 同一个用户的请求要始终路由到同一个版本，并且新版本创建的数据旧版本要能处理（或者至少不出错）。
+- 开关太多怎么管理？→ 每个开关记录负责人和到期时间，全量后及时删除代码分支和开关。
+
+**实战建议**
+
+- 每次发布都走灰度，从内部用户开始，逐步扩大到 1%、10%、50%、100%。
+- 回滚能力比灰度本身更重要：确保能在几分钟内完成回滚。
+
+=== web-22
+--- deep
+**原理展开**
+
+兼容性分两个方向：
+
+- **向后兼容**（backward）：新版本的服务端能处理旧版本客户端的请求；
+- **向前兼容**（forward）：旧版本的客户端能处理新版本服务端的响应（比如忽略不认识的字段）。
+
+**Postel 法则**（健壮性原则）：“发送时要保守，接收时要宽容”。客户端忽略不认识的字段和枚举值、服务端对缺失的可选字段使用默认值，双方就能各自独立地演进。protobuf 的设计天然支持这一点：未知字段会被保留，新增字段对旧代码透明。
+
+几种版本标识方式的比较：URL 路径（`/v1/`）最直观、方便路由和缓存；请求头（`Accept: application/vnd.x.v2+json`）URL 更干净；查询参数（`?version=2`）容易被缓存忽略。
+
+**代码示例**
+
+```go
+// 在同一个 handler 里通过“适配”支持多个版本，避免复制整套代码
+func getUser(w http.ResponseWriter, r *http.Request) {
+	u, err := svc.Get(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	switch apiVersion(r) {
+	case 1:
+		writeJSON(w, userV1{Name: u.FirstName + " " + u.LastName})
+	default:
+		writeJSON(w, userV2{FirstName: u.FirstName, LastName: u.LastName})
+	}
+}
+
+// 旧版本的下线通知
+func deprecated(next http.Handler, sunset time.Time) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Deprecation", "true")
+		w.Header().Set("Sunset", sunset.UTC().Format(http.TimeFormat))
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+**常见追问**
+
+- 枚举新增值为什么可能不兼容？→ 旧客户端用 switch 处理所有已知的值，遇到新值可能崩溃或者走错误的分支；所以客户端必须有 default 分支。
+- 修改字段的默认值算兼容吗？→ 语义上通常不兼容，旧客户端依赖原来的默认行为。
+- GraphQL 怎么处理版本？→ 通常不做版本，而是通过新增字段、标记旧字段为 `@deprecated` 来演进。
+
+**实战建议**
+
+- 设计 API 时就考虑演进：用对象而不是数组作为顶层响应（方便加字段）、用字符串枚举、分页用游标。
+- 记录每个版本的调用量和调用方，下线前逐一确认迁移完成。

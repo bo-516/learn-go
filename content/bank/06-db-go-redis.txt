@@ -1,0 +1,1792 @@
+数据库 · Go 与 Redis（DB-17 ~ DB-31）的编程小任务。database/sql 相关任务在测试里实现了一个假的驱动，你的代码用的是真实的 *sql.DB。
+
+=== db-17-1
+title: 用 Little 定律估算连接池
+--- desc
+按下面的规则估算每个服务实例的连接池配置，并应用到 `*sql.DB` 上：
+
+1. 每实例需要的并发连接 ≈ 每实例 QPS × 平均查询耗时（Little 定律），再留 50% 余量：`need = ceil(peakQPS × latencyMs × 1.5 / (instances × 1000))`，用整数运算（避免浮点误差），至少为 2；
+2. 所有实例的连接总数不能超过数据库 `max_connections` 的 80%：`MaxOpen = min(need, maxConnections × 8 / 10 / instances)`；
+3. `MaxIdle = MaxOpen`（默认只有 2，高并发下会频繁建连、产生大量 TIME_WAIT）；
+4. `MaxLifetime = min(30 分钟, waitTimeout / 2)`，必须小于 MySQL 的 `wait_timeout`；`MaxIdleTime = 5 分钟`。
+
+`Apply(db, cfg)` 调用 `SetMaxOpenConns` 等四个方法。
+--- solution
+package main
+
+import (
+	"database/sql"
+	"time"
+)
+
+type PoolConfig struct {
+	MaxOpen     int
+	MaxIdle     int
+	MaxLifetime time.Duration
+	MaxIdleTime time.Duration
+}
+
+func Plan(peakQPS int, avgLatency time.Duration, instances, maxConnections int, waitTimeout time.Duration) PoolConfig {
+	// @solution
+	ms := int(avgLatency.Milliseconds())
+	num := peakQPS * ms * 3
+	den := instances * 2000
+	need := max((num+den-1)/den, 2)
+	maxOpen := min(need, maxConnections*8/10/instances)
+	return PoolConfig{
+		MaxOpen:     maxOpen,
+		MaxIdle:     maxOpen,
+		MaxLifetime: min(30*time.Minute, waitTimeout/2),
+		MaxIdleTime: 5 * time.Minute,
+	}
+	// @starter
+	// return PoolConfig{} // TODO
+	// @end
+}
+
+func Apply(db *sql.DB, c PoolConfig) {
+	// @solution
+	db.SetMaxOpenConns(c.MaxOpen)
+	db.SetMaxIdleConns(c.MaxIdle)
+	db.SetConnMaxLifetime(c.MaxLifetime)
+	db.SetConnMaxIdleTime(c.MaxIdleTime)
+	// @starter
+	// // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"testing"
+	"time"
+)
+
+func TestPlan(t *testing.T) {
+	cases := []struct {
+		qps       int
+		latency   time.Duration
+		instances int
+		maxConn   int
+		wait      time.Duration
+		want      PoolConfig
+	}{
+		{3000, 20 * time.Millisecond, 10, 1000, 8 * time.Hour, PoolConfig{9, 9, 30 * time.Minute, 5 * time.Minute}},
+		{50000, 50 * time.Millisecond, 4, 500, 8 * time.Hour, PoolConfig{100, 100, 30 * time.Minute, 5 * time.Minute}},
+		{10, time.Millisecond, 2, 1000, 10 * time.Minute, PoolConfig{2, 2, 5 * time.Minute, 5 * time.Minute}},
+		{1000, 15 * time.Millisecond, 3, 2000, time.Hour, PoolConfig{8, 8, 30 * time.Minute, 5 * time.Minute}},
+	}
+	for _, c := range cases {
+		if got := Plan(c.qps, c.latency, c.instances, c.maxConn, c.wait); got != c.want {
+			t.Errorf("Plan(qps=%d, %v, %d 实例) = %+v，期望 %+v", c.qps, c.latency, c.instances, got, c.want)
+		}
+	}
+}
+
+type noopConnector struct{}
+
+func (noopConnector) Connect(context.Context) (driver.Conn, error) { return nil, errors.New("no db") }
+func (noopConnector) Driver() driver.Driver                       { return nil }
+
+func TestApply(t *testing.T) {
+	db := sql.OpenDB(noopConnector{})
+	defer db.Close()
+	Apply(db, PoolConfig{MaxOpen: 42, MaxIdle: 42, MaxLifetime: time.Minute, MaxIdleTime: time.Minute})
+	if got := db.Stats().MaxOpenConnections; got != 42 {
+		t.Fatalf("MaxOpenConnections = %d，期望 42", got)
+	}
+}
+
+=== db-18-1
+title: 修复 rows 没关闭导致的连接泄漏
+--- desc
+`FirstN(ctx, db, n)` 查询前 n 个用户名。起始代码有两个问题：
+
+1. 拿够 n 行就提前返回了，但**没有 `rows.Close()`**——结果集没读完，连接一直被占着。连接池只有 1 个连接时，第二次调用就会永远等不到连接；
+2. 遍历结束后没有检查 `rows.Err()`，网络中途断开时会把不完整的结果当成成功返回。
+
+修复它们。测试里用一个假的驱动模拟数据库，你的代码使用的是真实的 `database/sql`。
+--- solution
+package main
+
+import (
+	"context"
+	"database/sql"
+)
+
+func FirstN(ctx context.Context, db *sql.DB, n int) ([]string, error) {
+	rows, err := db.QueryContext(ctx, "SELECT name FROM users ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+		if len(names) == n {
+			return names, nil
+		}
+	}
+	return names, rows.Err()
+}
+--- starter
+package main
+
+import (
+	"context"
+	"database/sql"
+)
+
+func FirstN(ctx context.Context, db *sql.DB, n int) ([]string, error) {
+	rows, err := db.QueryContext(ctx, "SELECT name FROM users ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+		if len(names) == n {
+			return names, nil // BUG: 提前返回，rows 没有关闭
+		}
+	}
+	return names, nil // BUG: 没有检查 rows.Err()
+}
+--- test
+package main
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"io"
+	"slices"
+	"testing"
+	"time"
+)
+
+// ---- 一个最小的假驱动 ----
+
+type fakeConnector struct {
+	rows      []string
+	failAfter int // >0 时，返回这么多行之后模拟连接断开
+}
+
+func (c *fakeConnector) Connect(context.Context) (driver.Conn, error) { return &fakeConn{c}, nil }
+func (c *fakeConnector) Driver() driver.Driver                       { return nil }
+
+type fakeConn struct{ c *fakeConnector }
+
+func (cn *fakeConn) Prepare(q string) (driver.Stmt, error) { return &fakeStmt{cn.c}, nil }
+func (cn *fakeConn) Close() error                          { return nil }
+func (cn *fakeConn) Begin() (driver.Tx, error)             { return nil, errors.New("not supported") }
+
+type fakeStmt struct{ c *fakeConnector }
+
+func (s *fakeStmt) Close() error                                  { return nil }
+func (s *fakeStmt) NumInput() int                                 { return -1 }
+func (s *fakeStmt) Exec([]driver.Value) (driver.Result, error)    { return driver.RowsAffected(0), nil }
+func (s *fakeStmt) Query([]driver.Value) (driver.Rows, error)     { return &fakeRows{c: s.c}, nil }
+
+type fakeRows struct {
+	c *fakeConnector
+	i int
+}
+
+func (r *fakeRows) Columns() []string { return []string{"name"} }
+func (r *fakeRows) Close() error      { return nil }
+func (r *fakeRows) Next(dest []driver.Value) error {
+	if r.c.failAfter > 0 && r.i >= r.c.failAfter {
+		return errors.New("connection reset by peer")
+	}
+	if r.i >= len(r.c.rows) {
+		return io.EOF
+	}
+	dest[0] = r.c.rows[r.i]
+	r.i++
+	return nil
+}
+
+func open(c *fakeConnector) *sql.DB {
+	db := sql.OpenDB(c)
+	db.SetMaxOpenConns(1)
+	return db
+}
+
+// ---- 测试 ----
+
+func TestNoLeak(t *testing.T) {
+	db := open(&fakeConnector{rows: []string{"a", "b", "c", "d"}})
+	defer db.Close()
+	for i := 0; i < 3; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		got, err := FirstN(ctx, db, 2)
+		cancel()
+		if err != nil {
+			t.Fatalf("第 %d 次调用失败：%v（连接被上一次调用占着没释放？）", i+1, err)
+		}
+		if !slices.Equal(got, []string{"a", "b"}) {
+			t.Fatalf("FirstN = %v", got)
+		}
+	}
+	if n := db.Stats().InUse; n != 0 {
+		t.Fatalf("调用结束后仍有 %d 个连接被占用", n)
+	}
+}
+
+func TestAllRows(t *testing.T) {
+	db := open(&fakeConnector{rows: []string{"a", "b"}})
+	defer db.Close()
+	got, err := FirstN(context.Background(), db, 10)
+	if err != nil || !slices.Equal(got, []string{"a", "b"}) {
+		t.Fatalf("FirstN = %v, %v", got, err)
+	}
+}
+
+func TestRowsErr(t *testing.T) {
+	db := open(&fakeConnector{rows: []string{"a", "b", "c", "d"}, failAfter: 2})
+	defer db.Close()
+	if _, err := FirstN(context.Background(), db, 10); err == nil {
+		t.Fatal("遍历中途出错时应返回错误（rows.Err()）")
+	}
+}
+
+=== db-19-1
+title: 封装 WithTx：提交、回滚与 panic
+--- desc
+实现 `WithTx(ctx, db, fn)`：开启事务并执行 `fn(tx)`：
+
+- `fn` 返回 nil → 提交，返回 `Commit` 的错误；
+- `fn` 返回错误 → 回滚，返回 `fn` 的错误；
+- `fn` panic → 回滚后**继续向上 panic**（不要吞掉 panic）。
+
+测试里的假驱动会记录 begin / commit / rollback 的调用顺序。
+--- solution
+package main
+
+import (
+	"context"
+	"database/sql"
+)
+
+func WithTx(ctx context.Context, db *sql.DB, fn func(tx *sql.Tx) error) (err error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	// @solution
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback()
+			panic(p)
+		}
+		if err != nil {
+			_ = tx.Rollback()
+			return
+		}
+		err = tx.Commit()
+	}()
+	return fn(tx)
+	// @starter
+	// if err := fn(tx); err != nil { // TODO: 没有处理 panic，出错时也没有回滚
+	// 	return err
+	// }
+	// return tx.Commit()
+	// @end
+}
+--- test
+package main
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"slices"
+	"sync"
+	"testing"
+)
+
+type fakeConnector struct {
+	mu        sync.Mutex
+	log       []string
+	commitErr error
+}
+
+func (c *fakeConnector) record(s string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.log = append(c.log, s)
+}
+
+func (c *fakeConnector) Connect(context.Context) (driver.Conn, error) { return &fakeConn{c}, nil }
+func (c *fakeConnector) Driver() driver.Driver                       { return nil }
+
+type fakeConn struct{ c *fakeConnector }
+
+func (cn *fakeConn) Prepare(q string) (driver.Stmt, error) { return &fakeStmt{cn.c, q}, nil }
+func (cn *fakeConn) Close() error                          { return nil }
+func (cn *fakeConn) Begin() (driver.Tx, error) {
+	cn.c.record("begin")
+	return &fakeTx{cn.c}, nil
+}
+
+type fakeTx struct{ c *fakeConnector }
+
+func (t *fakeTx) Commit() error {
+	t.c.record("commit")
+	return t.c.commitErr
+}
+func (t *fakeTx) Rollback() error {
+	t.c.record("rollback")
+	return nil
+}
+
+type fakeStmt struct {
+	c *fakeConnector
+	q string
+}
+
+func (s *fakeStmt) Close() error  { return nil }
+func (s *fakeStmt) NumInput() int { return -1 }
+func (s *fakeStmt) Exec([]driver.Value) (driver.Result, error) {
+	s.c.record("exec")
+	return driver.RowsAffected(1), nil
+}
+func (s *fakeStmt) Query([]driver.Value) (driver.Rows, error) { return nil, errors.New("not supported") }
+
+func run(t *testing.T, c *fakeConnector, fn func(tx *sql.Tx) error) error {
+	t.Helper()
+	db := sql.OpenDB(c)
+	defer db.Close()
+	err := WithTx(context.Background(), db, fn)
+	if n := db.Stats().InUse; n != 0 {
+		t.Errorf("事务结束后仍有 %d 个连接被占用", n)
+	}
+	return err
+}
+
+func TestCommit(t *testing.T) {
+	c := &fakeConnector{}
+	err := run(t, c, func(tx *sql.Tx) error {
+		_, err := tx.Exec("UPDATE accounts SET balance = balance - 10 WHERE id = 1")
+		return err
+	})
+	if err != nil || !slices.Equal(c.log, []string{"begin", "exec", "commit"}) {
+		t.Fatalf("err=%v log=%v", err, c.log)
+	}
+}
+
+func TestRollbackOnError(t *testing.T) {
+	c := &fakeConnector{}
+	boom := errors.New("余额不足")
+	err := run(t, c, func(tx *sql.Tx) error {
+		tx.Exec("UPDATE ...")
+		return boom
+	})
+	if !errors.Is(err, boom) || !slices.Equal(c.log, []string{"begin", "exec", "rollback"}) {
+		t.Fatalf("err=%v log=%v", err, c.log)
+	}
+}
+
+func TestRollbackOnPanic(t *testing.T) {
+	c := &fakeConnector{}
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		run(t, c, func(tx *sql.Tx) error { panic("nil map") })
+	}()
+	if recovered != "nil map" {
+		t.Fatalf("panic 应该继续向上抛出，recover 得到 %v", recovered)
+	}
+	if !slices.Equal(c.log, []string{"begin", "rollback"}) {
+		t.Fatalf("panic 时应回滚：log=%v", c.log)
+	}
+}
+
+func TestCommitError(t *testing.T) {
+	c := &fakeConnector{commitErr: errors.New("connection lost")}
+	if err := run(t, c, func(tx *sql.Tx) error { return nil }); err == nil {
+		t.Fatal("Commit 失败时应返回错误")
+	}
+}
+
+=== db-20-1
+title: 用指针字段区分「没传」和「零值」
+--- desc
+用结构体做部分更新时，零值字段会被忽略：前端想把年龄改成 0、把状态改成 false，GORM 的 `Updates(struct)` 根本不会更新它们。
+
+把 `UserPatch` 的字段改成**指针**：JSON 里没有这个字段时指针是 nil，传了 0 或 false 时指针非 nil。然后实现：
+
+- `ToUpdates(p)`：只包含非 nil 的字段，key 分别为 `name`、`age`、`active`；
+- `ParsePatch(data)`：把请求 JSON 解析成 `UserPatch` 再转成更新 map。
+--- solution
+package main
+
+import "encoding/json"
+
+type UserPatch struct {
+	// @solution
+	Name   *string `json:"name"`
+	Age    *int    `json:"age"`
+	Active *bool   `json:"active"`
+	// @starter
+	// Name   string `json:"name"` // TODO: 改成指针
+	// Age    int    `json:"age"`
+	// Active bool   `json:"active"`
+	// @end
+}
+
+func ToUpdates(p UserPatch) map[string]any {
+	m := map[string]any{}
+	// @solution
+	if p.Name != nil {
+		m["name"] = *p.Name
+	}
+	if p.Age != nil {
+		m["age"] = *p.Age
+	}
+	if p.Active != nil {
+		m["active"] = *p.Active
+	}
+	// @starter
+	// if p.Name != "" {
+	// 	m["name"] = p.Name
+	// }
+	// if p.Age != 0 {
+	// 	m["age"] = p.Age
+	// }
+	// if p.Active {
+	// 	m["active"] = p.Active
+	// }
+	// @end
+	return m
+}
+
+func ParsePatch(data []byte) (map[string]any, error) {
+	var p UserPatch
+	if err := json.Unmarshal(data, &p); err != nil {
+		return nil, err
+	}
+	return ToUpdates(p), nil
+}
+--- test
+package main
+
+import (
+	"maps"
+	"testing"
+)
+
+func TestParsePatch(t *testing.T) {
+	cases := []struct {
+		in   string
+		want map[string]any
+	}{
+		{`{"age": 0, "active": false}`, map[string]any{"age": 0, "active": false}},
+		{`{"name": "bob"}`, map[string]any{"name": "bob"}},
+		{`{"name": "", "age": 30}`, map[string]any{"name": "", "age": 30}},
+		{`{}`, map[string]any{}},
+	}
+	for _, c := range cases {
+		got, err := ParsePatch([]byte(c.in))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !maps.Equal(got, c.want) {
+			t.Errorf("ParsePatch(%s) = %v，期望 %v", c.in, got, c.want)
+		}
+	}
+	if _, err := ParsePatch([]byte(`{`)); err == nil {
+		t.Error("非法 JSON 应返回错误")
+	}
+}
+
+=== db-21-1
+title: 参数化查询与白名单
+--- desc
+实现 `BuildQuery(filters, orderBy, limit)`，生成安全的查询语句：
+
+- 形如 `SELECT id, name FROM users WHERE age = ? AND name = ? ORDER BY age DESC LIMIT ?`；
+- `filters` 的**值**一律作为参数（`?` 占位），**列名**必须在白名单 `allowed` 中，否则返回错误；条件按列名字典序排列；没有过滤条件时不输出 `WHERE`；
+- `orderBy` 形如 `"age"`（升序）或 `"-age"`（降序），为空表示不排序；列名同样要在白名单中——**ORDER BY 和表名、列名不能用占位符**，只能白名单校验；
+- `limit` 作为最后一个参数。
+--- solution
+package main
+
+import (
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+)
+
+var allowed = map[string]bool{"id": true, "name": true, "age": true, "status": true}
+
+func BuildQuery(filters map[string]any, orderBy string, limit int) (string, []any, error) {
+	// @solution
+	var b strings.Builder
+	var args []any
+	b.WriteString("SELECT id, name FROM users")
+	for i, col := range slices.Sorted(maps.Keys(filters)) {
+		if !allowed[col] {
+			return "", nil, fmt.Errorf("unknown column %q", col)
+		}
+		if i == 0 {
+			b.WriteString(" WHERE ")
+		} else {
+			b.WriteString(" AND ")
+		}
+		b.WriteString(col + " = ?")
+		args = append(args, filters[col])
+	}
+	if orderBy != "" {
+		col, dir := orderBy, "ASC"
+		if rest, ok := strings.CutPrefix(orderBy, "-"); ok {
+			col, dir = rest, "DESC"
+		}
+		if !allowed[col] {
+			return "", nil, fmt.Errorf("unknown sort column %q", col)
+		}
+		b.WriteString(" ORDER BY " + col + " " + dir)
+	}
+	b.WriteString(" LIMIT ?")
+	args = append(args, limit)
+	return b.String(), args, nil
+	// @starter
+	// q := "SELECT id, name FROM users"
+	// for col, v := range filters {
+	// 	q += fmt.Sprintf(" WHERE %s = '%v'", col, v) // TODO: 拼接用户输入 = SQL 注入
+	// }
+	// return q + fmt.Sprintf(" ORDER BY %s LIMIT %d", orderBy, limit), nil, nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestBuildQuery(t *testing.T) {
+	q, args, err := BuildQuery(map[string]any{"name": "alice", "age": 30}, "-age", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q != "SELECT id, name FROM users WHERE age = ? AND name = ? ORDER BY age DESC LIMIT ?" {
+		t.Fatalf("SQL = %q", q)
+	}
+	if !slices.Equal(args, []any{30, "alice", 20}) {
+		t.Fatalf("args = %v", args)
+	}
+}
+
+func TestNoFilters(t *testing.T) {
+	q, args, err := BuildQuery(nil, "", 5)
+	if err != nil || q != "SELECT id, name FROM users LIMIT ?" || !slices.Equal(args, []any{5}) {
+		t.Fatalf("q=%q args=%v err=%v", q, args, err)
+	}
+	q, _, _ = BuildQuery(nil, "id", 5)
+	if q != "SELECT id, name FROM users ORDER BY id ASC LIMIT ?" {
+		t.Fatalf("q=%q", q)
+	}
+}
+
+func TestInjection(t *testing.T) {
+	evil := "x' OR '1'='1"
+	q, args, err := BuildQuery(map[string]any{"name": evil}, "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q != "SELECT id, name FROM users WHERE name = ? LIMIT ?" || args[0] != evil {
+		t.Fatalf("用户输入必须作为参数传递：q=%q args=%v", q, args)
+	}
+	if _, _, err := BuildQuery(map[string]any{"name; DROP TABLE users; --": 1}, "", 1); err == nil {
+		t.Error("不在白名单的列名应返回错误")
+	}
+	if _, _, err := BuildQuery(nil, "age; DROP TABLE users", 1); err == nil {
+		t.Error("不在白名单的排序列应返回错误")
+	}
+}
+
+=== db-22-1
+title: 用 map + 排序实现排行榜
+--- desc
+Redis 的有序集合（ZSet）适合做排行榜。用 Go 实现一个简化版：
+
+- `Add(member, score)`：设置分数（相当于 ZADD）；
+- `IncrBy(member, delta)`：增加分数并返回新分数（ZINCRBY），成员不存在时从 0 开始；
+- `Rank(member)`：从高到低的排名（从 0 开始，ZREVRANK），分数相同按成员名字典序；不存在返回 false；
+- `Top(n)`：前 n 名（ZREVRANGE 0 n-1 WITHSCORES）。
+
+Redis 用跳表让这些操作都是 O(log N)，这里每次排序即可。
+--- solution
+package main
+
+import (
+	"cmp"
+	"slices"
+)
+
+type Entry struct {
+	Member string
+	Score  float64
+}
+
+type Leaderboard struct {
+	scores map[string]float64
+}
+
+func NewLeaderboard() *Leaderboard { return &Leaderboard{scores: map[string]float64{}} }
+
+func (l *Leaderboard) Add(member string, score float64) { l.scores[member] = score }
+
+func (l *Leaderboard) IncrBy(member string, delta float64) float64 {
+	// @solution
+	l.scores[member] += delta
+	return l.scores[member]
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+
+func (l *Leaderboard) sorted() []Entry {
+	out := make([]Entry, 0, len(l.scores))
+	for m, s := range l.scores {
+		out = append(out, Entry{m, s})
+	}
+	// @solution
+	slices.SortFunc(out, func(a, b Entry) int {
+		return cmp.Or(cmp.Compare(b.Score, a.Score), cmp.Compare(a.Member, b.Member))
+	})
+	// @starter
+	// // TODO: 按分数从高到低排序，同分按成员名
+	// @end
+	return out
+}
+
+func (l *Leaderboard) Rank(member string) (int, bool) {
+	// @solution
+	if _, ok := l.scores[member]; !ok {
+		return 0, false
+	}
+	return slices.IndexFunc(l.sorted(), func(e Entry) bool { return e.Member == member }), true
+	// @starter
+	// return 0, false // TODO
+	// @end
+}
+
+func (l *Leaderboard) Top(n int) []Entry {
+	s := l.sorted()
+	return s[:min(n, len(s))]
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestLeaderboard(t *testing.T) {
+	lb := NewLeaderboard()
+	lb.Add("alice", 100)
+	lb.Add("bob", 80)
+	lb.Add("carol", 100)
+	if got := lb.IncrBy("bob", 30); got != 110 {
+		t.Fatalf("IncrBy = %v，期望 110", got)
+	}
+	if got := lb.IncrBy("dave", 5); got != 5 {
+		t.Fatalf("新成员 IncrBy = %v，期望 5", got)
+	}
+	want := []Entry{{"bob", 110}, {"alice", 100}, {"carol", 100}}
+	if got := lb.Top(3); !slices.Equal(got, want) {
+		t.Fatalf("Top(3) = %v，期望 %v", got, want)
+	}
+	if r, ok := lb.Rank("carol"); !ok || r != 2 {
+		t.Fatalf("Rank(carol) = %d, %v，期望 2", r, ok)
+	}
+	if _, ok := lb.Rank("nobody"); ok {
+		t.Fatal("不存在的成员应返回 false")
+	}
+	if len(lb.Top(100)) != 4 {
+		t.Fatal("n 大于成员数时返回全部")
+	}
+}
+
+=== db-23-1
+title: 缓存空值与随机过期时间
+--- desc
+实现一个能防**穿透**和**雪崩**的读缓存 `Cache.Get(key)`：
+
+1. 缓存命中且未过期 → 直接返回；如果缓存的是「空值」，返回 `ErrNotFound`（不再查库）；
+2. 未命中 → 调用 `load(key)`：
+   - 成功：缓存 `ttl + jitter(ttl/5)`，随机抖动让大量 key 不会在同一时刻过期；
+   - 返回 `ErrNotFound`：缓存一个空值，过期时间为较短的 `nullTTL`；
+   - 其他错误：不缓存，直接返回错误。
+
+时间和随机数都通过注入的函数获取，测试可以精确控制。
+--- solution
+package main
+
+import (
+	"errors"
+	"time"
+)
+
+var ErrNotFound = errors.New("not found")
+
+type item struct {
+	val      string
+	notFound bool
+	expire   time.Time
+}
+
+type Cache struct {
+	now     func() time.Time
+	jitter  func(max time.Duration) time.Duration
+	load    func(key string) (string, error)
+	ttl     time.Duration
+	nullTTL time.Duration
+	items   map[string]item
+}
+
+func NewCache(now func() time.Time, jitter func(time.Duration) time.Duration, load func(string) (string, error)) *Cache {
+	return &Cache{now: now, jitter: jitter, load: load, ttl: 10 * time.Minute, nullTTL: 30 * time.Second, items: map[string]item{}}
+}
+
+func (c *Cache) Get(key string) (string, error) {
+	// @solution
+	if it, ok := c.items[key]; ok && c.now().Before(it.expire) {
+		if it.notFound {
+			return "", ErrNotFound
+		}
+		return it.val, nil
+	}
+	v, err := c.load(key)
+	switch {
+	case err == nil:
+		c.items[key] = item{val: v, expire: c.now().Add(c.ttl + c.jitter(c.ttl/5))}
+		return v, nil
+	case errors.Is(err, ErrNotFound):
+		c.items[key] = item{notFound: true, expire: c.now().Add(c.nullTTL)}
+		return "", err
+	default:
+		return "", err
+	}
+	// @starter
+	// if it, ok := c.items[key]; ok && c.now().Before(it.expire) {
+	// 	return it.val, nil
+	// }
+	// v, err := c.load(key)
+	// if err != nil {
+	// 	return "", err // TODO: 不存在的数据每次都会打到数据库
+	// }
+	// c.items[key] = item{val: v, expire: c.now().Add(c.ttl)} // TODO: 同时写入的 key 会同时过期
+	// return v, nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"errors"
+	"testing"
+	"time"
+)
+
+func TestNullCaching(t *testing.T) {
+	now := time.Unix(0, 0)
+	loads := 0
+	c := NewCache(func() time.Time { return now }, func(time.Duration) time.Duration { return 0 },
+		func(key string) (string, error) {
+			loads++
+			return "", ErrNotFound
+		})
+	for i := 0; i < 5; i++ {
+		if _, err := c.Get("user:-1"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("应返回 ErrNotFound，实际 %v", err)
+		}
+	}
+	if loads != 1 {
+		t.Fatalf("不存在的 key 查了 %d 次库，期望 1 次（空值缓存）", loads)
+	}
+	now = now.Add(31 * time.Second)
+	c.Get("user:-1")
+	if loads != 2 {
+		t.Fatal("空值缓存过期后应重新查库")
+	}
+}
+
+func TestJitter(t *testing.T) {
+	now := time.Unix(0, 0)
+	var asked time.Duration
+	c := NewCache(func() time.Time { return now },
+		func(max time.Duration) time.Duration { asked = max; return 90 * time.Second },
+		func(key string) (string, error) { return "v-" + key, nil })
+	if v, err := c.Get("a"); err != nil || v != "v-a" {
+		t.Fatalf("Get = %q, %v", v, err)
+	}
+	if asked != 2*time.Minute {
+		t.Fatalf("抖动上限应为 ttl/5 = 2m，实际 %v", asked)
+	}
+	if exp := c.items["a"].expire; !exp.Equal(now.Add(11*time.Minute + 30*time.Second)) {
+		t.Fatalf("过期时间 = %v，期望 ttl + 抖动", exp.Sub(now))
+	}
+}
+
+func TestOtherErrorNotCached(t *testing.T) {
+	loads := 0
+	c := NewCache(time.Now, func(time.Duration) time.Duration { return 0 },
+		func(string) (string, error) { loads++; return "", errors.New("db timeout") })
+	c.Get("k")
+	c.Get("k")
+	if loads != 2 {
+		t.Fatal("数据库错误不应被缓存")
+	}
+}
+
+=== db-23-2
+title: 布隆过滤器
+--- desc
+布隆过滤器可以在访问缓存和数据库之前，挡掉绝大多数**一定不存在**的 key：它可能误判「存在」，但绝不会把存在的判断成不存在。
+
+实现 `Bloom`：
+
+- `NewBloom(m, k)`：`m` 个比特位、`k` 个哈希函数，比特位存放在 `[]uint64` 里；
+- 位置计算用**双重哈希**：对 key 做 FNV-1a 64 位哈希得到 `h`，令 `h1 = uint32(h)`、`h2 = uint32(h >> 32)`，第 i 个位置是 `(h1 + i*h2) % m`；
+- `Add(key)` 把 k 个位置置 1，`MayContain(key)` 检查 k 个位置是否都为 1。
+
+测试会加入 1000 个 key，要求它们全部命中，并且 10000 个不存在的 key 误判率低于 3%。
+--- solution
+package main
+
+import "hash/fnv"
+
+type Bloom struct {
+	bits []uint64
+	m    uint32
+	k    int
+}
+
+func NewBloom(m uint32, k int) *Bloom {
+	return &Bloom{bits: make([]uint64, (m+63)/64), m: m, k: k}
+}
+
+func (b *Bloom) positions(key string) []uint32 {
+	// @solution
+	h := fnv.New64a()
+	h.Write([]byte(key))
+	sum := h.Sum64()
+	h1, h2 := uint32(sum), uint32(sum>>32)
+	pos := make([]uint32, b.k)
+	for i := range pos {
+		pos[i] = (h1 + uint32(i)*h2) % b.m
+	}
+	return pos
+	// @starter
+	// return nil // TODO
+	// @end
+}
+
+func (b *Bloom) Add(key string) {
+	// @solution
+	for _, p := range b.positions(key) {
+		b.bits[p/64] |= 1 << (p % 64)
+	}
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (b *Bloom) MayContain(key string) bool {
+	// @solution
+	for _, p := range b.positions(key) {
+		if b.bits[p/64]&(1<<(p%64)) == 0 {
+			return false
+		}
+	}
+	return true
+	// @starter
+	// return true // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"testing"
+)
+
+func TestBloom(t *testing.T) {
+	b := NewBloom(9600, 7)
+	for i := 0; i < 1000; i++ {
+		b.Add(fmt.Sprintf("user:%d", i))
+	}
+	for i := 0; i < 1000; i++ {
+		if !b.MayContain(fmt.Sprintf("user:%d", i)) {
+			t.Fatalf("user:%d 已加入，却被判断为不存在（布隆过滤器不能有假阴性）", i)
+		}
+	}
+	fp := 0
+	for i := 0; i < 10000; i++ {
+		if b.MayContain(fmt.Sprintf("other:%d", i)) {
+			fp++
+		}
+	}
+	if rate := float64(fp) / 10000; rate > 0.03 {
+		t.Fatalf("误判率 %.2f%% 过高", rate*100)
+	}
+}
+
+=== db-24-1
+title: 单线程执行命令，不需要锁
+race: true
+--- desc
+Redis 用单线程执行命令，所以每条命令天然是原子的，数据结构不需要加锁。用 Go 的 goroutine + channel 实现同样的模型：
+
+- `NewServer()` 启动**唯一一个**执行 goroutine，它独占 `data` map；
+- `Incr(key, by)` / `Get(key)`：把命令发给执行 goroutine，等待它通过 reply channel 返回结果；
+- `Close()`：停止执行 goroutine。
+
+测试会让 50 个 goroutine 并发调用，并开启 `-race`：除了执行 goroutine，任何地方都不能直接碰 `data`。
+--- solution
+package main
+
+type command struct {
+	op    string
+	key   string
+	by    int
+	reply chan int
+}
+
+type Server struct {
+	cmds chan command
+	done chan struct{}
+	data map[string]int
+}
+
+func NewServer() *Server {
+	s := &Server{cmds: make(chan command), done: make(chan struct{}), data: map[string]int{}}
+	// @solution
+	go s.loop()
+	// @end
+	return s
+}
+
+// @solution
+func (s *Server) loop() {
+	defer close(s.done)
+	for c := range s.cmds {
+		switch c.op {
+		case "incr":
+			s.data[c.key] += c.by
+		}
+		c.reply <- s.data[c.key]
+	}
+}
+
+// @end
+
+func (s *Server) Incr(key string, by int) int {
+	// @solution
+	reply := make(chan int, 1)
+	s.cmds <- command{op: "incr", key: key, by: by, reply: reply}
+	return <-reply
+	// @starter
+	// s.data[key] += by // TODO: 多个 goroutine 直接修改 map
+	// return s.data[key]
+	// @end
+}
+
+func (s *Server) Get(key string) int {
+	// @solution
+	reply := make(chan int, 1)
+	s.cmds <- command{op: "get", key: key, reply: reply}
+	return <-reply
+	// @starter
+	// return s.data[key]
+	// @end
+}
+
+func (s *Server) Close() {
+	// @solution
+	close(s.cmds)
+	<-s.done
+	// @starter
+	// // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"sync"
+	"testing"
+)
+
+func TestServer(t *testing.T) {
+	s := NewServer()
+	defer s.Close()
+	var wg sync.WaitGroup
+	for g := 0; g < 50; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				s.Incr("pv", 1)
+				s.Get("pv")
+			}
+		}()
+	}
+	wg.Wait()
+	if got := s.Get("pv"); got != 5000 {
+		t.Fatalf("pv = %d，期望 5000", got)
+	}
+	if got := s.Incr("uv", 3); got != 3 {
+		t.Fatalf("Incr 返回 %d，期望 3", got)
+	}
+}
+
+=== db-25-1
+title: Cache Aside：先更新数据库，再删缓存
+--- desc
+实现旁路缓存 `Service`：
+
+- `Read(key)`：先读缓存；未命中读数据库，再写回缓存；
+- `Update(key, val)`：**先更新数据库，再删除缓存**（不是更新缓存）；然后通过 `s.after(500ms, …)` 安排一次**延迟双删**，清理并发读请求可能写回的旧值。
+
+测试用记录调用顺序的假存储验证操作顺序。
+--- solution
+package main
+
+import "time"
+
+type Store interface {
+	Get(key string) (string, bool)
+	Set(key, val string)
+	Del(key string)
+}
+
+type Service struct {
+	db    Store
+	cache Store
+	after func(d time.Duration, f func())
+}
+
+func (s *Service) Read(key string) (string, bool) {
+	// @solution
+	if v, ok := s.cache.Get(key); ok {
+		return v, true
+	}
+	v, ok := s.db.Get(key)
+	if ok {
+		s.cache.Set(key, v)
+	}
+	return v, ok
+	// @starter
+	// return s.db.Get(key) // TODO
+	// @end
+}
+
+func (s *Service) Update(key, val string) {
+	// @solution
+	s.db.Set(key, val)
+	s.cache.Del(key)
+	s.after(500*time.Millisecond, func() { s.cache.Del(key) })
+	// @starter
+	// s.cache.Set(key, val) // TODO: 并发下缓存和数据库的写入顺序可能不一致
+	// s.db.Set(key, val)
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+	"time"
+)
+
+type fakeStore struct {
+	name string
+	data map[string]string
+	log  *[]string
+}
+
+func (f *fakeStore) Get(k string) (string, bool) {
+	v, ok := f.data[k]
+	*f.log = append(*f.log, f.name+".get")
+	return v, ok
+}
+func (f *fakeStore) Set(k, v string) { f.data[k] = v; *f.log = append(*f.log, f.name+".set") }
+func (f *fakeStore) Del(k string)    { delete(f.data, k); *f.log = append(*f.log, f.name+".del") }
+
+func setup() (*Service, *[]string, *[]func(), *[]time.Duration) {
+	var log []string
+	var pending []func()
+	var delays []time.Duration
+	s := &Service{
+		db:    &fakeStore{"db", map[string]string{"k": "v1"}, &log},
+		cache: &fakeStore{"cache", map[string]string{}, &log},
+		after: func(d time.Duration, f func()) { delays = append(delays, d); pending = append(pending, f) },
+	}
+	return s, &log, &pending, &delays
+}
+
+func TestRead(t *testing.T) {
+	s, log, _, _ := setup()
+	if v, _ := s.Read("k"); v != "v1" {
+		t.Fatalf("Read = %q", v)
+	}
+	s.Read("k")
+	want := []string{"cache.get", "db.get", "cache.set", "cache.get"}
+	if !slices.Equal(*log, want) {
+		t.Fatalf("操作顺序 = %v，期望 %v", *log, want)
+	}
+}
+
+func TestUpdate(t *testing.T) {
+	s, log, pending, delays := setup()
+	s.Read("k")
+	*log = nil
+	s.Update("k", "v2")
+	if want := []string{"db.set", "cache.del"}; !slices.Equal(*log, want) {
+		t.Fatalf("Update 的操作顺序 = %v，期望 %v", *log, want)
+	}
+	if len(*pending) != 1 || (*delays)[0] != 500*time.Millisecond {
+		t.Fatalf("应安排一次 500ms 后的延迟删除，实际 %v", *delays)
+	}
+	*log = nil
+	(*pending)[0]()
+	if !slices.Equal(*log, []string{"cache.del"}) {
+		t.Fatalf("延迟任务应再次删除缓存：%v", *log)
+	}
+	if v, _ := s.Read("k"); v != "v2" {
+		t.Fatalf("更新后读到 %q", v)
+	}
+}
+
+=== db-26-1
+title: AOF 重放与重写
+--- desc
+AOF 把每条写命令追加到文件里，重启时重放恢复数据；文件越来越大时需要**重写**：用最少的命令表达当前状态。
+
+- `Replay(log)`：依次执行命令，返回最终数据。`SET k v` 设置值，`INCR k` 加一（不存在视为 0），`DEL k` 删除；
+- `Rewrite(log)`：返回与 `Replay(log)` 结果等价的最短命令序列：每个存在的 key 一条 `SET`，按 key 字典序。
+--- solution
+package main
+
+import (
+	"maps"
+	"slices"
+)
+
+type Cmd struct {
+	Op  string // SET / INCR / DEL
+	Key string
+	Val int
+}
+
+func Replay(log []Cmd) map[string]int {
+	// @solution
+	data := map[string]int{}
+	for _, c := range log {
+		switch c.Op {
+		case "SET":
+			data[c.Key] = c.Val
+		case "INCR":
+			data[c.Key]++
+		case "DEL":
+			delete(data, c.Key)
+		}
+	}
+	return data
+	// @starter
+	// return nil // TODO
+	// @end
+}
+
+func Rewrite(log []Cmd) []Cmd {
+	// @solution
+	data := Replay(log)
+	out := make([]Cmd, 0, len(data))
+	for _, k := range slices.Sorted(maps.Keys(data)) {
+		out = append(out, Cmd{"SET", k, data[k]})
+	}
+	return out
+	// @starter
+	// return log // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"maps"
+	"slices"
+	"testing"
+)
+
+func TestAOF(t *testing.T) {
+	log := []Cmd{
+		{"SET", "pv", 10}, {"INCR", "pv", 0}, {"INCR", "uv", 0}, {"SET", "tmp", 1},
+		{"INCR", "pv", 0}, {"DEL", "tmp", 0}, {"SET", "uv", 5}, {"INCR", "uv", 0},
+	}
+	data := Replay(log)
+	if want := map[string]int{"pv": 12, "uv": 6}; !maps.Equal(data, want) {
+		t.Fatalf("Replay = %v，期望 %v", data, want)
+	}
+	rw := Rewrite(log)
+	if want := []Cmd{{"SET", "pv", 12}, {"SET", "uv", 6}}; !slices.Equal(rw, want) {
+		t.Fatalf("Rewrite = %v，期望 %v", rw, want)
+	}
+	if !maps.Equal(Replay(rw), data) {
+		t.Fatal("重写后的 AOF 重放结果必须一致")
+	}
+}
+
+=== db-27-1
+title: 安全释放分布式锁
+--- desc
+`FakeRedis` 模拟了带过期时间的 `SET NX PX` 和一个「值相等才删除」的原子操作（相当于释放锁的 Lua 脚本）。实现：
+
+- `Acquire(r, key, token, ttl)`：用 `SetNX` 加锁，成功返回 `*Lock`；
+- `(*Lock).Release()`：**只能释放自己的锁**——用 `CompareAndDelete(key, token)`。
+
+经典事故：A 加锁后执行太久，锁过期了；B 拿到了锁；A 执行完直接 `DEL`，把 B 的锁删了。
+--- solution
+package main
+
+import "time"
+
+type entry struct {
+	val    string
+	expire time.Time
+}
+
+type FakeRedis struct {
+	now  func() time.Time
+	data map[string]entry
+}
+
+func NewFakeRedis(now func() time.Time) *FakeRedis {
+	return &FakeRedis{now: now, data: map[string]entry{}}
+}
+
+func (r *FakeRedis) get(key string) (entry, bool) {
+	e, ok := r.data[key]
+	if ok && !r.now().Before(e.expire) {
+		delete(r.data, key)
+		return entry{}, false
+	}
+	return e, ok
+}
+
+// SetNX 相当于 SET key val NX PX ttl
+func (r *FakeRedis) SetNX(key, val string, ttl time.Duration) bool {
+	if _, ok := r.get(key); ok {
+		return false
+	}
+	r.data[key] = entry{val, r.now().Add(ttl)}
+	return true
+}
+
+func (r *FakeRedis) Del(key string) { delete(r.data, key) }
+
+// CompareAndDelete 相当于 if GET(key) == val then DEL(key)，原子执行
+func (r *FakeRedis) CompareAndDelete(key, val string) bool {
+	if e, ok := r.get(key); ok && e.val == val {
+		delete(r.data, key)
+		return true
+	}
+	return false
+}
+
+func (r *FakeRedis) Owner(key string) string { e, _ := r.get(key); return e.val }
+
+type Lock struct {
+	r     *FakeRedis
+	key   string
+	token string
+}
+
+func Acquire(r *FakeRedis, key, token string, ttl time.Duration) (*Lock, bool) {
+	// @solution
+	if !r.SetNX(key, token, ttl) {
+		return nil, false
+	}
+	return &Lock{r: r, key: key, token: token}, true
+	// @starter
+	// return nil, false // TODO
+	// @end
+}
+
+func (l *Lock) Release() bool {
+	// @solution
+	return l.r.CompareAndDelete(l.key, l.token)
+	// @starter
+	// l.r.Del(l.key) // TODO: 可能删掉别人的锁
+	// return true
+	// @end
+}
+--- test
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+func TestMutualExclusion(t *testing.T) {
+	now := time.Unix(0, 0)
+	r := NewFakeRedis(func() time.Time { return now })
+	a, ok := Acquire(r, "lock:order:1", "A", 10*time.Second)
+	if !ok {
+		t.Fatal("A 应加锁成功")
+	}
+	if _, ok := Acquire(r, "lock:order:1", "B", 10*time.Second); ok {
+		t.Fatal("锁被 A 持有时 B 不应成功")
+	}
+	if !a.Release() {
+		t.Fatal("A 释放自己的锁应成功")
+	}
+	if _, ok := Acquire(r, "lock:order:1", "B", 10*time.Second); !ok {
+		t.Fatal("A 释放后 B 应能加锁")
+	}
+}
+
+func TestDoNotReleaseOthersLock(t *testing.T) {
+	now := time.Unix(0, 0)
+	r := NewFakeRedis(func() time.Time { return now })
+	a, _ := Acquire(r, "lock", "A", 10*time.Second)
+	now = now.Add(11 * time.Second) // A 执行太久，锁过期
+	if _, ok := Acquire(r, "lock", "B", 10*time.Second); !ok {
+		t.Fatal("锁过期后 B 应能加锁")
+	}
+	if a.Release() {
+		t.Fatal("A 的锁已经过期，Release 应返回 false")
+	}
+	if owner := r.Owner("lock"); owner != "B" {
+		t.Fatalf("B 的锁被 A 删掉了，当前持有者 %q", owner)
+	}
+}
+
+=== db-28-1
+title: 找出热 key：Top K
+--- desc
+实现 `TopK(keys, k)`：统计访问日志里出现次数最多的 k 个 key，次数从高到低，次数相同按 key 字典序。
+
+推荐做法：先用 map 计数，再用 `container/heap` 维护一个大小为 k 的**最小堆**——堆顶是当前第 k 名，新元素比它大才替换。这样内存只占 O(k)，适合在海量 key 中找热点。
+--- solution
+package main
+
+import (
+	"container/heap"
+	"slices"
+)
+
+type KV struct {
+	Key   string
+	Count int
+}
+
+// less 判断 a 是否比 b「更冷」：次数少，或次数相同但 key 更大
+func less(a, b KV) bool {
+	if a.Count != b.Count {
+		return a.Count < b.Count
+	}
+	return a.Key > b.Key
+}
+
+type minHeap []KV
+
+func (h minHeap) Len() int           { return len(h) }
+func (h minHeap) Less(i, j int) bool { return less(h[i], h[j]) }
+func (h minHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *minHeap) Push(x any)        { *h = append(*h, x.(KV)) }
+func (h *minHeap) Pop() any {
+	old := *h
+	x := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return x
+}
+
+func TopK(keys []string, k int) []KV {
+	// @solution
+	counts := map[string]int{}
+	for _, key := range keys {
+		counts[key]++
+	}
+	h := &minHeap{}
+	for key, c := range counts {
+		kv := KV{key, c}
+		if h.Len() < k {
+			heap.Push(h, kv)
+		} else if k > 0 && less((*h)[0], kv) {
+			(*h)[0] = kv
+			heap.Fix(h, 0)
+		}
+	}
+	out := slices.Clone(*h)
+	slices.SortFunc(out, func(a, b KV) int {
+		if less(a, b) {
+			return 1
+		}
+		if less(b, a) {
+			return -1
+		}
+		return 0
+	})
+	return out
+	// @starter
+	// return nil // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"strings"
+	"testing"
+)
+
+func TestTopK(t *testing.T) {
+	log := strings.Fields("a b c a b a d e e e e b c")
+	got := TopK(log, 3)
+	want := []KV{{"e", 4}, {"a", 3}, {"b", 3}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("TopK = %v，期望 %v", got, want)
+	}
+	if got := TopK(log, 0); len(got) != 0 {
+		t.Fatalf("k=0 应返回空，got %v", got)
+	}
+	if got := TopK([]string{"x"}, 5); !slices.Equal(got, []KV{{"x", 1}}) {
+		t.Fatalf("got %v", got)
+	}
+}
+
+=== db-29-1
+title: 惰性删除 + 定期删除
+--- desc
+Redis 对过期 key 采用两种策略结合：
+
+- **惰性删除**：`Get` 时发现 key 已过期，就地删除并返回不存在；
+- **定期删除**：`ActiveExpire(limit)` 最多检查 `limit` 个带过期时间的 key，删除其中已过期的，返回删除的数量。
+
+`Len()` 返回当前**实际存储**的 key 数量（包括已过期但还没被删除的），用来观察两种策略的效果。
+--- solution
+package main
+
+import "time"
+
+type item struct {
+	val    string
+	expire time.Time // 零值表示永不过期
+}
+
+type Store struct {
+	now  func() time.Time
+	data map[string]item
+}
+
+func NewStore(now func() time.Time) *Store { return &Store{now: now, data: map[string]item{}} }
+
+func (s *Store) Set(key, val string, ttl time.Duration) {
+	it := item{val: val}
+	if ttl > 0 {
+		it.expire = s.now().Add(ttl)
+	}
+	s.data[key] = it
+}
+
+func (s *Store) expired(it item) bool {
+	return !it.expire.IsZero() && !s.now().Before(it.expire)
+}
+
+func (s *Store) Get(key string) (string, bool) {
+	// @solution
+	it, ok := s.data[key]
+	if !ok {
+		return "", false
+	}
+	if s.expired(it) {
+		delete(s.data, key)
+		return "", false
+	}
+	return it.val, true
+	// @starter
+	// it, ok := s.data[key] // TODO: 过期的 key 也会被返回
+	// return it.val, ok
+	// @end
+}
+
+func (s *Store) ActiveExpire(limit int) int {
+	// @solution
+	removed, checked := 0, 0
+	for k, it := range s.data {
+		if checked >= limit {
+			break
+		}
+		if it.expire.IsZero() {
+			continue
+		}
+		checked++
+		if s.expired(it) {
+			delete(s.data, k)
+			removed++
+		}
+	}
+	return removed
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+
+func (s *Store) Len() int { return len(s.data) }
+--- test
+package main
+
+import (
+	"fmt"
+	"testing"
+	"time"
+)
+
+func TestLazyExpire(t *testing.T) {
+	now := time.Unix(0, 0)
+	s := NewStore(func() time.Time { return now })
+	s.Set("session", "abc", time.Minute)
+	s.Set("config", "v1", 0)
+	if v, ok := s.Get("session"); !ok || v != "abc" {
+		t.Fatal("未过期时应能读到")
+	}
+	now = now.Add(2 * time.Minute)
+	if _, ok := s.Get("session"); ok {
+		t.Fatal("过期后 Get 应返回不存在")
+	}
+	if s.Len() != 1 {
+		t.Fatalf("惰性删除后应只剩 1 个 key，实际 %d", s.Len())
+	}
+	if _, ok := s.Get("config"); !ok {
+		t.Fatal("永不过期的 key 不应被删除")
+	}
+}
+
+func TestActiveExpire(t *testing.T) {
+	now := time.Unix(0, 0)
+	s := NewStore(func() time.Time { return now })
+	for i := 0; i < 10; i++ {
+		s.Set(fmt.Sprint("tmp", i), "x", time.Second)
+	}
+	for i := 0; i < 5; i++ {
+		s.Set(fmt.Sprint("keep", i), "x", 0)
+	}
+	now = now.Add(2 * time.Second)
+	if n := s.ActiveExpire(4); n != 4 {
+		t.Fatalf("ActiveExpire(4) 删除了 %d 个，期望 4", n)
+	}
+	if s.Len() != 11 {
+		t.Fatalf("Len = %d，期望 11", s.Len())
+	}
+	if n := s.ActiveExpire(100); n != 6 {
+		t.Fatalf("ActiveExpire(100) 删除了 %d 个，期望 6", n)
+	}
+	if s.Len() != 5 {
+		t.Fatalf("只应剩下 5 个永不过期的 key，实际 %d", s.Len())
+	}
+}
+
+=== db-30-1
+title: 计算 Redis Cluster 的 hash slot
+--- desc
+Redis Cluster 把 key 映射到 16384 个槽：`slot = CRC16(key) % 16384`，CRC16 使用 XMODEM 变体（多项式 0x1021，初始值 0）。
+
+**hash tag**：如果 key 里有 `{`，并且后面有 `}`，两者之间至少有一个字符，那么只对第一对花括号中间的内容计算哈希。这样 `{user:1000}.following` 和 `{user:1000}.followers` 会落到同一个槽，才能在一条命令里同时操作（比如 MULTI、Lua 脚本）。
+
+已知：`foo` → 12182，`bar` → 5061，`hello` → 866。
+--- solution
+package main
+
+import "strings"
+
+func crc16(data string) uint16 {
+	// @solution
+	var crc uint16
+	for i := 0; i < len(data); i++ {
+		crc ^= uint16(data[i]) << 8
+		for range 8 {
+			if crc&0x8000 != 0 {
+				crc = crc<<1 ^ 0x1021
+			} else {
+				crc <<= 1
+			}
+		}
+	}
+	return crc
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+
+func HashSlot(key string) int {
+	// @solution
+	if start := strings.IndexByte(key, '{'); start >= 0 {
+		if end := strings.IndexByte(key[start+1:], '}'); end > 0 {
+			key = key[start+1 : start+1+end]
+		}
+	}
+	// @starter
+	// // TODO: 处理 hash tag
+	// @end
+	return int(crc16(key) % 16384)
+}
+--- test
+package main
+
+import "testing"
+
+func TestHashSlot(t *testing.T) {
+	cases := map[string]int{"foo": 12182, "bar": 5061, "hello": 866}
+	for k, want := range cases {
+		if got := HashSlot(k); got != want {
+			t.Errorf("HashSlot(%q) = %d，期望 %d", k, got, want)
+		}
+	}
+}
+
+func TestHashTag(t *testing.T) {
+	a := HashSlot("{user:1000}.following")
+	b := HashSlot("{user:1000}.followers")
+	if a != b || a != HashSlot("user:1000") {
+		t.Fatalf("同一个 hash tag 应落在同一个槽：%d %d", a, b)
+	}
+	if HashSlot("foo{}bar") != int(crc16("foo{}bar")%16384) {
+		t.Fatal("空的 {} 不算 hash tag，应对整个 key 计算")
+	}
+	if HashSlot("{a}{b}") != HashSlot("a") {
+		t.Fatal("只使用第一对花括号")
+	}
+	if HashSlot("no-close{brace") != int(crc16("no-close{brace")%16384) {
+		t.Fatal("没有右括号时对整个 key 计算")
+	}
+}
+
+=== db-31-1
+title: 原子地扣减库存
+race: true
+--- desc
+「先 GET 判断库存，再 DECRBY」是两条命令，中间可能插入其他客户端的命令，导致超卖。Lua 脚本会被原子执行，这里用 `Store.Eval` 模拟：传入的函数在执行期间独占数据。
+
+实现 `Deduct(s, key, n)`：库存不少于 n 时扣减并返回剩余库存，否则返回 -1。必须在**一次** `Eval` 里完成判断和扣减。
+
+测试会让 300 个 goroutine 抢 100 件库存：成功的请求必须正好 100 个，库存不能变成负数。
+--- solution
+package main
+
+import (
+	// @starter
+	// "runtime"
+	// @end
+	"sync"
+)
+
+type Store struct {
+	mu   sync.Mutex
+	data map[string]int
+}
+
+func NewStore() *Store { return &Store{data: map[string]int{}} }
+
+func (s *Store) Get(key string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.data[key]
+}
+
+func (s *Store) Set(key string, v int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data[key] = v
+}
+
+// Eval 原子地执行 fn，相当于 Redis 执行一段 Lua 脚本。
+func (s *Store) Eval(fn func(data map[string]int) int) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return fn(s.data)
+}
+
+func Deduct(s *Store, key string, n int) int {
+	// @solution
+	return s.Eval(func(data map[string]int) int {
+		if data[key] < n {
+			return -1
+		}
+		data[key] -= n
+		return data[key]
+	})
+	// @starter
+	// stock := s.Get(key)
+	// runtime.Gosched() // 模拟两条命令之间的网络往返
+	// if stock < n {
+	// 	return -1
+	// }
+	// s.Set(key, stock-n) // TODO: GET 和 SET 之间可能被其他请求插入
+	// return stock - n
+	// @end
+}
+--- test
+package main
+
+import (
+	"sync"
+	"sync/atomic"
+	"testing"
+)
+
+func TestNoOversell(t *testing.T) {
+	s := NewStore()
+	s.Set("stock:sku1", 100)
+	var ok atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 300; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if Deduct(s, "stock:sku1", 1) >= 0 {
+				ok.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if ok.Load() != 100 || s.Get("stock:sku1") != 0 {
+		t.Fatalf("成功 %d 次，剩余库存 %d：超卖了", ok.Load(), s.Get("stock:sku1"))
+	}
+}
+
+func TestInsufficient(t *testing.T) {
+	s := NewStore()
+	s.Set("k", 3)
+	if Deduct(s, "k", 5) != -1 || s.Get("k") != 3 {
+		t.Fatal("库存不足时应返回 -1 且不扣减")
+	}
+	if Deduct(s, "k", 3) != 0 {
+		t.Fatal("正好够时应扣减到 0")
+	}
+}

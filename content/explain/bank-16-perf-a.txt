@@ -1,0 +1,268 @@
+=== perf-01-1
+--- explain
+**思路**
+
+登录到变慢的机器上，第一条命令通常是 `uptime`（或 `top` 第一行），它显示 1、5、15 分钟的平均负载。三个值放在一起看**趋势**：1 分钟远高于 15 分钟，说明问题正在发生；反过来说明高峰已经过去。负载和 CPU 核数比较，才能判断是否过载。
+
+**代码讲解**
+
+1. `strings.Fields(s)` 按空白切分，必须正好 5 个字段。
+2. 三个浮点数逐个 `strconv.ParseFloat`。`if l.L1, err = ...; err != nil` 在 if 的初始化语句里给**已有变量**赋值（用 `=` 不是 `:=`），这样结果直接写进结构体字段。
+3. `strings.Cut(f[3], "/")` 拆出可运行数和总任务数。
+4. 最后一个字段直接 `l.LastPID, err = ...` 然后 `return l, err`。
+5. `Trend` 和 `Overloaded` 用值接收者：只读，结构体很小。
+
+**易错点**
+
+- 负载“高”是相对于 CPU 核数的：8 核机器负载 6 很正常，单核机器负载 2 就已经过载了。
+- 看完负载之后的 60 秒排查清单（Brendan Gregg）：`dmesg | tail`、`vmstat 1`、`mpstat -P ALL 1`、`pidstat 1`、`iostat -xz 1`、`free -m`、`sar -n DEV 1`、`sar -n TCP,ETCP 1`、`top`。
+
+=== perf-02-1
+--- explain
+**思路**
+
+Linux 的 load average 统计的是“**活跃任务数**”的指数衰减平均值，活跃任务包括 R（正在运行或等待 CPU）和 **D（不可中断睡眠，通常在等磁盘 IO）**。所以大量进程卡在磁盘 IO、NFS 或者某些内核锁上时，CPU 并不忙，负载却很高。
+
+**代码讲解**
+
+1. `ActiveTasks`：统计状态为 R 或 D 的任务数。
+2. `decay`：`e := math.Exp(-5 / period)`，每 5 秒更新一次，周期越长 e 越接近 1，历史值的权重越大，曲线越平滑。
+3. `load*e + float64(active)*(1-e)`：指数加权移动平均（EWMA），int 要先转成 float64 才能参与运算。
+4. `Update` 用**指针接收者**：要修改三个字段。
+
+**易错点**
+
+- 负载高但 CPU 低时，用 `ps -eo stat,pid,cmd | grep '^D'` 找 D 状态的进程，再用 `iostat` 看磁盘、`cat /proc/<pid>/stack` 看它卡在内核的什么地方。
+- load average 不是百分比，1 分钟的值也不是“过去 1 分钟的平均”，而是一个衰减系数对应 1 分钟的 EWMA，所以它对突发的反应有延迟。
+
+=== perf-03-1
+--- explain
+**思路**
+
+`/proc/stat` 的 cpu 行是**开机以来**各种状态累计的时钟滴答数，单独一次读数没有意义。`top` 的做法是间隔一段时间采样两次，用各项的**增量**除以总增量，得到这段时间内的百分比。
+
+**各项含义**
+
+- `us`：用户态（业务代码）；`sy`：内核态（系统调用多、上下文切换多时偏高）；
+- `wa`：CPU 空闲但有任务在等 IO；`si`：软中断（网络包处理多时偏高）；
+- `st`：被宿主机“偷走”的时间（虚拟机里偏高说明宿主机超卖）。
+
+**代码讲解**
+
+1. `ptrs := []*uint64{&c.User, &c.Nice, ...}`：用**指针切片**按顺序指向结构体的各个字段，一个循环就能填充所有字段，避免写 8 段重复代码。
+2. `*p = v` 通过指针写入字段。
+3. `total()` 把各项加起来。
+4. `Percent` 里定义了一个闭包 `pct`，捕获了 `total`，计算单项增量占比。`us` 把 user 和 nice 合在一起。
+
+**易错点**
+
+- 计数器是单调递增的 uint64，后一次减前一次才是增量；两次采样间隔太短时增量很小，百分比误差大。
+- 多核机器上 `cpu` 行是所有核的总和，`cpu0`、`cpu1`… 是每个核的；单核打满在总体平均里可能只显示 12%（8 核），需要用 `mpstat -P ALL` 看每个核。
+
+=== perf-04-1
+--- explain
+**思路**
+
+先用 `top` 找到 CPU 最高的进程，再用 `top -H -p <pid>` 或 `ps -L` 看这个进程里哪些线程最忙。对 Go 程序来说，线程这一层能告诉你的有限：goroutine 会在线程之间迁移，线程 ID 对应不到具体的代码。定位到进程后，下一步应该是抓 **CPU profile**。
+
+**代码讲解**
+
+1. `strings.TrimSpace(output)` 去掉首尾空行，再按行切分。
+2. `i == 0` 跳过表头，字段数不足的行跳过。
+3. TID 用 `Atoi`，CPU 用 `ParseFloat`，命令名可能包含空格，`strings.Join(f[2:], " ")` 把剩下的字段拼回去。
+4. `Thread{tid, cpu, ...}`：按位置初始化结构体。
+5. 排序用 `cmp.Or`：CPU 降序，相同按 TID 升序。
+6. `out[:min(n, len(out))]` 防止越界。
+
+**易错点**
+
+- 如果只有一个线程 100%、其他线程都很闲，可能是某个 goroutine 在死循环，或者是单线程的瓶颈（比如 GOMAXPROCS=1、某个全局锁）。
+- Go 程序抓 CPU profile：`go tool pprof http://host:6060/debug/pprof/profile?seconds=30`，然后用 `top`、`list 函数名`、`web`（火焰图）查看热点。
+
+=== perf-05-1
+--- explain
+**思路**
+
+`free` 命令里的 `free` 列是**完全没有被使用**的内存，Linux 会尽量把空闲内存用作文件缓存（buff/cache），所以 free 很小是正常的。判断内存是否紧张应该看 **available**：内核估算的“不需要换出就能分配给新程序的内存”，包括可以回收的缓存。另外 swap 使用率高也说明内存不够用。
+
+**代码讲解**
+
+1. `ParseMeminfo`：每行 `strings.Cut(line, ":")` 拆成键和剩余部分，剩余部分 `strings.Fields` 后取第一个数字（忽略单位 kB）。
+2. `Pressure` 使用命名返回值 `(availPct, swapPct float64, tight bool)`：签名本身就说明了三个返回值的含义。
+3. 读 map 中不存在的 key 得到 0；没有 swap 时跳过计算，`swapPct` 保持零值。
+4. `availPct < 10 || swapPct > 50` 作为第三个返回值。
+
+**易错点**
+
+- 用 `MemFree / MemTotal` 判断内存紧张，会在大量文件缓存的机器上误报。
+- 容器里看到的 `/proc/meminfo` 通常是宿主机的数据，容器的内存限制和使用量要看 cgroup（`memory.max`、`memory.current`）。
+- 内存不足的最终表现是 OOM Killer 杀进程，用 `dmesg | grep -i oom` 查看记录。
+
+=== perf-06-1
+--- explain
+**思路**
+
+`iostat -x` 最关键的几个指标：
+
+- `r_await` / `w_await`：读写请求的平均耗时（包括排队），直接反映磁盘响应速度；
+- `aqu-sz`：平均队列长度，持续大于 1 说明请求在排队；
+- `%util`：设备忙碌的时间比例。对机械盘来说接近 100% 意味着饱和；**SSD 和 NVMe 可以并行处理很多请求**，100% util 不代表饱和。
+
+不同版本的 iostat 列名和顺序不同（老版本是 `avgqu-sz`、`await`），所以要**按表头的列名**取值。
+
+**代码讲解**
+
+1. 遇到以 `Device` 或 `Device:` 开头的行就记录为表头；表头之前的行（CPU 统计）跳过。
+2. 数据行的字段数必须和表头一致，`d.Fields[header[i]] = v` 按列名存。
+3. `Diagnose`：`limit` 根据是否 SSD 选择阈值；读不存在的列得到 0，不会误报。
+
+**易错点**
+
+- iostat 第一次输出的是**开机以来的平均值**，要看后面按间隔输出的数据（`iostat -xz 1`）。
+- 磁盘慢的常见原因：日志刷盘太频繁、数据库的 checkpoint、同一块盘上的其他进程、云盘的 IOPS 限额。`iotop` 或 `pidstat -d 1` 可以找到是哪个进程在读写。
+
+=== perf-07-1
+--- explain
+**思路**
+
+网络问题常见的指标：带宽（`sar -n DEV`）、连接状态分布（`ss -s`）、**重传率**、丢包和队列溢出（`netstat -s`）。重传率可以从 `/proc/net/snmp` 的 Tcp 段计算：两次采样之间重传的报文数除以发出的报文数，持续超过 1% 就说明网络质量有问题。
+
+**代码讲解**
+
+1. `/proc/net/snmp` 的格式：同一个协议有两行，第一行是字段名，第二行是值，都以 `Tcp:` 开头。
+2. 收集所有以 `Tcp:` 开头的行，`strings.Fields(line)[1:]` 去掉前缀。必须正好两行且字段数相同。
+3. 值用 `ParseInt`（有符号），因为 `MaxConn` 的值是 -1。
+4. `RetransRate`：增量相除；发出报文数没有增长时返回 0，避免除以 0。
+
+**易错点**
+
+- 计数器是累计值，单次读取没有意义，一定要两次采样做差。
+- 重传高的常见原因：网络拥塞或丢包、对方处理太慢导致接收窗口满、中间设备问题。进一步用 `tcpdump` 抓包，或者 `ss -ti` 查看单个连接的 RTT 和重传次数。
+- `netstat -s` 里的 `listen queue overflow`、`SYNs to LISTEN sockets dropped` 说明全连接队列溢出（见「全连接队列」一题）。
+
+=== perf-08-1
+--- explain
+**思路**
+
+`import _ "net/http/pprof"` 的副作用是在 `init` 里把 pprof 的处理函数注册到 **`http.DefaultServeMux`** 上。如果业务服务也用了 DefaultServeMux（比如 `http.ListenAndServe(":8080", nil)`），`/debug/pprof` 就随业务端口暴露出去了：任何人都能抓 profile、看命令行参数，甚至用 30 秒的 CPU profile 给服务增加负担。正确的做法是：**单独的 mux + 单独的内网端口 + 鉴权**。
+
+**代码讲解**
+
+1. 导入的是 `net/http/pprof` 包本身（不是 `_` 导入），直接使用它导出的处理函数。
+2. `mux.HandleFunc("/debug/pprof/", pprof.Index)`：以 `/` 结尾的模式匹配所有子路径，Index 会根据路径分发到 heap、goroutine、allocs 等 profile。
+3. 外层用 `http.HandlerFunc` 包装一个鉴权检查，不通过返回 401，通过才交给 mux。
+
+**易错点**
+
+- 用 `!=` 比较 token 有时序攻击的风险，更严格的写法是 `subtle.ConstantTimeCompare`。
+- 生产环境常用的 profile：`profile`（CPU，默认 30 秒）、`heap`（存活对象）、`allocs`（累计分配）、`goroutine`、`mutex` 和 `block`（这两个需要先调用 `runtime.SetMutexProfileFraction` / `SetBlockProfileRate` 开启）。
+- 持续性能分析（Pyroscope、Parca）会定期采集 profile，出问题后可以回看事发时的数据。
+
+=== perf-09-1
+--- explain
+**思路**
+
+CPU 飙高的排查流程：确认是哪个进程 → 抓 CPU profile → 看火焰图找最宽的函数 → 读代码分析原因。这道题的热点是 `regexp.Compile`：每次调用都把正则表达式编译一遍，编译比匹配贵得多，还会产生大量的内存分配，进一步增加 GC 的 CPU 消耗。
+
+**代码讲解**
+
+1. `var emailRe = regexp.MustCompile(...)`：包级变量，程序启动时编译**一次**。
+2. 正则用反引号写成原始字符串，`\.` 不需要写成 `\\.`。
+3. `IsValidEmail` 只调用 `emailRe.MatchString(s)`。`*regexp.Regexp` 是并发安全的，多个 goroutine 可以同时使用。
+
+**易错点**
+
+- `MustCompile` 在表达式写错时会 panic，适合在包初始化时使用固定的表达式（启动时就会发现错误）；用户输入的正则要用 `regexp.Compile` 并处理错误。
+- 类似的“把重复的初始化移出热路径”：`template.Must(template.New(...).Parse(...))`、`json.Decoder` 的复用、`sync.Pool` 缓存 buffer。
+- 简单的前缀、后缀、包含判断用 `strings` 包，比正则快一个数量级。
+
+=== perf-10-1
+--- explain
+**思路**
+
+`s[:i]` 得到的子串和原字符串**共享底层内存**（只是一个新的指针和长度）。如果从一个几 MB 的日志里截取第一行并长期缓存，整个几 MB 的字符串都无法被回收。切片同理，而且切片还有容量：`b[:16]` 的容量仍然是整个底层数组。所以需要长期保存的子串、子切片要**复制**一份。
+
+**代码讲解**
+
+1. `strings.Cut(s, "\n")` 取第一行（没有换行符时就是整个字符串）。
+2. `strings.Clone(line)`（Go 1.20+）：分配一块新内存并复制，结果和原字符串没有任何关系。
+3. `b[:min(16, len(b))]` 防止越界，`bytes.Clone(h)` 复制，新切片的容量等于长度。
+
+**易错点**
+
+- `string(b[:16])` 对切片也能得到独立的副本（因为 string 和 []byte 互转会复制），但 `[]byte` 的子切片要用 `bytes.Clone` 或 `append([]byte(nil), h...)`。
+- heap profile 里显示的是**分配位置**（谁分配了这块内存），而不是谁在持有它。这种“小引用持有大对象”的问题，在 profile 里表现为读取大文件 / 大响应的位置占用很高，要顺着代码去找谁保留了它的子串。
+
+=== perf-11-1
+--- explain
+**思路**
+
+goroutine 泄漏的特征：`runtime.NumGoroutine()` 持续增长。抓一份 goroutine dump，统计每个 goroutine 卡在哪个**业务函数**、处于什么**状态**，数量最多的那个通常就是泄漏点（比如几千个 goroutine 都卡在 `chan send`，并且都在同一个函数里）。
+
+**代码讲解**
+
+1. `blocks`：dump 里每个 goroutine 之间用空行分隔，`strings.Split(..., "\n\n")` 切成块，只保留以 `goroutine ` 开头的块。
+2. `States`：从第一行的方括号里取状态，`strings.Cut(..., ",")` 去掉后面的等待时长（如 `, 10 minutes`）。
+3. `TopFunc`：遍历每个块的栈帧：
+   - 以 tab 开头的行是文件位置，`created by` 是创建者，都跳过；
+   - **带标签的 continue**：`continue frames` 跳到外层循环的下一个栈帧。内层循环检查前缀，命中就要跳过当前栈帧，普通的 continue 只能继续内层循环；
+   - 找到第一个业务函数后，`strings.LastIndexByte(fn, '(')` 去掉参数部分，计数后 `break`。
+
+**易错点**
+
+- 泄漏的常见原因：往没人接收的 channel 发送、从没人发送也不关闭的 channel 接收、忘记调用 cancel 的 context、没有超时的网络调用。
+- `goroutine?debug=1` 会把相同栈的 goroutine 合并并给出数量，比 `debug=2` 更适合快速定位。
+
+=== perf-12-1
+--- explain
+**思路**
+
+CPU 使用率低但延迟高，说明时间花在了**等待**上：等数据库、等下游服务、等锁、等连接池、等磁盘。CPU profile 只统计 CPU 时间，看不到这些等待。最直接的办法是给请求的各个阶段计时，看看时间到底花在了哪里。链路追踪（tracing）的 span 也是同样的思路。
+
+**代码讲解**
+
+1. `Start(stage)` 记录开始时间，返回一个**闭包**：调用它时计算耗时并累加到 `totals[stage]`。
+2. 使用方式：`defer t.Start("db")()`。注意最后的 `()`：`t.Start("db")` 在 defer 语句执行时**立即调用**（开始计时），返回的结束函数被 defer 到函数返回时执行。
+3. `Report`：`slices.Collect(maps.Keys(t.totals))` 把迭代器收集成切片，按耗时降序、名字升序排序。
+4. `time.Duration` 的 `String()` 输出 `120ms` 这样易读的格式。
+
+**易错点**
+
+- 写成 `defer t.Start("db")`（少了最后的括号）：开始计时被推迟到函数返回时，结束函数永远不会被调用。
+- 其他排查工具：`block` 和 `mutex` profile 看锁和 channel 的等待；`go tool trace` 看 goroutine 的调度延迟；`db.Stats()` 看连接池的等待；`ss -ti` 看网络 RTT。
+
+=== perf-13-1
+--- explain
+**思路**
+
+pprof 是**采样统计**：告诉你哪些函数占用了最多的 CPU 或内存，但看不到时间线。`go tool trace` 记录的是**事件**：每个 goroutine 在每个时刻在做什么（运行、阻塞、等待调度）、GC 什么时候发生、系统调用花了多久。适合分析延迟毛刺、调度问题、并发度不够等“时间维度”的问题。用 task 和 region 标注后，可以按业务操作查看耗时。
+
+**代码讲解**
+
+1. `ctx, task := trace.NewTask(ctx, "batch-import")`：创建任务并得到一个新的 ctx，之后的 region 和 log 都通过这个 ctx 关联到任务上。`defer task.End()`。
+2. `trace.WithRegion(ctx, "import-item", func() {...})`：区域会记录这段代码的开始和结束。
+3. `trace.Log(ctx, "item", it)`：在 trace 里记录一条带分类的日志。
+4. 没有开启 trace 时，这些调用的开销非常小，可以放心留在生产代码里。
+
+**易错点**
+
+- 区域必须在同一个 goroutine 里开始和结束（WithRegion 自然保证了这一点）。
+- trace 文件很大，采集时间一般只有几秒：`curl -o trace.out http://host:6060/debug/pprof/trace?seconds=5`，然后 `go tool trace trace.out`。Go 1.21 起支持“飞行记录器”模式，只保留最近一段时间的 trace，出问题时再导出。
+
+=== perf-14-1
+--- explain
+**思路**
+
+怀疑延迟毛刺来自 GC 时，看两类数据：GC 的**频率**（gctrace、`/gc/cycles/total:gc-cycles`）和**暂停时间分布**。`runtime/metrics` 提供了暂停时间的直方图，可以导出到监控系统，和接口的 p99 延迟曲线对比：如果毛刺出现的时间和长暂停对得上，就是 GC 的问题。
+
+**代码讲解**
+
+1. `Float64Histogram`：`Counts[i]` 是落在 `[Buckets[i], Buckets[i+1])` 区间的样本数，所以 Buckets 比 Counts 多一个。
+2. `Quantile`：先求总数，`rank = q × total`；累加计数，第一次达到 rank 的非空桶就是目标桶，返回它的上界 `Buckets[i+1]`；上界是 +Inf 时用 `math.IsInf(upper, 1)` 判断，返回下界。
+3. `GCPauses`：`metrics.Read` 接收一个 `[]metrics.Sample`，按名字填充值；先检查 `Kind()` 是否是直方图类型，再调用 `Float64Histogram()`。
+
+**易错点**
+
+- Go 的 GC 大部分工作是并发的，STW 暂停通常在 1ms 以内。GC 引起的延迟更常见的原因是**辅助标记**（业务 goroutine 被拉去做标记工作）和 GC 占用 CPU 导致的调度延迟，而不是 STW 本身。
+- 降低 GC 影响的手段：减少分配（复用对象、预分配、避免装箱）、调大 GOGC、设置 GOMEMLIMIT 让 GC 在内存充足时少运行。
+- `runtime/metrics` 比 `runtime.ReadMemStats` 开销小，不需要 STW，适合高频采集。

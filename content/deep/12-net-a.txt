@@ -1,0 +1,503 @@
+=== net-01
+--- deep
+**原理展开**
+
+**初始序列号**（ISN）为什么是随机的：如果每次都从 0 开始，旧连接残留在网络中的报文可能恰好落在新连接的序列号窗口里被误收；而且可预测的序列号会让攻击者伪造报文（TCP 劫持）。Linux 基于时钟和四元组的哈希生成 ISN。
+
+**SYN 洪水攻击**：攻击者发送大量 SYN 但不完成握手，服务端的半连接队列被占满，正常的连接无法建立。**SYN Cookie** 的解决办法：队列满时不保存半连接状态，而是把必要的信息编码进 SYN+ACK 的序列号里，客户端回复 ACK 时再从确认号中还原出来验证。
+
+**为什么挥手是四次**：被动方收到 FIN 时可能还有数据要发，所以先回复 ACK（表示“知道你不发了”），等自己的数据发完再发 FIN。如果被动方没有数据要发，ACK 和 FIN 可以合并，变成三次挥手（抓包时经常能看到）。
+
+**代码示例**
+
+```bash
+# 抓包观察握手和挥手
+sudo tcpdump -i lo -nn 'tcp port 8080 and (tcp[tcpflags] & (tcp-syn|tcp-fin) != 0)'
+
+# 各状态的连接数
+ss -tan | awk 'NR>1 {print $1}' | sort | uniq -c
+```
+
+```go
+// 半关闭：只关闭写方向，仍然可以读取对方的数据
+tc := conn.(*net.TCPConn)
+tc.Write(request)
+tc.CloseWrite()                 // 发送 FIN，告诉对方请求发完了
+resp, _ := io.ReadAll(tc)       // 继续读取响应直到对方关闭
+```
+
+**常见追问**
+
+- 握手时第三个 ACK 丢了会怎样？→ 服务端停在 SYN_RCVD，会重传 SYN+ACK；客户端已经认为连接建立，发送数据时，服务端收到带 ACK 的数据包也会完成握手。
+- 2MSL 为什么是两倍？→ 一个 MSL 让主动方最后的 ACK 到达对方（或者丢失），对方重传的 FIN 再经过一个 MSL 到达。
+- 能否跳过 TIME_WAIT？→ 设置 `SO_LINGER` 为 0 后 close 会直接发送 RST 关闭，跳过 TIME_WAIT，但会丢弃未发送的数据，一般不推荐。
+
+**实战建议**
+
+- 服务端尽量不要主动关闭连接（让客户端关闭），TIME_WAIT 就会留在客户端。
+- 排查连接问题时，抓包是最可靠的手段，能直接看到 SYN、RST、重传。
+
+=== net-02
+--- deep
+**原理展开**
+
+TCP 为了可靠性付出的代价：
+
+- **握手延迟**：建立连接需要 1 个 RTT（加上 TLS 还要 1～2 个 RTT）；
+- **队头阻塞**：字节流必须按顺序交付，一个包丢失，后面已经到达的数据也要等它重传；
+- **拥塞控制**：慢启动阶段发送速率较低，丢包时速率减半，对实时音视频不友好（宁愿丢帧也不要卡顿）；
+- **内核实现**：TCP 在内核中，协议的改进需要升级操作系统，演进缓慢。
+
+QUIC 选择 UDP 正是为了绕开这些：在用户态实现可靠传输，每个流独立重传，握手与 TLS 合并，可以快速迭代。
+
+**代码示例**
+
+```go
+// UDP 服务端：每个数据报是一条完整的消息
+pc, err := net.ListenPacket("udp", ":9000")
+if err != nil {
+	log.Fatal(err)
+}
+defer pc.Close()
+buf := make([]byte, 1500) // 以太网 MTU，避免 IP 分片
+for {
+	n, addr, err := pc.ReadFrom(buf)
+	if err != nil {
+		continue
+	}
+	pc.WriteTo(buf[:n], addr) // 回显，不需要建立连接
+}
+```
+
+**常见追问**
+
+- UDP 数据报最大多大？→ 理论上约 64KB，但超过路径 MTU（通常 1500 字节减去头部）会在 IP 层分片，任何一片丢失整个数据报就丢失，所以实践中控制在 1200～1400 字节以内。
+- DNS 为什么用 UDP？→ 查询和响应都很小，一次往返即可，不需要建立连接；响应过大时会切换到 TCP。
+- UDP 怎么防止被用于放大攻击？→ 服务端的响应不要远大于请求，或者先验证客户端的地址（QUIC 的地址验证令牌）。
+
+**实战建议**
+
+- 绝大多数业务直接用 TCP（HTTP、gRPC）；需要低延迟实时传输时，优先考虑基于 UDP 的成熟协议（QUIC、WebRTC），而不是自己实现可靠性。
+
+=== net-03
+--- deep
+**原理展开**
+
+为什么会出现粘包和拆包：
+
+- 发送端：内核把应用的多次 `write` 放进发送缓冲区，按照 MSS（最大报文段长度）、Nagle 算法、拥塞窗口切分成报文段发送，应用的“写入边界”在这一步就丢失了；
+- 接收端：一次 `read` 返回接收缓冲区中当前可用的所有数据（最多到 buf 的大小），可能包含多条消息，也可能只有半条。
+
+所以只要基于 TCP 自定义协议，就必须在应用层定义“一条消息从哪里开始、到哪里结束”。HTTP/1.1 用 `\r\n` 分隔头部、用 `Content-Length` 或 chunked 编码确定消息体的长度；gRPC 在 HTTP/2 的数据帧里用 5 字节前缀；Redis 的 RESP 协议用 `$长度\r\n`。
+
+**代码示例**
+
+```go
+// 一个完整的帧协议：魔数 + 版本 + 类型 + 长度 + 消息体
+type Header struct {
+	Magic   uint16
+	Version uint8
+	Type    uint8
+	Length  uint32
+}
+
+const headerSize = 8
+
+func readMessage(r *bufio.Reader) (Header, []byte, error) {
+	var h Header
+	if err := binary.Read(r, binary.BigEndian, &h); err != nil {
+		return h, nil, err
+	}
+	if h.Magic != 0xCAFE {
+		return h, nil, errors.New("bad magic") // 协议不匹配，应该断开连接
+	}
+	if h.Length > maxFrame {
+		return h, nil, ErrFrameTooLarge
+	}
+	body := make([]byte, h.Length)
+	_, err := io.ReadFull(r, body)
+	return h, body, err
+}
+```
+
+**常见追问**
+
+- UDP 有粘包问题吗？→ 没有，UDP 保留消息边界，一次接收得到一个完整的数据报（缓冲区不够大时多余部分会被截断）。
+- 为什么要加魔数？→ 快速识别协议错误（比如连错了端口），避免把垃圾数据当作长度去分配巨大的内存。
+- 长度字段用多少字节？→ 根据最大消息大小决定；也可以用 varint 编码节省空间（protobuf 的流式格式就是这样）。
+
+**实战建议**
+
+- 读取一定用 `io.ReadFull` 或 `bufio.Reader`，并限制单条消息的最大长度。
+- 能用现成的协议（HTTP、gRPC、WebSocket）就不要自定义协议。
+
+=== net-04
+--- deep
+**原理展开**
+
+**HTTP/2 的帧**：每个帧有 9 字节的头部（长度、类型、标志、stream ID）。一次请求由 HEADERS 帧（压缩后的请求头）和若干 DATA 帧组成，属于同一个请求的帧带相同的 stream ID，不同 stream 的帧可以交错发送。**流量控制**是每个 stream 和整个连接各有一个窗口（WINDOW_UPDATE 帧调整），防止一个慢的 stream 占满连接的缓冲。
+
+**HPACK** 头部压缩：维护一个双方同步的动态表，重复出现的头部（Cookie、User-Agent、Authorization）只需要发送一个索引号。
+
+**QUIC 的连接迁移**：TCP 连接由四元组标识，IP 变了连接就断了；QUIC 连接由连接 ID 标识，客户端换了网络（Wi-Fi 切到 4G），只要连接 ID 不变就能继续通信。
+
+**代码示例**
+
+```go
+// Go 的 HTTP/2：TLS 服务自动启用；明文的 h2c 需要显式配置（Go 1.24+）
+srv := &http.Server{Addr: ":8080", Handler: mux}
+var protocols http.Protocols
+protocols.SetHTTP1(true)
+protocols.SetUnencryptedHTTP2(true) // 允许明文 HTTP/2（内网服务间调用）
+srv.Protocols = &protocols
+
+// 判断请求使用的协议
+func handler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, r.Proto) // HTTP/1.1 或 HTTP/2.0
+}
+```
+
+**常见追问**
+
+- HTTP/2 下还需要域名分片、雪碧图这些优化吗？→ 不需要了，反而有害（多个连接无法共享拥塞窗口和压缩上下文）。
+- 为什么服务端推送被废弃了？→ 实际效果不好，服务端很难准确判断客户端缓存中已有哪些资源，经常推送重复的内容。
+- HTTP/3 在哪些场景收益最大？→ 高丢包、高延迟的移动网络；内网服务之间通常没有明显收益。
+
+**实战建议**
+
+- 服务间调用使用 HTTP/2（或 gRPC），减少连接数；注意 HTTP/2 长连接在负载均衡上的问题（见 gRPC 负载均衡一题）。
+
+=== net-05
+--- deep
+**原理展开**
+
+TLS 要解决三个问题：**加密**（窃听者看不懂）、**完整性**（篡改能被发现）、**身份认证**（对方确实是它声称的那个服务器）。
+
+- 身份认证靠**证书**：服务器证书由 CA 用私钥签名，客户端用内置的根证书逐级验证签名链；服务器在握手中用证书对应的私钥签名，证明自己拥有这个证书；
+- 密钥协商靠 **ECDHE**：每次连接生成临时密钥对，即使服务器的长期私钥将来泄露，过去的会话也无法被解密（前向安全）；早期的 RSA 密钥交换没有这个性质，已经在 TLS 1.3 中被删除；
+- 加密和完整性靠 **AEAD**（AES-GCM、ChaCha20-Poly1305）。
+
+TLS 1.3 的 1-RTT：客户端在 ClientHello 里就**猜测**服务器会选择的密钥交换算法，直接附上自己的公钥，服务器回复时就可以算出密钥并开始加密，省掉了一个往返。
+
+**代码示例**
+
+```go
+// 服务端：只允许 TLS 1.2+
+srv := &http.Server{
+	Addr: ":443",
+	TLSConfig: &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	},
+}
+srv.ListenAndServeTLS("cert.pem", "key.pem")
+
+// 客户端：信任内部 CA
+pool, _ := x509.SystemCertPool()
+caPEM, _ := os.ReadFile("internal-ca.pem")
+pool.AppendCertsFromPEM(caPEM)
+client := &http.Client{Transport: &http.Transport{
+	TLSClientConfig: &tls.Config{RootCAs: pool},
+}}
+
+// 双向 TLS（mTLS）：服务端验证客户端证书
+srv.TLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
+srv.TLSConfig.ClientCAs = pool
+```
+
+**常见追问**
+
+- `InsecureSkipVerify: true` 有什么问题？→ 跳过证书验证就等于没有身份认证，任何中间人都可以冒充服务器，只能在本地调试时使用。
+- 0-RTT 有什么风险？→ 0-RTT 的数据可以被重放，只能用于幂等的请求。
+- 证书快过期了怎么自动更新？→ 使用 ACME（Let's Encrypt），Go 有 `golang.org/x/crypto/acme/autocert`；或者用 `tls.Config.GetCertificate` 动态加载证书，支持不重启更新。
+
+**实战建议**
+
+- 内部服务之间使用 mTLS（或者服务网格自动提供），做到零信任网络。
+- 监控证书的过期时间，提前 30 天告警。
+
+=== net-06
+--- deep
+**原理展开**
+
+TIME_WAIT 的数量可以估算：每秒新建的短连接数 × 60 秒。每秒 1000 个短连接就会有 6 万个 TIME_WAIT。作为客户端时，同一个目标（IP + 端口）的可用本地端口约 28000 个（默认 32768～60999），TIME_WAIT 占满后就无法建立新连接。
+
+`tcp_tw_reuse` 的原理：新连接的 SYN 中带有时间戳，只要时间戳比旧连接最后的时间戳大，就可以安全地复用处于 TIME_WAIT 的端口（旧连接的残留报文时间戳更小，会被识别并丢弃）。所以它要求开启 TCP 时间戳（默认开启），并且只对**主动发起**连接的一方有效。
+
+CLOSE_WAIT 不会自动消失：只要程序不调用 close，连接就一直存在，占用文件描述符和内存，最终导致 `too many open files`。
+
+**代码示例**
+
+```bash
+# TIME_WAIT 按对端分组，找出是对哪个服务的短连接
+ss -tan state time-wait | awk 'NR>1 {print $4}' | cut -d: -f1 | sort | uniq -c | sort -rn | head
+
+# CLOSE_WAIT 按进程分组
+ss -tanp state close-wait | awk 'NR>1 {print $NF}' | sort | uniq -c | sort -rn
+
+# 内核参数
+sysctl net.ipv4.ip_local_port_range net.ipv4.tcp_tw_reuse net.ipv4.tcp_fin_timeout
+```
+
+**常见追问**
+
+- `tcp_fin_timeout` 能缩短 TIME_WAIT 吗？→ 不能，它控制的是 FIN_WAIT_2 的超时时间；TIME_WAIT 在 Linux 中固定为 60 秒（`TCP_TIMEWAIT_LEN`）。
+- 服务端有大量 TIME_WAIT 是什么原因？→ 服务端主动关闭了连接，比如 HTTP 响应带 `Connection: close`、空闲超时关闭、短连接的 RPC 协议。
+- 怎么用 Go 的 pprof 找到 CLOSE_WAIT 的原因？→ 看 goroutine profile 里阻塞在业务逻辑中、持有连接却一直没有走到 Close 的 goroutine。
+
+**实战建议**
+
+- 治本：连接复用（HTTP 连接池、数据库连接池、RPC 长连接）；治标：调整内核参数。
+- CLOSE_WAIT 数量纳入监控，持续增长立即排查代码。
+
+=== net-07
+--- deep
+**原理展开**
+
+TCP keepalive 的三个参数：空闲多久开始探测（`tcp_keepalive_time`，默认 7200 秒）、探测间隔（`tcp_keepalive_intvl`，默认 75 秒）、探测次数（`tcp_keepalive_probes`，默认 9 次）。默认配置下，对端掉线后要 2 小时 11 分钟才能发现。Go 默认把空闲时间和间隔都设为 15 秒，探测 9 次，大约 2.5 分钟能发现。
+
+为什么还需要应用层心跳：
+
+1. 对端**进程卡死**（死锁、长时间 GC），但内核还在正常回复 keepalive 探测；
+2. 中间设备（NAT、防火墙、负载均衡）的空闲超时可能只有几分钟，TCP keepalive 的间隔太长时连接会被悄悄清理；
+3. 应用层心跳可以携带业务信息（负载、版本），还能测量往返延迟。
+
+**代码示例**
+
+```go
+// Go 1.23+：精细配置 TCP keepalive
+d := net.Dialer{
+	KeepAliveConfig: net.KeepAliveConfig{
+		Enable:   true,
+		Idle:     30 * time.Second,
+		Interval: 10 * time.Second,
+		Count:    3,
+	},
+}
+conn, err := d.DialContext(ctx, "tcp", addr)
+
+// 应用层心跳：读超时 + 定期 ping
+func keepAlive(ctx context.Context, conn net.Conn, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if _, err := conn.Write(pingFrame); err != nil {
+				conn.Close() // 写失败，触发读循环退出
+				return
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+// 读循环：每次读之前设置读超时为 3 个心跳间隔，超时就认为对端失联
+```
+
+**常见追问**
+
+- HTTP keep-alive 的连接空闲多久会被关闭？→ 客户端由 `Transport.IdleConnTimeout` 控制，服务端由 `Server.IdleTimeout` 控制。
+- WebSocket 的心跳怎么做？→ 协议本身有 ping / pong 控制帧，服务端定期发 ping，客户端自动回复 pong。
+- gRPC 的保活？→ 客户端和服务端都可以配置 keepalive 参数，基于 HTTP/2 的 PING 帧；服务端还要配置 `EnforcementPolicy`，防止客户端 ping 得太频繁。
+
+**实战建议**
+
+- 长连接服务的心跳间隔要小于链路上所有中间设备的空闲超时（通常 30 秒到 1 分钟）。
+- 用读超时来检测失联，而不是只依赖写失败（写操作可能成功写入了发送缓冲区，但对方根本没有收到）。
+
+=== net-08
+--- deep
+**原理展开**
+
+每个网络 fd 在运行时有一个 `pollDesc`，里面有两个“信号量”（`rg` 和 `wg`），分别记录等待读和等待写的 goroutine。
+
+读的流程（`internal/poll.FD.Read`）：
+
+1. 调用 `syscall.Read`，成功就返回；
+2. 返回 `EAGAIN`：调用 `pollDesc.waitRead` → `runtime.netpollblock`，把当前 G 记在 `rg` 上并 park；
+3. epoll 报告 fd 可读：`netpoll` 返回就绪的 G 列表，调度器把它们放回运行队列；
+4. G 被唤醒后回到第 1 步重试。
+
+Go 使用 epoll 的**边缘触发**模式（EPOLLET），fd 在创建时只注册一次，不需要每次读写都修改 epoll。超时：`SetReadDeadline` 设置一个运行时定时器，到期时把 `rg` 上的 G 唤醒并让读操作返回超时错误。
+
+**代码示例**
+
+```go
+// 用 syscall.RawConn 获取底层 fd 做自定义的 socket 设置
+ln, _ := net.Listen("tcp", ":8080")
+raw, _ := ln.(*net.TCPListener).SyscallConn()
+raw.Control(func(fd uintptr) {
+	syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 1<<20)
+})
+
+// 也可以在创建时设置：ListenConfig.Control
+lc := net.ListenConfig{
+	Control: func(network, address string, c syscall.RawConn) error {
+		var opErr error
+		err := c.Control(func(fd uintptr) {
+			opErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 0xf /* SO_REUSEPORT */, 1)
+		})
+		if err != nil {
+			return err
+		}
+		return opErr
+	},
+}
+ln2, _ := lc.Listen(ctx, "tcp", ":8081")
+_ = ln2
+```
+
+**常见追问**
+
+- 为什么 Go 不直接暴露 epoll 的事件接口？→ 设计哲学是让开发者写同步的代码，由运行时处理异步；需要事件驱动时可以使用第三方库。
+- netpoller 和调度器怎么配合？→ 调度器在找不到可运行的 G 时会调用阻塞的 netpoll（带超时，超时时间是最近的定时器），这样 M 在等待网络事件的同时也能及时处理定时器。
+- 大量连接时 netpoll 会成为瓶颈吗？→ epoll 的效率很高，瓶颈通常在每个连接的 goroutine 和缓冲区的内存上。
+
+**实战建议**
+
+- 理解 netpoller 可以解释很多现象：网络 IO 多不会增加线程数、deadline 的精度、goroutine profile 里大量的 `netpollblock` 是正常的等待。
+
+=== net-09
+--- deep
+**原理展开**
+
+全连接队列满了之后的行为由 `tcp_abort_on_overflow` 控制：
+
+- 0（默认）：服务端**丢弃**客户端发来的第三次握手的 ACK，保持半连接状态，并重传 SYN+ACK；客户端以为连接已经建立，发送的数据得不到响应，表现为请求超时；
+- 1：服务端直接回复 RST，客户端立即收到 `connection reset by peer`。
+
+所以默认情况下，全连接队列溢出的表现是“偶发的连接超时”，很难直接联想到队列问题。
+
+应用 accept 慢的常见原因：进程整体卡顿（CPU 打满、长时间 GC、cgroup 限流）、accept 循环里做了耗时的操作（比如同步地做 TLS 握手，Go 的 net/http 已经把握手放在每个连接的 goroutine 里了）。
+
+**代码示例**
+
+```bash
+# 监听套接字的队列：Recv-Q 是当前长度，Send-Q 是上限
+ss -lnt 'sport = :8080'
+# State  Recv-Q Send-Q Local Address:Port
+# LISTEN 129    128    *:8080          ← 已经溢出
+
+# 溢出计数（持续增长说明有问题）
+nstat -az TcpExtListenOverflows TcpExtListenDrops
+
+# 调整上限
+sysctl -w net.core.somaxconn=4096
+sysctl -w net.ipv4.tcp_max_syn_backlog=8192
+```
+
+**常见追问**
+
+- Go 程序怎么设置 backlog？→ `net.Listen` 不提供参数，它读取 `/proc/sys/net/core/somaxconn` 作为 backlog；所以调整系统参数后需要重启进程。
+- 容器里的 somaxconn 和宿主机一样吗？→ 它是按网络命名空间隔离的，Pod 里需要单独设置（Kubernetes 的 `securityContext.sysctls`）。
+- 半连接队列满了会怎样？→ 开启了 syncookies 时仍然能建立连接；否则新的 SYN 被丢弃。
+
+**实战建议**
+
+- 把 `ListenOverflows` 纳入监控。
+- 队列溢出是“结果”，根本原因通常是处理能力不足，调大队列只是缓冲。
+
+=== net-10
+--- deep
+**原理展开**
+
+**延迟确认**（Delayed ACK）：接收方收到数据后不立即回复 ACK，等待一段时间（Linux 最多 40ms），期望和自己要发送的数据一起捎带回去，减少纯 ACK 包的数量。
+
+**Nagle + 延迟确认的死锁**：客户端先写了请求头（小包，立即发送），再写请求体（小包，因为有未确认的数据，被 Nagle 攒着）；服务端收到请求头后在等请求体，所以没有数据可以捎带 ACK，只能等 40ms 的延迟确认定时器到期才发 ACK；客户端收到 ACK 后才发送请求体。每个请求白白多了 40ms。
+
+Go 默认关闭 Nagle（`TCP_NODELAY`），避免了这个问题，代价是每次 Write 都可能产生一个小包和一次系统调用，所以应用层要自己合并写入。
+
+**代码示例**
+
+```go
+// 一次系统调用写多个缓冲区（writev），不需要先拼接
+bufs := net.Buffers{header, body, trailer}
+_, err := bufs.WriteTo(conn)
+
+// 或者用 bufio，一次 Flush
+bw := bufio.NewWriterSize(conn, 32<<10)
+bw.Write(header)
+bw.Write(body)
+err = bw.Flush()
+```
+
+```bash
+# 观察小包：抓包看数据包的大小分布
+sudo tcpdump -i eth0 -nn 'tcp port 6379' -c 1000 | awk '{print $NF}' | sort | uniq -c | sort -rn | head
+```
+
+**常见追问**
+
+- 什么场景需要开启 Nagle？→ 大量非常小的、不需要及时发送的数据（比如 telnet 风格的逐字符输入），现在已经很少见。
+- `TCP_CORK` 是什么？→ Linux 特有的选项，“塞住”套接字，攒够数据或者取消 cork 时才发送，适合先发头再发文件内容（sendfile）的场景。
+- 延迟确认可以关闭吗？→ Linux 上可以用 `TCP_QUICKACK` 临时关闭，但每次读之后都要重新设置。
+
+**实战建议**
+
+- 协议设计上让一条消息尽量在一次 Write 中发出。
+- 用 `strace -c` 观察 write 系统调用的次数，次数过多说明需要合并写入。
+
+=== net-11
+--- deep
+**原理展开**
+
+一次 gRPC 一元调用在 HTTP/2 上的样子：
+
+```text
+HEADERS (stream 1)   :method POST, :path /pkg.Service/Method, content-type application/grpc, grpc-timeout 500m
+DATA    (stream 1)   [0][00 00 00 0c][12 字节的 protobuf 消息]
+HEADERS (stream 1, 响应)  :status 200, content-type application/grpc
+DATA    (stream 1)   [0][长度][响应消息]
+HEADERS (stream 1, trailers, END_STREAM)  grpc-status 0, grpc-message
+```
+
+gRPC 的状态码（`grpc-status`）放在 trailer 里，HTTP 状态码几乎总是 200。这让流式调用成为可能：响应可以一边产生一边发送，最后才告诉客户端成功与否。
+
+截止时间通过 `grpc-timeout` 头传播，服务端会据此为 handler 的 ctx 设置超时，下游调用再继续传播剩余时间。
+
+**代码示例**
+
+```go
+// 服务端流：推送实时价格
+func (s *server) Watch(req *pb.WatchRequest, stream pb.Prices_WatchServer) error {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			if err := stream.Send(&pb.Price{Symbol: req.Symbol, Value: s.price(req.Symbol)}); err != nil {
+				return err // 客户端断开
+			}
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		}
+	}
+}
+
+// 客户端
+ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+defer cancel()
+st, err := client.Watch(ctx, &pb.WatchRequest{Symbol: "GOOG"})
+for {
+	p, err := st.Recv()
+	if err == io.EOF {
+		break
+	}
+	if err != nil {
+		return status.Code(err) // 用 status 包解析 gRPC 错误码
+	}
+	fmt.Println(p.Value)
+}
+```
+
+**常见追问**
+
+- gRPC 的错误怎么传递详细信息？→ 用 `status.New(code, msg).WithDetails(...)` 附带结构化的错误详情（如 `errdetails.BadRequest`）。
+- 一个 gRPC 连接能承载多少并发调用？→ 受服务端 `MaxConcurrentStreams` 限制（Go 默认 100 万，很多代理默认 100），超过时调用会排队。
+- 消息大小有限制吗？→ 默认接收最大 4MB，可以通过选项调整；大数据应该用流式传输分块发送。
+
+**实战建议**
+
+- 每个 RPC 调用都带截止时间（ctx 超时），服务端检查 ctx 及时退出。
+- 用拦截器统一处理日志、指标、追踪、恢复 panic 和认证。

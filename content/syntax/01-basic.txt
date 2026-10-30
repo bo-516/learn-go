@@ -1,0 +1,350 @@
+=== short-var
+name: 短变量声明 :=
+group: 基础与变量
+--- body
+`:=` 同时完成**声明 + 赋值**，类型由右边的值推导出来。它只能用在函数内部，是 Go 里最常见的声明方式。
+
+**写法**
+
+```go
+x := 10              // int
+name, age := "Tom", 18
+f, err := os.Open("a.txt")
+```
+
+**例子**
+
+```go
+a, err := strconv.Atoi("12")
+b, err := strconv.Atoi("34") // 合法：b 是新变量，err 只是被重新赋值
+fmt.Println(a+b, err)        // 46 <nil>
+```
+
+**注意**
+
+- `:=` 左边**至少要有一个新变量**，其余已存在的变量（同一作用域内）只是赋值；全是旧变量会报 `no new variables on left side of :=`。
+- 在 `if`、`for`、内层 `{}` 里用 `:=` 会创建**新的同名变量**，遮蔽（shadow）外层变量。常见 bug：
+
+```go
+var err error
+if true {
+	_, err := strconv.Atoi("x") // 这是新的 err，外层 err 仍然是 nil
+	_ = err
+}
+```
+
+- 包级别（函数外）不能用 `:=`，只能用 `var`。
+- 推导出的类型是“默认类型”：`x := 1` 是 `int`，`y := 1.5` 是 `float64`，`r := 'a'` 是 `rune`。
+
+=== var-zero
+name: var 声明与零值
+group: 基础与变量
+--- body
+`var` 声明变量时如果不赋初值，变量会被自动设为该类型的**零值**。Go 没有“未初始化”的变量，这是很多代码能写得很短的原因。
+
+**写法**
+
+```go
+var n int            // 0
+var s string         // ""
+var ok bool          // false
+var p *Node          // nil
+var buf []byte       // nil 切片，len 为 0，可以直接 append
+var m map[string]int // nil map，可以读，不能写
+var mu sync.Mutex    // 零值就是一把可用的未加锁的锁
+var (
+	a = 1
+	b string
+)
+```
+
+**各类型的零值**：数值 `0`、字符串 `""`、布尔 `false`，指针 / 切片 / map / channel / 函数 / 接口都是 `nil`，结构体是“每个字段都取零值”。
+
+**例子**
+
+```go
+type Counter struct {
+	mu sync.Mutex
+	n  map[string]int
+}
+
+var c Counter            // 不需要构造函数，mu 已经可用
+c.mu.Lock()
+fmt.Println(c.n["x"])    // 0：读 nil map 是安全的
+c.mu.Unlock()
+```
+
+**注意**
+
+- **向 nil map 写入会 panic**：`var m map[string]int; m["a"] = 1` → `assignment to entry in nil map`，要先 `make`。
+- nil 切片和空切片 `[]int{}` 用起来几乎一样（len、range、append 都正常），但 `json.Marshal` 时前者是 `null`，后者是 `[]`。
+- 设计类型时尽量让“零值可用”，比如 `sync.Mutex`、`bytes.Buffer`、`strings.Builder` 都不需要初始化。
+
+=== const-iota
+name: 常量与 iota
+group: 基础与变量
+--- body
+`const` 定义编译期常量；在 `const ( ... )` 块里，`iota` 从 0 开始，每行加 1，常用来定义枚举。
+
+**写法**
+
+```go
+const Pi = 3.14159
+const (
+	StateIdle State = iota // 0
+	StateRunning           // 1：省略的行会重复上一行的表达式
+	StateDone              // 2
+)
+const (
+	_  = iota             // 跳过 0
+	KB = 1 << (10 * iota) // 1 << 10
+	MB                    // 1 << 20
+)
+```
+
+**例子**
+
+```go
+type Weekday int
+
+const (
+	Sunday Weekday = iota
+	Monday
+	Tuesday
+)
+
+func (d Weekday) String() string {
+	return [...]string{"Sun", "Mon", "Tue"}[d]
+}
+
+fmt.Println(Monday) // Mon：实现了 String() 后 fmt 会自动调用
+```
+
+**注意**
+
+- 无类型常量（`const N = 10`）精度很高，可以直接和 `int64`、`float64` 等运算，用到时才确定类型。
+- `iota` 是“在当前 const 块里的行号”，每个新的 `const (` 块都从 0 重新开始。
+- 只有布尔、数字、字符串可以是常量；切片、map、结构体不能 `const`。
+- 枚举通常给 0 值留一个“未知 / 未设置”的含义，避免零值被误当作有效状态。
+
+=== multi-assign
+name: 多重赋值与交换
+group: 基础与变量
+--- body
+Go 支持一次给多个变量赋值。右边所有表达式**先全部求值**，然后再统一赋给左边，所以交换两个变量不需要临时变量。
+
+**写法**
+
+```go
+a, b = b, a                  // 交换
+a, b = b, a+b                // 斐波那契：用的是旧的 a 和 b
+nums[i], nums[j] = nums[j], nums[i]
+_, err = io.Copy(dst, src)   // _ 丢弃不需要的值
+```
+
+**例子**
+
+```go
+// 反转切片
+func reverse(s []int) {
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		s[i], s[j] = s[j], s[i]
+	}
+}
+```
+
+**注意**
+
+- `a, b = b, a+b` 和分两行写 `a = b; b = a + b` 结果不同：后者第二行用的是**新的** a。
+- 链表反转这类题经常写成 `prev, cur, cur.Next = cur, cur.Next, prev`，虽然合法，但求值顺序很容易想错，推荐拆成几行清楚的赋值。
+- `_` 是空白标识符，可以接收任意值但不能读取。
+
+=== type-def
+name: 自定义类型 type
+group: 基础与变量
+--- body
+`type 新类型 底层类型` 基于已有类型定义一个**全新的类型**，可以给它加方法；`type A = B` 则只是起别名，两者是同一个类型。
+
+**写法**
+
+```go
+type UserID int64                // 新类型：和 int64 不能直接混用
+type Celsius float64
+type HandlerFunc func(w http.ResponseWriter, r *http.Request)
+type Set map[string]struct{}
+type byte = uint8                // 别名（标准库里的写法）
+```
+
+**例子**
+
+```go
+type Celsius float64
+
+func (c Celsius) Fahrenheit() float64 { return float64(c)*9/5 + 32 }
+
+t := Celsius(100)
+fmt.Println(t.Fahrenheit()) // 212
+var f float64 = t           // 编译错误：不能把 Celsius 直接赋给 float64
+```
+
+**注意**
+
+- 新类型**不继承**原类型的方法：`type MyMutex sync.Mutex` 之后 `MyMutex` 没有 `Lock` 方法（想要继承方法应该用结构体嵌入）。
+- 新类型和底层类型之间可以显式转换：`int64(id)`、`UserID(42)`。
+- 用新类型区分含义（`UserID` 和 `OrderID`）可以让编译器帮你发现参数传错的问题。
+- 函数类型也能定义方法，`http.HandlerFunc` 就是这样让普通函数实现接口的。
+
+=== type-conv
+name: 类型转换 T(x)
+group: 基础与变量
+--- body
+Go **没有隐式类型转换**，`int` 和 `int64`、`int` 和 `float64` 之间都必须显式写 `T(x)`。
+
+**写法**
+
+```go
+f := float64(n) / 2
+i := int(3.9)          // 3：浮点转整数直接截断小数
+u := uint8(300)        // 44：整数转换超出范围会按位截断
+d := time.Duration(n) * time.Millisecond
+id := UserID(42)
+```
+
+**例子**
+
+```go
+// 平均值：先转 float64 再除，否则是整数除法
+func avg(nums []int) float64 {
+	sum := 0
+	for _, n := range nums {
+		sum += n
+	}
+	return float64(sum) / float64(len(nums))
+}
+```
+
+**注意**
+
+- `7 / 2` 是 `3`（整数除法）；要得到 `3.5` 需要 `float64(7) / 2`。
+- 整数和字符串互转**不能**用 `string(65)`，那会得到 `"A"`（按 Unicode 码点）。数字转字符串用 `strconv.Itoa`，反过来用 `strconv.Atoi`。
+- `[]byte(s)`、`string(b)` 是会复制数据的转换，见「字符串与 []byte 互转」。
+- 类型转换 `T(x)` 和类型断言 `x.(T)` 是两回事：断言只用于接口值。
+
+=== pointer
+name: 指针 & 和 *
+group: 基础与变量
+--- body
+`&x` 取变量的地址，得到 `*T` 类型的指针；`*p` 通过指针读写它指向的值。Go 的指针不能做算术运算，比 C 安全很多。
+
+**写法**
+
+```go
+x := 1
+p := &x        // p 的类型是 *int
+*p = 2         // 通过指针修改 x
+n := new(int)  // 分配一个零值 int，返回 *int
+u := &User{Name: "Tom"} // 最常见：直接取复合字面量的地址
+u.Name = "Jerry"        // 结构体指针访问字段不用写 (*u).Name
+```
+
+**例子**
+
+```go
+func inc(p *int) { *p++ }
+
+n := 1
+inc(&n)
+fmt.Println(n) // 2：函数参数是值拷贝，想修改调用方的变量就传指针
+```
+
+**什么时候用指针**
+
+- 函数需要修改参数；
+- 结构体较大，避免拷贝；
+- 需要表达“没有值”（`nil`），比如链表、树的节点 `*ListNode`；
+- 类型里有不能复制的字段（`sync.Mutex`）。
+
+**注意**
+
+- 对 nil 指针解引用会 panic：`invalid memory address or nil pointer dereference`，访问前要判空。
+- 返回局部变量的地址是安全的，编译器会通过逃逸分析把它分配到堆上。
+- 切片、map、channel 本身已经是“引用语义”的小结构，一般不需要再取指针。
+
+=== ptr-ptr
+name: 指向指针的指针 **T
+group: 基础与变量
+--- body
+`**T` 是“指针的指针”。当你需要**修改调用方手里的那个指针变量本身**（而不是它指向的对象）时会用到，链表的删除、插入是典型场景。
+
+**写法**
+
+```go
+var head *ListNode
+pp := &head      // pp 的类型是 **ListNode
+*pp = &ListNode{Val: 1} // 修改的是 head 本身
+```
+
+**例子：不需要哨兵节点的链表删除**
+
+```go
+func removeElements(head *ListNode, val int) *ListNode {
+	pp := &head                   // 指向“当前要检查的那个指针”
+	for *pp != nil {
+		if (*pp).Val == val {
+			*pp = (*pp).Next      // 直接把这个指针改成跳过当前节点
+		} else {
+			pp = &(*pp).Next      // 移动到下一个节点的 Next 字段
+		}
+	}
+	return head
+}
+```
+
+`pp` 一开始指向 `head` 变量，之后指向某个节点的 `Next` 字段，所以删除头节点和删除中间节点是同一段代码。
+
+**注意**
+
+- `(*pp).Val` 的括号不能省：`*pp.Val` 会被解析成 `*(pp.Val)`。
+- 大多数时候用“哨兵节点（dummy head）”写法更直观；`**T` 写法更短，但读代码的人要多想一步。
+- 函数参数里出现 `**T` 通常是为了“在函数里替换调用方的指针”，在 Go 里更常见的做法是**返回新指针**。
+
+=== bits
+name: 位运算
+group: 基础与变量
+--- body
+Go 的位运算符：`&` 与、`|` 或、`^` 异或（一元时是按位取反）、`&^` 按位清除、`<<` 左移、`>>` 右移。`math/bits` 提供计数、旋转等高效函数。
+
+**写法**
+
+```go
+x & 1          // 判断奇偶
+x & (x - 1)    // 去掉最低位的 1
+x & -x         // 只保留最低位的 1
+x ^ y          // 相同为 0，不同为 1；a ^ a == 0
+flags |= 1 << 3   // 置位
+flags &^= 1 << 3  // 清除（and not）
+bits.OnesCount(uint(x)) // 1 的个数
+```
+
+**例子**
+
+```go
+// 只出现一次的数字：成对的数异或后抵消
+func singleNumber(nums []int) int {
+	x := 0
+	for _, n := range nums {
+		x ^= n
+	}
+	return x
+}
+
+// 2 的幂：二进制里只有一个 1
+func isPowerOfTwo(n int) bool { return n > 0 && n&(n-1) == 0 }
+```
+
+**注意**
+
+- 运算符优先级：`&`、`<<`、`>>` 和 `*` 同级，**比 `==` 高**，所以 `n&(n-1) == 0` 就是 `(n & (n-1)) == 0`（这点和 C 相反）。
+- 有符号数右移是算术右移（保留符号位），`-8 >> 1 == -4`。
+- 移位次数可以是变量，但不能是负数（运行时 panic）。
+- Go 没有 `~x` 取反写法，用 `^x`。

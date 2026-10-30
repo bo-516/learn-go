@@ -1,0 +1,757 @@
+=== perf-29-1
+title: 实现磁盘满故障智能诊断器与安全日志原地截断（Truncate vs Remove）
+race: true
+--- desc
+线上排查 `No space left on device` 时，需快速区分“Inode 耗尽”与“已 `rm` 但未关闭句柄的大文件未释放”，并在清理活跃日志时使用 `Truncate(0)` 而非 `os.Remove`。请实现：
+
+1. `DiagnoseDiskFull(usedBytes, totalBytes, usedInodes, totalInodes, visibleDuBytes int64) string`：
+   - 若 `usedInodes >= totalInodes`（且 `totalInodes > 0`），返回 `"inode_exhausted"`；
+   - 若磁盘使用率 `usedBytes * 100 >= totalBytes * 90` **且** `usedBytes - visibleDuBytes > totalBytes / 5`（即 `df` 已用空间比 `du` 可见文件总和大了超过总容量的 20%），返回 `"deleted_open_files"`；
+   - 否则返回 `"normal_disk_full"`；
+2. `TruncateActiveLog(f *os.File) error`：
+   - 严禁调用 `os.Remove`！请调用 `f.Truncate(0)` 将正在写入的日志文件长度原地截断为 0，并调用 `f.Seek(0, 0)` 将文件偏移量重置回开头。
+--- solution
+package main
+
+import "os"
+
+func DiagnoseDiskFull(usedBytes, totalBytes, usedInodes, totalInodes, visibleDuBytes int64) string {
+	// @solution
+	if totalInodes > 0 && usedInodes >= totalInodes {
+		return "inode_exhausted"
+	}
+	if totalBytes > 0 && usedBytes*100 >= totalBytes*90 && (usedBytes-visibleDuBytes) > totalBytes/5 {
+		return "deleted_open_files"
+	}
+	return "normal_disk_full"
+	// @starter
+	// return "" // TODO: 区分 inode_exhausted、deleted_open_files 和 normal_disk_full
+	// @end
+}
+
+func TruncateActiveLog(f *os.File) error {
+	// @solution
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	_, err := f.Seek(0, 0)
+	return err
+	// @starter
+	// return nil // TODO: 原地截断文件为 0 字节并将读写偏移量归零
+	// @end
+}
+--- test
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestDiagnoseDiskFullAndTruncate(t *testing.T) {
+	if got := DiagnoseDiskFull(20, 100, 1000, 1000, 20); got != "inode_exhausted" {
+		t.Fatalf("got %q, want inode_exhausted", got)
+	}
+	if got := DiagnoseDiskFull(95, 100, 100, 1000, 10); got != "deleted_open_files" {
+		t.Fatalf("got %q, want deleted_open_files", got)
+	}
+	if got := DiagnoseDiskFull(95, 100, 100, 1000, 92); got != "normal_disk_full" {
+		t.Fatalf("got %q, want normal_disk_full", got)
+	}
+
+	path := filepath.Join(t.TempDir(), "app.log")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	_, _ = f.WriteString("very large log content that fills disk...")
+	if err := TruncateActiveLog(f); err != nil {
+		t.Fatalf("TruncateActiveLog err: %v", err)
+	}
+	_, _ = f.WriteString("fresh")
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "fresh" {
+		t.Fatalf("file content after truncate+write = %q, want %q (did you forget Seek(0,0)?)", string(data), "fresh")
+	}
+}
+--- explain
+**思路**
+
+1. **诊断模型**：先看 `df -i`（`usedInodes >= totalInodes` 则是小文件把 Inode 耗尽）；再对比 `df`（`usedBytes`）与 `du`（`visibleDuBytes`）的差值，若差值悬殊则必然存在已被 `rm` 但仍被进程打开的幽灵大文件（`lsof +L1`）。
+2. **原地截断与偏移重置**：对一个未以 `O_APPEND` 打开的普通文件描述符调用 `f.Truncate(0)` 后，文件大小虽然变成了 0，但句柄当前的写入偏移量（offset）仍然停留在原来的高水位处！如果不调用 `f.Seek(0, 0)`，下一次 `Write` 会在原偏移量之前补齐一串 `\x00` 空洞（稀疏文件）。
+
+**代码讲解**
+
+- `f.Truncate(0)` 立即通知内核回收数据块，同时保持原 Inode 不变；紧接着 `f.Seek(0, 0)` 将游标拉回文件首部。
+
+**易错点**
+
+- 切记 `Truncate(0)` 不会自动修改文件描述符的 `offset`，必须配合 `Seek(0, 0)`。
+
+=== perf-30-1
+title: 实现带 Singleflight 合并与故障旧值兜底（Serve-Stale）的进程内 DNS 缓存解析器
+race: true
+--- desc
+为解决 K8s 下 CoreDNS 偶发 5 秒超时毛刺与高频重复解析，请实现进程内 DNS 缓存器 `CachingResolver`：
+
+1. `Resolve(host string, now time.Time) ([]string, error)`：
+   - **命中未过期缓存**：若 `host` 在缓存中且 `now.Before(entry.expireAt)`，直接返回缓存的 IP 切片副本；
+   - **缓存未命中或已过期**：调用底层 `lookup(host) ([]string, error)`：
+     - **并发去重（Singleflight）**：同一时刻针对同一个 `host` 的多个并发 `Resolve` 请求，底层 `lookup(host)` **只允许执行 1 次**，共享结果；
+     - **查询成功（`err == nil`）**：更新缓存（过期时间设为 `now.Add(ttl)`）并返回结果；
+     - **查询失败（`err != nil`，模拟 CoreDNS 超时故障）**：如果缓存中存在该 `host` **已过期的历史记录（Stale Cache）**，**返回该历史旧 IP 列表与 `nil` 错误（Serve Stale on Error 容灾）**！只有既查失败又没有任何历史缓存时，才返回 `err`。
+--- solution
+package main
+
+import (
+	"sync"
+	"time"
+)
+
+type dnsEntry struct {
+	ips      []string
+	expireAt time.Time
+}
+
+type dnsCall struct {
+	wg  sync.WaitGroup
+	ips []string
+	err error
+}
+
+type CachingResolver struct {
+	mu       sync.Mutex
+	ttl      time.Duration
+	cache    map[string]dnsEntry
+	inflight map[string]*dnsCall
+	lookup   func(host string) ([]string, error)
+}
+
+func NewCachingResolver(ttl time.Duration, lookup func(string) ([]string, error)) *CachingResolver {
+	return &CachingResolver{
+		ttl:      ttl,
+		cache:    make(map[string]dnsEntry),
+		inflight: make(map[string]*dnsCall),
+		lookup:   lookup,
+	}
+}
+
+func (r *CachingResolver) Resolve(host string, now time.Time) ([]string, error) {
+	// @solution
+	r.mu.Lock()
+	if ent, ok := r.cache[host]; ok && now.Before(ent.expireAt) {
+		r.mu.Unlock()
+		return ent.ips, nil
+	}
+	if call, ok := r.inflight[host]; ok {
+		r.mu.Unlock()
+		call.wg.Wait()
+		return call.ips, call.err
+	}
+	call := &dnsCall{}
+	call.wg.Add(1)
+	r.inflight[host] = call
+	r.mu.Unlock()
+
+	ips, err := r.lookup(host)
+
+	r.mu.Lock()
+	delete(r.inflight, host)
+	if err == nil {
+		r.cache[host] = dnsEntry{ips: ips, expireAt: now.Add(r.ttl)}
+		call.ips, call.err = ips, nil
+	} else if stale, ok := r.cache[host]; ok {
+		call.ips, call.err = stale.ips, nil
+	} else {
+		call.ips, call.err = nil, err
+	}
+	r.mu.Unlock()
+
+	call.wg.Done()
+	return call.ips, call.err
+	// @starter
+	// return r.lookup(host) // TODO: 实现 TTL 缓存、并发 Singleflight 合并与故障 Serve-Stale 兜底
+	// @end
+}
+--- test
+package main
+
+import (
+	"errors"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestCachingResolverSingleflightAndStale(t *testing.T) {
+	var lookups atomic.Int32
+	var shouldFail atomic.Bool
+
+	res := NewCachingResolver(30*time.Second, func(host string) ([]string, error) {
+		lookups.Add(1)
+		time.Sleep(15 * time.Millisecond)
+		if shouldFail.Load() {
+			return nil, errors.New("dns i/o timeout (5s)")
+		}
+		return []string{"10.0.0.1"}, nil
+	})
+
+	t0 := time.Now()
+	// 1. 20 个协程并发解析冷域名，只应触发 1 次底层 UDP 查询
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ips, err := res.Resolve("api.pay.internal", t0)
+			if err != nil || len(ips) != 1 || ips[0] != "10.0.0.1" {
+				t.Errorf("unexpected resolve: %v, %v", ips, err)
+			}
+		}()
+	}
+	wg.Wait()
+	if lookups.Load() != 1 {
+		t.Fatalf("lookups = %d, want 1", lookups.Load())
+	}
+
+	// 2. TTL 过期后，模拟 CoreDNS 挂掉报错 -> 应优雅降级返回过期的旧 IP (10.0.0.1)，零报错！
+	shouldFail.Store(true)
+	ips, err := res.Resolve("api.pay.internal", t0.Add(time.Minute))
+	if err != nil || len(ips) != 1 || ips[0] != "10.0.0.1" {
+		t.Fatalf("expected stale IP fallback when DNS fails, got ips=%v err=%v", ips, err)
+	}
+
+	// 3. 从未缓存过的全新域名在 DNS 故障时应如实返回错误
+	if _, err := res.Resolve("never.seen.internal", t0); err == nil {
+		t.Fatal("expected error for cold host when DNS fails")
+	}
+}
+--- explain
+**思路**
+
+在 Go 服务内加一层 DNS 缓存要解决两个核心问题：
+1. **并发击穿（Singleflight）**：缓存过期的瞬间如果有 500 个请求同时建连，只能发 1 个 DNS 请求。
+2. **故障旧值兜底（Serve Stale on Error）**：后端服务的 IP 往往几天甚至几周都不变。当 CoreDNS 偶发抖动超时（5s 毛刺）时，继续使用 1 分钟前刚过期的旧 IP 列表几乎 100% 能正常连通，从而让业务对 DNS 故障完全无感！
+
+**代码讲解**
+
+- 当 `r.lookup(host)` 返回 `err != nil` 时，检查 `if stale, ok := r.cache[host]; ok`，若存在旧记录则将 `call.ips, call.err = stale.ips, nil` 返回给所有等待的调用方。
+
+**易错点**
+
+- 注意在缓存未命中发起 `r.lookup(host)` 前必须保留 `r.cache[host]` 中的旧条目（不要在过期时立刻 `delete(r.cache, host)`），否则 `lookup` 失败时就找不到旧值兜底了。
+
+=== perf-31-1
+title: 实现容器内存水位拆解与隐藏内存（Cgo / Mmap / PageCache）诊断器
+race: true
+--- desc
+当容器发生 OOMKilled 或内存告警，但 `pprof/heap`（`HeapAlloc`）看起来很低时，需要通过运行时的完整内存账本定位真正的内存去向。请实现 `AnalyzeContainerMemory(s MemorySnapshot) string`：
+
+给定快照 `MemorySnapshot`：
+- `ContainerUsage`：容器 cgroup 统计的总内存用量
+- `ProcessRSS`：Go 进程的物理内存占用（`VmRSS`）
+- `GoHeapAlloc`：Go 存活堆对象大小
+- `GoHeapIdleUnrel`：`HeapIdle - HeapReleased`（Go 未归还给操作系统的空闲堆页）
+- `GoStackInuse`：所有 Goroutine 栈占用的内存
+
+请按以下优先级返回占比最高（超过 30% `ContainerUsage`）的隐形内存元凶：
+1. 若 `ContainerUsage - ProcessRSS > ContainerUsage * 30 / 100`（容器总用量远大于 Go 进程 RSS），说明是容器内 **PageCache 或其他子进程** 占用，返回 `"page_cache_or_subprocesses"`；
+2. 若 `GoRunTimeKnown := GoHeapAlloc + GoHeapIdleUnrel + GoStackInuse`，且 `ProcessRSS - GoRunTimeKnown > ContainerUsage * 30 / 100`（进程 RSS 远大于 Go 运行时已知内存总和），说明存在 **Cgo / Mmap 堆外内存**，返回 `"off_heap_cgo_or_mmap"`；
+3. 若 `GoStackInuse > ContainerUsage * 30 / 100`，说明是 **Goroutine 栈膨胀/泄漏**，返回 `"goroutine_stack_bloat"`；
+4. 若 `GoHeapIdleUnrel > ContainerUsage * 30 / 100`，说明是 **Go 空闲堆未归还 OS（需配置 GOMEMLIMIT）**，返回 `"unreleased_heap_idle"`；
+5. 否则返回 `"go_heap_alloc"`。
+--- solution
+package main
+
+type MemorySnapshot struct {
+	ContainerUsage  int64
+	ProcessRSS      int64
+	GoHeapAlloc     int64
+	GoHeapIdleUnrel int64
+	GoStackInuse    int64
+}
+
+func AnalyzeContainerMemory(s MemorySnapshot) string {
+	// @solution
+	threshold := s.ContainerUsage * 30 / 100
+	if s.ContainerUsage-s.ProcessRSS > threshold {
+		return "page_cache_or_subprocesses"
+	}
+	goRuntimeKnown := s.GoHeapAlloc + s.GoHeapIdleUnrel + s.GoStackInuse
+	if s.ProcessRSS-goRuntimeKnown > threshold {
+		return "off_heap_cgo_or_mmap"
+	}
+	if s.GoStackInuse > threshold {
+		return "goroutine_stack_bloat"
+	}
+	if s.GoHeapIdleUnrel > threshold {
+		return "unreleased_heap_idle"
+	}
+	return "go_heap_alloc"
+	// @starter
+	// return "" // TODO: 逐层比对 cgroup、ProcessRSS 与 Go Runtime 内部账本，定位隐形内存去向
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestAnalyzeContainerMemory(t *testing.T) {
+	const GiB = 1024 * 1024 * 1024
+
+	// 场景 1：容器 2GiB 满了，但 Go 进程 RSS 只有 800MiB -> 本地大文件读写产生的 PageCache 或子进程
+	if got := AnalyzeContainerMemory(MemorySnapshot{
+		ContainerUsage: 2000, ProcessRSS: 800, GoHeapAlloc: 600, GoHeapIdleUnrel: 100, GoStackInuse: 50,
+	}); got != "page_cache_or_subprocesses" {
+		t.Fatalf("case 1 = %q, want page_cache_or_subprocesses", got)
+	}
+
+	// 场景 2：进程 RSS 高达 1900MiB，但 Go 堆+栈加起来才 500MiB -> Cgo / mmap 堆外内存
+	if got := AnalyzeContainerMemory(MemorySnapshot{
+		ContainerUsage: 2000, ProcessRSS: 1900, GoHeapAlloc: 400, GoHeapIdleUnrel: 50, GoStackInuse: 50,
+	}); got != "off_heap_cgo_or_mmap" {
+		t.Fatalf("case 2 = %q, want off_heap_cgo_or_mmap", got)
+	}
+
+	// 场景 3：20 万个阻塞协程栈吃掉了 900MiB
+	if got := AnalyzeContainerMemory(MemorySnapshot{
+		ContainerUsage: 2000, ProcessRSS: 1800, GoHeapAlloc: 500, GoHeapIdleUnrel: 200, GoStackInuse: 900,
+	}); got != "goroutine_stack_bloat" {
+		t.Fatalf("case 3 = %q, want goroutine_stack_bloat", got)
+	}
+
+	// 场景 4：流量波峰过后未归还给 OS 的空闲页占了 900MiB
+	if got := AnalyzeContainerMemory(MemorySnapshot{
+		ContainerUsage: 2000, ProcessRSS: 1800, GoHeapAlloc: 500, GoHeapIdleUnrel: 900, GoStackInuse: 100,
+	}); got != "unreleased_heap_idle" {
+		t.Fatalf("case 4 = %q, want unreleased_heap_idle", got)
+	}
+}
+--- explain
+**思路**
+
+排查容器 OOM 必须采用**“自顶向下剥洋葱”**的减法账本：
+1. 第一层用 `cgroup.memory.current - VmRSS` 剥离出非本进程内存（文件 PageCache、tmpfs、子进程）；
+2. 第二层用 `VmRSS - GoRuntimeSys` 剥离出 Go 运行时管辖之外的堆外内存（Cgo `malloc`、`syscall.Mmap`）；
+3. 第三层在 Go 运行时内部拆解 `StackInuse`（协程栈）、`HeapIdle - HeapReleased`（未归还空闲页）和 `HeapAlloc`（真实存活堆对象）。
+
+**代码讲解**
+
+- 依次按照 `ContainerUsage -> ProcessRSS -> GoRuntimeKnown -> StackInuse / HeapIdleUnrel` 的包含关系计算差值并与 `30%` 阈值比对。
+
+**易错点**
+
+- 切记 `pprof/heap` 只看得到 `GoHeapAlloc`，前四种场景在 `pprof/heap` 火焰图里全都看不出任何异常！
+
+=== perf-32-1
+title: 实现火焰图折叠调用栈（Collapsed Stacks）的 Flat 与 Cum 热点统计器
+race: true
+--- desc
+火焰图的底层标准输入格式是 Brendan Gregg 定义的折叠调用栈文本（每行格式为 `funcA;funcB;funcC 采样次数`，分号分隔从根到叶子的调用链）。请实现解析与统计函数 `ComputeFlameStats(lines []string) map[string]FlameStat`：
+
+1. 输入每行形如 `"main;Handler;MarshalJSON 90"`（忽略空行或格式非法行）；
+2. 对每个出现的函数名统计两个核心指标 `FlameStat{Flat int64, Cum int64}`：
+   - **`Flat`（自身耗时/大平顶宽度）**：该函数作为调用栈**最末端叶子节点**（即分号切分后的最后一个函数）时的采样次数之和；
+   - **`Cum`（累计耗时/底座总宽度）**：该函数出现在调用栈任意位置时的采样次数之和（注意：**若同一行调用栈中存在递归调用如 `A;B;A 10`，`A` 在该行的 `Cum` 只加一次 `10`，不能重复累加**！）。
+--- solution
+package main
+
+import (
+	"strconv"
+	"strings"
+)
+
+type FlameStat struct {
+	Flat int64
+	Cum  int64
+}
+
+func ComputeFlameStats(lines []string) map[string]FlameStat {
+	// @solution
+	stats := make(map[string]FlameStat)
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		spaceIdx := strings.LastIndexByte(line, ' ')
+		if spaceIdx <= 0 {
+			continue
+		}
+		stackStr := line[:spaceIdx]
+		samples, err := strconv.ParseInt(strings.TrimSpace(line[spaceIdx+1:]), 10, 64)
+		if err != nil {
+			continue
+		}
+		frames := strings.Split(stackStr, ";")
+		if len(frames) == 0 {
+			continue
+		}
+
+		// 栈顶（最右侧叶子函数）计入 Flat
+		leaf := frames[len(frames)-1]
+		st := stats[leaf]
+		st.Flat += samples
+		stats[leaf] = st
+
+		// 调用链上所有去重后的函数计入 Cum
+		seen := make(map[string]struct{}, len(frames))
+		for _, fn := range frames {
+			if _, dup := seen[fn]; dup {
+				continue
+			}
+			seen[fn] = struct{}{}
+			s := stats[fn]
+			s.Cum += samples
+			stats[fn] = s
+		}
+	}
+	return stats
+	// @starter
+	// return nil // TODO: 解析折叠调用栈，计算每个函数的 Flat（栈顶自身耗时）与 Cum（去重累计耗时）
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestComputeFlameStats(t *testing.T) {
+	lines := []string{
+		"main;Handler;Service;MarshalJSON 90",
+		"main;Handler;Service 5",
+		"main;Handler;Walk;Walk 10", // 递归调用 Walk;Walk
+	}
+
+	got := ComputeFlameStats(lines)
+
+	// main 和 Handler 只是入口底座：Cum=105, Flat=0
+	if got["Handler"] != (FlameStat{Flat: 0, Cum: 105}) {
+		t.Fatalf("Handler = %+v, want {Flat:0 Cum:105}", got["Handler"])
+	}
+	// Service 自身作为栈顶 5 次，调用 MarshalJSON 90 次：Flat=5, Cum=95
+	if got["Service"] != (FlameStat{Flat: 5, Cum: 95}) {
+		t.Fatalf("Service = %+v, want {Flat:5 Cum:95}", got["Service"])
+	}
+	// MarshalJSON 是真正的 CPU 大平顶热点：Flat=90, Cum=90
+	if got["MarshalJSON"] != (FlameStat{Flat: 90, Cum: 90}) {
+		t.Fatalf("MarshalJSON = %+v, want {Flat:90 Cum:90}", got["MarshalJSON"])
+	}
+	// 递归函数 Walk 的 Cum 不能翻倍算成 20！
+	if got["Walk"] != (FlameStat{Flat: 10, Cum: 10}) {
+		t.Fatalf("recursive Walk = %+v, want {Flat:10 Cum:10}", got["Walk"])
+	}
+}
+--- explain
+**思路**
+
+这道题直接揭示了火焰图与 `pprof top` 中 `flat` 和 `cum` 的数学定义：
+- **`Flat`（大平顶）**：采样中断发生时，CPU 的程序计数器（PC）正停在该函数内部执行指令（即它位于调用栈的最末端 `frames[len(frames)-1]`），这是优化代码的唯一直接目标。
+- **`Cum`（底座宽）**：只要调用栈里包含该函数，就计入它的累计开销。
+
+**代码讲解**
+
+1. `leaf := frames[len(frames)-1]`：将样本数加到叶子函数的 `Flat` 上。
+2. 遍历 `frames` 时用 `seen` 集合去重，防止递归函数 `Walk;Walk` 把单次 10ms 的采样重复累加变成 20ms（超过总采样数 100%）。
+
+**易错点**
+
+- 递归调用去重是 `pprof` 和火焰图工具链计算 `Cum` 时的经典边界条件。
+
+=== perf-33-1
+title: 实现消除滚动发布冷启动毛刺的线性慢启动（Slow-Start）权重计算器
+race: true
+--- desc
+新节点刚上线的前几十秒内，由于连接池和本地缓存尚未预热，负载均衡器应采用**线性慢启动（Slow-Start Warmup）**逐步放大其流量权重。请实现：
+
+1. `SlowStartWeight(uptime, warmupWindow time.Duration, minWeight float64) float64`：
+   - 若 `warmupWindow <= 0` 或 `uptime >= warmupWindow`，说明预热已完成，返回满额权重 `1.0`；
+   - 若 `uptime <= 0`，返回起步最小权重 `minWeight`；
+   - 当 `0 < uptime < warmupWindow` 时，按时间进度比例 `ratio := float64(uptime) / float64(warmupWindow)` 计算，若 `ratio < minWeight` 则返回 `minWeight`，否则返回 `ratio`（即 $\max(\text{minWeight}, \min(1.0, \text{uptime}/\text{warmupWindow}))$）。
+--- solution
+package main
+
+import "time"
+
+func SlowStartWeight(uptime, warmupWindow time.Duration, minWeight float64) float64 {
+	// @solution
+	if warmupWindow <= 0 || uptime >= warmupWindow {
+		return 1.0
+	}
+	if uptime <= 0 {
+		return minWeight
+	}
+	ratio := float64(uptime) / float64(warmupWindow)
+	if ratio < minWeight {
+		return minWeight
+	}
+	return ratio
+	// @starter
+	// return 1.0 // TODO: 计算慢启动期间的动态流量权重
+	// @end
+}
+--- test
+package main
+
+import (
+	"math"
+	"testing"
+	"time"
+)
+
+func almostEqual(a, b float64) bool {
+	return math.Abs(a-b) < 1e-6
+}
+
+func TestSlowStartWeight(t *testing.T) {
+	window := 30 * time.Second
+	minW := 0.1
+
+	// 刚上线 0s 或 1s（1/30 = 0.033 < 0.1）时，使用保底权重 0.1
+	if w := SlowStartWeight(0, window, minW); !almostEqual(w, 0.1) {
+		t.Fatalf("uptime 0s weight = %v, want 0.1", w)
+	}
+	if w := SlowStartWeight(time.Second, window, minW); !almostEqual(w, 0.1) {
+		t.Fatalf("uptime 1s weight = %v, want 0.1", w)
+	}
+
+	// 上线 15s（半程）时，权重线性升至 0.5
+	if w := SlowStartWeight(15*time.Second, window, minW); !almostEqual(w, 0.5) {
+		t.Fatalf("uptime 15s weight = %v, want 0.5", w)
+	}
+
+	// 满 30s 及以后，恢复 1.0 全量权重
+	if w := SlowStartWeight(30*time.Second, window, minW); !almostEqual(w, 1.0) {
+		t.Fatalf("uptime 30s weight = %v, want 1.0", w)
+	}
+	if w := SlowStartWeight(2*time.Minute, window, minW); !almostEqual(w, 1.0) {
+		t.Fatalf("uptime 2m weight = %v, want 1.0", w)
+	}
+}
+--- explain
+**思路**
+
+Envoy 的 `slow_start_config` 与 gRPC 慢启动负载均衡器的核心思想是：新实例通过 Readiness 探针上线后，不要第 1 秒就给它 100% 的流量，而是从 `minWeight`（如 10%）开始，在 `warmupWindow`（如 30 秒）内随时间线性增加到 100%，给足连接池建连和本地缓存预热的缓冲期。
+
+**代码讲解**
+
+- 先处理 `warmupWindow <= 0 || uptime >= warmupWindow` 的短路分支（返回 `1.0`），这也是节点稳定运行 99.9% 时间所走的快路径。
+
+**易错点**
+
+- 必须设置保底权重 `minWeight`（如 `0.1`），否则在刚上线 `uptime == 0` 的一瞬间权重为 `0`，新节点永远分不到第一批触发预热的请求。
+
+=== perf-34-1
+title: 实现防磁盘 I/O 雪崩的窗口日志采样器（zap Sampler 核心算法）
+race: true
+--- desc
+当下游故障导致每秒爆发数万条相同报错日志时，全量刷盘会打满磁盘 I/O 并锁死业务协程。请仿照 `uber-go/zap` 的 `zapcore.sampler` 实现按时间窗口与消息模板采样的 `LogSampler`：
+
+1. `NewLogSampler(window time.Duration, first, thereafter int) *LogSampler`：
+   - 在每个固定时间窗口 `window`（按 `now.UnixNano() / int64(window)` 划分窗口槽位 `tick`）内，按日志消息键 `msgKey` 独立计数（从 `1` 开始）；
+2. `ShouldLog(msgKey string, now time.Time) bool`：
+   - 若该 `msgKey` 进入了新的时间窗口 `tick`，将其计数重置为 `1`；否则计数 `+1`；
+   - 若当前窗口内计数 `n <= first`：返回 `true`（每个窗口的前 `first` 条日志 100% 放行，保留完整故障第一现场）；
+   - 若 `n > first`：仅当 `thereafter > 0 && (n - first) % thereafter == 0` 时返回 `true`（之后每 `thereafter` 条只采样打印 1 条），其余返回 `false`。
+--- solution
+package main
+
+import (
+	"sync"
+	"time"
+)
+
+type sampleCounter struct {
+	tick  int64
+	count int
+}
+
+type LogSampler struct {
+	mu         sync.Mutex
+	window     time.Duration
+	first      int
+	thereafter int
+	counters   map[string]*sampleCounter
+}
+
+func NewLogSampler(window time.Duration, first, thereafter int) *LogSampler {
+	return &LogSampler{
+		window:     window,
+		first:      first,
+		thereafter: thereafter,
+		counters:   make(map[string]*sampleCounter),
+	}
+}
+
+func (s *LogSampler) ShouldLog(msgKey string, now time.Time) bool {
+	// @solution
+	tick := now.UnixNano() / int64(s.window)
+	s.mu.Lock()
+	c, ok := s.counters[msgKey]
+	if !ok || c.tick != tick {
+		c = &sampleCounter{tick: tick, count: 1}
+		s.counters[msgKey] = c
+	} else {
+		c.count++
+	}
+	n := c.count
+	s.mu.Unlock()
+
+	if n <= s.first {
+		return true
+	}
+	if s.thereafter <= 0 {
+		return false
+	}
+	return (n-s.first)%s.thereafter == 0
+	// @starter
+	// return true // TODO: 每个时间窗口前 first 条全放行，超出后每 thereafter 条采样 1 条
+	// @end
+}
+--- test
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+func TestLogSamplerBurstProtection(t *testing.T) {
+	// 每秒窗口内：前 5 条全打，之后每 100 条打 1 条
+	sampler := NewLogSampler(time.Second, 5, 100)
+	t0 := time.Unix(1700000000, 0)
+
+	allowed := 0
+	for range 1005 {
+		if sampler.ShouldLog("redis_conn_timeout", t0) {
+			allowed++
+		}
+	}
+	// 1005 条相同报错日志：前 5 条 + 后续 1000 条采样 10 条 = 仅写入 15 条！削减 98.5% I/O
+	if allowed != 15 {
+		t.Fatalf("allowed logs in 1005 burst = %d, want 15 (5 + 1000/100)", allowed)
+	}
+
+	// 同一秒内另一种全新的报错类型不受影响，依然能打出前 5 条
+	if !sampler.ShouldLog("mysql_deadlock", t0) {
+		t.Fatal("different error key must have its own quota")
+	}
+
+	// 进入下一秒窗口（t0 + 1s），配额自动恢复
+	if !sampler.ShouldLog("redis_conn_timeout", t0.Add(time.Second)) {
+		t.Fatal("new time window should reset counter")
+	}
+}
+--- explain
+**思路**
+
+这是 `uber-go/zap` 生产环境默认开启的 `NewSamplerWithOptions` 算法：
+- 为什么不能用固定概率随机采样（如 1% 随机打印）？因为如果某类偶发关键报错一秒只出现了 3 次，1% 随机采样大概率会把这 3 条全丢掉，导致死无对证！
+- **`first + thereafter` 策略**：保证任何错误在每秒钟的前 `first`（如 10）次**100% 必打**，只有当同一秒内爆发第 11~100000 次刷屏时，才开启每 `thereafter`（如 100）次抽 1 次的降频保护。
+
+**代码讲解**
+
+1. `tick := now.UnixNano() / int64(s.window)`：将时间戳映射到离散的时间窗口编号。
+2. 当 `c.tick != tick` 时原地重置 `count = 1`，无需后台启动清理定时器。
+
+**易错点**
+
+- 注意当 `s.thereafter == 0`（含义是超过 `first` 后彻底静默丢弃）时，不能执行 `% s.thereafter`，必须先判断 `if s.thereafter <= 0 { return false }` 防止除以 0 panic。
+
+=== perf-35-1
+title: 实现多可用区容灾的同机房亲和路由（Zone-Aware Routing）选择器
+race: true
+--- desc
+为消除跨可用区（Cross-AZ）网络抖动毛刺并节省跨机房带宽费，微服务客户端应优先路由到**同可用区（Same Zone）**的健康节点，但当本可用区健康节点占比过低时需自动降级到全集群路由。请实现 `SelectZoneEndpoints(clientZone string, all []Endpoint, minLocalHealthyRatio float64) []Endpoint`：
+
+1. 每个 `Endpoint` 包含 `Addr string`、`Zone string`、`Healthy bool`；
+2. 统计所有 `Healthy == true` 的全局健康节点列表 `globalHealthy`，以及位于 `clientZone` 的总节点数 `localTotal` 和健康节点列表 `localHealthy`；
+3. **亲和判定**：只有当 `localTotal > 0`、`len(localHealthy) > 0`，且本可用区健康率 `float64(len(localHealthy)) / float64(localTotal) >= minLocalHealthyRatio` 时，返回 `localHealthy`（仅在同机房内部转发）；
+4. **故障溢出降级（Fallback）**：否则返回全集群健康节点 `globalHealthy`（避免本机房仅存的 1 台机器被全量流量压垮）。
+--- solution
+package main
+
+type Endpoint struct {
+	Addr    string
+	Zone    string
+	Healthy bool
+}
+
+func SelectZoneEndpoints(clientZone string, all []Endpoint, minLocalHealthyRatio float64) []Endpoint {
+	// @solution
+	var globalHealthy []Endpoint
+	var localHealthy []Endpoint
+	localTotal := 0
+
+	for _, ep := range all {
+		if ep.Zone == clientZone {
+			localTotal++
+			if ep.Healthy {
+				localHealthy = append(localHealthy, ep)
+			}
+		}
+		if ep.Healthy {
+			globalHealthy = append(globalHealthy, ep)
+		}
+	}
+
+	if localTotal > 0 && len(localHealthy) > 0 {
+		ratio := float64(len(localHealthy)) / float64(localTotal)
+		if ratio >= minLocalHealthyRatio {
+			return localHealthy
+		}
+	}
+	return globalHealthy
+	// @starter
+	// return nil // TODO: 本机房健康率达标时只返回 localHealthy，否则降级返回 globalHealthy
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestSelectZoneEndpoints(t *testing.T) {
+	cluster := []Endpoint{
+		{Addr: "10.1.0.1", Zone: "az-a", Healthy: true},
+		{Addr: "10.1.0.2", Zone: "az-a", Healthy: true},
+		{Addr: "10.1.0.3", Zone: "az-a", Healthy: false}, // az-a 2/3 健康 (66.7%)
+		{Addr: "10.2.0.1", Zone: "az-b", Healthy: true},
+		{Addr: "10.2.0.2", Zone: "az-b", Healthy: true},
+	}
+
+	// 1. 阈值设为 0.5（50%）：az-a 健康率 66.7% >= 50%，100% 走同机房 az-a 的 2 台节点
+	got1 := SelectZoneEndpoints("az-a", cluster, 0.5)
+	if len(got1) != 2 || got1[0].Zone != "az-a" || got1[1].Zone != "az-a" {
+		t.Fatalf("expected 2 local az-a endpoints, got %+v", got1)
+	}
+
+	// 2. az-a 又挂了 1 台，只剩 1/3 (33.3% < 50%) 健康 -> 触发安全水位保护，降级到全集群 3 台健康节点！
+	cluster[1].Healthy = false
+	got2 := SelectZoneEndpoints("az-a", cluster, 0.5)
+	if len(got2) != 3 {
+		t.Fatalf("expected fallback to all 3 global healthy endpoints when local ratio < 0.5, got %+v", got2)
+	}
+}
+--- explain
+**思路**
+
+同可用区亲和路由（如 Envoy `zone_aware_routing` / K8s Topology Aware Hints）为什么必须设一个 **`minLocalHealthyRatio`（通常 50%~60%）安全水位线**？
+假设 `az-a` 原本有 10 台下游机器，突然挂了 9 台只剩 1 台存活。如果不判断健康占比，仍然死板地遵守“本机房有存活节点就只调本机房”，那么 `az-a` 10 台上游机器的 100% 流量会全部砸向那仅存的 1 台下游机器，瞬间将其压爆引发连环雪崩！因此当本机房健康率低于阈值时，必须立即打破机房隔离，将流量打散到全集群所有健康节点。
+
+**代码讲解**
+
+- 一次遍历同时收集 `localTotal`、`localHealthy` 和 `globalHealthy`，当 `float64(len(localHealthy))/float64(localTotal) >= minLocalHealthyRatio` 时返回 `localHealthy`，否则兜底返回 `globalHealthy`。
+
+**易错点**
+
+- 注意计算比例前先判断 `localTotal > 0`，防止客户端所在可用区原本就没有部署任何下游实例时发生 `0.0 / 0.0 = NaN`。

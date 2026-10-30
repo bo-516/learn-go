@@ -1,0 +1,273 @@
+=== perf-15-1
+--- explain
+**思路**
+
+“优化”必须用数据证明。基准测试测量每次操作的耗时和分配次数，优化前后各跑多次，用 `benchstat` 做统计比较，才能判断差异是真实的还是噪声。
+
+**代码讲解**
+
+1. `Join` 和「用 strings.Builder 拼接」一题相同：先算总长度，`Grow` 一次，再写入，只分配一次。
+2. `BenchmarkJoin(b *testing.B)`：函数名必须以 `Benchmark` 开头。
+3. `b.ReportAllocs()`：在结果里报告每次操作的分配次数和字节数（等同于命令行的 `-benchmem`）。
+4. `for i := 0; i < b.N; i++`：框架会自动调整 `b.N`，直到运行时间足够长、结果足够稳定。
+5. `sink = Join(...)`：把结果赋给**包级变量**，防止编译器发现结果没被使用而把整个调用优化掉。
+
+**易错点**
+
+- 不使用结果：编译器可能把调用内联后直接删除，测出来的耗时接近 0，测试正是在检查这一点。
+- 准备数据的耗时不要算进去：在循环前准备好，必要时调用 `b.ResetTimer()`。
+- Go 1.24 的 `for b.Loop() { ... }` 写法：自动处理计时，并保证循环体里的调用不会被优化掉，更不容易写错。
+- 结果的波动很大时，用 `-count=10` 多跑几次，再用 `benchstat old.txt new.txt` 比较，它会给出差异是否显著（p 值）。
+
+=== perf-16-1
+--- explain
+**思路**
+
+问题往往是偶发的：等你收到告警、登录上去抓 profile 时，现场已经没了。**持续性能剖析**定期采集 profile 并保存最近的若干份（或者上传到 Pyroscope、Parca 这类服务），出问题后可以回看事发时刻的数据，还能对比发布前后的变化。
+
+**代码讲解**
+
+1. `time.NewTicker(interval)` + `defer t.Stop()`：周期触发，函数退出时停止。
+2. `for { select { ... } }`：收到 tick 就采集，ctx 取消就返回。
+3. 采集是在**锁外**进行的（`capture()` 可能很慢，比如 CPU profile 要采集 10 秒），拿到结果后才加锁修改切片。
+4. 超过 `keep` 份时 `slices.Delete(c.profiles, 0, len(c.profiles)-c.keep)` 删除最旧的部分。
+5. `Latest` 返回 `slices.Clone`：调用方拿到的切片和内部的切片不共享底层数组，内部之后的 append / delete 不会影响调用方。
+
+**易错点**
+
+- 在持锁时调用 `capture()`：`Latest` 会被阻塞很久。
+- `slices.Clone` 只复制了外层切片，内层的 `[]byte` 仍然共享，但 profile 写入后不再修改，这是安全的。
+- 生产环境的持续 profile 一般采样 10 秒、间隔 1 分钟，CPU 开销约 1%～2%。
+
+=== perf-17-1
+--- explain
+**思路**
+
+进程卡死时最需要的是**所有 goroutine 的调用栈**：它们分别卡在哪里、在等什么。`kill -QUIT <pid>`（或者 `GOTRACEBACK=all` 下的崩溃）会让运行时把所有 goroutine 的栈打印到 stderr；代码里可以用 `runtime.Stack(buf, true)` 主动获取，比如注册一个信号处理函数，收到 SIGUSR1 时写到文件里。
+
+**代码讲解**
+
+1. `buf := make([]byte, 64<<10)`：从 64KB 开始。
+2. `n := runtime.Stack(buf, true)`：第二个参数 true 表示所有 goroutine；返回写入的字节数，**超出缓冲区的部分会被直接截断**，不会报错。
+3. `n < len(buf)`：没写满，说明完整了。
+4. 写满了就分配两倍大小的缓冲区重试。
+
+**易错点**
+
+- 只调用一次固定大小的 `runtime.Stack`：goroutine 很多时只能拿到一部分，恰好漏掉最关键的那个。
+- `runtime.Stack(buf, true)` 会**暂停所有 goroutine**（STW）来获取一致的快照，goroutine 有几十万个时停顿可能很明显，不要高频调用。
+- 和 pprof 的 `/debug/pprof/goroutine?debug=2` 输出的是同样的内容。死锁时还可以用 `dlv attach <pid>` 连上进程调试。
+
+=== perf-18-1
+--- explain
+**思路**
+
+OOM 常常是突发的：一批大请求同时到达，每个都把大量数据加载进内存。与其等着被 OOM Killer 杀掉（所有请求一起失败、服务重启），不如给“正在处理中的数据量”设一个**内存预算**：超过预算的请求直接拒绝，返回 503 让客户端稍后重试。这是一种**背压**（backpressure）。
+
+**代码讲解**
+
+1. `used`、`limit` 用 Mutex 保护。
+2. `TryAcquire(n)`：`b.used+n > b.limit` 时拒绝，否则占用。判断和占用在同一个临界区里，保证不会超额。
+3. `Release(n)`：处理完成后释放。调用方通常写成 `if !b.TryAcquire(size) { return 503 }; defer b.Release(size)`。
+
+**易错点**
+
+- 先判断后占用（两次加锁）：并发时多个请求同时通过判断，总量超过预算。
+- 单个请求就超过整个预算时它永远无法成功，应该在更早的地方用请求大小限制（`http.MaxBytesReader`）拒绝。
+- 排查 OOM：`dmesg` 看 OOM Killer 的记录；对比 heap profile 和 RSS（见「RSS 为什么不下降」）；`GOMEMLIMIT` 设置在容器限制的 80%～90%，让 GC 在接近上限时更积极地回收。
+
+=== perf-19-1
+--- explain
+**思路**
+
+`too many open files` 说明进程打开的文件描述符达到了上限（`ulimit -n`）。在 Linux 上，socket、pipe、epoll 实例都占用 fd。先看看 fd 都是什么类型：**socket 占绝大多数时，通常是连接泄漏**（忘记关闭 HTTP 响应体、数据库 rows、或者连接池配置不当）。
+
+**代码讲解**
+
+1. `strings.Cut(line, " -> ")`：取箭头后面的目标；没有箭头的行（如 `total 0`）跳过。
+2. 无条件 switch 按前缀分类，`m["socket"]++` 利用零值计数。
+3. `Check`：一次遍历同时求总数和数量最多的类型。条件 `top == "" || v > counts[top] || (v == counts[top] && k < top)` 在数量相同时选名字较小的，保证结果确定（map 遍历顺序是随机的）。
+4. `pct := total * 100 / limit`：整数百分比，先乘后除。
+5. `%d%%`：`%%` 输出一个百分号。
+
+**易错点**
+
+- 调大 `ulimit -n` 只能推迟问题，真正要找的是泄漏点：`ss -tanp | grep <pid>` 看连接的状态和对端（大量 CLOSE_WAIT 就是没关闭）。
+- systemd 管理的服务要在 unit 文件里设置 `LimitNOFILE`；容器里的限制来自容器运行时。
+- Go 程序启动时会自动把软限制提高到硬限制（Go 1.19+）。
+
+=== perf-20-1
+--- explain
+**思路**
+
+- **strace**：跟踪系统调用，回答“程序在和内核交互时做了什么、在哪个调用上卡住了”。`-c` 统计每种系统调用的次数和耗时。开销很大（每个系统调用都会暂停进程），只适合短时间使用。
+- **perf**：基于采样的 CPU 性能分析，开销小，能看到内核和用户态的热点函数，适合“CPU 时间花在哪里”的问题。Go 程序的 CPU 分析一般优先用 pprof。
+
+**代码讲解**
+
+1. 按空白切分后，跳过：字段太少的行、分隔线（以 `-` 开头）、表头（以 `%` 开头）、最后的 `total` 行。
+2. 系统调用名总是**最后一个字段**；errors 列可能为空，所以字段数可能是 5 或 6，只有 6 个字段时才解析 errors。
+3. `if s.Seconds, err = ...; err != nil`：在 if 里给已有变量赋值。
+4. `Top`：复制后**稳定排序**（耗时相同时保持原顺序），取前 n 个。
+
+**易错点**
+
+- 用固定下标取系统调用名：没有 errors 列的行会取错。
+- 结论举例：`write` 调用次数巨大、每次耗时很短，说明在做大量小块写入，用 `bufio.Writer` 合并；`futex` 耗时很高，说明有大量的锁竞争或者 goroutine 在等待。
+
+=== perf-21-1
+--- explain
+**思路**
+
+服务端关闭了空闲连接（发送 FIN），客户端这一侧的连接就进入 **CLOSE_WAIT**，直到客户端程序调用 Close。这里的 bug 是只取了状态码、没有关闭响应体：连接既没有放回连接池复用，也没有被关闭，就一直停留在 CLOSE_WAIT。
+
+**代码讲解**
+
+1. `client.Get(url)` 出错时 `resp` 为 nil，直接返回。
+2. `defer resp.Body.Close()`：任何返回路径都会关闭。
+3. `io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))`：把剩余的响应体读完（最多 64KB）。HTTP/1.1 的连接只有在响应体**被完整读取并关闭**后才能放回连接池；只关闭不读完，Transport 会直接关闭这个连接，下次请求要重新建连。
+4. 限制最多读 64KB：如果对方返回了一个巨大的响应体，没必要全部读完，直接关闭连接更划算。
+
+**易错点**
+
+- 测试统计服务端看到的新连接数：正确的实现在 20 次顺序调用中只建立 1 个连接。
+- 排查 CLOSE_WAIT：`ss -tanp state close-wait` 找到进程和对端地址，确定是哪个下游的连接，然后检查调用它的代码有没有在所有分支上关闭响应体。
+
+=== perf-22-1
+--- explain
+**思路**
+
+接口慢的时候，第一个要确认的问题往往是“是不是 SQL 慢”。在数据访问层统一包一层计时，超过阈值就打印慢日志，所有查询自动被覆盖，不需要每个地方都手写计时代码。这就是装饰器 / 中间件模式在数据库层的应用。
+
+**代码讲解**
+
+1. `type QueryFunc func(ctx context.Context, sql string, args ...any) error`：可变参数的函数类型。
+2. `WithSlowLog` 返回一个同类型的函数（闭包），捕获了阈值、时钟、日志函数和下一层。
+3. `next(ctx, sql, args...)`：调用下一层时要用 `args...` **展开**传递，否则 args 会被当成一个 `[]any` 类型的单个参数。
+4. `strings.Join(strings.Fields(sql), " ")`：Fields 按任意空白切分并丢掉空串，再用单个空格连接，就把换行和多余空格压缩掉了。
+5. 截断到 100 个字符，加 `...`。
+6. `%v` 格式化 `time.Duration` 得到 `120ms` 这样的字符串。
+
+**易错点**
+
+- 把参数写进日志：可能泄露手机号、身份证号、密码等敏感信息。
+- `s[:100]` 按**字节**截断，SQL 里有中文时可能截在一个字符的中间。
+- 数据库侧也要开启慢查询日志；日志里带上 trace ID，才能和具体的请求关联起来。
+
+=== perf-23-1
+--- explain
+**思路**
+
+- **502 Bad Gateway**：网关没有从上游拿到有效的响应（连接被拒绝、被重置）。
+- **504 Gateway Timeout**：网关等上游响应超时了。
+
+偶发 502 的经典原因：负载均衡器和后端之间使用长连接，后端的空闲超时比 LB 的**短**。后端先关闭了空闲连接，LB 不知道，恰好在这个连接上转发请求，收到 RST，返回 502。所以后端的 `IdleTimeout` 必须**大于** LB 的空闲超时，让关闭总是由 LB 发起。
+
+**代码讲解**
+
+1. `CheckIdle`：`backendIdle <= lbIdle` 时返回错误，错误信息里用 `%v` 打印两个时长。
+2. `Classify` 用无条件 switch 按顺序判断：
+   - 上游状态为 `-` 表示没有收到上游的响应；耗时达到代理超时就是 504，否则是连接被重置（502）；
+   - 上游返回了 5xx：问题在上游服务本身；
+   - 其他正常。
+
+**易错点**
+
+- 常见的默认值：AWS ALB 空闲超时 60 秒、Nginx 的 `keepalive_timeout` 75 秒；Go `http.Server` 的 `IdleTimeout` 不设置时使用 `ReadTimeout`（如果设置了的话）。
+- 504 的排查方向是上游为什么慢：看上游的慢日志、依赖的数据库和下游、是否有 GC 停顿或 CPU 限流。
+
+=== perf-24-1
+--- explain
+**思路**
+
+每来一条消息就唤醒一次消费者、调用一次下游，会产生大量的 goroutine 切换和系统调用。**攒批**：攒够 max 条或者等待时间到了才处理一次，用少量延迟换取吞吐量的大幅提升。Kafka 生产者的 `linger.ms` + `batch.size` 就是这个机制。
+
+**代码讲解**
+
+1. 输出 channel 在 goroutine 里 `defer close(out)`。
+2. `var timeout <-chan time.Time`：**nil channel 在 select 里永远不会就绪**。没有待发送的数据时 timeout 是 nil，那个 case 相当于被禁用。
+3. 收到这一批的**第一条**数据时才创建定时器，并把 `timer.C` 赋给 timeout。
+4. 攒够 max 条立即 `flush()`。
+5. `flush` 是一个闭包：发送当前批次后 `batch = nil`（下一次 append 会分配新的底层数组，保证每批都是独立的切片），然后停止定时器并把 timeout 置回 nil。
+6. 输入关闭时 flush 剩余数据后返回。
+
+**易错点**
+
+- 发送后用 `batch = batch[:0]` 复用切片：下游拿到的切片会被后续的 append 覆盖。
+- 用固定周期的 Ticker 代替“从第一条开始计时”：一批数据的等待时间可能接近两个周期，延迟上限不确定。
+- 排查上下文切换：`vmstat 1` 的 `cs` 列、`pidstat -w` 看每个进程的自愿 / 非自愿切换；Go 程序还可以看 `go tool trace` 里 goroutine 的阻塞和唤醒。
+
+=== perf-25-1
+--- explain
+**思路**
+
+监控面板上的 p99 是**滑动窗口**内的统计（比如最近 60 秒）。按秒分桶，用 `秒数 % size` 作为下标的环形数组存放各秒的样本，内存固定；写入时发现桶里存的是更早的某一秒（已经不在窗口内了），先清空再写。
+
+**代码讲解**
+
+1. `b := &w.buckets[sec%int64(w.size)]`：取**指针**，才能修改数组里的那个桶。
+2. `b.sec != sec`：桶里是旧数据，`b.sec, b.samples = sec, b.samples[:0]` 重置（复用切片的底层数组，减少分配）。
+3. `P99`：只收集 `(now − size, now]` 范围内的桶，没有被覆盖但已经过期的桶会被这个条件过滤掉。
+4. `(len(all)*99 + 99) / 100`：整数版的 `ceil(0.99 × n)`，避免浮点误差。
+
+**易错点**
+
+- 每次计算 p99 都要排序所有样本，样本多时很贵。生产环境用直方图（固定的桶计数）或者 t-digest、HDR Histogram 之类的数据结构近似计算。
+- **多个实例的 p99 不能取平均**：要把直方图合并后再算分位数，这也是 Prometheus 用直方图而不是 Summary 的原因之一。
+- 系统化排查 p99 飙升：先看是所有接口还是部分接口、是所有实例还是部分实例、是否和发布 / 流量 / GC / 下游变慢的时间吻合，再逐层下钻。
+
+=== perf-26-1
+--- explain
+**思路**
+
+容器的 CPU limit 是通过 CFS 带宽控制实现的：每个周期（默认 100ms）最多使用 `limit × 100ms` 的 CPU 时间，用完了这个周期剩下的时间里**所有线程都会被暂停**（throttle）。Go 程序的 GOMAXPROCS 如果大于 CPU limit（比如在 64 核机器上 limit 是 2 核），多个线程并行运行，可能在周期的前 30ms 就用完了配额，然后被暂停 70ms，表现为平均 CPU 使用率不高、延迟却周期性飙升。
+
+**代码讲解**
+
+1. `ParseCPUStat`：每行两个字段，`ParseInt` 解析值，格式不对返回错误。
+2. `Throttle` 用命名返回值 `(ratio float64, avg time.Duration)`。
+3. 两次采样的增量：被限流的周期数 / 总周期数 = 限流比例；被限流的总时长 / 被限流的次数 = 每次平均被暂停多久。
+4. `time.Duration(usec/throttled) * time.Microsecond`：微秒数转成 Duration。
+
+**易错点**
+
+- 解决方法：让 GOMAXPROCS 与 CPU limit 匹配（Go 1.25 自动处理，之前用 `automaxprocs`）；或者适当提高 limit；有些团队干脆只设置 request 不设置 limit。
+- 只看 CPU 使用率的平均值发现不了限流问题，一定要看 `nr_throttled` 和 `throttled_usec`（或者 Prometheus 的 `container_cpu_cfs_throttled_periods_total`）。
+
+=== perf-27-1
+--- explain
+**思路**
+
+`ping` 的统计行给出了最基础的网络质量数据：**丢包率**和**延迟分布**（min / avg / max / mdev）。max 远大于 avg 说明有偶发的排队或重传；mdev（标准差）大说明抖动严重。
+
+**代码讲解**
+
+1. `ms := func(v float64) time.Duration {...}`：把毫秒的浮点数转成 Duration，`v * float64(time.Millisecond)` 在浮点数上计算后再转换。
+2. 统计行用 `fmt.Sscanf` 按格式取出发送数和接收数（后面的内容不需要匹配）。
+3. rtt 行在 Linux 上以 `rtt` 开头、在 macOS 上以 `round-trip` 开头，都要支持；`strings.Cut(line, "= ")` 取等号后面的四个数，再用 Sscanf 解析。
+4. 多重赋值一次设置四个字段。
+5. 丢包率自己根据发送数和接收数计算，比解析输出里的百分比更精确（输出里可能是 `3.03%` 也可能是整数）。
+
+**易错点**
+
+- 全部丢包时没有 rtt 行，四个延迟保持零值。
+- ICMP 可能被防火墙限速或者优先级比较低，ping 正常不代表业务流量正常；TCP 层面的问题要看重传率（`ss -ti`、`/proc/net/snmp`），用 `mtr` 可以看到每一跳的丢包情况。
+
+=== perf-28-1
+--- explain
+**思路**
+
+eBPF 可以在内核里安全地运行小程序：在事件发生的地方（磁盘 IO 完成、调度、TCP 重传）直接统计，把延迟按 **2 的幂**分桶计数，只把几十个桶的计数传回用户态，所以开销极低，可以在生产环境长时间运行。bcc 工具集里的 `biolatency`、`runqlat`、`tcpretrans` 都是这样实现的。
+
+**代码讲解**
+
+1. `bits.Len64(v)` 返回表示 v 需要的二进制位数，`Len64(v) - 1` 就是最高位的位置，即 `floor(log2(v))`。0 和 1 都放在第 0 个桶。
+2. `for len(counts) <= k { counts = append(counts, 0) }`：按需扩展，中间的空桶也会被创建。
+3. 桶的范围：第 k 个桶是 `[2^k, 2^(k+1) − 1]`，`uint64(1) << k`；第 0 个桶特殊处理，下界是 0。`uint64(1)<<(k+1) - 1`：`<<` 优先级高于 `-`。
+4. `Render`：先求最大计数；星号数 = `Count × width / maxCount`（整数除法）；`strings.Repeat` 生成星号和补齐用的空格。
+5. `fmt.Fprintf(&sb, ...)`：`*strings.Builder` 实现了 `io.Writer`；`%-8d` 左对齐、`%8d` 右对齐。
+
+**易错点**
+
+- 对数分桶的精度有限（每个桶的上下界相差一倍），但足以看出延迟分布的形状：是一个峰还是两个峰（比如缓存命中和未命中）。
+- 常用的 eBPF 工具：`execsnoop`（新进程）、`opensnoop`（打开的文件）、`biolatency`（磁盘延迟）、`runqlat`（调度延迟）、`tcpretrans`（重传）、`offcputime`（线程在等什么）。

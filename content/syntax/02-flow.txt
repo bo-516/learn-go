@@ -1,0 +1,322 @@
+=== if-init
+name: if 带初始化语句
+group: 流程控制
+--- body
+`if` 可以先执行一条简短语句，再判断条件。这里声明的变量**只在 if / else 块里有效**，常用于“调用 + 判错”和 map 查询。
+
+**写法**
+
+```go
+if err := do(); err != nil {
+	return err
+}
+if v, ok := m[key]; ok {
+	use(v)
+} else {
+	// 这里也能用 v 和 ok
+}
+```
+
+**例子**
+
+```go
+func parsePort(s string) (int, error) {
+	if n, err := strconv.Atoi(s); err != nil {
+		return 0, fmt.Errorf("端口不是数字: %w", err)
+	} else if n < 1 || n > 65535 {
+		return 0, fmt.Errorf("端口超出范围: %d", n)
+	} else {
+		return n, nil
+	}
+}
+```
+
+**注意**
+
+- 条件不需要括号，但大括号必须有，且 `{` 必须和 `if` 在同一行。
+- 变量作用域很小是优点：不会污染外层，也避免后面误用。但如果后面还要用这个值，就不要放在 if 里声明。
+- Go 惯用写法是“提前返回”：错误分支 `return`，正常逻辑不缩进，少写 `else`。
+
+=== for-classic
+name: for 三段式循环
+group: 流程控制
+--- body
+Go 只有 `for` 一种循环关键字。三段式写法和 C 一样：初始化; 条件; 后置语句。
+
+**写法**
+
+```go
+for i := 0; i < n; i++ { }
+for i := n - 1; i >= 0; i-- { }
+for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 { } // 多个变量用多重赋值
+```
+
+**例子**
+
+```go
+// 冒泡排序的内外层循环
+for i := 0; i < len(a); i++ {
+	for j := 0; j < len(a)-1-i; j++ {
+		if a[j] > a[j+1] {
+			a[j], a[j+1] = a[j+1], a[j]
+		}
+	}
+}
+```
+
+**注意**
+
+- `i++` 是**语句**不是表达式：不能写 `x = i++`，也没有 `++i`。
+- 后置语句里不能写 `i++, j--`，要写 `i, j = i+1, j-1`。
+- **Go 1.22 起**，`for` 声明的循环变量每次迭代都是新变量，闭包和 goroutine 捕获 `i` 不再有经典的“全部拿到最后一个值”问题（模块 `go` 版本需 ≥ 1.22）。
+- 只需要遍历下标或元素时，优先用 `range`。
+
+=== for-while
+name: for 当作 while
+group: 流程控制
+--- body
+省略初始化和后置语句，只留条件，`for` 就是其他语言里的 `while`。
+
+**写法**
+
+```go
+for cond { }
+for left < right { }
+for node != nil { node = node.Next }
+```
+
+**例子**
+
+```go
+// 二分查找
+func search(nums []int, target int) int {
+	lo, hi := 0, len(nums)-1
+	for lo <= hi {
+		mid := lo + (hi-lo)/2 // 防止 lo+hi 溢出的写法
+		switch {
+		case nums[mid] == target:
+			return mid
+		case nums[mid] < target:
+			lo = mid + 1
+		default:
+			hi = mid - 1
+		}
+	}
+	return -1
+}
+```
+
+**注意**
+
+- Go 没有 `while`、`do ... while` 关键字。`do-while` 可以写成 `for { ...; if !cond { break } }`。
+- 条件里的变量要在循环体内更新，否则就是死循环。
+
+=== for-ever
+name: 无限循环 for { }
+group: 流程控制
+--- body
+什么条件都不写的 `for { }` 是无限循环，靠 `break`、`return` 或 `select` 里的退出分支结束。常用于后台 goroutine、事件循环、重试。
+
+**写法**
+
+```go
+for {
+	select {
+	case <-ctx.Done():
+		return
+	case job := <-jobs:
+		handle(job)
+	}
+}
+```
+
+**例子：带次数上限的重试**
+
+```go
+func retry(n int, fn func() error) error {
+	var err error
+	for i := 0; ; i++ {        // 条件留空也是无限循环
+		if err = fn(); err == nil || i == n-1 {
+			return err
+		}
+		time.Sleep(time.Duration(i+1) * 10 * time.Millisecond)
+	}
+}
+```
+
+**注意**
+
+- 在 `select` 或 `switch` 里写 `break` **只会跳出 select / switch**，不会跳出外层 for。要跳出循环用 `return` 或带标签的 `break Loop`。
+- 后台循环一定要有退出条件（`ctx.Done()`、关闭的 channel），否则会导致 goroutine 泄漏。
+- 空的 `for {}` 会一直占用 CPU，等待应该用 channel 或 `select {}`（永久阻塞且不占 CPU）。
+
+=== switch-tag
+name: switch 值匹配
+group: 流程控制
+--- body
+`switch x { case ... }` 按值匹配。Go 的 case **默认不会贯穿**（不需要写 `break`），一个 case 可以列多个值。
+
+**写法**
+
+```go
+switch op {
+case "+":
+	return a + b
+case "-", "minus":   // 多个值
+	return a - b
+default:
+	return 0
+}
+
+switch c := s[i]; c { // 也可以带初始化语句
+case '(', '[', '{':
+}
+```
+
+**例子**
+
+```go
+func romanValue(c byte) int {
+	switch c {
+	case 'I':
+		return 1
+	case 'V':
+		return 5
+	case 'X':
+		return 10
+	}
+	return 0
+}
+```
+
+**注意**
+
+- 需要继续执行下一个 case 时显式写 `fallthrough`（很少用，且会**无条件**进入下一个 case）。
+- `case` 后面可以是变量或表达式，不要求是常量；但重复的常量 case 会编译报错。
+- 在 `switch` 里 `break` 只跳出 switch，循环里要跳出外层用标签。
+
+=== switch-true
+name: 无条件 switch（if-else 链）
+group: 流程控制
+--- body
+`switch` 后面不写表达式，相当于 `switch true`，每个 case 是一个布尔条件，**从上往下第一个为真的分支执行**。比长长的 `if / else if` 更整齐。
+
+**写法**
+
+```go
+switch {
+case score >= 90:
+	grade = "A"
+case score >= 60:
+	grade = "B"
+default:
+	grade = "C"
+}
+```
+
+**例子**
+
+```go
+func fizzBuzz(i int) string {
+	switch {
+	case i%15 == 0:
+		return "FizzBuzz"
+	case i%3 == 0:
+		return "Fizz"
+	case i%5 == 0:
+		return "Buzz"
+	default:
+		return strconv.Itoa(i)
+	}
+}
+```
+
+**注意**
+
+- 条件的顺序很重要：更具体的条件（`i%15 == 0`）要放在更宽泛的条件前面。
+- `default` 可以放在任意位置，但它总是在所有 case 都不满足时才执行；习惯上放最后。
+
+=== label
+name: 标签 break / continue
+group: 流程控制
+--- body
+给外层循环加标签，就可以在内层直接 `break 标签` 或 `continue 标签`，一次跳出多层循环，或者从 `select` / `switch` 里跳出外层的 `for`。
+
+**写法**
+
+```go
+Outer:
+	for i := range grid {
+		for j := range grid[i] {
+			if grid[i][j] == target {
+				break Outer   // 跳出两层循环
+			}
+			if grid[i][j] < 0 {
+				continue Outer // 直接进入外层的下一次迭代
+			}
+		}
+	}
+```
+
+**例子：select 里退出循环**
+
+```go
+Loop:
+	for {
+		select {
+		case v, ok := <-ch:
+			if !ok {
+				break Loop // 只写 break 只会跳出 select
+			}
+			sum += v
+		case <-timeout:
+			break Loop
+		}
+	}
+```
+
+**注意**
+
+- 标签名习惯首字母大写；定义了但没用到的标签会编译报错。
+- `goto` 也能用标签，但几乎不推荐；`break / continue 标签` 是正常、清晰的写法。
+- 很多时候把内层逻辑抽成函数、用 `return` 退出，代码更好读。
+
+=== defer
+name: defer 延迟执行
+group: 流程控制
+--- body
+`defer` 把一个函数调用推迟到**当前函数返回前**执行，多个 defer 按**后进先出**顺序执行。主要用于释放资源：解锁、关闭文件、结束 span、`recover`。
+
+**写法**
+
+```go
+mu.Lock()
+defer mu.Unlock()
+
+f, err := os.Open(name)
+if err != nil {
+	return err
+}
+defer f.Close()
+
+defer func() { log.Println("done") }()
+```
+
+**例子**
+
+```go
+func demo() (n int) {
+	defer func() { n *= 2 }() // 可以修改命名返回值
+	for i := 1; i <= 3; i++ {
+		defer fmt.Print(i, " ")  // 输出 3 2 1
+	}
+	return 5                  // 先把 n 设为 5，再执行 defer，最终返回 10
+}
+```
+
+**注意**
+
+- **参数在 defer 语句执行时就求值了**：`defer fmt.Println(i)` 打印的是当时的 i；想用最终值就用闭包 `defer func() { fmt.Println(i) }()`。
+- 不要在长循环里 `defer`：所有 defer 要等函数结束才执行，资源会一直占着。把循环体抽成函数。
+- 函数 panic 时 defer 仍然会执行，所以锁、文件不会泄漏。
+- `return x` 的执行顺序是：给返回值赋值 → 执行 defer → 真正返回。所以 defer 只能通过**命名返回值**改变结果。

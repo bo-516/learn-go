@@ -1,0 +1,834 @@
+=== perf-15
+--- deep
+**原理展开**
+
+编写微基准测试（Microbenchmark）最容易掉进的两个编译器优化陷阱是**死代码消除（Dead Code Elimination）**和**常量折叠 / 循环外提（Loop Hoisting）**：
+
+- 在 Go 1.24 之前使用 `for i := 0; i < b.N; i++` 时，如果被测函数是一个没有副作用的纯函数且返回值被直接丢弃（如 `_ = FastHash(input)`），编译器内联后发现计算结果没人用，可能把整个计算过程全部删掉，测出 `0.2 ns/op` 的假数据；
+- **Go 1.24 引入的 `b.Loop()`** 由编译器特殊识别：首先它自动将 `b.Loop()` 之前的数据初始化代码排除在计时之外（不再需要手动调用容易出错的 `b.ResetTimer()`）；其次编译器会自动禁止对 `b.Loop()` 循环体内部的函数调用进行跨循环外提或死代码消除，并且保证了每个基准测试只调用一次目标函数做热身探测。
+
+`benchstat` 使用 **Mann-Whitney U 检验（Wilcoxon 秩和检验）**来判断改动前后的两组样本分布是否存在统计学上的显著差异（默认要求 $p < 0.05$ 且样本数至少 6～10 组），防止把 CPU 睿频波动或后台进程噪声当成优化成果。
+
+**代码示例**
+
+```go
+// 1. 子基准测试（Sub-benchmarks）对比不同数据规模 + 报告自定义吞吐指标
+func BenchmarkParse(b *testing.B) {
+	for _, size := range []int{64, 1024, 65536} {
+		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
+			payload := bytes.Repeat([]byte("a"), size)
+			b.SetBytes(int64(size)) // 自动在结果中计算并打印 MB/s 吞吐量
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = parsePayload(payload)
+			}
+		})
+	}
+}
+
+// 2. 并发基准测试：使用 b.RunParallel 测试存在锁争用、原子操作或 sync.Pool 的组件
+func BenchmarkCacheParallel(b *testing.B) {
+	c := NewShardedCache()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			c.Set(i%1024, i)
+			_, _ = c.Get(i % 1024)
+			i++
+		}
+	})
+}
+```
+
+**常见追问**
+
+- 在 `for i := 0; i < b.N; i++` 里反复调用 `b.StopTimer()` 和 `b.StartTimer()` 为什么会导致结果极度不准？→ 每次启停计时器都需要读取系统时钟并累加开销，当被测函数本身只有几百纳秒时，计时器本身的开销甚至比被测代码还大，还会打乱 CPU 缓存局部性。
+- `b.RunParallel` 和普通的 `for b.Loop()` 测出来的 `ns/op` 含义有什么不同？→ 普通基准测试是单 goroutine 串行耗时；`RunParallel` 会启动 `GOMAXPROCS` 个 goroutine 同时跑，报告的 `ns/op` 是**总墙钟时间除以总操作次数**（即吞吐量的倒数），专门用于评估多核扩展性和锁争用。
+- 为什么有时候在 Benchmark 里 `sync.Pool` 看起来效果极好，上线后却提升不大？→ Benchmark 是在极短时间内单线程/固定协程紧循环，中间几乎不触发 GC，对象 100% 命中本地 P 的 `private` 槽位；而线上请求有间隔且伴随周期性 GC 清空 Pool。
+
+**实战建议**
+
+- 跑基准测试对比时，建议固定 CPU 频率或关闭笔记本省电模式，并使用 `-cpu=1,4,8` 观察单核与多核下的扩展性表现。
+- 对核心路径的解析器或序列化函数，可以用 `testing.AllocsPerRun(100, fn)` 写进普通单元测试断言 `allocs == 0`，防止后续有人改代码不小心引入隐式堆逃逸。
+
+=== perf-16
+--- deep
+**原理展开**
+
+持续性能剖析（Continuous Profiling）的架构核心在于**低开销采样 + 符号化分离 + 高压缩时序存储**：
+
+1. **采集模式（Pull vs Push）**：
+   - **Pull 模式**：服务端暴露标准的 `/debug/pprof/*` 接口，由集群内的采集器（如 Grafana Alloy / Pyroscope Agent）每隔 15～60 秒主动拉取一次 10 秒的 CPU Profile 和一次 Heap/Goroutine 快照；
+   - **Push 模式**：服务进程内集成 SDK，定时在后台调用 `pprof.StartCPUProfile` 并将压缩后的 `profile.proto` 字节流加上业务标签（`env=prod`、`version=v1.4.2`、`region=ap-east`）直接推送到服务端；
+   - **eBPF 全系统零侵入模式**（Parca Agent / Pyroscope eBPF）：直接在宿主机内核通过 `perf_event_open` 定时读取所有容器进程的硬件指令指针和帧指针栈，业务代码一行不用改，连 C/C++/Rust/内核态都能一起抓。
+2. **自适应阈值抓拍（Adaptive Dump，如 Holmes）**：持续剖析为了控制开销，采样率较低且一般不抓高开销的 `trace`；而自适应抓拍器在进程内每 5 秒检查一次 `runtime.ReadMemStats` 和 CPU 使用率，当发现“内存相比 1 分钟前暴涨 50%”或“goroutine 数突破 20000”时，立刻触发一次高精度的 `heap` / `goroutine` / `trace` 快照落盘并发送告警通知。
+
+**代码示例**
+
+```go
+// 自研轻量级自适应水位线守卫（类似 Holmes 核心逻辑）：当堆内存或协程数突破警戒线且满足冷却时间时自动落盘现场
+type GuardConfig struct {
+	MaxGoroutines int
+	MaxHeapBytes  uint64
+	Cooldown      time.Duration
+	DumpDir       string
+}
+
+func watchRuntime(ctx context.Context, cfg GuardConfig) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	var lastDump time.Time
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if time.Since(lastDump) < cfg.Cooldown {
+				continue
+			}
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			gNum := runtime.NumGoroutine()
+			if gNum > cfg.MaxGoroutines || m.HeapInuse > cfg.MaxHeapBytes {
+				lastDump = time.Now()
+				dumpSnapshot(cfg.DumpDir, gNum, m.HeapInuse)
+			}
+		}
+	}
+}
+
+func dumpSnapshot(dir string, gNum int, heap uint64) {
+	ts := time.Now().Format("20060102-150405")
+	if f, err := os.Create(filepath.Join(dir, fmt.Sprintf("heap-%s.pb.gz", ts))); err == nil {
+		_ = pprof.WriteHeapProfile(f)
+		_ = f.Close()
+	}
+	if f, err := os.Create(filepath.Join(dir, fmt.Sprintf("goroutine-%s.pb.gz", ts))); err == nil {
+		_ = pprof.Lookup("goroutine").WriteTo(f, 0)
+		_ = f.Close()
+	}
+	slog.Warn("auto dumped profile on high watermark", "goroutines", gNum, "heap_mb", heap>>20)
+}
+```
+
+**常见追问**
+
+- 容器发生 OOM 被杀（退出码 137）后，自适应抓拍写在本机容器临时目录里的 profile 文件也跟着没了怎么办？→ 必须将 Dump 目录挂载为宿主机 `hostPath` 卷、EmptyDir（Pod 不重建而是只重启容器时仍保留）或在触发阈值时直接通过对象存储（S3/OSS）流式上传。
+- 持续剖析存储成千上万个实例每分钟的火焰图，为什么不会把磁盘撑爆？→ `pprof` 的 protobuf 格式本身只存调用栈地址数组和计数值，经过字典编码和列式压缩（如 Parquet）后，单实例一整天的全部 Profile 数据通常只有几 MB。
+- 如何用持续剖析结合 PGO（Profile-Guided Optimization）形成闭环？→ 直接从生产环境的 Pyroscope 导出过去一周聚合后的全集群 CPU Profile 文件，提交到代码仓库的 `default.pgo`，下次编译时编译器就能根据真实生产负载做精准内联优化。
+
+**实战建议**
+
+- 在灰度发布（Canary）流程中，将新版本实例与老版本实例的持续剖析火焰图做 Diff 对比，能在全量上线前直接看出新代码是否引入了意外的反射或内存分配退化。
+- 容器内存达到 75% Limit 时就触发自动抓拍 `heap` profile，不要等到 95%（那时可能来不及写完文件就已经被内核 OOM Killer `SIGKILL` 了）。
+
+=== perf-17
+--- deep
+**原理展开**
+
+为什么有时候进程还没死，但连独立端口的 `/debug/pprof/` 都完全连不上或一直转圈？底层原因通常有三种：
+
+1. **所有 P 都被不可抢占的操作占满或 STW 卡死**：例如某个 goroutine 调用了写得很烂的 C 代码或陷入死循环（在极特殊的不含安全点的汇编/运行时内部），而此时恰好触发了 GC 的 STW 或 `ReadMemStats`——运行时已经停止了部分 P，正在等待最后一个 P 停下（`stopTheWorld`），此时新进来的 HTTP 请求连被调度的机会都没有。
+2. **文件描述符（fd）彻底耗尽**：进程打开的 fd 达到了 `RLIMIT_NOFILE` 上限，内核在 `accept4()` 新连接时持续返回 `EMFILE`，导致任何新的 HTTP 请求（包括 pprof 请求）都无法建立连接。
+3. **死锁或全局锁饥饿**：比如业务日志钩子或监控中间件卡死，连带阻塞了进程内关键组件。
+
+`kill -QUIT <pid>`（发送 `SIGQUIT` 信号）之所以在此时依然有效，是因为 Go 运行时的信号处理函数 `sighandler` 直接运行在操作系统线程的 **gsignal 信号栈**上，**不需要经过常规的 GMP 调度器分配 P**，它可以强行遍历全局 `allgs` 切片把所有 goroutine 的栈直接通过底层 `write(2, ...)` 系统调用打印到标准错误流。
+
+**代码示例**
+
+```bash
+# 1. 发送 SIGQUIT 并从容器日志中提取死锁现场（注意：进程会随后退出，务必先摘除流量）
+kill -QUIT <pid>
+kubectl logs <pod-name> --previous --tail=2000 > crash_stacks.log
+
+# 2. 如果连 SIGQUIT 都没反应（如线程全部卡在内核态 D 状态），直接查看所有线程的内核栈与用户态寄存器
+for tid in $(ls /proc/<pid>/task); do
+  echo "=== TID $tid ($(cat /proc/<pid>/task/$tid/status | grep State)) ==="
+  cat /proc/<pid>/task/$tid/stack
+done
+```
+
+```go
+// 预防 fd 耗尽导致管理端口失联：为运维诊断提供基于 Unix Domain Socket 或预留连接池的后门，
+// 或者在进程内监听 SIGUSR1 信号，收到信号时主动把 pprof 写到本地磁盘而不退出进程！
+func setupSignalDump(dumpDir string) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGUSR1) // kill -USR1 <pid> 触发落盘，且不会杀死进程
+	go func() {
+		for range ch {
+			f, err := os.Create(filepath.Join(dumpDir, fmt.Sprintf("sigusr1-%d.txt", time.Now().Unix())))
+			if err == nil {
+				_ = pprof.Lookup("goroutine").WriteTo(f, 2)
+				_ = f.Close()
+			}
+		}
+	}()
+}
+```
+
+**常见追问**
+
+- `GOTRACEBACK` 环境变量有哪些可选值，生产环境推荐设什么？→ 默认是 `single`（panic 时只打印当前崩溃 goroutine 的栈）；设为 `all` 会打印所有用户 goroutine 的栈；设为 `system` 还会额外打印运行时内部 goroutine 的栈；设为 `crash` 会在打印完所有栈后触发 `SIGABRT` 生成 core dump。生产环境排查疑难杂症时建议设为 `GOTRACEBACK=system`。
+- 用 `gcore <pid>` 抓 Go 进程的 Core Dump 有什么需要注意的？→ Go 进程的虚拟地址空间（VIRT）通常很大，而且如果堆有好几 GB，`gcore` 写出期间会用 `ptrace` 暂停目标进程好几秒甚至几十秒，必须先从负载均衡摘流后再执行。
+- 怎么用 `dlv` 查看 core 文件里某个卡死 goroutine 局部变量的具体值？→ 执行 `dlv core ./app core.<pid>` 进入交互界面后，输入 `goroutines -t` 列出所有协程，然后 `goroutine <id>` 切换过去，用 `bt` 看调用栈、`frame <n>` 切换栈帧、`locals` 和 `print 变量名` 即可看到崩溃瞬间的全部内存变量值。
+
+**实战建议**
+
+- 在基础框架里统一注册 `SIGUSR1` 信号处理协程，收到信号就将 `goroutine?debug=2` 和 `heap` 写入日志目录——这样当 HTTP 端口因 fd 耗尽无法访问时，只需在宿主机执行 `kill -USR1 <pid>` 就能无损拿到全部调用栈，且进程不会退出。
+- Kubernetes 的 Liveness Probe（存活探针）失败重启容器前，可以通过 `preStop` 钩子或包装启动脚本，在进程异常退出前自动归档最后时刻的栈日志。
+
+=== perf-18
+--- deep
+**原理展开**
+
+当 Linux 内核或容器 cgroup 的内存分配无法通过页回收（Page Reclaim）满足时，就会唤醒 **OOM Killer（Out Of Memory Killer）**：
+
+1. **打分机制（`oom_score`）**：内核遍历目标范围内的所有进程，根据进程实际占用的物理内存（RSS + Swap）占比计算基础分（0～1000），再加上管理员配置的偏移量 `oom_score_adj`（-1000 到 +1000，Kubernetes 会根据 Pod 的 QoS 等级自动设置：`Guaranteed` 为 -997，`Burstable` 按 request 比例计算，`BestEffort` 为 1000），挑出总分最高的进程发送 `SIGKILL`（信号 9）。
+2. **为什么应用日志里没有任何 panic 或 fatal 记录？**：因为 `SIGKILL` 由内核直接处理并销毁进程地址空间，用户态的 Go 进程**无法捕获、无法忽略、也来不及执行任何 `defer` 或日志刷盘**，表现为进程突然凭空消失，只留下宿主机 `dmesg` 里的 `Killed process <pid>` 和容器退出码 `137`。
+3. **Go 的 `GOMEMLIMIT` 为什么不能 100% 免疫 OOM？**：`GOMEMLIMIT` 控制的只是 Go 运行时可回收的垃圾回收周期。如果业务代码在 100ms 内并发读取了 10 个 500MB 的大文件到内存中（全部是被局部变量强引用的**存活对象**），此时就算 GC 把 CPU 跑到 100% 也回收不掉一字节，向 OS 申请新页时照样立即突破 cgroup `memory.max` 被杀。
+
+**代码示例**
+
+```go
+// 典型突发 OOM 诱因：不加限制的 io.ReadAll 读取不可信的客户端上传或大响应体
+func readBodyBad(r *http.Request) ([]byte, error) {
+	return io.ReadAll(r.Body) // 恶意客户端发一个 2GB 的 Body，瞬间分配数倍缓冲导致 OOM
+}
+
+// 防御性写法：使用 http.MaxBytesReader 或 io.LimitReader 硬性截断最大允许内存
+func readBodySafe(w http.ResponseWriter, r *http.Request, maxBytes int64) ([]byte, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	return io.ReadAll(r.Body)
+}
+```
+
+```go
+// 数据库或大文件导出避免 OOM：使用流式游标（sql.Rows.Next + json.Encoder / csv.Writer）逐行写出，
+// 内存占用恒定为 O(1)，而不是先 append 到一个百万元素的 []Row 切片里再一次性 Marshal
+func streamRowsToJSON(w io.Writer, rows *sql.Rows) error {
+	enc := json.NewEncoder(w)
+	for rows.Next() {
+		var item Record
+		if err := rows.Scan(&item.ID, &item.Name); err != nil {
+			return err
+		}
+		if err := enc.Encode(item); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+```
+
+**常见追问**
+
+- 怎么区分是“容器内部达到了自己的 memory limit 被 OOM”，还是“宿主机整机内存不足把容器杀了”？→ 看宿主机 `dmesg -T`：如果日志里写的是 `Memory cgroup out of memory: Killed process ...`，说明是容器自身的 limit 触发；如果是 `Out of memory: Killed process ...`（没有 `Memory cgroup` 前缀），说明是宿主机全局物理内存耗尽。
+- 为什么 `bytes.Buffer` 或 `io.ReadAll` 读取一个 300MB 的数据，峰值可能会消耗近 1GB 的内存？→ 因为切片在不知道总长度时按倍增策略扩容（比如从 128MB 扩到 256MB 再扩到 512MB），扩容瞬间**旧数组和新数组同时存在于内存中**，如果在最后还转成 `string(buf)` 又要再拷贝一份 300MB，瞬间峰值接近原数据的 3 倍！若已知 `Content-Length`，应先 `bytes.NewBuffer(make([]byte, 0, contentLength))` 预分配。
+- `GOMEMLIMIT` 引发的“GC 死亡螺旋（Death Spiral）”是怎么回事，Go 是怎么缓解的？→ 当真实存活内存已经达到 `GOMEMLIMIT` 时，GC 会不停触发但每次都回收不到内存，如果不加限制会导致 CPU 100% 卡死在 GC 上。Go 运行时为此设定了 CPU 软上限（默认 GC 最多占用约 50% 的 CPU 时间窗口），宁可放行内存分配让操作系统触发干脆的 OOM 重启，也不让服务陷入 0 吞吐的假死状态。
+
+**实战建议**
+
+- 对所有外部输入（HTTP Body、gRPC 最大消息字节、文件解压流、SQL 查询 `LIMIT`、批量接口数组长度）必须在网关或校验层设置硬上限——**任何无上限的 `append` 和 `io.ReadAll` 都是定时 OOM 炸弹**。
+- 将 Kubernetes Pod 的内存 `requests` 和 `limits` 设为相等（尽可能获得更高的 QoS 优先级），并配置 `GOMEMLIMIT` 为该值的 80%。
+
+=== perf-19
+--- deep
+**原理展开**
+
+Linux 对文件描述符（File Descriptor，简称 fd）有**三个层级**的限制，任何一层触顶都会报错：
+
+1. **进程级限制（`RLIMIT_NOFILE`）**：每个进程独立计算（见 `/proc/<pid>/limits` 的 `Max open files`），又分为软限制（Soft Limit）和硬限制（Hard Limit）。超出时 `open()` / `socket()` / `accept()` 返回 **`EMFILE`（`too many open files`）**。
+2. **系统级总限制（`fs.file-max`）**：整台宿主机所有进程打开的文件句柄总上限（通过 `/proc/sys/fs/file-nr` 查看当前已分配数）。超出时返回 **`ENFILE`（`file table overflow`）**。
+3. **内核句柄上限（`fs.nr_open`）**：单个进程 `RLIMIT_NOFILE` 硬限制允许设置的最大天花板（默认 1048576）。
+
+在 Go 标准库的 `net/http.Server.Serve` 主循环中，如果 `Listener.Accept()` 因为 `EMFILE` 失败，标准库会退避等待（从 5ms 指数退避到最大 1s）并打印 `http: Accept error: accept tcp ...: too many open files; retrying in ...`，试图等旧连接关闭释放 fd 后自愈；但如果泄漏点不消除，服务就会陷入间歇性假死。
+
+**代码示例**
+
+```go
+// 典型错误 1：在 for 循环内部使用 defer 关闭文件，导致函数退出前所有 fd 全部攒着不释放！
+func processFilesBad(paths []string) error {
+	for _, p := range paths {
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		defer f.Close() // 错误：如果 paths 有 10 万个文件，会同时打开 10 万个 fd 直接打爆上限！
+		_ = parseFile(f)
+	}
+	return nil
+}
+
+// 正确写法：抽成独立小函数，或在循环内显式 Close
+func processFilesGood(paths []string) error {
+	for _, p := range paths {
+		if err := processOne(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func processOne(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close() // 函数返回即刻释放 fd
+	return parseFile(f)
+}
+```
+
+```go
+// 典型错误 2：http.Client 只在 StatusCode == 200 时才关闭 Body，或没读完 Body 就 Close 导致连接无法复用
+func callDownstream(ctx context.Context, cli *http.Client, url string) error {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	resp, err := cli.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// 丢弃剩余未读完的响应体字节（限制最大读取量防止大包阻塞），确保底层 TCP 连接能回到空闲连接池复用
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	}
+	return nil
+}
+```
+
+**常见追问**
+
+- Go 1.19 对 `RLIMIT_NOFILE` 做了什么自动优化？→ 在 Unix 系统上，传统的软限制默认只有 `1024`（为了兼容古老的 C 语言 `select(2)` `FD_SETSIZE` 位图上限），而硬限制通常是 `524288` 或 `1048576`。Go 不用 `select` 而用 `epoll/kqueue`，所以 Go 1.19 起 `os` 包初始化时会自动调用 `setrlimit` 把软限制直接拉满到硬限制的值。
+- 为什么有时候在 `/proc/<pid>/fd` 里看到大量指向 `anon_inode:[eventpoll]` 或 `pipe:[...]` 的 fd？→ 每个 `epoll` 实例或内部唤醒管道占一个 fd。如果代码里错误地频繁初始化某个会创建独立事件循环或监控 watcher（如 `fsnotify.NewWatcher()`）的组件且不调用 `Close()`，就会泄漏这类特殊 fd。
+- 删除一个正在被 Go 进程写入的巨大日志文件（`rm app.log`），为什么 fd 还在且磁盘空间也没释放？→ `rm` 只是调用 `unlink` 删掉了目录项链接，只要进程还持有该文件的打开 fd（在 `/proc/<pid>/fd` 里显示为 `(deleted)`），内核就不会释放对应的 inode 和磁盘块；应当用 `truncate -s 0 app.log` 清空内容，或通知进程重新打开日志文件。
+
+**实战建议**
+
+- 用 Prometheus 的 `process_open_fds / process_max_fds > 0.7` 配置告警：fd 泄漏通常是线性缓慢增长的，提前几天就能在突破 70% 水位时捕获并修复，根本不会演变到线上报错。
+- 静态检查工具（如 `bodyclose` linter）集成到 CI 流水线中，自动拦截任何漏写 `defer resp.Body.Close()` 的 HTTP 调用。
+
+=== perf-20
+--- deep
+**原理展开**
+
+为什么 `strace` 是生产高并发服务的“性能杀手”，而 `perf` 却能安全运行？这取决于它们在 Linux 内核中的底层实现机制：
+
+- **`strace` 的 `ptrace` 机制（同步拦截）**：`strace` 挂载到目标进程后，将目标线程标记为被追踪状态。目标线程每次执行系统调用**进入内核时**，都会被内核强行暂停（变为 `TASK_TRACED` 状态），触发一次上下文切换唤醒 `strace` 进程；`strace` 通过 `ptrace` 读取寄存器参数后放行目标线程；等系统调用**即将返回用户态时**，目标线程**再一次被暂停**并切换到 `strace` 读取返回值。也就是说，**每一次系统调用都会变成至少 4 次进程上下文切换**！如果 Go 服务每秒有 5 万次网络收发系统调用，`strace` 一挂上去，吞吐量立刻断崖式下跌 90% 以上。
+- **`perf` 的 PMU 与环形缓冲机制（异步采样）**：`perf` 利用 CPU 硬件内置的性能监控单元（PMU）计数器，比如每执行完 1000 万条 CPU 周期指令才触发一次硬件中断，内核直接在中断上下文里把当前指令指针（IP）和栈帧地址追加到一块与用户态共享的 `mmap` 环形内存缓冲区中，**完全不需要暂停目标线程，也不发生进程切换**。
+
+**代码示例**
+
+```bash
+# 生产环境替代 strace 的神器：perf trace（基于内核 tracepoint 环形缓冲，不暂停目标进程！）
+# 1. 汇总统计某进程 5 秒内所有系统调用的次数、错误数、平均耗时与最大耗时
+perf trace -s -p <pid> -- sleep 5
+
+# 2. 只抓取耗时超过 10ms 的慢系统调用（过滤掉海量的正常快速调用，开销极小）
+perf trace --duration 10 -p <pid>
+
+# 3. 用 perf stat 查看硬件级 CPU 效率指标：IPC（每时钟周期指令数）、分支预测失误率、缓存未命中率
+perf stat -d -p <pid> -- sleep 5
+```
+
+```go
+// Go 1.7+ 默认开启了帧指针（Frame Pointer，amd64 下使用 RBP 寄存器保存调用栈帧基址），
+// 因此 perf record -g 无需解析复杂的 DWARF 调试信息，就能以极低开销顺着 RBP 链瞬间回溯整个 Go 调用栈
+```
+
+**常见追问**
+
+- 什么时候仍然值得用 `strace`？→ ① 进程启动即报错退出（如找不到某个隐蔽的配置文件、动态库或证书权限不足）：直接 `strace -f -e trace=file ./app` 一眼看穿它试图打开哪个路径失败；② 进程已经彻底卡死、CPU 为 0（低频状态），挂上去看它阻塞在哪个 `futex` 或 `read` fd 上。
+- `perf stat` 输出里的 **IPC（insn per cycle，每周期指令数）** 很低（比如 < 0.5）说明什么？→ 现代超标量 CPU 每个时钟周期理论上能执行 3～4 条指令。如果 CPU 使用率 100%，但 IPC 只有 0.3，说明 CPU 绝大部分时间属于 **Stalled Cycles（流水线停顿）**——通常是因为频繁跨核争用缓存行（False Sharing）或随机访问超大内存结构导致 L3 Cache / 内存总线等待，而不是算术逻辑重。
+- 在 Docker / Kubernetes 容器里跑 `perf` 报 `Permission denied` 怎么办？→ 容器默认被 seccomp 策略限制了 `perf_event_open` 系统调用，且缺少 `CAP_PERFMON`（或 `CAP_SYS_ADMIN`）权限；一般直接在宿主机上指定目标容器进程在宿主机视角的 `<pid>` 运行 `perf`。
+
+**实战建议**
+
+- 记住这条红线：**永远不要对线上正在承载高流量的 Go 进程直接执行不带过滤器的 `strace -f -p <pid>`**；需要看系统调用时，优先用 `perf trace -s -p <pid>` 或 eBPF 工具。
+- 当遇到诡异的“算法逻辑明明很简单，但 CPU 就是很高”时，用 `perf stat -d` 看一眼 `L1-dcache-load-misses` 和 `LLC-load-misses`，往往能发现数据结构内存布局不连续导致的缓存未命中问题。
+
+=== perf-21
+--- deep
+**原理展开**
+
+回顾 TCP 四次挥手的状态机：当对端调用 `close()` 发送 `FIN` 包过来时，本端内核的 TCP 协议栈会自动回复 `ACK`，并把该 socket 的状态从 `ESTABLISHED` 变为 **`CLOSE_WAIT`**。在操作系统层面，内核在接收到对端 `FIN` 时会立刻将该 socket 标记为**可读**（如果应用在用 `epoll` 等待读事件，会被立即唤醒，`read()` 系统调用返回 `0` 字节，在 Go 中即表现为 `io.EOF`）。
+
+为什么 `CLOSE_WAIT` 永远不会自动超时消失？因为根据 TCP 规范，TCP 支持**半关闭（Half-Close）**：对端发来 `FIN` 只代表“对端不再发送数据了”，但理论上本端仍然可以继续往这个连接上发送剩余数据，直到本端应用程序显式调用 `close(fd)` 才会发出第三次挥手的 `FIN` 并进入 `LAST_ACK`。如果本端的 Go 代码压根没再去读这个连接（因此没感知到 `EOF`），或者感知到了却漏调了 `conn.Close()`，内核就会无限期替你保留这个处于 `CLOSE_WAIT` 的连接。
+
+**代码示例**
+
+```go
+// 场景 1：自定义 TCP 服务端处理协程在推送下游或写 channel 时永久阻塞，迟迟走不到 defer conn.Close()
+func handleConnBad(conn net.Conn, out chan<- []byte) {
+	defer conn.Close()
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return
+	}
+	// 如果客户端读超时断开（发来 FIN），连接已变为 CLOSE_WAIT；
+	// 但若 out channel 满了没人消费，当前 goroutine 永久卡死在这里，defer conn.Close() 永远不会执行！
+	out <- buf[:n]
+}
+
+// 场景 2：database/sql 连接池若不设 ConnMaxIdleTime / ConnMaxLifetime，
+// 当防火墙或 MySQL 服务端主动断开空闲连接（wait_timeout）后，池中躺着的空闲连接可能长时间处于 CLOSE_WAIT
+func configureDBPool(db *sql.DB) {
+	db.SetMaxOpenConns(100)
+	db.SetMaxIdleConns(50)
+	db.SetConnMaxIdleTime(3 * time.Minute)  // 小于 MySQL 的 wait_timeout 和中间 LB 的空闲超时
+	db.SetConnMaxLifetime(30 * time.Minute) // 定期轮换连接，防止单实例负载不均与僵死连接
+}
+```
+
+**常见追问**
+
+- 用 `net/http` 的 `http.Client` 请求下游时，如果我已经把 `resp.Body` 读到了 `io.EOF`，但忘了调 `resp.Body.Close()`，连接还能复用吗？→ 标准库在某些特定条件下读取到 EOF 时会尝试回收，但**只要存在分块传输尾部、提前返回、错误分支或 HTTP/1.1 keep-alive 状态同步，不调 `Close()` 就会导致连接无法归还连接池并泄漏为 `CLOSE_WAIT`**。任何时候都必须无条件 `defer resp.Body.Close()`。
+- 怎么把 `ss -tanp state close-wait` 里的连接和 Go 的 `goroutine` profile 对应起来？→ 先从 `ss` 输出里看对端 IP 和端口（比如是客户端还是 Redis/MySQL），再抓 `/debug/pprof/goroutine?debug=1`，搜索持有 `net.(*TCPConn)` 或对应客户端库阻塞的调用栈，阻塞数量与 `CLOSE_WAIT` 数量一致的那组调用栈就是根因。
+- 如果连接已经处于 `CLOSE_WAIT`，本端代码再去调用 `conn.Write()` 会发生什么？→ 第一次 `Write` 通常还能成功把数据发出去，但因为对端已经彻底关闭了连接，对端内核收到数据后会直接回复一个 **`RST`（Reset）**包；本端第二次再调用 `Write` 时就会收到 `write: broken pipe`（`EPIPE`）错误。
+
+**实战建议**
+
+- 所有自定义 TCP/WebSocket 服务端的连接处理函数，必须给每次 `Read` / `Write` 设置超时（`conn.SetDeadline`），并且禁止在持有连接期间无限期等待无超时控制的内部 channel 或锁。
+- 监控 `node_netstat_Tcp_CurrEstab` 的同时，单独对主机上 `CLOSE_WAIT` 状态连接数超过 100 触发告警——正常健康的服务 `CLOSE_WAIT` 应该接近 0。
+
+=== perf-22
+--- deep
+**原理展开**
+
+应用层看到“执行一条 SQL 耗时 800ms”，在 Go 的 `database/sql` 内部实际上经历了最多**四个阶段**，排查时最忌讳把所有锅都直接甩给 SQL 语句本身：
+
+1. **连接池排队等待（Pool Wait）**：当前活跃连接数已达 `MaxOpenConns`，goroutine 阻塞在 `db.conn(ctx)` 的等待队列里干等别人归还连接。可能真正的 SQL 只需 1ms，但排队等了 799ms！
+2. **连接保活探测与重连（Ping / Dial / Handshake）**：从空闲池拿出的连接已经失效，触发重连、TCP 握手、TLS 握手和 MySQL 认证。
+3. **服务端真实执行或锁等待（Server Execution / Lock Wait）**：SQL 真正发到了 MySQL，可能因为全表扫描慢，也可能 SQL 本身很快（按主键 `UPDATE`），但那一行正被另一个未提交的长事务锁住，阻塞在 `innodb_lock_wait` 上。
+4. **大结果集网络传输与反序列化（Rows Fetch & Scan）**：查询返回了几万行数据，慢在网络收包和反射 `Scan` 上。
+
+**代码示例**
+
+```go
+// 在 Go 业务层细粒度埋点或包装查询：区分“获取连接耗时”与“真正 SQL 执行耗时”
+func queryWithTrace(ctx context.Context, db *sql.DB, query string, args ...any) (*sql.Rows, error) {
+	t0 := time.Now()
+	// 显式先从连接池借出一个独占连接 sql.Conn，单独测量借连接的排队耗时
+	conn, err := db.Conn(ctx)
+	waitDur := time.Since(t0)
+	if err != nil {
+		slog.Warn("db pool acquire failed", "wait", waitDur, "err", err)
+		return nil, err
+	}
+	// 注意：如果是 QueryContext 返回 Rows，conn 的释放必须交给调用方处理，
+	// 或者在日常排查时直接通过 httptrace / driver.Connector 钩子及 db.Stats() 观察 WaitDuration
+	_ = conn.Close()
+
+	t1 := time.Now()
+	rows, err := db.QueryContext(ctx, query, args...)
+	execDur := time.Since(t1)
+	if waitDur > 20*time.Millisecond || execDur > 100*time.Millisecond {
+		slog.Warn("slow db op", "pool_wait", waitDur, "sql_exec", execDur, "query", query)
+	}
+	return rows, err
+}
+```
+
+```go
+// 最隐蔽的连接池耗尽元凶：在事务开启（db.BeginTx）期间发起耗时的外部 HTTP/RPC 调用！
+func createOrderBad(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil) // 此时已经独占了连接池里的 1 个物理连接，且可能持有了行锁
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, _ = tx.ExecContext(ctx, "UPDATE inventory SET stock = stock - 1 WHERE id = 100")
+	// 致命错误：在事务提交前调用外部慢接口（耗时 500ms），
+	// 不仅把单个数据库连接占死了 500ms，还让 id=100 这行的行锁整整锁了 500ms，瞬间拖垮所有并发请求！
+	_ = callThirdPartyPaymentHTTP(ctx)
+	return tx.Commit()
+}
+```
+
+**常见追问**
+
+- 为什么 MySQL 的慢查询日志（Slow Query Log）里一条记录都没有，但业务监控显示数据库请求全部超时？→ ① 请求根本没拿到连接，全部超时死在 Go 侧的 `db.Stats().WaitCount` 排队上；② MySQL 的慢日志是在**语句执行完毕后**才写入的，如果当前有一百条 SQL 正在被死锁或长事务卡住还没执行完，慢日志里暂时看不到，必须看 `SHOW PROCESSLIST` 和 `performance_schema.data_lock_waits`。
+- `EXPLAIN` 看到 `type: ref` 且用上了索引，为什么查询还是慢？→ 检查三点：① **回表代价**：二级索引匹配了 10 万行，虽然走了索引，但 10 万次随机回表聚簇索引极慢；② **索引基数与数据倾斜**：某个状态字段 `status = 0` 占了全表 80% 的数据；③ **Buffer Pool 命中率下降**：大表扫描把热数据挤出了内存，每次索引查找都变成了物理磁盘读。
+- Go 的 `db.QueryContext` 忘记调用 `rows.Close()` 会发生什么？→ `sql.Rows` 在未读完且未调用 `Close()` 前，会一直独占底层的数据库连接不归还给连接池，只需泄漏几十次就会达到 `MaxOpenConns`，此后整个服务的所有数据库操作全部卡死超时！
+
+**实战建议**
+
+- 严禁在数据库事务（`BeginTx` ～ `Commit`）内部执行任何网络 RPC、HTTP 请求或消息队列发送；将非数据库操作移到事务外，把事务生命周期压缩到几毫秒以内。
+- 为每条 SQL 加上注释形式的 TraceID 或调用入口标记（如 `/* trace_id=xxx route=CreateOrder */ SELECT ...`），在 DBA 的 `SHOW PROCESSLIST` 和慢日志里能一秒钟反查到对应的 Go 代码位置。
+
+=== perf-23
+--- deep
+**原理展开**
+
+**偶发 502（TCP Keep-Alive 竞态条件 / Race Condition）**是高并发微服务中最经典的跨层协议问题，其数据包级的发生过程如下：
+
+```text
+负载均衡器 / API 网关 (LB)                          Go 后端服务 (Server)
+       |                                                  |
+       | <--- 连接空闲达到 60s，Go 的 IdleTimeout 先到期 --- |
+       |                                                  | 1. Go 调用 close()，发送 FIN
+       | 2. 此时恰好有新用户请求到达 LB，                    |
+       |    LB 尚未收到 FIN，从空闲池挑中这条连接发送 HTTP 请求 |
+       | ---------------- PSH, ACK (HTTP Request) ------> |
+       | <--- FIN, ACK (在网络上与请求擦肩而过) ------------ |
+       |                                                  | 3. Go 发现已关闭的连接收到数据，
+       | <--- RST (Connection Reset by Peer) ------------ |    内核直接回复 RST！
+       | 4. LB 收到 RST，对于非幂等的 POST 请求不敢自动重试，  |
+       |    直接向客户端返回 502 Bad Gateway               |
+```
+
+为什么 GET 请求有时不报 502 而 POST 请求必报 502？因为 Nginx / Envoy 等网关默认对幂等的 `GET` 请求在遇到 `RST` 时会自动换一条连接重试（`proxy_next_upstream`），而 `POST` 请求可能已经部分到达后端产生副作用，网关不敢重试，只能直接把 502 抛给用户。
+
+**代码示例**
+
+```go
+// 生产级 Go HTTP Server 超时配置与 Kubernetes 零停机优雅关闭完整模板
+func runProductionHTTPServer(ctx context.Context, handler http.Handler) error {
+	srv := &http.Server{
+		Addr:              ":8080",
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,  // 防御 Slowloris 慢速请求头攻击
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		// 关键：IdleTimeout 必须大于上游 Nginx / ALB / Ingress 的 keepalive_timeout（例如上游 60s，这里设 90s），
+		// 让连接永远由上游网关主动发起关闭，彻底消除双向竞争导致的偶发 502！
+		IdleTimeout: 90 * time.Second,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+		close(errCh)
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		// 收到 SIGTERM 时：Kubernetes 从摘除 Endpoint 到 kube-proxy / Ingress 同步生效需要几秒钟，
+		// 先 sleep 一小会儿继续接住还在路上的请求，再调用 Shutdown 关闭监听并等待在途请求处理完毕
+		time.Sleep(5 * time.Second)
+		shutCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		return srv.Shutdown(shutCtx)
+	}
+}
+```
+
+**常见追问**
+
+- 在 Kubernetes 中，我已经写了 `srv.Shutdown(ctx)`，为什么每次滚动发布时还是会偶发几十个 502？→ 因为 K8s 在给容器发送 `SIGTERM` 的**同时**才开始通知 kube-proxy 和 Ingress Controller 摘除该 Pod 的 IP（两者是**并行异步**的，不是串行的！）。如果你的 Go 进程收到 `SIGTERM` 毫秒级立刻执行 `srv.Shutdown()` 关闭了监听 socket，而 Ingress 还要等 2 秒才把你的 IP 从 upstream 列表删掉，这 2 秒内发过来的流量就会全部 `Connection Refused` 报 502。解决办法是在收到 `SIGTERM` 后（或配置 `lifecycle.preStop: sleep 5`）先等待 3～5 秒并把就绪探针置为失败，然后再调 `srv.Shutdown()`。
+- 作为客户端的 Go `http.Transport` 调用外部服务时偶发 `EOF` 错误，也是同样的原因吗？→ 是的！当远端服务端先关闭了空闲连接，而本端 `http.Transport` 的 `IdleConnTimeout` 设得太大，恰好复用该连接发请求就会报错。所以超时链条原则是：**客户端 `IdleConnTimeout` < 网关 `keepalive_timeout` < 后端 `IdleTimeout`**（从上游到下游逐层递增）。
+- 504 Gateway Timeout 时，后端 Go 服务里的请求一定会自动停止吗？→ 网关超时断开连接后，如果后端 Go 代码没有监听 `r.Context().Done()`（或者下游调用没传 `r.Context()`），后端 goroutine 依然会傻傻地继续往下执行甚至写库，造成“前端报错超时，后端却扣款成功”的数据不一致。
+
+**实战建议**
+
+- 检查所有上下游组件的空闲连接超时配置，严格保证 **上游超时 < 下游超时**（上游主动关，下游被动关）。
+- 在网关日志和业务日志中打印相同的 `X-Request-ID`：排查 502/504 时，拿网关报错的 Request-ID 去后端日志搜——搜不到说明请求根本没进到 Go 进程（死在建连或连接复用 RST 上），搜得到说明是处理中途崩溃或超时。
+
+=== perf-24
+--- deep
+**原理展开**
+
+先厘清**操作系统线程切换（OS Thread Context Switch）**与 **Go 协程切换（Goroutine Switch）**的成本数量级差异：
+
+- **OS 线程上下文切换（约 1µs～3µs）**：必须陷入内核态，保存当前线程的所有通用寄存器、浮点寄存器，切换虚拟内存页表基址（如果是跨进程切换还会刷新 TLB），更重要的是会造成 **CPU L1/L2 Cache、分支预测缓冲区的污染与失效（间接成本往往高达数微秒）**。
+- **Goroutine 用户态切换（约 100ns～200ns）**：在同一个 M（OS 线程）上切换两个 G 时，完全在用户态由 `runtime.gogo` / `gosave` 完成，只需保存/恢复 PC、SP 和少量寄存器，不陷入内核、不切换页表，そのため `vmstat` 的 `cs` 计数**完全不会增加**。
+
+那么什么情况下 Go 进程还会导致 OS 的 `cs`（上下文切换）飙到每秒几十万次？
+1. **M 的频繁休眠与唤醒（Futex Storm）**：当任务突发极不均匀、或者频繁通过无缓冲 channel 在不同 P 之间乒乓传递微小消息时，空闲的 M 找不到活干就会调用 `futex` 陷入内核休眠，几微秒后新消息到来又调用 `futex` 唤醒它，产生海量的**自愿切换（`cswch/s`）**。
+2. **线程数远超物理核数（Over-subscription）**：容器只给了 2 核配额，却跑了 64 个活跃 M（如未修正 `GOMAXPROCS`、或大量 cgo/阻塞文件 IO 创建了上百个线程），内核 CFS 调度器不停地抢占时间片，产生海量的**非自愿切换（`nvcswch/s`）**。
+
+**代码示例**
+
+```bash
+# 使用 perf sched 诊断内核调度器行为，统计每个线程的切换次数与平均调度延迟（Max delay）
+perf sched record -- sleep 3
+perf sched latency --sort max
+```
+
+```go
+// 反例：把微小的计算拆成几万个细粒度消息在无缓冲 channel 上跨协程传递，
+// 每次传递都伴随锁竞争与潜在的 M 休眠/唤醒，切换开销比实际计算还大 10 倍
+func sumFineGrainedBad(nums []int) int {
+	ch := make(chan int)
+	go func() {
+		for _, n := range nums {
+			ch <- n // 每次发送一个 int 都可能触发 gopark / goready
+		}
+		close(ch)
+	}()
+	total := 0
+	for v := range ch {
+		total += v
+	}
+	return total
+}
+
+// 正例：按块批量传递（Batching），将万次同步切换缩减为十几次
+func sumBatchedGood(nums []int) int {
+	const batchSize = 1024
+	ch := make(chan []int, 4)
+	go func() {
+		for i := 0; i < len(nums); i += batchSize {
+			end := min(i+batchSize, len(nums))
+			ch <- nums[i:end]
+		}
+		close(ch)
+	}()
+	total := 0
+	for batch := range ch {
+		for _, v := range batch {
+			total += v
+		}
+	}
+	return total
+}
+```
+
+**常见追问**
+
+- 在 CPU Profile 里看到 `runtime.futex` 占了 20% 以上的 CPU，说明什么？→ `futex`（Fast Userspace Mutex）是 Linux 用于实现线程休眠等待与唤醒的系统调用。它在 Go 的 CPU profile 里占比高，说明运行时正在极其频繁地挂起（park）和唤醒（unpark）操作系统线程 M——通常是因为严重的锁竞争、channel 乒乓等待、或 `GOMAXPROCS` 设置过大导致大量 M 抢少量的活。
+- `vmstat 1` 里的 `in`（interrupts，中断次数）和 `cs`（context switches）同时暴增说明什么？→ 往往是高 PPS 的小网络包风暴，或者高频定时器中断触发了内核软中断与唤醒用户态收包线程。
+- 每秒多少次上下文切换算“过高”？→ 没有绝对固定的阈值，取决于 CPU 核数。经验上单核每秒超过 1 万～2 万次切换，且伴随着 `sy`（内核态 CPU）明显升高（如 > 20%）时，就需要排查切换来源。
+
+**实战建议**
+
+- 在高吞吐流水线设计中，遵循**“批量化（Batching）优于逐条传递”**的原则：无论是 channel 传数据、写日志还是刷指标，合并成小批次能同时大幅降低 goroutine 调度开销与 OS 线程切换次数。
+- 修正容器环境的 `GOMAXPROCS` 使之与实际 CPU 核数一致，通常能立刻砍掉 50% 以上的无谓非自愿上下文切换。
+
+=== perf-25
+--- deep
+**原理展开**
+
+为什么线上监控千万不能只看**平均延迟（Avg）**，而必须紧盯 **p99 / p999（长尾延迟，Tail Latency）**？
+
+1. **平均值会掩盖灾难**：假设 99% 的请求耗时 1ms，1% 的请求超时卡了 1000ms，算出来的平均延迟只有 $10.99\text{ms}$，看起来一片岁月静好，但实际上每 100 个请求就有 1 个用户体验极差。
+2. **扇出放大效应（Tail Latency Amplification）**：在微服务架构中，如果一个聚合网关请求需要并行或串行调用后端的 $N = 20$ 个子服务，且每个子服务自身的 p99 慢请求概率是 $1\%$（即单个服务正常的概率是 $99\%$），那么整个聚合请求**不撞上任何一个慢调用**的概率只有：
+   $$P(\text{全部正常}) = 0.99^{20} \approx 81.8\%$$
+   也就是说，高达 **$18.2\%$** 的用户请求会被那 $1\%$ 的长尾毛刺拖慢！子调用越多，单个节点的 p99 毛刺就越会演变成全局的 p80 普遍变慢。
+
+**代码示例**
+
+```go
+// 对抗 p99 长尾延迟的经典工程模式：Hedged Requests（对冲请求 / 备份请求）
+// 当第一个请求耗时超过 p95 阈值（例如 15ms）仍未返回时，不立即取消第一个请求，
+// 而是并发向另一个副本节点发出第二个备份请求，谁先返回就用谁的结果，并立即 cancel 另一个！
+// 仅增加约 5% 的额外流量，就能把 p999 长尾延迟削平一个数量级。
+func hedgedCall(ctx context.Context, hedgeDelay time.Duration, call func(context.Context) (string, error)) (string, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type result struct {
+		val string
+		err error
+	}
+	ch := make(chan result, 2)
+	go func() {
+		v, err := call(ctx)
+		ch <- result{v, err}
+	}()
+
+	timer := time.NewTimer(hedgeDelay)
+	defer timer.Stop()
+
+	select {
+	case r := <-ch:
+		return r.val, r.err
+	case <-timer.C:
+		// 超过 p95 阈值未返回，发起第二个对冲请求
+		go func() {
+			v, err := call(ctx)
+			ch <- result{v, err}
+		}()
+		r := <-ch
+		return r.val, r.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+```
+
+**常见追问**
+
+- p50（中位数）完全没变，只有 p99 和 p999 突然翻了 10 倍，最可能是什么原因？→ 说明绝大多数普通请求走的路径完全正常，毛刺只击中了少部分时间点或少部分特定请求。排名前四的凶手是：① **周期性停顿**（Go GC Mark Assist、容器每 100ms 的 CFS CPU 限流、内核刷脏页）；② **特定大 Key / 大租户请求**（某个大客户一次查了 5 万条记录，普通客户只查 10 条）；③ **连接池偶发重连 / DNS 偶发丢包重传（1s/3s 台阶）**；④ **集群中只有 1 台坏实例慢，分摊了 1% 流量**。
+- Prometheus 中用 `Histogram` 算出来的 `histogram_quantile(0.99, ...)` 为什么有时候看着像一条水平直线（比如恒定卡在 500ms）？→ 因为 `Histogram` 是按预设的分桶边界（`le="0.1"`, `le="0.5"`, `le="1.0"`）做线性插值估算的！如果真实耗时集中在 320ms，而你的桶边界只配了 `0.1s` 和 `0.5s` 两个跨度极大的桶，插值算出来的 p99 就会严重失真。必须围绕业务的 SLA 阈值加密分桶边界，或者开启 Prometheus Native Histograms。
+- 对冲请求（Hedged Requests）在什么条件下才能用？→ 要求下游接口必须是**幂等**的（主要是读操作，或带唯一幂等键的写操作），且当时下游没有处于全局过载状态（必须配合令牌桶限制对冲请求最多只占总流量的 5%～10%，防止雪崩）。
+
+**实战建议**
+
+- 在慢请求日志中自动附带当时的请求特征（响应字节数、查询条数、租户 ID、下游各阶段耗时），一眼就能区分是“数据大导致的必然慢”还是“系统抖动导致的偶然慢”。
+- 将实例粒度的 p99 延迟画在同一张图上对比：如果只有一两条线凸起，直接摘除坏机器；如果所有线整齐划一地在同一秒凸起，立刻查公共依赖（DB/Redis）或定时任务冲击。
+
+=== perf-26
+--- deep
+**原理展开**
+
+Linux 内核的 **CFS 带宽控制（CFS Bandwidth Control）** 由两个参数决定（在 cgroup v2 中位于 `/sys/fs/cgroup/cpu.max`，cgroup v1 中为 `cpu.cfs_quota_us` 和 `cpu.cfs_period_us`）：
+
+- `period`（统计周期）：Kubernetes 默认固定为 `100000` 微秒（即 **100ms**）；
+- `quota`（周期内配额）：例如设置容器 `limits.cpu: "2"`，则 `quota = 200000` 微秒（即每 100ms 内所有线程累计最多使用 **200ms** 的 CPU 核时）。
+
+为什么 Go 程序比单线程 Node.js 或小线程池程序更容易遭遇严重的 CFS Throttling？
+1. **默认 `GOMAXPROCS` 取宿主机物理核数**（Go 1.24 及以前）：在 64 核宿主机上跑一个 limit 2 核的容器，`GOMAXPROCS` 默认是 64。当请求到来或进入 **GC 并发标记阶段**（立刻唤醒 $64 \times 25\% = 16$ 个后台标记线程并行扫描堆）时，20 个线程同时跑满，只需 $\frac{200\text{ms}}{20} = 10\text{ms}$ 就把整整 100ms 周期的配额全部烧光！剩下的 **90ms** 内，容器内所有线程被内核强行挂起（throttled），任何正在处理的请求都会无故卡顿 90ms。
+2. **Go 1.25 的原生容器感知**：Go 1.25 起，运行时在启动和运行期间会自动读取 cgroup v1/v2 的 CPU 配额限制（如 `cpu.max`），将默认 `GOMAXPROCS` 自动设为 `max(2, ceil(quota / period))`，不再需要第三方库。
+
+**代码示例**
+
+```go
+// Go 1.24 及更早版本：在容器启动时自动读取 cgroup v2 的 cpu.max 计算合理的 GOMAXPROCS
+func tuneGOMAXPROCSFromCgroupV2() {
+	if os.Getenv("GOMAXPROCS") != "" {
+		return // 优先尊重显式配置的环境变量
+	}
+	data, err := os.ReadFile("/sys/fs/cgroup/cpu.max")
+	if err != nil {
+		return
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) != 2 || fields[0] == "max" {
+		return // 未限制 CPU limit
+	}
+	quota, err1 := strconv.Atoi(fields[0])
+	period, err2 := strconv.Atoi(fields[1])
+	if err1 != nil || err2 != nil || period <= 0 {
+		return
+	}
+	procs := max(2, (quota+period-1)/period) // 向上取整，且最小保持为 2
+	runtime.GOMAXPROCS(procs)
+}
+```
+
+```bash
+# Prometheus 查询语句：计算每个容器的 CPU 限流周期比例（超过 5% 就说明限流已经开始明显影响长尾延迟）
+rate(container_cpu_cfs_throttled_periods_total[5m])
+  / rate(container_cpu_cfs_periods_total[5m])
+```
+
+**常见追问**
+
+- 如果把 `GOMAXPROCS` 设成和容器 limit 一致（比如 2），就彻底不会发生 CPU Throttling 了吗？→ 能消除绝大部分，但**仍有可能发生少量限流**。因为除了 `GOMAXPROCS` 控制的 2 个运行 Go 代码的线程外，Go 还有 `sysmon` 线程、后台 GC 线程、网络轮询或系统调用线程，加上业务负载在 100ms 内的微观突发，如果平均 CPU 使用率已经达到 limit 的 70% 以上，仍然会触碰配额红线。
+- 为什么社区里有观点建议 Kubernetes 生产环境“只设 CPU request，不设 CPU limit（或把 limit 设得比 request 大很多）”？→ CPU 是**可压缩资源**（不像内存超了会死机）。`requests.cpu` 通过 `cpu.weight`（`cpu.shares`）保证在宿主机繁忙时你的容器一定能分到保底的 CPU 权重；而不设 `limits.cpu` 则允许容器在宿主机其他核空闲时借用空闲算力平抑突发毛刺（如 GC 标记），完全避免 CFS 配额冻结带来的 90ms 延迟停顿。
+- Linux 内核升级对容器 CPU Throttling 有影响吗？→ 有极大影响！Linux 5.4 之前的旧内核存在著名的 CFS 配额分配 bug（即使 CPU 没用满配额，多核分发本地桶过期时也会错误触发限流），升级到 5.4+ 内核后误限流大幅减少。
+
+**实战建议**
+
+- 对延迟敏感的在线 Go 服务：第一，确保 `GOMAXPROCS` 与容器 CPU 配额对齐（升级 Go 1.25+ 或引入 `automaxprocs`）；第二，将 CPU Limit 设为日常峰值 CPU 使用率的 2 倍以上，给 GC 并发标记和突发请求留出充足的 100ms 窗口缓冲。
+- 把容器 CPU 限流率（`throttled_periods / total_periods`）放到和 CPU 使用率紧挨着的同一个监控面板上。
+
+=== perf-27
+--- deep
+**原理展开**
+
+一个数据包从网卡进来，到最终被 Go 协程通过 `conn.Read()` 读走，中间经过四个缓冲环节，**任何一个环节满了都会直接丢包**：
+
+```text
+[物理网卡]
+   |-- 1. Ring Buffer (网卡环形队列满 -> ethtool rx_dropped / rx_missed_errors)
+   v
+[硬中断 / NAPI 软中断 ksoftirqd]
+   |-- 2. netdev_max_backlog (CPU 收包队列满 -> /proc/net/softnet_stat 第 2 列增长)
+   v
+[IP 层 / Netfilter (iptables / conntrack)]
+   |-- 3. nf_conntrack_max (连接跟踪表满 -> dmesg: nf_conntrack: table full)
+   v
+[TCP 协议栈]
+   |-- 4a. 建连阶段：SYN Queue / Accept Queue 满 (TcpExtListenOverflows / Drops)
+   |-- 4b. 传输阶段：Socket 接收缓冲区 rmem 满 -> 通告 TCP ZeroWindow（对端暂停发送）
+   v
+[Go 应用层 netpoller / conn.Read]
+```
+
+当发生丢包时，TCP 依靠两种机制恢复：**快速重传（Fast Retransmit，收到 3 个重复的 Dup ACK 立即重传，耗时几毫秒）** 和 **超时重传（RTO，連 Dup ACK 都没收到，比如尾包丢失或 SYN 包丢失，只能干等 200ms～1s 的重传定时器到期）**。线上偶发“正好慢了 200ms 或 1000ms”的请求，几乎都是撞上了 TCP 超时重传（RTO）！
+
+**代码示例**
+
+```bash
+# 1. 检查软中断收包队列统计（每一行代表一个 CPU 核）：
+# 第 1 列是处理包数，第 2 列是因 netdev_max_backlog 满而丢弃的包数，第 3 列是 time_squeeze（软中断预算耗尽次数）
+cat /proc/net/softnet_stat
+
+# 2. 精确区分“快速重传”与致命的“超时重传（RTO）”及“SYN 建连重传”
+nstat -az | grep -E 'TcpExtTCPSynRetrans|TcpExtTCPFastRetrans|TcpExtTCPSlowStartRetrans|TcpExtTCPTimeouts'
+
+# 3. 抓取出现 TCP RST 或重传标志的数据包
+tcpdump -i any -nn 'tcp[tcpflags] & tcp-rst != 0' -c 50
+```
+
+```go
+// Go 中通过 syscall.RawConn 读取单个 TCP 连接底层的内核 TCP_INFO（Linux），
+// 直接在应用层获取该连接发生过的重传次数（TotalRetrans）和 RTT（往返微秒数）
+func inspectTCPConn(tc *net.TCPConn) {
+	raw, err := tc.SyscallConn()
+	if err != nil {
+		return
+	}
+	_ = raw.Control(func(fd uintptr) {
+		// Linux 下可通过 unix.GetsockoptTCPInfo(int(fd), unix.SOL_TCP, unix.TCP_INFO)
+		// 获取 rtt、snd_cwnd、total_retrans 等内核级指标
+		_ = fd
+	})
+}
+```
+
+**常见追问**
+
+- 抓包看到大量的 **`TCP ZeroWindow`** 是网络丢包吗？→ 不是网络链路丢包，而是**接收方应用程序读取太慢**！比如接收方的 Go 进程因为 GC、锁阻塞或下游卡死，没有及时调用 `conn.Read()`，导致内核里该 socket 的接收缓冲区（Recv-Q）被塞满，内核通过 TCP 窗口字段向发送方通告 `win=0`，强制发送方停下来等待，直到接收方把数据读走并发出 `TCP WindowUpdate`。
+- 为什么新连接偶然会卡整整 **1 秒** 才连上？→ 第一次握手的 `SYN` 包在网络上丢了（或者被对端溢出的全连接队列丢弃了），Linux 默认的初始 SYN 重传超时（RTO）正好是 **1 秒**（之后依次是 2s、4s、8s... 由 `net.ipv4.tcp_syn_retries` 控制次数）。
+- 抓包时为什么在发送机上看到了高达 32KB 甚至 64KB 的超大 TCP 包（远超 MTU 1500），是不是配置错了？→ 正常现象。现代网卡普遍开启了 **TSO（TCP Segmentation Offload）** 和 **GRO（Generic Receive Offload）**，内核协议栈直接把 64KB 的大块数据交给网卡硬件去切分成 1500 字节的帧，而 `tcpdump` 抓包点位于网卡驱动之上，所以看到的是切分前的大包。
+
+**实战建议**
+
+- 当慢请求耗时呈现出非常规律的 **200ms、1s、3s** 等台阶状分布时，第一反应永远是查 `TcpExtTCPSynRetrans`（建连丢包重传）和 `TcpExtTCPTimeouts`（数据超时重传）。
+- 抓包分析生产问题时，用 `-s 96`（只抓前 96 字节协议头，不抓业务载荷）既能完整分析 TCP 握手、窗口、ACK 和重传时序，又能大幅减小 pcap 文件体积并避免泄露敏感业务数据。
+
+=== perf-28
+--- deep
+**原理展开**
+
+eBPF（Extended Berkeley Packet Filter）之所以成为现代 Linux 与云原生可观测性的基石，是因为它允许我们在不修改内核源码、不重启应用的前提下，把一段经过**内核验证器（Verifier）**严格静态检查（保证无死循环、无非法越界指针访问）的字节码通过 **JIT 编译器**转为原生机器码，直接挂载在内核事件点上运行：
+
+- **四种核心挂载点**：`kprobe`（内核任意函数入口/出口）、`tracepoint`（内核静态稳定埋点，推荐优先使用）、`uprobe`（用户态程序函数，如 Go 二进制里的函数）、`perf_event`（定时硬件采样）。
+- **内核态聚合，零拷贝汇总**：传统工具（如 `strace`、`tcpdump`）之所以慢，是因为要把海量原始事件一条条拷贝到用户态再过滤；而 eBPF 直接在内核态使用 **BPF Maps**（哈希表、直方图数组）完成过滤、耗时计算和统计聚合，每秒只把聚合后的几十字节直方图结果传回用户态，开销低于 **1%**。
+- **为什么对 Go 程序绝对禁止使用 `uretprobe`（用户态函数返回探针）？**
+  `uretprobe` 的内核实现原理是：在目标函数入口处，**偷偷把栈帧上的真实返回地址（Return Address）篡改指向内核的一段跳板地址（trampoline）**，并把原返回地址保存在内核里。但 Go 的 goroutine 使用的是**可动态扩容并移动的连续栈**！一旦函数执行期间触发了栈扩容（`runtime.morestack` -> `copystack`），整个栈被拷贝到新内存地址，或者运行时在做栈回溯（GC 扫描、`runtime.Callers`）时检查栈帧上的返回地址，遇到被内核篡改的跳板地址就会直接校验失败引发 **`runtime: unexpected return pc` 致命崩溃**！
+
+**代码示例**
+
+```bash
+# 1. bpftrace 一行命令：统计指定 Go 进程内每次系统调用 read 的耗时微秒级直方图（内核态聚合，极其轻量）
+bpftrace -e '
+tracepoint:syscalls:sys_enter_read /pid == 12345/ { @start[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_read  /pid == 12345 && @start[tid]/ {
+    @usecs = hist((nsecs - @start[tid]) / 1000);
+    delete(@start[tid]);
+}'
+
+# 2. 使用 bcc 工具 offcputime 抓取 5 秒内 Go 进程阻塞不在 CPU 上的调用栈（需要帧指针支持）
+offcputime-bpfcc -df -p 12345 5 > offcpu.folded
+```
+
+```go
+// Go 1.17+ 采用了基于寄存器的调用规约（Register-based calling convention）：
+// 在 amd64 上，前 9 个整数/指针参数依次通过 AX, BX, CX, DI, SI, R8, R9, R10, R11 寄存器传递（不再全放栈上）。
+// 因此用 eBPF uprobe 挂载 Go 函数读取参数时，直接读取对应的 CPU 寄存器即可。
+```
+
+**常见追问**
+
+- 在 Go 中既然不能用 `uretprobe` 挂载函数返回来算函数耗时，那 eBPF 工具（如 Beyla、Pixie、 Cilium）是怎么做 Go 函数/HTTP 耗时追踪的？→ 通过反汇编目标 Go 函数的机器码，找到该函数内部所有的 **`RET` 返回指令偏移量**，然后在这些指令偏移位置挂载普通的 **`uprobe`**（而不是 `uretprobe`），既拿到了返回时刻的时间戳和返回值寄存器，又完全不修改 goroutine 的栈内存。
+- Go 的 goroutine ID（`goid`）在 eBPF 程序里怎么获取？→ 在 amd64 Linux 下，Go 运行时把当前正在执行的 `g` 结构体指针固定存放在线程本地存储（TLS，即 `FS` 段寄存器偏移 `-8` 的位置）或特定寄存器（arm64 的 `R28`）中；eBPF 程序只需读取 `g` 结构体加上 `goid` 字段的固定字节偏移量，就能拿到准确的 `goroutine ID`，用 `(pid, goid)` 作为 Map 的 key 就能跨越线程迁移精准追踪同一个协程！
+- 使用 eBPF 做 TLS 加密流量的明文抓包（如 `ecapture`）是什么原理？→ 对 OpenSSL 的 `SSL_write`/`SSL_read` 或 Go 标准库的 `crypto/tls.(*Conn).Write` / `Read` 函数挂载 `uprobe`，在数据加密前和解密后的用户态函数入口直接把明文缓冲区拷出来，无需配置证书或中间人代理。
+
+**实战建议**
+
+- 遇到应用层日志和 pprof 无法解释的系统级黑盒问题（如偶发 DNS 超时、内核连接重置、虚拟文件系统卡顿），优先使用 bcc 现成工具集（`tcpretrans`、`biolatency`、`runqlat`、`gethostlatency`）在宿主机上旁路观测。
+- 记住铁律：**在生产环境的 Go 二进制上可以使用 `uprobe`，但严禁挂载 `uretprobe`**。

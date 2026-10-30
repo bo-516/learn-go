@@ -1,0 +1,2947 @@
+架构设计（ARCH-01 ~ ARCH-20）的编程小任务。
+
+=== arch-01-1
+title: 服务依赖的发布顺序
+--- desc
+微服务拆分后，服务之间有依赖关系，循环依赖意味着拆分不合理。实现 `DeployOrder(deps)`：
+
+- `deps[a]` 是服务 a 依赖的服务列表，被依赖的服务要先发布；
+- 返回一个发布顺序（拓扑排序）。有多个服务可以同时发布时，按名字字典序选择，保证结果确定；
+- 存在循环依赖时返回错误。
+
+提示：Kahn 算法——统计每个服务还有多少依赖没发布，依赖数为 0 的可以发布。
+--- solution
+package main
+
+import (
+	"errors"
+	"slices"
+)
+
+func DeployOrder(deps map[string][]string) ([]string, error) {
+	// @solution
+	pending := map[string]int{}       // 还没发布的依赖数
+	dependents := map[string][]string{} // 被谁依赖
+	for svc, ds := range deps {
+		if _, ok := pending[svc]; !ok {
+			pending[svc] = 0
+		}
+		for _, d := range ds {
+			pending[svc]++
+			dependents[d] = append(dependents[d], svc)
+			if _, ok := pending[d]; !ok {
+				pending[d] = 0
+			}
+		}
+	}
+	var ready, order []string
+	for svc, n := range pending {
+		if n == 0 {
+			ready = append(ready, svc)
+		}
+	}
+	for len(ready) > 0 {
+		slices.Sort(ready)
+		svc := ready[0]
+		ready = ready[1:]
+		order = append(order, svc)
+		for _, d := range dependents[svc] {
+			pending[d]--
+			if pending[d] == 0 {
+				ready = append(ready, d)
+			}
+		}
+	}
+	if len(order) != len(pending) {
+		return nil, errors.New("cyclic dependency")
+	}
+	return order, nil
+	// @starter
+	// return nil, errors.New("TODO")
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestDeployOrder(t *testing.T) {
+	deps := map[string][]string{
+		"gateway": {"order", "user"},
+		"order":   {"user", "stock"},
+		"stock":   {},
+		"user":    {"config"},
+	}
+	got, err := DeployOrder(deps)
+	want := []string{"config", "stock", "user", "order", "gateway"}
+	if err != nil || !slices.Equal(got, want) {
+		t.Fatalf("DeployOrder = %v, %v\n期望 %v", got, err, want)
+	}
+}
+
+func TestCycle(t *testing.T) {
+	deps := map[string][]string{"a": {"b"}, "b": {"c"}, "c": {"a"}, "d": {}}
+	if _, err := DeployOrder(deps); err == nil {
+		t.Fatal("循环依赖应返回错误")
+	}
+}
+
+=== arch-02-1
+title: Quorum 读写：W + R > N
+--- desc
+N 个副本，写入至少 W 个成功才算成功，读取至少读 R 个副本、取版本号最大的值。当 `W + R > N` 时，读写集合必然有交集，能读到最新写入。
+
+- `Overlaps(n, w, r)`：是否满足 `W + R > N`；
+- `Write(rs, w, version, value)`：写入所有**存活**的副本；存活数少于 w 时返回 `ErrNoQuorum`（简化：已写入的不回滚）；
+- `Read(rs, r)`：按顺序从**存活**的副本中读取前 r 个，返回其中版本最大的值；存活数不足 r 返回 `ErrNoQuorum`。
+--- solution
+package main
+
+import "errors"
+
+var ErrNoQuorum = errors.New("not enough replicas")
+
+type Replica struct {
+	Alive   bool
+	Version int
+	Value   string
+}
+
+func Overlaps(n, w, r int) bool {
+	// @solution
+	return w+r > n
+	// @starter
+	// return false // TODO
+	// @end
+}
+
+func Write(rs []*Replica, w int, version int, value string) error {
+	// @solution
+	ok := 0
+	for _, r := range rs {
+		if r.Alive {
+			r.Version, r.Value = version, value
+			ok++
+		}
+	}
+	if ok < w {
+		return ErrNoQuorum
+	}
+	return nil
+	// @starter
+	// return ErrNoQuorum // TODO
+	// @end
+}
+
+func Read(rs []*Replica, r int) (string, error) {
+	// @solution
+	var best *Replica
+	read := 0
+	for _, rep := range rs {
+		if read == r {
+			break
+		}
+		if !rep.Alive {
+			continue
+		}
+		read++
+		if best == nil || rep.Version > best.Version {
+			best = rep
+		}
+	}
+	if read < r {
+		return "", ErrNoQuorum
+	}
+	return best.Value, nil
+	// @starter
+	// return "", ErrNoQuorum // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"errors"
+	"testing"
+)
+
+func TestQuorum(t *testing.T) {
+	if !Overlaps(3, 2, 2) || Overlaps(3, 1, 2) || !Overlaps(5, 3, 3) {
+		t.Fatal("Overlaps 判断不对")
+	}
+	rs := []*Replica{{Alive: true}, {Alive: true}, {Alive: true}}
+	if err := Write(rs, 2, 1, "v1"); err != nil {
+		t.Fatal(err)
+	}
+	rs[0].Alive = false
+	if err := Write(rs, 2, 2, "v2"); err != nil {
+		t.Fatalf("2 个副本存活时 W=2 应成功：%v", err)
+	}
+	rs[0].Alive = true // 副本 0 恢复，但数据还是 v1
+	rs[2].Alive = false
+	if v, err := Read(rs, 2); err != nil || v != "v2" {
+		t.Fatalf("R=2 应读到最新的 v2，实际 %q, %v", v, err)
+	}
+	if v, _ := Read(rs, 1); v != "v1" {
+		t.Fatalf("W+R<=N 时可能读到旧数据：R=1 读到 %q，期望 v1", v)
+	}
+	rs[1].Alive = false
+	if _, err := Read(rs, 2); !errors.Is(err, ErrNoQuorum) {
+		t.Fatal("存活副本不足时应返回 ErrNoQuorum")
+	}
+	if err := Write(rs, 2, 3, "v3"); !errors.Is(err, ErrNoQuorum) {
+		t.Fatal("存活副本不足时写入应失败")
+	}
+}
+
+=== arch-03-1
+title: 基于心跳 TTL 的服务注册中心
+--- desc
+实现一个简化的注册中心：服务实例定期发送心跳，超过 TTL 没有心跳的实例自动下线。
+
+- `Register(service, addr)`：注册或续约（心跳也调用它）；
+- `Deregister(service, addr)`：优雅下线时主动注销；
+- `Instances(service)`：返回 TTL 内有心跳的实例地址（升序），并顺便清理过期实例。
+
+时间通过注入的 `now` 获取。
+--- solution
+package main
+
+import (
+	"slices"
+	"time"
+)
+
+type Registry struct {
+	now       func() time.Time
+	ttl       time.Duration
+	instances map[string]map[string]time.Time
+}
+
+func NewRegistry(now func() time.Time, ttl time.Duration) *Registry {
+	return &Registry{now: now, ttl: ttl, instances: map[string]map[string]time.Time{}}
+}
+
+func (r *Registry) Register(service, addr string) {
+	// @solution
+	m, ok := r.instances[service]
+	if !ok {
+		m = map[string]time.Time{}
+		r.instances[service] = m
+	}
+	m[addr] = r.now()
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (r *Registry) Deregister(service, addr string) {
+	// @solution
+	delete(r.instances[service], addr)
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (r *Registry) Instances(service string) []string {
+	// @solution
+	var out []string
+	now := r.now()
+	for addr, last := range r.instances[service] {
+		if now.Sub(last) > r.ttl {
+			delete(r.instances[service], addr)
+			continue
+		}
+		out = append(out, addr)
+	}
+	slices.Sort(out)
+	return out
+	// @starter
+	// return nil // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+	"time"
+)
+
+func TestRegistry(t *testing.T) {
+	now := time.Unix(0, 0)
+	r := NewRegistry(func() time.Time { return now }, 10*time.Second)
+	r.Register("order", "10.0.0.2:9000")
+	r.Register("order", "10.0.0.1:9000")
+	r.Register("user", "10.0.1.1:9000")
+	if got := r.Instances("order"); !slices.Equal(got, []string{"10.0.0.1:9000", "10.0.0.2:9000"}) {
+		t.Fatalf("Instances = %v", got)
+	}
+	now = now.Add(8 * time.Second)
+	r.Register("order", "10.0.0.1:9000") // 心跳
+	now = now.Add(5 * time.Second)
+	if got := r.Instances("order"); !slices.Equal(got, []string{"10.0.0.1:9000"}) {
+		t.Fatalf("没有心跳的实例应下线：%v", got)
+	}
+	r.Deregister("order", "10.0.0.1:9000")
+	if got := r.Instances("order"); len(got) != 0 {
+		t.Fatalf("注销后应为空：%v", got)
+	}
+	if got := r.Instances("unknown"); len(got) != 0 {
+		t.Fatal("不存在的服务返回空")
+	}
+}
+
+=== arch-04-1
+title: 平滑加权轮询（Nginx 算法）
+--- desc
+普通加权轮询在权重 `a:5, b:1, c:1` 时会产生 `a a a a a b c`，a 会在短时间内集中收到大量请求。Nginx 的**平滑加权轮询**能把它们打散：
+
+每次选择时：
+
+1. 每个节点的 `current += weight`；
+2. 选出 `current` 最大的节点（相同时选靠前的）；
+3. 被选中节点的 `current -= 所有权重之和`。
+
+权重 `a:5, b:1, c:1` 时，前 7 次的结果是 `a a b a c a a`。
+--- solution
+package main
+
+type node struct {
+	name    string
+	weight  int
+	current int
+}
+
+type SWRR struct {
+	nodes []*node
+}
+
+func (s *SWRR) Add(name string, weight int) {
+	s.nodes = append(s.nodes, &node{name: name, weight: weight})
+}
+
+func (s *SWRR) Next() string {
+	// @solution
+	total := 0
+	var best *node
+	for _, n := range s.nodes {
+		n.current += n.weight
+		total += n.weight
+		if best == nil || n.current > best.current {
+			best = n
+		}
+	}
+	if best == nil {
+		return ""
+	}
+	best.current -= total
+	return best.name
+	// @starter
+	// return "" // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestSWRR(t *testing.T) {
+	var s SWRR
+	s.Add("a", 5)
+	s.Add("b", 1)
+	s.Add("c", 1)
+	var got []string
+	for i := 0; i < 14; i++ {
+		got = append(got, s.Next())
+	}
+	want := []string{"a", "a", "b", "a", "c", "a", "a", "a", "a", "b", "a", "c", "a", "a"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got  %v\nwant %v", got, want)
+	}
+}
+
+func TestEqualWeights(t *testing.T) {
+	var s SWRR
+	s.Add("x", 1)
+	s.Add("y", 1)
+	if a, b, c := s.Next(), s.Next(), s.Next(); a != "x" || b != "y" || c != "x" {
+		t.Fatalf("权重相同时应轮流：%s %s %s", a, b, c)
+	}
+	var empty SWRR
+	if empty.Next() != "" {
+		t.Fatal("没有节点时返回空字符串")
+	}
+}
+
+=== arch-04-2
+title: P2C：随机选两个，挑负载低的
+--- desc
+P2C（Power of Two Choices）：随机选出两个**不同**的节点，选择在途请求数（`Inflight`）更少的那个，相同时选第一个。实现简单，效果接近「全局最少连接」，又不需要扫描所有节点。
+
+`PickP2C(nodes, randIntn)`：随机数通过 `randIntn(n)`（返回 `[0, n)`）注入。只有一个节点时直接返回它。
+--- solution
+package main
+
+type Node struct {
+	Name     string
+	Inflight int
+}
+
+func PickP2C(nodes []*Node, randIntn func(int) int) *Node {
+	// @solution
+	if len(nodes) == 1 {
+		return nodes[0]
+	}
+	i := randIntn(len(nodes))
+	j := randIntn(len(nodes) - 1)
+	if j >= i {
+		j++ // 保证 j != i
+	}
+	a, b := nodes[i], nodes[j]
+	if b.Inflight < a.Inflight {
+		return b
+	}
+	return a
+	// @starter
+	// return nodes[randIntn(len(nodes))] // TODO: 纯随机
+	// @end
+}
+--- test
+package main
+
+import (
+	"math/rand/v2"
+	"testing"
+)
+
+func TestDistinctAndLess(t *testing.T) {
+	nodes := []*Node{{"a", 5}, {"b", 1}, {"c", 3}}
+	seq := []int{0, 0} // i=0, j=0 → 应映射成 1
+	k := 0
+	pick := PickP2C(nodes, func(n int) int { v := seq[k]; k++; return v })
+	if pick.Name != "b" {
+		t.Fatalf("应在两个不同节点中选在途请求少的，得到 %s", pick.Name)
+	}
+	if PickP2C(nodes[:1], nil).Name != "a" {
+		t.Fatal("只有一个节点时直接返回")
+	}
+}
+
+func TestAvoidsHotNode(t *testing.T) {
+	nodes := []*Node{{"hot", 100}, {"n1", 1}, {"n2", 2}, {"n3", 1}, {"n4", 3}}
+	r := rand.New(rand.NewPCG(1, 2))
+	hot := 0
+	for i := 0; i < 10000; i++ {
+		if PickP2C(nodes, r.IntN).Name == "hot" {
+			hot++
+		}
+	}
+	if hot != 0 {
+		t.Fatalf("负载最高的节点被选中了 %d 次（它永远不会比另一个候选更空闲）", hot)
+	}
+}
+
+=== arch-05-1
+title: 超时降级：返回兜底数据
+--- desc
+降级是在下游故障时主动返回兜底数据，保证核心功能可用。实现 `WithFallback(ctx, timeout, primary, fallback)`：
+
+- 调用 `primary`，在 `timeout` 内成功就返回它的结果，`degraded = false`；
+- 超时或出错时返回 `fallback()` 的结果，`degraded = true`；
+- **即使 `primary` 不响应 ctx（卡住不返回）**，也必须在超时后立即返回——所以要在单独的 goroutine 里调用它，用 `select` 等待；
+- 返回前取消传给 `primary` 的 ctx，结果 channel 要有缓冲，避免 goroutine 泄漏。
+--- solution
+package main
+
+import (
+	"context"
+	"time"
+)
+
+func WithFallback(ctx context.Context, timeout time.Duration,
+	primary func(ctx context.Context) (string, error), fallback func() string) (string, bool) {
+	// @solution
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	type result struct {
+		v   string
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		v, err := primary(ctx)
+		ch <- result{v, err}
+	}()
+	select {
+	case r := <-ch:
+		if r.err == nil {
+			return r.v, false
+		}
+	case <-ctx.Done():
+	}
+	return fallback(), true
+	// @starter
+	// v, err := primary(ctx) // TODO: primary 卡住时会一直等
+	// if err != nil {
+	// 	return fallback(), true
+	// }
+	// return v, false
+	// @end
+}
+--- test
+package main
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
+
+func fb() string { return "热门推荐（缓存）" }
+
+func TestPrimaryOK(t *testing.T) {
+	v, degraded := WithFallback(context.Background(), time.Second,
+		func(ctx context.Context) (string, error) { return "个性化推荐", nil }, fb)
+	if v != "个性化推荐" || degraded {
+		t.Fatalf("got %q degraded=%v", v, degraded)
+	}
+}
+
+func TestPrimaryError(t *testing.T) {
+	v, degraded := WithFallback(context.Background(), time.Second,
+		func(ctx context.Context) (string, error) { return "", errors.New("503") }, fb)
+	if v != fb() || !degraded {
+		t.Fatalf("出错时应降级：%q %v", v, degraded)
+	}
+}
+
+func TestPrimaryHangs(t *testing.T) {
+	var seen context.Context
+	start := time.Now()
+	v, degraded := WithFallback(context.Background(), 30*time.Millisecond,
+		func(ctx context.Context) (string, error) {
+			seen = ctx
+			time.Sleep(500 * time.Millisecond) // 完全不理会 ctx
+			return "too late", nil
+		}, fb)
+	if v != fb() || !degraded {
+		t.Fatalf("超时应降级：%q %v", v, degraded)
+	}
+	if d := time.Since(start); d > 200*time.Millisecond {
+		t.Fatalf("耗时 %v，应在超时后立即返回", d)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if seen == nil || seen.Err() == nil {
+		t.Fatal("返回前应取消传给 primary 的 ctx")
+	}
+}
+
+=== arch-06-1
+title: Saga：失败时逆序补偿
+--- desc
+Saga 把分布式事务拆成一系列本地事务，每一步都有对应的**补偿操作**。实现编排式 Saga `RunSaga(steps)`：
+
+1. 依次执行每一步的 `Action`；
+2. 某一步失败时，**按相反顺序**对已经成功的步骤执行 `Compensate`；
+3. 返回的错误用 `fmt.Errorf("step %s: %w", name, err)` 包装原始错误；
+4. 补偿本身也可能失败：继续补偿其余步骤，并用 `errors.Join` 把补偿错误也合并进返回值（真实系统中这些需要重试或人工介入）。
+--- solution
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+type Step struct {
+	Name       string
+	Action     func() error
+	Compensate func() error
+}
+
+func RunSaga(steps []Step) error {
+	// @solution
+	for i, s := range steps {
+		if err := s.Action(); err != nil {
+			errs := []error{fmt.Errorf("step %s: %w", s.Name, err)}
+			for j := i - 1; j >= 0; j-- {
+				if cerr := steps[j].Compensate(); cerr != nil {
+					errs = append(errs, fmt.Errorf("compensate %s: %w", steps[j].Name, cerr))
+				}
+			}
+			return errors.Join(errs...)
+		}
+	}
+	return nil
+	// @starter
+	// for _, s := range steps {
+	// 	if err := s.Action(); err != nil {
+	// 		return fmt.Errorf("step %s: %w", s.Name, err) // TODO: 没有补偿
+	// 	}
+	// }
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"errors"
+	"slices"
+	"testing"
+)
+
+func TestSaga(t *testing.T) {
+	var log []string
+	mk := func(name string, fail error, compFail error) Step {
+		return Step{
+			Name:       name,
+			Action:     func() error { log = append(log, "do "+name); return fail },
+			Compensate: func() error { log = append(log, "undo "+name); return compFail },
+		}
+	}
+	errPay := errors.New("余额不足")
+	err := RunSaga([]Step{mk("order", nil, nil), mk("stock", nil, nil), mk("pay", errPay, nil), mk("ship", nil, nil)})
+	want := []string{"do order", "do stock", "do pay", "undo stock", "undo order"}
+	if !slices.Equal(log, want) {
+		t.Fatalf("执行顺序 = %v\n期望 %v", log, want)
+	}
+	if !errors.Is(err, errPay) || err.Error() != "step pay: 余额不足" {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestCompensateFailure(t *testing.T) {
+	errStock := errors.New("库存服务不可用")
+	steps := []Step{
+		{"order", func() error { return nil }, func() error { return nil }},
+		{"stock", func() error { return nil }, func() error { return errStock }},
+		{"pay", func() error { return errors.New("boom") }, func() error { return nil }},
+	}
+	err := RunSaga(steps)
+	if !errors.Is(err, errStock) {
+		t.Fatalf("补偿失败的错误也应包含在返回值中：%v", err)
+	}
+	if RunSaga(steps[:2]) != nil {
+		t.Fatal("全部成功时返回 nil")
+	}
+}
+
+=== arch-06-2
+title: 本地消息表（Outbox）投递
+--- desc
+本地消息表：业务数据和待发送的消息在**同一个本地事务**里写入，再由后台任务把消息投递到 MQ。投递可能失败，所以要能重试，下游需要幂等。
+
+实现 `Outbox.Relay(publish)`：按 ID 顺序投递所有未发送的消息：
+
+- `publish` 成功才标记 `Sent = true`；
+- 失败的消息 `Attempts++`，保留到下次再试；
+- 返回本次成功投递的数量。
+--- solution
+package main
+
+type Message struct {
+	ID       int
+	Payload  string
+	Sent     bool
+	Attempts int
+}
+
+type Outbox struct {
+	Msgs []*Message // 按 ID 升序
+}
+
+func (o *Outbox) Relay(publish func(Message) error) int {
+	// @solution
+	n := 0
+	for _, m := range o.Msgs {
+		if m.Sent {
+			continue
+		}
+		if err := publish(*m); err != nil {
+			m.Attempts++
+			continue
+		}
+		m.Sent = true
+		n++
+	}
+	return n
+	// @starter
+	// for _, m := range o.Msgs {
+	// 	m.Sent = true // TODO: 先标记再发送，发送失败消息就丢了
+	// 	publish(*m)
+	// }
+	// return len(o.Msgs)
+	// @end
+}
+--- test
+package main
+
+import (
+	"errors"
+	"slices"
+	"testing"
+)
+
+func TestRelay(t *testing.T) {
+	o := &Outbox{Msgs: []*Message{{ID: 1, Payload: "a"}, {ID: 2, Payload: "b"}, {ID: 3, Payload: "c"}}}
+	var delivered []int
+	mqDown := true
+	publish := func(m Message) error {
+		if m.ID == 2 && mqDown {
+			return errors.New("broker unavailable")
+		}
+		delivered = append(delivered, m.ID)
+		return nil
+	}
+	if n := o.Relay(publish); n != 2 {
+		t.Fatalf("第一次投递成功 %d 条，期望 2", n)
+	}
+	if o.Msgs[1].Sent || o.Msgs[1].Attempts != 1 {
+		t.Fatalf("失败的消息应保留并记录尝试次数：%+v", *o.Msgs[1])
+	}
+	mqDown = false
+	if n := o.Relay(publish); n != 1 {
+		t.Fatalf("第二次只需要投递剩下的 1 条，实际 %d", n)
+	}
+	if !slices.Equal(delivered, []int{1, 3, 2}) {
+		t.Fatalf("投递记录 = %v", delivered)
+	}
+	if n := o.Relay(publish); n != 0 {
+		t.Fatal("已发送的消息不应重复投递")
+	}
+}
+
+=== arch-07-1
+title: 实现雪花算法
+race: true
+--- desc
+雪花 ID（64 位）：1 位符号 + 41 位毫秒时间戳（相对自定义纪元）+ 10 位机器 ID + 12 位序列号。实现 `Snowflake.Next()`（并发安全）：
+
+1. 取当前毫秒 `ts`；
+2. `ts` 小于上次的时间戳（时钟回拨）：回拨不超过 5ms 就**等待**（反复调用 `now()` 直到追上），超过 5ms 返回 `ErrClockBackwards`；
+3. 和上次在同一毫秒：序列号加一；序列号用完（超过 4095）时等待到下一毫秒；
+4. 进入新的毫秒：序列号归零；
+5. `id = (ts - epoch) << 22 | worker << 12 | seq`。
+
+`Decompose(id)` 反向解析出毫秒时间戳、机器 ID 和序列号。时间通过注入的 `now`（毫秒）获取。
+--- solution
+package main
+
+import (
+	"errors"
+	"sync"
+)
+
+const (
+	epoch       int64 = 1704067200000 // 2024-01-01 00:00:00 UTC
+	workerBits        = 10
+	seqBits           = 12
+	maxSeq            = 1<<seqBits - 1
+	maxBackward       = 5
+)
+
+var ErrClockBackwards = errors.New("clock moved backwards")
+
+type Snowflake struct {
+	mu     sync.Mutex
+	now    func() int64
+	worker int64
+	lastMs int64
+	seq    int64
+}
+
+func New(worker int64, now func() int64) (*Snowflake, error) {
+	if worker < 0 || worker >= 1<<workerBits {
+		return nil, errors.New("worker id out of range")
+	}
+	return &Snowflake{now: now, worker: worker}, nil
+}
+
+func (s *Snowflake) Next() (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// @solution
+	ts := s.now()
+	if ts < s.lastMs {
+		if s.lastMs-ts > maxBackward {
+			return 0, ErrClockBackwards
+		}
+		for ts < s.lastMs {
+			ts = s.now()
+		}
+	}
+	if ts == s.lastMs {
+		s.seq++
+		if s.seq > maxSeq {
+			for ts <= s.lastMs {
+				ts = s.now()
+			}
+			s.seq = 0
+		}
+	} else {
+		s.seq = 0
+	}
+	s.lastMs = ts
+	return (ts-epoch)<<(workerBits+seqBits) | s.worker<<seqBits | s.seq, nil
+	// @starter
+	// return 0, errors.New("TODO")
+	// @end
+}
+
+func Decompose(id int64) (ms, worker, seq int64) {
+	// @solution
+	return id>>(workerBits+seqBits) + epoch, id >> seqBits & (1<<workerBits - 1), id & maxSeq
+	// @starter
+	// return 0, 0, 0 // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"errors"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestUniqueAndIncreasing(t *testing.T) {
+	s, _ := New(7, func() int64 { return time.Now().UnixMilli() })
+	var mu sync.Mutex
+	seen := map[int64]bool{}
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var last int64
+			for i := 0; i < 5000; i++ {
+				id, err := s.Next()
+				if err != nil || id <= last {
+					t.Errorf("id=%d last=%d err=%v：同一个调用方拿到的 ID 应递增", id, last, err)
+					return
+				}
+				last = id
+				mu.Lock()
+				seen[id] = true
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if len(seen) != 20000 {
+		t.Fatalf("应生成 20000 个不重复的 ID，实际 %d 个", len(seen))
+	}
+}
+
+func TestLayout(t *testing.T) {
+	base := epoch + 1000
+	s, _ := New(513, func() int64 { return base })
+	s.Next()
+	id, _ := s.Next()
+	if id != 1000<<22|513<<12|1 {
+		t.Fatalf("id = %d，位布局不对", id)
+	}
+	if ms, w, seq := Decompose(id); ms != base || w != 513 || seq != 1 {
+		t.Fatalf("Decompose = %d %d %d", ms, w, seq)
+	}
+}
+
+func TestSequenceOverflow(t *testing.T) {
+	calls := int64(0)
+	base := epoch + 50
+	s, _ := New(1, func() int64 { calls++; return base + calls/5000 })
+	var id int64
+	for i := 0; i < 4097; i++ {
+		id, _ = s.Next()
+	}
+	if ms, _, seq := Decompose(id); ms != base+1 || seq != 0 {
+		t.Fatalf("同一毫秒序列号用完后应等到下一毫秒：ms=%d seq=%d", ms-base, seq)
+	}
+}
+
+func TestClockBackwards(t *testing.T) {
+	vals := []int64{1000, 998, 999, 1000, 1001, 900}
+	i := 0
+	s, _ := New(1, func() int64 { v := vals[min(i, len(vals)-1)]; i++; return epoch + v })
+	first, _ := s.Next()
+	second, err := s.Next() // 回拨 2ms：等待追上
+	if err != nil || second <= first {
+		t.Fatalf("小幅回拨应等待：err=%v", err)
+	}
+	s.Next()
+	if _, err := s.Next(); !errors.Is(err, ErrClockBackwards) {
+		t.Fatalf("回拨 100ms 应返回 ErrClockBackwards，实际 %v", err)
+	}
+	if _, err := New(1024, nil); err == nil {
+		t.Fatal("机器 ID 超出 10 位应返回错误")
+	}
+}
+
+=== arch-08-1
+title: 计算系统可用性
+--- desc
+- `Series(a...)`：串联依赖（全部可用系统才可用）的可用性 = 各部分相乘。依赖越多，整体可用性越低；
+- `Parallel(a...)`：冗余部署（任一可用即可用）的可用性 = `1 − ∏(1 − aᵢ)`；
+- `Downtime(a)`：按一年 365 天计算，每年允许的不可用时间。
+
+比如两个 99% 的实例做冗余就能达到 99.99%；而一个请求串行依赖 5 个 99.9% 的服务，整体只有约 99.5%。
+--- solution
+package main
+
+import "time"
+
+func Series(avail ...float64) float64 {
+	// @solution
+	p := 1.0
+	for _, a := range avail {
+		p *= a
+	}
+	return p
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+
+func Parallel(avail ...float64) float64 {
+	// @solution
+	fail := 1.0
+	for _, a := range avail {
+		fail *= 1 - a
+	}
+	return 1 - fail
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+
+func Downtime(avail float64) time.Duration {
+	// @solution
+	year := 365 * 24 * time.Hour
+	return time.Duration((1 - avail) * float64(year))
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"math"
+	"testing"
+	"time"
+)
+
+func near(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
+
+func TestAvailability(t *testing.T) {
+	if !near(Series(0.999, 0.999), 0.998001) {
+		t.Errorf("Series = %v", Series(0.999, 0.999))
+	}
+	if s := Series(0.999, 0.999, 0.999, 0.999, 0.999); s > 0.996 || s < 0.995 {
+		t.Errorf("5 个 99.9%% 串联 = %v", s)
+	}
+	if !near(Parallel(0.99, 0.99), 0.9999) {
+		t.Errorf("Parallel = %v", Parallel(0.99, 0.99))
+	}
+	if !near(Series(Parallel(0.99, 0.99), 0.9999), 0.9999*0.9999) {
+		t.Error("组合计算不对")
+	}
+	d := Downtime(0.9999)
+	if d < 52*time.Minute || d > 53*time.Minute {
+		t.Errorf("99.99%% 每年停机 %v，期望约 52.6 分钟", d)
+	}
+}
+
+=== arch-09-1
+title: 多级缓存与失效广播
+--- desc
+每个服务实例有一份本地缓存（L1），所有实例共享 Redis（L2）。实现 `Node`：
+
+- `Get(key)`：依次查 L1 → L2 → 数据库，查到后**逐级回填**；
+- `Update(key, val)`：写数据库，删除 L2，再通过消息总线**广播**失效消息，所有实例（包括自己）收到后删除本地 L1。
+
+没有广播的话，其他实例的本地缓存会一直是旧值。`Bus` 已经实现，`Publish` 会同步调用所有订阅者。
+--- solution
+package main
+
+import "sync"
+
+type Store struct {
+	mu    sync.Mutex
+	data  map[string]string
+	Reads int
+}
+
+func NewStore() *Store { return &Store{data: map[string]string{}} }
+
+func (s *Store) Get(k string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Reads++
+	v, ok := s.data[k]
+	return v, ok
+}
+func (s *Store) Set(k, v string) { s.mu.Lock(); s.data[k] = v; s.mu.Unlock() }
+func (s *Store) Del(k string)    { s.mu.Lock(); delete(s.data, k); s.mu.Unlock() }
+
+type Bus struct {
+	mu   sync.Mutex
+	subs []func(key string)
+}
+
+func (b *Bus) Subscribe(fn func(key string)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.subs = append(b.subs, fn)
+}
+
+func (b *Bus) Publish(key string) {
+	b.mu.Lock()
+	subs := append([]func(string){}, b.subs...)
+	b.mu.Unlock()
+	for _, fn := range subs {
+		fn(key)
+	}
+}
+
+type Node struct {
+	l1  *Store
+	l2  *Store
+	db  *Store
+	bus *Bus
+}
+
+func NewNode(l2, db *Store, bus *Bus) *Node {
+	n := &Node{l1: NewStore(), l2: l2, db: db, bus: bus}
+	// @solution
+	bus.Subscribe(func(key string) { n.l1.Del(key) })
+	// @starter
+	// // TODO: 订阅失效消息
+	// @end
+	return n
+}
+
+func (n *Node) Get(key string) (string, bool) {
+	// @solution
+	if v, ok := n.l1.Get(key); ok {
+		return v, true
+	}
+	if v, ok := n.l2.Get(key); ok {
+		n.l1.Set(key, v)
+		return v, true
+	}
+	v, ok := n.db.Get(key)
+	if ok {
+		n.l2.Set(key, v)
+		n.l1.Set(key, v)
+	}
+	return v, ok
+	// @starter
+	// return n.db.Get(key) // TODO
+	// @end
+}
+
+func (n *Node) Update(key, val string) {
+	// @solution
+	n.db.Set(key, val)
+	n.l2.Del(key)
+	n.bus.Publish(key)
+	// @starter
+	// n.db.Set(key, val) // TODO: 缓存没有失效
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestMultiLevel(t *testing.T) {
+	l2, db, bus := NewStore(), NewStore(), &Bus{}
+	db.Set("price:1", "100")
+	a := NewNode(l2, db, bus)
+	b := NewNode(l2, db, bus)
+
+	if v, _ := a.Get("price:1"); v != "100" {
+		t.Fatalf("a.Get = %q", v)
+	}
+	if v, _ := b.Get("price:1"); v != "100" {
+		t.Fatalf("b.Get = %q", v)
+	}
+	if db.Reads != 1 {
+		t.Fatalf("b 应该命中 L2，数据库被读了 %d 次", db.Reads)
+	}
+	before := l2.Reads
+	a.Get("price:1")
+	b.Get("price:1")
+	if l2.Reads != before {
+		t.Fatal("再次读取应命中 L1，不访问 L2")
+	}
+
+	a.Update("price:1", "80")
+	if v, _ := b.Get("price:1"); v != "80" {
+		t.Fatalf("a 更新后 b 读到 %q，本地缓存没有失效", v)
+	}
+	if v, _ := a.Get("price:1"); v != "80" {
+		t.Fatalf("a 读到 %q", v)
+	}
+}
+
+=== arch-10-1
+title: 直方图与分位数估算
+--- desc
+Prometheus 的 Histogram 只记录每个桶的计数，分位数是查询时用 `histogram_quantile` 估算出来的。实现：
+
+- `Observe(v)`：v 落入第一个满足 `v <= Bounds[i]` 的桶，都不满足则落入最后的 `+Inf` 桶；
+- `Quantile(q)`：和 `histogram_quantile` 一样：
+  1. `rank = q × 总数`；
+  2. 找到累计计数第一次 `>= rank` 的桶；
+  3. 在这个桶的上下界之间**线性插值**：`下界 + (上界 − 下界) × (rank − 前面桶的累计数) / 本桶计数`。第一个桶的下界取 0；
+  4. 落在 `+Inf` 桶时返回最大的有限上界；没有数据返回 `NaN`。
+
+注意估算值依赖桶的划分——桶太粗，p99 可能偏差很大。
+--- solution
+package main
+
+import "math"
+
+type Histogram struct {
+	Bounds []float64
+	Counts []uint64 // len(Bounds)+1，最后一个是 +Inf 桶
+	Total  uint64
+}
+
+func NewHistogram(bounds []float64) *Histogram {
+	return &Histogram{Bounds: bounds, Counts: make([]uint64, len(bounds)+1)}
+}
+
+func (h *Histogram) Observe(v float64) {
+	// @solution
+	i := 0
+	for i < len(h.Bounds) && v > h.Bounds[i] {
+		i++
+	}
+	h.Counts[i]++
+	h.Total++
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (h *Histogram) Quantile(q float64) float64 {
+	// @solution
+	if h.Total == 0 {
+		return math.NaN()
+	}
+	rank := q * float64(h.Total)
+	var cum uint64
+	for i, c := range h.Counts {
+		prev := cum
+		cum += c
+		if float64(cum) < rank || c == 0 {
+			continue
+		}
+		if i == len(h.Bounds) {
+			return h.Bounds[len(h.Bounds)-1]
+		}
+		lower := 0.0
+		if i > 0 {
+			lower = h.Bounds[i-1]
+		}
+		return lower + (h.Bounds[i]-lower)*(rank-float64(prev))/float64(c)
+	}
+	return h.Bounds[len(h.Bounds)-1]
+	// @starter
+	// return math.NaN() // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"math"
+	"testing"
+)
+
+func TestQuantile(t *testing.T) {
+	h := NewHistogram([]float64{0.1, 0.25, 0.5, 1})
+	if !math.IsNaN(h.Quantile(0.5)) {
+		t.Fatal("没有数据时返回 NaN")
+	}
+	for i := 0; i < 50; i++ {
+		h.Observe(0.05)
+	}
+	for i := 0; i < 30; i++ {
+		h.Observe(0.2)
+	}
+	for i := 0; i < 15; i++ {
+		h.Observe(0.4)
+	}
+	for i := 0; i < 5; i++ {
+		h.Observe(0.8)
+	}
+	cases := map[float64]float64{0.5: 0.1, 0.9: 0.25 + 0.25*10.0/15.0, 0.99: 0.9, 0.25: 0.05}
+	for q, want := range cases {
+		if got := h.Quantile(q); math.Abs(got-want) > 1e-9 {
+			t.Errorf("Quantile(%v) = %v，期望 %v", q, got, want)
+		}
+	}
+	h.Observe(5) // 落入 +Inf 桶
+	if got := h.Quantile(0.999); got != 1 {
+		t.Errorf("落在 +Inf 桶时返回最大有限上界，实际 %v", got)
+	}
+	if h.Counts[4] != 1 || h.Total != 101 {
+		t.Fatalf("Counts = %v", h.Counts)
+	}
+}
+
+=== arch-11-1
+title: Raft：处理投票请求
+--- desc
+实现 Raft 节点处理 `RequestVote` 的规则：
+
+1. 请求的任期小于自己的当前任期 → 拒绝；
+2. 请求的任期更大 → 更新自己的任期，清空投票记录（`VotedFor = -1`，变回 Follower）；
+3. 本任期还没投票（或者已经投给了这个候选者），**并且**候选者的日志至少和自己一样新 → 投票，记录 `VotedFor`；
+4. 「日志更新」的判断：先比较最后一条日志的任期，任期大的更新；任期相同则日志更长的更新。没有日志时，最后的任期和下标都视为 0；
+5. 响应中的 `Term` 是处理后自己的当前任期。
+
+第 4 条保证当选的 Leader 一定包含所有已提交的日志。
+--- solution
+package main
+
+type Node struct {
+	CurrentTerm int
+	VotedFor    int   // -1 表示本任期还没投票
+	LogTerms    []int // 每条日志的任期，下标从 1 开始对应 LogTerms[0]
+}
+
+type VoteReq struct {
+	Term         int
+	CandidateID  int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+type VoteResp struct {
+	Term    int
+	Granted bool
+}
+
+func (n *Node) HandleRequestVote(req VoteReq) VoteResp {
+	// @solution
+	if req.Term < n.CurrentTerm {
+		return VoteResp{n.CurrentTerm, false}
+	}
+	if req.Term > n.CurrentTerm {
+		n.CurrentTerm = req.Term
+		n.VotedFor = -1
+	}
+	lastIndex, lastTerm := len(n.LogTerms), 0
+	if lastIndex > 0 {
+		lastTerm = n.LogTerms[lastIndex-1]
+	}
+	upToDate := req.LastLogTerm > lastTerm || (req.LastLogTerm == lastTerm && req.LastLogIndex >= lastIndex)
+	if (n.VotedFor == -1 || n.VotedFor == req.CandidateID) && upToDate {
+		n.VotedFor = req.CandidateID
+		return VoteResp{n.CurrentTerm, true}
+	}
+	return VoteResp{n.CurrentTerm, false}
+	// @starter
+	// return VoteResp{n.CurrentTerm, false} // TODO
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestVoteRules(t *testing.T) {
+	n := &Node{CurrentTerm: 3, VotedFor: -1, LogTerms: []int{1, 1, 3}}
+	if r := n.HandleRequestVote(VoteReq{Term: 2, CandidateID: 5, LastLogIndex: 9, LastLogTerm: 3}); r.Granted || r.Term != 3 {
+		t.Fatalf("过期任期的请求应被拒绝：%+v", r)
+	}
+	if r := n.HandleRequestVote(VoteReq{Term: 4, CandidateID: 2, LastLogIndex: 5, LastLogTerm: 2}); r.Granted {
+		t.Fatal("候选者最后日志任期 2 < 3，日志更旧，不应投票")
+	}
+	if n.CurrentTerm != 4 || n.VotedFor != -1 {
+		t.Fatalf("看到更大的任期应更新任期并清空投票：term=%d votedFor=%d", n.CurrentTerm, n.VotedFor)
+	}
+	if r := n.HandleRequestVote(VoteReq{Term: 4, CandidateID: 7, LastLogIndex: 2, LastLogTerm: 3}); r.Granted {
+		t.Fatal("任期相同但日志更短，不应投票")
+	}
+	if r := n.HandleRequestVote(VoteReq{Term: 4, CandidateID: 7, LastLogIndex: 3, LastLogTerm: 3}); !r.Granted || n.VotedFor != 7 {
+		t.Fatal("日志一样新，应投票")
+	}
+	if r := n.HandleRequestVote(VoteReq{Term: 4, CandidateID: 8, LastLogIndex: 10, LastLogTerm: 4}); r.Granted {
+		t.Fatal("同一任期只能投一票")
+	}
+	if r := n.HandleRequestVote(VoteReq{Term: 4, CandidateID: 7, LastLogIndex: 3, LastLogTerm: 3}); !r.Granted {
+		t.Fatal("重复的请求（同一个候选者）应再次同意")
+	}
+}
+
+func TestEmptyLog(t *testing.T) {
+	n := &Node{CurrentTerm: 0, VotedFor: -1}
+	if r := n.HandleRequestVote(VoteReq{Term: 1, CandidateID: 1}); !r.Granted || r.Term != 1 {
+		t.Fatalf("空日志时应投票：%+v", r)
+	}
+}
+
+=== arch-11-2
+title: Raft：Leader 推进提交下标
+--- desc
+Leader 根据每个节点已复制的位置推进 `commitIndex`：找最大的 `N > commitIndex`，满足：
+
+1. **多数**节点的 `matchIndex >= N`（`matchIndex` 包含 Leader 自己）；
+2. `logTerms[N-1] == currentTerm`——Leader **只能通过计数提交当前任期的日志**，之前任期的日志随当前任期的日志一起间接提交。
+
+第 2 条来自 Raft 论文的 Figure 8：旧任期的日志即使已经复制到多数节点，也可能被新 Leader 覆盖，直接提交会出错。
+--- solution
+package main
+
+import "slices"
+
+func AdvanceCommit(matchIndex []int, logTerms []int, currentTerm, commitIndex int) int {
+	// @solution
+	sorted := slices.Clone(matchIndex)
+	slices.Sort(sorted)
+	// 升序排序后，下标 (n-1)/2 处的值，就是至少多数节点都已达到的最大日志下标
+	majority := sorted[(len(sorted)-1)/2]
+	for n := majority; n > commitIndex; n-- {
+		if logTerms[n-1] == currentTerm {
+			return n
+		}
+	}
+	return commitIndex
+	// @starter
+	// return commitIndex // TODO
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestAdvanceCommit(t *testing.T) {
+	cases := []struct {
+		name        string
+		match       []int
+		terms       []int
+		term, cur   int
+		want        int
+	}{
+		{"多数已复制", []int{5, 5, 3, 2, 5}, []int{1, 1, 2, 2, 2}, 2, 0, 5},
+		{"只有少数", []int{5, 2, 1}, []int{1, 1, 1, 1, 1}, 1, 0, 2},
+		{"偶数个节点", []int{4, 4, 3, 1}, []int{1, 1, 1, 1}, 1, 0, 3},
+		{"旧任期的日志不能靠计数提交", []int{3, 3, 3, 1, 1}, []int{1, 1, 2, 4}, 4, 1, 1},
+		{"当前任期的日志复制到多数后一起提交", []int{4, 4, 4, 1, 1}, []int{1, 1, 2, 4}, 4, 1, 4},
+		{"不能回退", []int{2, 2, 2}, []int{1, 1, 1}, 1, 3, 3},
+	}
+	for _, c := range cases {
+		if got := AdvanceCommit(c.match, c.terms, c.term, c.cur); got != c.want {
+			t.Errorf("%s：AdvanceCommit = %d，期望 %d", c.name, got, c.want)
+		}
+	}
+}
+
+=== arch-12-1
+title: 带虚拟节点的一致性哈希
+--- desc
+实现一致性哈希环 `Ring`：
+
+- `NewRing(replicas)`：每个物理节点对应 `replicas` 个虚拟节点；
+- `Add(nodes...)`：虚拟节点 `node#i`（i 从 0 到 replicas-1）的哈希为 `crc32.ChecksumIEEE`，排序后存入环；
+- `Remove(node)`：移除这个节点的所有虚拟节点；
+- `Get(key)`：对 key 求哈希，用二分查找找到**顺时针**第一个虚拟节点（哈希 ≥ key 的哈希），越过末尾就回到第一个。环为空返回空字符串。
+
+测试会验证：加入第 4 个节点时，只有约 1/4 的 key 迁移，并且迁移的 key 全部去了新节点。
+--- solution
+package main
+
+import (
+	"hash/crc32"
+	"slices"
+	"strconv"
+)
+
+type Ring struct {
+	replicas int
+	hashes   []uint32
+	owner    map[uint32]string
+}
+
+func NewRing(replicas int) *Ring {
+	return &Ring{replicas: replicas, owner: map[uint32]string{}}
+}
+
+func (r *Ring) Add(nodes ...string) {
+	// @solution
+	for _, n := range nodes {
+		for i := 0; i < r.replicas; i++ {
+			h := crc32.ChecksumIEEE([]byte(n + "#" + strconv.Itoa(i)))
+			if _, exists := r.owner[h]; !exists {
+				r.hashes = append(r.hashes, h)
+			}
+			r.owner[h] = n
+		}
+	}
+	slices.Sort(r.hashes)
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (r *Ring) Remove(node string) {
+	// @solution
+	r.hashes = slices.DeleteFunc(r.hashes, func(h uint32) bool {
+		if r.owner[h] == node {
+			delete(r.owner, h)
+			return true
+		}
+		return false
+	})
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (r *Ring) Get(key string) string {
+	// @solution
+	if len(r.hashes) == 0 {
+		return ""
+	}
+	h := crc32.ChecksumIEEE([]byte(key))
+	i, _ := slices.BinarySearch(r.hashes, h)
+	if i == len(r.hashes) {
+		i = 0
+	}
+	return r.owner[r.hashes[i]]
+	// @starter
+	// return "" // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"testing"
+)
+
+func keys(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("user:%d", i)
+	}
+	return out
+}
+
+func TestMinimalMovement(t *testing.T) {
+	r := NewRing(150)
+	r.Add("cache-a", "cache-b", "cache-c")
+	ks := keys(20000)
+	before := map[string]string{}
+	for _, k := range ks {
+		before[k] = r.Get(k)
+	}
+	r.Add("cache-d")
+	moved := 0
+	for _, k := range ks {
+		if after := r.Get(k); after != before[k] {
+			moved++
+			if after != "cache-d" {
+				t.Fatalf("%s 从 %s 迁移到了 %s，应该只迁移到新节点", k, before[k], after)
+			}
+		}
+	}
+	if ratio := float64(moved) / float64(len(ks)); ratio < 0.15 || ratio > 0.35 {
+		t.Fatalf("迁移比例 %.2f，期望约 0.25", ratio)
+	}
+}
+
+func TestBalance(t *testing.T) {
+	r := NewRing(150)
+	r.Add("n1", "n2", "n3", "n4")
+	count := map[string]int{}
+	for _, k := range keys(40000) {
+		count[r.Get(k)]++
+	}
+	for n, c := range count {
+		if c < 7000 || c > 13000 {
+			t.Errorf("%s 分到 %d 个 key，分布不均匀（期望约 10000）", n, c)
+		}
+	}
+}
+
+func TestRemove(t *testing.T) {
+	r := NewRing(100)
+	if r.Get("x") != "" {
+		t.Fatal("空环返回空字符串")
+	}
+	r.Add("a", "b")
+	r.Remove("a")
+	for _, k := range keys(1000) {
+		if r.Get(k) != "b" {
+			t.Fatal("移除 a 之后所有 key 都应落到 b")
+		}
+	}
+}
+
+=== arch-13-1
+title: 秒杀扣库存：不超卖、一人一单
+race: true
+--- desc
+实现秒杀的核心逻辑 `Seckill.Buy(user)`，必须在高并发下保证：
+
+- 每个用户最多买一件，重复购买返回 `ErrDuplicate`；
+- 库存不能超卖，卖完返回 `ErrSoldOut`；
+- 因为卖完而失败的用户，不应被记为已购买。
+
+用 `sync.Map.LoadOrStore` 做一人一单的判断，用 `atomic` 的 CAS 循环扣减库存（库存永远不会变成负数）。真实系统里这一步通常在 Redis 里用 Lua 脚本完成。
+--- solution
+package main
+
+import (
+	"errors"
+	"sync"
+	"sync/atomic"
+)
+
+var (
+	ErrSoldOut   = errors.New("sold out")
+	ErrDuplicate = errors.New("already purchased")
+)
+
+type Seckill struct {
+	stock  atomic.Int64
+	bought sync.Map
+}
+
+func NewSeckill(stock int64) *Seckill {
+	s := &Seckill{}
+	s.stock.Store(stock)
+	return s
+}
+
+func (s *Seckill) Remaining() int64 { return s.stock.Load() }
+
+func (s *Seckill) Buy(user string) error {
+	// @solution
+	if _, loaded := s.bought.LoadOrStore(user, true); loaded {
+		return ErrDuplicate
+	}
+	for {
+		cur := s.stock.Load()
+		if cur <= 0 {
+			s.bought.Delete(user)
+			return ErrSoldOut
+		}
+		if s.stock.CompareAndSwap(cur, cur-1) {
+			return nil
+		}
+	}
+	// @starter
+	// if s.stock.Load() <= 0 { // TODO: 检查和扣减不是原子的，也没有一人一单
+	// 	return ErrSoldOut
+	// }
+	// s.stock.Add(-1)
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+)
+
+func TestSeckill(t *testing.T) {
+	s := NewSeckill(100)
+	var success atomic.Int32
+	var mu sync.Mutex
+	winners := map[string]int{}
+	var wg sync.WaitGroup
+	for u := 0; u < 300; u++ {
+		for try := 0; try < 3; try++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				user := fmt.Sprint("user-", u)
+				if err := s.Buy(user); err == nil {
+					success.Add(1)
+					mu.Lock()
+					winners[user]++
+					mu.Unlock()
+				}
+			}()
+		}
+	}
+	wg.Wait()
+	if success.Load() != 100 || s.Remaining() != 0 {
+		t.Fatalf("成功 %d 单，剩余库存 %d，期望 100 / 0", success.Load(), s.Remaining())
+	}
+	for u, n := range winners {
+		if n > 1 {
+			t.Fatalf("%s 买到了 %d 件", u, n)
+		}
+	}
+}
+
+func TestErrors(t *testing.T) {
+	s := NewSeckill(1)
+	if err := s.Buy("a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Buy("a"); !errors.Is(err, ErrDuplicate) {
+		t.Fatalf("重复购买：%v", err)
+	}
+	if err := s.Buy("b"); !errors.Is(err, ErrSoldOut) {
+		t.Fatalf("卖完：%v", err)
+	}
+	if err := s.Buy("b"); !errors.Is(err, ErrSoldOut) {
+		t.Fatalf("因为卖完而失败的用户不应被记为已购买，再试应仍是 ErrSoldOut，实际 %v", err)
+	}
+}
+
+=== arch-13-2
+title: 用有界队列削峰
+race: true
+--- desc
+秒杀流量远超下单服务的处理能力。把同步下单改成「请求进队列 + 后台 worker 异步处理」：
+
+- `Submit(o)`：**非阻塞**入队，队列满了立即返回 `ErrBusy`（前端提示稍后重试），不能让请求堆积；
+- `Start(n, handle)`：启动 n 个 worker 消费队列，返回一个 `stop` 函数：关闭队列，并等待已经入队的订单**全部处理完**再返回。
+--- solution
+package main
+
+import (
+	"errors"
+	"sync"
+)
+
+var ErrBusy = errors.New("system busy, retry later")
+
+type Order struct{ ID int }
+
+type Queue struct {
+	ch chan Order
+}
+
+func NewQueue(size int) *Queue { return &Queue{ch: make(chan Order, size)} }
+
+func (q *Queue) Submit(o Order) error {
+	// @solution
+	select {
+	case q.ch <- o:
+		return nil
+	default:
+		return ErrBusy
+	}
+	// @starter
+	// q.ch <- o // TODO: 队列满时会阻塞
+	// return nil
+	// @end
+}
+
+func (q *Queue) Start(n int, handle func(Order)) (stop func()) {
+	// @solution
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for o := range q.ch {
+				handle(o)
+			}
+		}()
+	}
+	return func() {
+		close(q.ch)
+		wg.Wait()
+	}
+	// @starter
+	// return func() {} // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"errors"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestPeakShaving(t *testing.T) {
+	q := NewQueue(10)
+	var handled atomic.Int32
+	stop := q.Start(2, func(Order) {
+		time.Sleep(2 * time.Millisecond)
+		handled.Add(1)
+	})
+	accepted, busy := 0, 0
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 200; i++ {
+			if err := q.Submit(Order{i}); errors.Is(err, ErrBusy) {
+				busy++
+			} else {
+				accepted++
+			}
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Submit 被阻塞了")
+	}
+	if busy == 0 {
+		t.Fatal("瞬时流量超过处理能力时应有请求被拒绝")
+	}
+	stop()
+	if int(handled.Load()) != accepted {
+		t.Fatalf("接收了 %d 个，处理了 %d 个：stop 应等待已入队的全部处理完", accepted, handled.Load())
+	}
+}
+
+=== arch-14-1
+title: Base62 编解码
+--- desc
+短链接的短码通常是自增 ID 的 Base62 编码。字符表为 `0-9a-zA-Z`（`0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ`），高位在前。
+
+- `Encode(id)`：0 编码为 `"0"`；
+- `Decode(s)`：遇到非法字符、空字符串或溢出 uint64 时返回错误。
+
+7 位 Base62 可以表示 62⁷ ≈ 3.5 万亿个短码。
+--- solution
+package main
+
+import (
+	"errors"
+	"math"
+	"strings"
+)
+
+const alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+func Encode(id uint64) string {
+	// @solution
+	if id == 0 {
+		return "0"
+	}
+	var buf [11]byte
+	i := len(buf)
+	for id > 0 {
+		i--
+		buf[i] = alphabet[id%62]
+		id /= 62
+	}
+	return string(buf[i:])
+	// @starter
+	// return "" // TODO
+	// @end
+}
+
+func Decode(s string) (uint64, error) {
+	// @solution
+	if s == "" {
+		return 0, errors.New("empty code")
+	}
+	var n uint64
+	for i := 0; i < len(s); i++ {
+		d := strings.IndexByte(alphabet, s[i])
+		if d < 0 {
+			return 0, errors.New("invalid character")
+		}
+		if n > (math.MaxUint64-uint64(d))/62 {
+			return 0, errors.New("overflow")
+		}
+		n = n*62 + uint64(d)
+	}
+	return n, nil
+	// @starter
+	// return 0, errors.New("TODO")
+	// @end
+}
+--- test
+package main
+
+import (
+	"math"
+	"testing"
+)
+
+func TestBase62(t *testing.T) {
+	cases := map[uint64]string{0: "0", 61: "Z", 62: "10", 3843: "ZZ", 3844: "100", 125: "21"}
+	for id, want := range cases {
+		if got := Encode(id); got != want {
+			t.Errorf("Encode(%d) = %q，期望 %q", id, got, want)
+		}
+		if back, err := Decode(want); err != nil || back != id {
+			t.Errorf("Decode(%q) = %d, %v", want, back, err)
+		}
+	}
+	for _, id := range []uint64{1, 999999, 1 << 40, math.MaxUint64} {
+		if back, err := Decode(Encode(id)); err != nil || back != id {
+			t.Errorf("往返失败：%d → %q → %d (%v)", id, Encode(id), back, err)
+		}
+	}
+	for _, bad := range []string{"", "ab-c", "中", "zzzzzzzzzzzzzzzzzzzz"} {
+		if _, err := Decode(bad); err == nil {
+			t.Errorf("Decode(%q) 应返回错误", bad)
+		}
+	}
+}
+
+=== arch-14-2
+title: 短链接服务
+race: true
+--- desc
+实现一个内存版的短链接服务：
+
+- `Shorten(rawURL)`：只接受 `http` / `https` 链接（用 `net/url` 解析校验，必须有 host），否则返回错误；同一个长链接重复提交返回**同一个**短码；新链接用自增 ID（从 1 开始）的 Base62 编码作为短码；
+- `Resolve(code)`：查找长链接；
+- `Handler()`：`GET /{code}` 返回 `302` 并设置 `Location`（302 而不是 301：浏览器不会缓存，每次访问都会经过服务端，方便统计点击）；不存在返回 404。
+
+`Encode` 已经提供。并发调用要安全。
+--- solution
+package main
+
+import (
+	"errors"
+	"net/http"
+	"net/url"
+	"sync"
+)
+
+const alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+func Encode(id uint64) string {
+	if id == 0 {
+		return "0"
+	}
+	var buf [11]byte
+	i := len(buf)
+	for id > 0 {
+		i--
+		buf[i] = alphabet[id%62]
+		id /= 62
+	}
+	return string(buf[i:])
+}
+
+type Shortener struct {
+	mu     sync.RWMutex
+	nextID uint64
+	byCode map[string]string
+	byURL  map[string]string
+}
+
+func NewShortener() *Shortener {
+	return &Shortener{byCode: map[string]string{}, byURL: map[string]string{}}
+}
+
+func (s *Shortener) Shorten(rawURL string) (string, error) {
+	// @solution
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", errors.New("invalid url")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if code, ok := s.byURL[rawURL]; ok {
+		return code, nil
+	}
+	s.nextID++
+	code := Encode(s.nextID)
+	s.byCode[code] = rawURL
+	s.byURL[rawURL] = code
+	return code, nil
+	// @starter
+	// return "", errors.New("TODO")
+	// @end
+}
+
+func (s *Shortener) Resolve(code string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	u, ok := s.byCode[code]
+	return u, ok
+}
+
+func (s *Shortener) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{code}", func(w http.ResponseWriter, r *http.Request) {
+		// @solution
+		target, ok := s.Resolve(r.PathValue("code"))
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, target, http.StatusFound)
+		// @starter
+		// http.NotFound(w, r) // TODO
+		// @end
+	})
+	return mux
+}
+--- test
+package main
+
+import (
+	"net/http/httptest"
+	"sync"
+	"testing"
+)
+
+func TestShorten(t *testing.T) {
+	s := NewShortener()
+	a, err := s.Shorten("https://go.dev/doc/effective_go")
+	if err != nil || a != "1" {
+		t.Fatalf("第一个短码 = %q, %v，期望 1", a, err)
+	}
+	b, _ := s.Shorten("https://pkg.go.dev/")
+	again, _ := s.Shorten("https://go.dev/doc/effective_go")
+	if b != "2" || again != a {
+		t.Fatalf("b=%q again=%q", b, again)
+	}
+	for _, bad := range []string{"ftp://x.com/a", "javascript:alert(1)", "not a url", "https://"} {
+		if _, err := s.Shorten(bad); err == nil {
+			t.Errorf("Shorten(%q) 应返回错误", bad)
+		}
+	}
+}
+
+func TestRedirect(t *testing.T) {
+	s := NewShortener()
+	code, _ := s.Shorten("https://go.dev/")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/"+code, nil))
+	if rec.Code != 302 || rec.Header().Get("Location") != "https://go.dev/" {
+		t.Fatalf("got %d Location=%q", rec.Code, rec.Header().Get("Location"))
+	}
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/nope", nil))
+	if rec.Code != 404 {
+		t.Fatalf("不存在的短码应返回 404，实际 %d", rec.Code)
+	}
+}
+
+func TestConcurrentSameURL(t *testing.T) {
+	s := NewShortener()
+	codes := make([]string, 50)
+	var wg sync.WaitGroup
+	for i := range codes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes[i], _ = s.Shorten("https://example.com/same")
+		}()
+	}
+	wg.Wait()
+	for _, c := range codes {
+		if c != codes[0] {
+			t.Fatal("并发提交同一个链接应得到同一个短码")
+		}
+	}
+}
+
+=== arch-15-1
+title: 拉模式：合并多个有序 Feed
+--- desc
+拉模式下，用户打开首页时，从关注的每个作者那里拉取最新的帖子，再合并成一条时间线。每个作者的帖子已经按时间**从新到旧**排好序。
+
+实现 `MergeFeeds(feeds, limit)`：用 `container/heap` 做 K 路归并，返回最新的 `limit` 条（时间相同按 ID 从大到小）。只需要访问 `limit` 条左右的数据，不用把所有帖子排序。
+--- solution
+package main
+
+import "container/heap"
+
+type Post struct {
+	ID   int
+	Time int64
+}
+
+func newer(a, b Post) bool {
+	if a.Time != b.Time {
+		return a.Time > b.Time
+	}
+	return a.ID > b.ID
+}
+
+type cursor struct {
+	feed []Post
+	pos  int
+}
+
+type cursorHeap []*cursor
+
+func (h cursorHeap) Len() int           { return len(h) }
+func (h cursorHeap) Less(i, j int) bool { return newer(h[i].feed[h[i].pos], h[j].feed[h[j].pos]) }
+func (h cursorHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *cursorHeap) Push(x any)        { *h = append(*h, x.(*cursor)) }
+func (h *cursorHeap) Pop() any {
+	old := *h
+	x := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return x
+}
+
+func MergeFeeds(feeds [][]Post, limit int) []Post {
+	// @solution
+	h := &cursorHeap{}
+	for _, f := range feeds {
+		if len(f) > 0 {
+			*h = append(*h, &cursor{feed: f})
+		}
+	}
+	heap.Init(h)
+	var out []Post
+	for h.Len() > 0 && len(out) < limit {
+		c := (*h)[0]
+		out = append(out, c.feed[c.pos])
+		c.pos++
+		if c.pos == len(c.feed) {
+			heap.Pop(h)
+		} else {
+			heap.Fix(h, 0)
+		}
+	}
+	return out
+	// @starter
+	// return nil // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestMergeFeeds(t *testing.T) {
+	feeds := [][]Post{
+		{{1, 100}, {4, 70}, {9, 10}},
+		{},
+		{{2, 90}, {3, 70}, {5, 50}},
+		{{7, 95}},
+	}
+	got := MergeFeeds(feeds, 5)
+	want := []Post{{1, 100}, {7, 95}, {2, 90}, {4, 70}, {3, 70}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("MergeFeeds = %v\n期望 %v", got, want)
+	}
+	if all := MergeFeeds(feeds, 100); len(all) != 7 {
+		t.Fatalf("limit 超过总数时返回全部，实际 %d 条", len(all))
+	}
+	if MergeFeeds(nil, 3) != nil {
+		t.Fatal("没有 feed 时返回 nil")
+	}
+}
+
+=== arch-15-2
+title: 推拉结合：大 V 不推送
+--- desc
+推模式（写扩散）：发帖时写入每个粉丝的收件箱，读取很快；但粉丝千万的大 V 发一条就要写千万次。常见做法是**推拉结合**：
+
+- `Publish(author, p)`：帖子写入作者的发件箱；作者粉丝数**不超过** `bigV` 时，推送到每个粉丝的收件箱（统计推送次数 `Pushes`）；大 V 只写发件箱；
+- `Timeline(user, limit)`：用户收件箱 + 他关注的**大 V** 的发件箱，合并后按时间从新到旧返回前 `limit` 条（时间相同按 ID 从大到小）。
+--- solution
+package main
+
+import (
+	"cmp"
+	"slices"
+)
+
+type Post struct {
+	ID   int
+	Time int64
+}
+
+type Feed struct {
+	bigV      int
+	followers map[string][]string
+	following map[string][]string
+	inbox     map[string][]Post
+	outbox    map[string][]Post
+	Pushes    int
+}
+
+func NewFeed(bigV int) *Feed {
+	return &Feed{bigV: bigV, followers: map[string][]string{}, following: map[string][]string{},
+		inbox: map[string][]Post{}, outbox: map[string][]Post{}}
+}
+
+func (f *Feed) Follow(user, author string) {
+	f.followers[author] = append(f.followers[author], user)
+	f.following[user] = append(f.following[user], author)
+}
+
+func (f *Feed) isBigV(author string) bool { return len(f.followers[author]) > f.bigV }
+
+func (f *Feed) Publish(author string, p Post) {
+	// @solution
+	f.outbox[author] = append(f.outbox[author], p)
+	if f.isBigV(author) {
+		return
+	}
+	for _, u := range f.followers[author] {
+		f.inbox[u] = append(f.inbox[u], p)
+		f.Pushes++
+	}
+	// @starter
+	// f.outbox[author] = append(f.outbox[author], p)
+	// for _, u := range f.followers[author] { // TODO: 大 V 也全量推送了
+	// 	f.inbox[u] = append(f.inbox[u], p)
+	// 	f.Pushes++
+	// }
+	// @end
+}
+
+func (f *Feed) Timeline(user string, limit int) []Post {
+	// @solution
+	posts := slices.Clone(f.inbox[user])
+	for _, a := range f.following[user] {
+		if f.isBigV(a) {
+			posts = append(posts, f.outbox[a]...)
+		}
+	}
+	slices.SortFunc(posts, func(a, b Post) int {
+		return cmp.Or(cmp.Compare(b.Time, a.Time), cmp.Compare(b.ID, a.ID))
+	})
+	return posts[:min(limit, len(posts))]
+	// @starter
+	// return nil // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"slices"
+	"testing"
+)
+
+func TestHybrid(t *testing.T) {
+	f := NewFeed(3)
+	for i := 0; i < 1000; i++ {
+		f.Follow(fmt.Sprint("fan", i), "star") // 大 V
+	}
+	f.Follow("fan0", "friend")
+	f.Follow("fan1", "friend")
+
+	f.Publish("star", Post{1, 100})
+	f.Publish("friend", Post{2, 200})
+	f.Publish("star", Post{3, 300})
+	if f.Pushes != 2 {
+		t.Fatalf("推送了 %d 次：大 V 不应推送，普通作者推给 2 个粉丝", f.Pushes)
+	}
+	if got := f.Timeline("fan0", 10); !slices.Equal(got, []Post{{3, 300}, {2, 200}, {1, 100}}) {
+		t.Fatalf("fan0 的时间线 = %v", got)
+	}
+	if got := f.Timeline("fan999", 10); !slices.Equal(got, []Post{{3, 300}, {1, 100}}) {
+		t.Fatalf("fan999 的时间线 = %v", got)
+	}
+	if got := f.Timeline("fan0", 1); len(got) != 1 || got[0].ID != 3 {
+		t.Fatalf("limit：%v", got)
+	}
+}
+
+=== arch-16-1
+title: 基于小顶堆的延迟队列
+--- desc
+「订单 30 分钟未支付自动取消」这类延迟任务，单机可以用按执行时间排序的小顶堆实现（Redis ZSet 的思路相同）：
+
+- `Push(id, at)`：添加任务，在 `at` 时刻执行；
+- `PopReady(now)`：按执行时间顺序取出所有 `at <= now` 的任务 ID（执行时间相同按加入顺序）；
+- `Len()`。
+
+用 `container/heap` 实现。
+--- solution
+package main
+
+import (
+	"container/heap"
+	"time"
+)
+
+type task struct {
+	id  string
+	at  time.Time
+	seq int
+}
+
+type taskHeap []task
+
+func (h taskHeap) Len() int { return len(h) }
+func (h taskHeap) Less(i, j int) bool {
+	if !h[i].at.Equal(h[j].at) {
+		return h[i].at.Before(h[j].at)
+	}
+	return h[i].seq < h[j].seq
+}
+func (h taskHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *taskHeap) Push(x any)   { *h = append(*h, x.(task)) }
+func (h *taskHeap) Pop() any {
+	old := *h
+	x := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return x
+}
+
+type DelayQueue struct {
+	h   taskHeap
+	seq int
+}
+
+func (q *DelayQueue) Push(id string, at time.Time) {
+	// @solution
+	q.seq++
+	heap.Push(&q.h, task{id, at, q.seq})
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (q *DelayQueue) PopReady(now time.Time) []string {
+	// @solution
+	var out []string
+	for q.h.Len() > 0 && !q.h[0].at.After(now) {
+		out = append(out, heap.Pop(&q.h).(task).id)
+	}
+	return out
+	// @starter
+	// return nil // TODO
+	// @end
+}
+
+func (q *DelayQueue) Len() int { return q.h.Len() }
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+	"time"
+)
+
+func TestDelayQueue(t *testing.T) {
+	base := time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
+	var q DelayQueue
+	q.Push("order-3", base.Add(30*time.Minute))
+	q.Push("order-1", base.Add(10*time.Minute))
+	q.Push("order-2", base.Add(20*time.Minute))
+	q.Push("order-4", base.Add(10*time.Minute))
+	if got := q.PopReady(base.Add(5 * time.Minute)); len(got) != 0 {
+		t.Fatalf("还没到时间：%v", got)
+	}
+	if got := q.PopReady(base.Add(20 * time.Minute)); !slices.Equal(got, []string{"order-1", "order-4", "order-2"}) {
+		t.Fatalf("PopReady = %v", got)
+	}
+	if q.Len() != 1 {
+		t.Fatalf("Len = %d", q.Len())
+	}
+	if got := q.PopReady(base.Add(time.Hour)); !slices.Equal(got, []string{"order-3"}) {
+		t.Fatalf("PopReady = %v", got)
+	}
+}
+
+=== arch-16-2
+title: 超时取消与支付并发：条件更新
+race: true
+--- desc
+延迟任务到期取消订单时，用户可能恰好在同一时刻完成了支付。两边都必须用**带原状态条件**的更新（相当于 `UPDATE ... WHERE status = 'UNPAID'`），保证只有一方成功：
+
+- `Store.CompareAndSet(id, from, to)`：只有当前状态等于 `from` 时才改成 `to`，返回是否成功；
+- `CancelIfUnpaid(s, id)`：超时任务调用，成功返回 `"cancelled"`，否则（已支付等）返回 `"skipped"`；
+- `Pay(s, id)`：支付回调调用，只能从 UNPAID 变为 PAID。
+
+任务可能被重复执行（至少一次），重复执行也必须是安全的。
+--- solution
+package main
+
+import "sync"
+
+type Store struct {
+	mu     sync.Mutex
+	status map[string]string
+}
+
+func NewStore() *Store { return &Store{status: map[string]string{}} }
+
+func (s *Store) Set(id, st string) { s.mu.Lock(); s.status[id] = st; s.mu.Unlock() }
+func (s *Store) Get(id string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.status[id]
+}
+
+func (s *Store) CompareAndSet(id, from, to string) bool {
+	// @solution
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.status[id] != from {
+		return false
+	}
+	s.status[id] = to
+	return true
+	// @starter
+	// s.Set(id, to) // TODO: 没有检查原状态
+	// return true
+	// @end
+}
+
+func CancelIfUnpaid(s *Store, id string) string {
+	if s.CompareAndSet(id, "UNPAID", "CANCELLED") {
+		return "cancelled"
+	}
+	return "skipped"
+}
+
+func Pay(s *Store, id string) bool {
+	return s.CompareAndSet(id, "UNPAID", "PAID")
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"sync"
+	"testing"
+)
+
+func TestRaceBetweenPayAndCancel(t *testing.T) {
+	s := NewStore()
+	for i := 0; i < 200; i++ {
+		s.Set(fmt.Sprint("o", i), "UNPAID")
+	}
+	var wg sync.WaitGroup
+	paid := make([]bool, 200)
+	cancelled := make([]int, 200)
+	for i := 0; i < 200; i++ {
+		id := fmt.Sprint("o", i)
+		wg.Add(3)
+		go func() { defer wg.Done(); paid[i] = Pay(s, id) }()
+		go func() {
+			defer wg.Done()
+			if CancelIfUnpaid(s, id) == "cancelled" {
+				cancelled[i]++
+			}
+		}()
+		go func() { // 延迟任务被重复投递
+			defer wg.Done()
+			if CancelIfUnpaid(s, id) == "cancelled" {
+				cancelled[i]++
+			}
+		}()
+	}
+	wg.Wait()
+	for i := 0; i < 200; i++ {
+		st := s.Get(fmt.Sprint("o", i))
+		switch {
+		case paid[i] && (st != "PAID" || cancelled[i] != 0):
+			t.Fatalf("o%d 支付成功却被取消了：%s", i, st)
+		case !paid[i] && (st != "CANCELLED" || cancelled[i] != 1):
+			t.Fatalf("o%d：状态 %s，取消成功 %d 次", i, st, cancelled[i])
+		}
+	}
+}
+
+=== arch-17-1
+title: 用整数处理金额
+--- desc
+`0.1 + 0.2 != 0.3`——金额绝对不要用浮点数，统一用 `int64` 表示「分」。实现：
+
+- `ParseYuan(s)`：把 `"12.34"`、`"12"`、`"0.5"`、`"-3.07"` 解析成分（1234、1200、50、-307）。最多两位小数；`"1.234"`、`"abc"`、`""`、`"1e3"`、`".5"`、`"1."` 都返回错误；**不能**用 `strconv.ParseFloat`；
+- `FormatCents(c)`：反向格式化，总是两位小数：`5` → `"0.05"`，`-307` → `"-3.07"`；
+- `Split(total, n)`：把金额平均分成 n 份，除不尽的分从前往后各多分 1 分，总和必须等于 total（如 100 分 3 份 → 34、33、33）。
+--- solution
+package main
+
+import (
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+var ErrBadAmount = errors.New("invalid amount")
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func ParseYuan(s string) (int64, error) {
+	// @solution
+	neg := strings.HasPrefix(s, "-")
+	s = strings.TrimPrefix(s, "-")
+	intPart, frac, hasDot := strings.Cut(s, ".")
+	if !allDigits(intPart) || (hasDot && (!allDigits(frac) || len(frac) > 2)) {
+		return 0, ErrBadAmount
+	}
+	yuan, err := strconv.ParseInt(intPart, 10, 64)
+	if err != nil {
+		return 0, ErrBadAmount
+	}
+	for len(frac) < 2 {
+		frac += "0"
+	}
+	cents, _ := strconv.ParseInt(frac, 10, 64)
+	total := yuan*100 + cents
+	if neg {
+		total = -total
+	}
+	return total, nil
+	// @starter
+	// return 0, ErrBadAmount // TODO
+	// @end
+}
+
+func FormatCents(c int64) string {
+	// @solution
+	sign := ""
+	if c < 0 {
+		sign, c = "-", -c
+	}
+	return fmt.Sprintf("%s%d.%02d", sign, c/100, c%100)
+	// @starter
+	// return fmt.Sprintf("%.2f", float64(c)/100) // TODO: 不要经过浮点数
+	// @end
+}
+
+func Split(total int64, n int) []int64 {
+	// @solution
+	out := make([]int64, n)
+	base, rem := total/int64(n), total%int64(n)
+	for i := range out {
+		out[i] = base
+		if int64(i) < rem {
+			out[i]++
+		}
+	}
+	return out
+	// @starter
+	// return nil // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestParseYuan(t *testing.T) {
+	ok := map[string]int64{"12.34": 1234, "12": 1200, "0.5": 50, "-3.07": -307, "0.01": 1, "100.10": 10010, "92233720368547758.07": 9223372036854775807}
+	for in, want := range ok {
+		if got, err := ParseYuan(in); err != nil || got != want {
+			t.Errorf("ParseYuan(%q) = %d, %v，期望 %d", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"1.234", "abc", "", "1e3", ".5", "1.", "1.2.3", "--1", "+1", " 1"} {
+		if _, err := ParseYuan(bad); err == nil {
+			t.Errorf("ParseYuan(%q) 应返回错误", bad)
+		}
+	}
+}
+
+func TestFormatCents(t *testing.T) {
+	cases := map[int64]string{1234: "12.34", 5: "0.05", -307: "-3.07", 0: "0.00", 100: "1.00"}
+	for in, want := range cases {
+		if got := FormatCents(in); got != want {
+			t.Errorf("FormatCents(%d) = %q，期望 %q", in, got, want)
+		}
+	}
+}
+
+func TestSplit(t *testing.T) {
+	if got := Split(100, 3); !slices.Equal(got, []int64{34, 33, 33}) {
+		t.Fatalf("Split(100, 3) = %v", got)
+	}
+	parts := Split(1001, 7)
+	var sum int64
+	for _, p := range parts {
+		sum += p
+	}
+	if sum != 1001 {
+		t.Fatalf("分摊后总和 %d != 1001", sum)
+	}
+}
+
+=== arch-17-2
+title: 订单状态机与幂等的支付回调
+--- desc
+订单状态只能按规定的方向流转：
+
+| 当前状态 | 可以变为 |
+| --- | --- |
+| UNPAID | PAID, CANCELLED |
+| PAID | SHIPPED, REFUNDED |
+| SHIPPED | DONE |
+
+实现：
+
+- `Transition(to)`：非法转移返回 `ErrInvalidTransition`；
+- `OnPaymentCallback(txn, amount)`：处理支付平台的回调：
+  1. 回调金额和订单金额不一致 → `ErrAmountMismatch`（可能是伪造或篡改）；
+  2. 已经用**同一个**交易号处理过 → 直接返回 nil（回调会重复推送，必须幂等）；
+  3. 否则尝试转为 PAID，记录交易号；状态不允许（比如订单已取消）返回 `ErrInvalidTransition`，需要走退款流程。
+--- solution
+package main
+
+import (
+	"errors"
+	"slices"
+)
+
+var (
+	ErrInvalidTransition = errors.New("invalid status transition")
+	ErrAmountMismatch    = errors.New("amount mismatch")
+)
+
+type Status string
+
+var allowed = map[Status][]Status{
+	"UNPAID":  {"PAID", "CANCELLED"},
+	"PAID":    {"SHIPPED", "REFUNDED"},
+	"SHIPPED": {"DONE"},
+}
+
+type Order struct {
+	Status  Status
+	Amount  int64
+	PaidTxn string
+}
+
+func (o *Order) Transition(to Status) error {
+	// @solution
+	if !slices.Contains(allowed[o.Status], to) {
+		return ErrInvalidTransition
+	}
+	o.Status = to
+	return nil
+	// @starter
+	// o.Status = to // TODO: 没有校验
+	// return nil
+	// @end
+}
+
+func (o *Order) OnPaymentCallback(txn string, amount int64) error {
+	// @solution
+	if amount != o.Amount {
+		return ErrAmountMismatch
+	}
+	if o.PaidTxn == txn {
+		return nil
+	}
+	if err := o.Transition("PAID"); err != nil {
+		return err
+	}
+	o.PaidTxn = txn
+	return nil
+	// @starter
+	// return o.Transition("PAID") // TODO: 没有校验金额，也不幂等
+	// @end
+}
+--- test
+package main
+
+import (
+	"errors"
+	"testing"
+)
+
+func TestTransitions(t *testing.T) {
+	o := &Order{Status: "UNPAID", Amount: 9900}
+	if err := o.Transition("SHIPPED"); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatal("未支付不能发货")
+	}
+	for _, s := range []Status{"PAID", "SHIPPED", "DONE"} {
+		if err := o.Transition(s); err != nil {
+			t.Fatalf("→ %s：%v", s, err)
+		}
+	}
+	if err := o.Transition("REFUNDED"); err == nil {
+		t.Fatal("已完成的订单不能直接变为已退款")
+	}
+}
+
+func TestCallback(t *testing.T) {
+	o := &Order{Status: "UNPAID", Amount: 9900}
+	if err := o.OnPaymentCallback("T1", 1); !errors.Is(err, ErrAmountMismatch) {
+		t.Fatalf("金额不一致：%v", err)
+	}
+	if err := o.OnPaymentCallback("T1", 9900); err != nil || o.Status != "PAID" {
+		t.Fatalf("第一次回调：%v %s", err, o.Status)
+	}
+	if err := o.OnPaymentCallback("T1", 9900); err != nil {
+		t.Fatalf("重复回调应幂等返回 nil：%v", err)
+	}
+	if err := o.OnPaymentCallback("T2", 9900); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("另一笔交易重复支付应报错（需要退款）：%v", err)
+	}
+	c := &Order{Status: "CANCELLED", Amount: 100}
+	if err := c.OnPaymentCallback("T9", 100); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("已取消的订单收到支付：%v", err)
+	}
+}
+
+=== arch-18-1
+title: 压测数据：分位数与实例数估算
+--- desc
+- `Percentile(samples, p)`：用**最近秩法**计算第 p 百分位：排序后取第 `ceil(p/100 × n)` 个（从 1 开始计），p 为 0 时取最小值；没有样本返回 0。不能修改入参；
+- `Instances(peakQPS, perInstanceQPS, targetUtil, extra)`：单实例压测能扛 `perInstanceQPS`，线上只让它跑到 `targetUtil`% 的水位，需要 `ceil(peakQPS × 100 / (perInstanceQPS × targetUtil))` 台，再加 `extra` 台冗余（N+1 / N+2）。用整数运算。
+
+平均值会掩盖长尾，看延迟一定要看 p99。
+--- solution
+package main
+
+import (
+	"slices"
+	"time"
+)
+
+func Percentile(samples []time.Duration, p float64) time.Duration {
+	// @solution
+	if len(samples) == 0 {
+		return 0
+	}
+	s := slices.Clone(samples)
+	slices.Sort(s)
+	rank := int(p / 100 * float64(len(s)))
+	if float64(rank) < p/100*float64(len(s)) {
+		rank++ // 向上取整
+	}
+	rank = max(rank, 1)
+	return s[rank-1]
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+
+func Instances(peakQPS, perInstanceQPS, targetUtil, extra int) int {
+	// @solution
+	need := peakQPS * 100
+	capacity := perInstanceQPS * targetUtil
+	return (need+capacity-1)/capacity + extra
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+func TestPercentile(t *testing.T) {
+	var s []time.Duration
+	for i := 100; i >= 1; i-- {
+		s = append(s, time.Duration(i)*time.Millisecond)
+	}
+	cases := map[float64]int{50: 50, 99: 99, 99.9: 100, 100: 100, 0: 1, 90: 90}
+	for p, want := range cases {
+		if got := Percentile(s, p); got != time.Duration(want)*time.Millisecond {
+			t.Errorf("p%v = %v，期望 %dms", p, got, want)
+		}
+	}
+	if s[0] != 100*time.Millisecond {
+		t.Fatal("不应修改入参")
+	}
+	if Percentile(nil, 99) != 0 {
+		t.Fatal("没有样本返回 0")
+	}
+	tail := []time.Duration{10, 10, 10, 10, 10, 10, 10, 10, 10, 1000}
+	if Percentile(tail, 95) != 1000 {
+		t.Fatal("p95 应暴露长尾")
+	}
+}
+
+func TestInstances(t *testing.T) {
+	if n := Instances(50000, 2000, 60, 1); n != 43 {
+		t.Fatalf("Instances = %d，期望 43", n)
+	}
+	if n := Instances(1200, 2000, 60, 0); n != 1 {
+		t.Fatalf("Instances = %d，期望 1", n)
+	}
+	if n := Instances(1201, 2000, 60, 2); n != 4 {
+		t.Fatalf("Instances = %d，期望 4", n)
+	}
+}
+
+=== arch-19-1
+title: 按优先级的负载保护
+race: true
+--- desc
+流量突增时，宁可拒绝一部分请求，也不能让所有请求一起变慢。实现 `Shedder`：
+
+- 系统最多同时处理 `limit` 个请求；
+- `Acquire(high)`：高优先级请求（下单、支付）在在途数 `< limit` 时放行；低优先级请求（推荐、评论）只能用前 80% 的容量（在途数 `< limit × 80 / 100`），留出余量给核心链路；
+- `Release()`：请求结束时调用。
+--- solution
+package main
+
+import "sync"
+
+type Shedder struct {
+	mu       sync.Mutex
+	limit    int
+	inflight int
+}
+
+func NewShedder(limit int) *Shedder { return &Shedder{limit: limit} }
+
+func (s *Shedder) Acquire(high bool) bool {
+	// @solution
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	max := s.limit
+	if !high {
+		max = s.limit * 80 / 100
+	}
+	if s.inflight >= max {
+		return false
+	}
+	s.inflight++
+	return true
+	// @starter
+	// return true // TODO
+	// @end
+}
+
+func (s *Shedder) Release() {
+	s.mu.Lock()
+	s.inflight--
+	s.mu.Unlock()
+}
+--- test
+package main
+
+import (
+	"sync"
+	"testing"
+)
+
+func TestShedder(t *testing.T) {
+	s := NewShedder(10)
+	low := 0
+	for i := 0; i < 20; i++ {
+		if s.Acquire(false) {
+			low++
+		}
+	}
+	if low != 8 {
+		t.Fatalf("低优先级最多占用 8 个，实际 %d", low)
+	}
+	high := 0
+	for i := 0; i < 20; i++ {
+		if s.Acquire(true) {
+			high++
+		}
+	}
+	if high != 2 {
+		t.Fatalf("剩下的 2 个容量留给高优先级，实际 %d", high)
+	}
+	s.Release()
+	if s.Acquire(false) {
+		t.Fatal("总在途 9 个时低优先级仍应被拒绝")
+	}
+	if !s.Acquire(true) {
+		t.Fatal("高优先级应能拿到释放出来的容量")
+	}
+}
+
+func TestConcurrent(t *testing.T) {
+	s := NewShedder(50)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	peak, cur := 0, 0
+	for i := 0; i < 500; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if s.Acquire(i%2 == 0) {
+				mu.Lock()
+				cur++
+				peak = max(peak, cur)
+				mu.Unlock()
+				mu.Lock()
+				cur--
+				mu.Unlock()
+				s.Release()
+			}
+		}()
+	}
+	wg.Wait()
+	if peak > 50 {
+		t.Fatalf("在途峰值 %d 超过上限", peak)
+	}
+}
+
+=== arch-20-1
+title: 单元化路由与故障切换
+--- desc
+异地多活常按用户 ID 把用户划分到不同的单元：`uid % 100` 落在 `[From, To)` 区间的用户属于这个单元，一个用户的读写都在自己的单元内完成。
+
+实现 `Router`：
+
+- `Route(uid)`：返回用户所属单元；如果这个单元被标记为故障，切换到它配置的备份单元（备份也故障则返回错误）；
+- `MarkDown(unit)` / `MarkUp(unit)`。
+--- solution
+package main
+
+import "errors"
+
+type Unit struct {
+	Name     string
+	From, To int // uid % 100 ∈ [From, To)
+	Backup   string
+}
+
+type Router struct {
+	units []Unit
+	down  map[string]bool
+}
+
+func NewRouter(units []Unit) *Router { return &Router{units: units, down: map[string]bool{}} }
+
+func (r *Router) MarkDown(unit string) { r.down[unit] = true }
+func (r *Router) MarkUp(unit string)   { delete(r.down, unit) }
+
+func (r *Router) Route(uid int64) (string, error) {
+	// @solution
+	slot := int(uid % 100)
+	for _, u := range r.units {
+		if slot >= u.From && slot < u.To {
+			if !r.down[u.Name] {
+				return u.Name, nil
+			}
+			if u.Backup != "" && !r.down[u.Backup] {
+				return u.Backup, nil
+			}
+			return "", errors.New("unit and backup are both down")
+		}
+	}
+	return "", errors.New("no unit for uid")
+	// @starter
+	// return "", errors.New("TODO")
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestRoute(t *testing.T) {
+	r := NewRouter([]Unit{
+		{"shanghai", 0, 50, "beijing"},
+		{"beijing", 50, 100, "shanghai"},
+	})
+	cases := map[int64]string{10: "shanghai", 149: "shanghai", 1050: "beijing", 99: "beijing"}
+	for uid, want := range cases {
+		if got, err := r.Route(uid); err != nil || got != want {
+			t.Errorf("Route(%d) = %s, %v，期望 %s", uid, got, err, want)
+		}
+	}
+	r.MarkDown("shanghai")
+	if got, _ := r.Route(10); got != "beijing" {
+		t.Fatalf("上海故障后应切到北京，实际 %s", got)
+	}
+	if got, _ := r.Route(99); got != "beijing" {
+		t.Fatal("北京的用户不受影响")
+	}
+	r.MarkDown("beijing")
+	if _, err := r.Route(10); err == nil {
+		t.Fatal("两个单元都故障时应返回错误")
+	}
+	r.MarkUp("shanghai")
+	if got, _ := r.Route(10); got != "shanghai" {
+		t.Fatal("恢复后应切回")
+	}
+}
+
+=== arch-20-2
+title: 跨地域数据合并：最后写入者胜
+--- desc
+多个地域异步同步数据时，同一条记录可能在两边都被修改。最简单的冲突解决策略是 **LWW（Last Write Wins）**：
+
+`Merge(a, b)`：时间戳大的胜出；时间戳相同时，按地域名字典序**大的**胜出。
+
+要求 `Merge` 满足交换律和结合律——无论各地域以什么顺序收到同步消息，最终都收敛到同一个值。这也是 LWW 的代价：被覆盖的那次写入会悄悄丢失。
+--- solution
+package main
+
+type Versioned struct {
+	Value string
+	TS    int64
+	Unit  string
+}
+
+func Merge(a, b Versioned) Versioned {
+	// @solution
+	if a.TS != b.TS {
+		if a.TS > b.TS {
+			return a
+		}
+		return b
+	}
+	if a.Unit >= b.Unit {
+		return a
+	}
+	return b
+	// @starter
+	// return b // TODO
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestMerge(t *testing.T) {
+	sh := Versioned{"addr-A", 100, "shanghai"}
+	bj := Versioned{"addr-B", 105, "beijing"}
+	if Merge(sh, bj) != bj || Merge(bj, sh) != bj {
+		t.Fatal("时间戳大的胜出，且与参数顺序无关")
+	}
+	tie1 := Versioned{"x", 100, "beijing"}
+	tie2 := Versioned{"y", 100, "shanghai"}
+	if Merge(tie1, tie2) != tie2 || Merge(tie2, tie1) != tie2 {
+		t.Fatal("时间戳相同时按地域名决胜，结果必须一致")
+	}
+	a, b, c := Versioned{"a", 3, "u1"}, Versioned{"b", 5, "u2"}, Versioned{"c", 5, "u3"}
+	if Merge(Merge(a, b), c) != Merge(a, Merge(b, c)) {
+		t.Fatal("Merge 应满足结合律")
+	}
+}

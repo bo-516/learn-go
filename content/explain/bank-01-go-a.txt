@@ -1,0 +1,226 @@
+=== go-01-1
+--- explain
+**思路**
+
+`s[i:j]` 只是一个新的切片头（指针、长度、容量），指针仍然指向 `s` 的底层数组，所以修改它或对它 `append` 都可能影响 `s`。要“独立”，就必须**分配一块新的数组并把数据复制过去**。
+
+**代码讲解**
+
+1. `out := make([]int, j-i)`：分配长度正好为 `j-i` 的新切片，它有自己的底层数组。
+2. `copy(out, s[i:j])`：复制元素。`copy` 复制 `min(len(dst), len(src))` 个元素，这里两者相等。
+3. 返回 `out`：之后无论怎么修改或 append，都和 `s` 无关。
+
+**易错点**
+
+- `make([]int, 0, j-i)` 再 `copy` 一个元素都不会复制，因为 `copy` 看的是目标的**长度**而不是容量。
+- 等价写法：`slices.Clone(s[i:j])`（Go 1.21+）或 `append([]int(nil), s[i:j]...)`。
+
+**延伸**
+
+如果只是不想让 `append` 覆盖原数据、但允许共享已有元素，可以用完整切片表达式 `s[i:j:j]`：容量被限制为 `j-i`，下一次 `append` 一定会分配新数组。见语法卡片「完整切片表达式」。
+
+=== go-01-2
+--- explain
+**思路**
+
+数组是**值类型**：传参时整个数组被复制，函数里改的是副本，必须返回才能让调用方拿到结果。切片是一个小的“视图”结构（指针 + 长度 + 容量），传参时复制的只是这个头，指针仍指向同一个底层数组，所以函数内修改元素调用方能看到。
+
+**代码讲解**
+
+1. `DoubleArray(a [4]int) [4]int`：`a` 已经是调用方数组的副本，直接改它，然后 `return a`。返回时又会复制一次（4 个 int，很小）。
+2. `for i := range a`：只要下标，用下标修改元素。写成 `for _, v := range a { v *= 2 }` 改的是循环变量的副本，没有效果。
+3. `DoubleSlice(s []int)`：没有返回值，`s[i] *= 2` 直接写到共享的底层数组里。
+
+**易错点**
+
+- 在 `DoubleSlice` 里 `append` 新元素，调用方是看不到的：调用方的切片头长度没有变（见下一题）。
+- 大数组传参代价很高，一般传切片 `a[:]` 或指针 `*[N]int`。
+
+=== go-02-1
+--- explain
+**思路**
+
+照着 `runtime.nextslicecap` 的规则写：需要的容量超过两倍就直接用需要的值；小切片翻倍；大切片按“约 1.25 倍 + 192”的公式增长，直到够用。这个公式让增长因子从 2 平滑过渡到 1.25，避免在 256 处突变。
+
+**代码讲解**
+
+1. `doubleCap := oldCap * 2`，`needed > doubleCap` 时直接返回 `needed`（例如一次 append 很多元素）。
+2. `const threshold = 256`：局部常量，表达“阈值”的含义，比直接写 256 更清楚。
+3. `oldCap < threshold`：返回翻倍的容量。
+4. 否则循环 `newCap += (newCap + 3*threshold) / 4`，即每次增加 `newCap/4 + 192`。
+
+**易错点**
+
+- Go 1.18 之前的规则是“小于 1024 翻倍，否则增加 25%”，网上很多资料还是旧规则。
+- 真实的 `append` 还会把容量按内存分配器的 **size class** 向上取整，所以实际看到的 `cap` 可能比这个函数的结果大（例如 `[]int` 从 5 扩容可能得到 10 或 12）。题目明确不考虑这一步。
+
+=== go-02-2
+--- explain
+**思路**
+
+最终长度已知是 n，所以一开始就 `make` 出容量为 n 的切片，之后 `append` 都不会扩容，整个函数只有这一次分配。
+
+**代码讲解**
+
+1. `out := make([]int, 0, n)`：长度 0、容量 n。
+2. `for i := range n`：Go 1.22 起可以直接 range 一个整数。
+3. `out = append(out, i*i)`：容量足够，只是修改长度，不分配内存。
+
+**易错点**
+
+- `make([]int, n)` 后再 `append`，结果前面会多出 n 个 0。定长写法应该是 `out[i] = i * i`，同样只分配一次。
+- 从 nil 切片开始 append，n = 1000 时会扩容十几次，每次都要分配新数组并复制旧数据。
+
+**延伸**
+
+`testing.AllocsPerRun(runs, f)` 返回 f 平均每次调用的堆分配次数，适合用来写“不应该分配”的回归测试。基准测试里可以用 `b.ReportAllocs()` 或 `-benchmem` 查看。
+
+=== go-03-1
+--- explain
+**思路**
+
+`append` 返回的新切片头（可能长度变了、甚至指针变了）只存在于函数的局部变量里，调用方的切片头没有任何变化。要让调用方看到结果，要么**把新切片返回**，要么**传切片的指针**让函数直接修改调用方的切片头。
+
+**代码讲解**
+
+1. `AddReturn`：`s = append(s, 4)` 修改局部的 `s`，`s[0] = 100` 改元素，最后 `return s`，调用方写 `s = AddReturn(s)`——这和标准库 `append` 本身的用法一模一样。
+2. `AddPtr(s *[]int)`：`*s = append(*s, 4)` 解引用后赋值，修改的是调用方的那个切片变量。
+3. `(*s)[0] = 100`：括号必不可少。`*s[0]` 会被解析成 `*(s[0])`，对指针取下标编译不通过。
+
+**易错点**
+
+- 测试里提到的现象：容量足够时，`append` 写入的是共享的底层数组，所以原切片的第 0 个元素也变成了 100；容量不够时 `append` 分配了新数组，之后的修改与原切片无关。**是否共享取决于容量**，这正是切片最容易出 bug 的地方。
+- Go 里更推荐返回新切片的写法；`*[]T` 参数比较少见。
+
+=== go-04-1
+--- explain
+**思路**
+
+Go 的 map 不是并发安全的，并发写会触发运行时检测，直接 `fatal error: concurrent map writes`（不能 recover）。用 `sync.RWMutex` 保护：写操作用写锁，读操作用读锁，多个读可以同时进行。
+
+**代码讲解**
+
+1. 结构体里放 `mu sync.RWMutex` 和 `m map[string]int`；锁放在它保护的数据旁边，是 Go 的惯例。
+2. `NewSafeCounter` 返回 `*SafeCounter`，并初始化 map（nil map 不能写）。
+3. `Inc`：`c.mu.Lock()` + `defer c.mu.Unlock()`，即使中间 panic 也会解锁。
+4. `Get`：`RLock` / `RUnlock`，读 nil 或不存在的 key 返回 0。
+5. 方法必须是**指针接收者**：值接收者会复制整个结构体，包括锁，每次调用锁的都是一把新锁，等于没加锁（`go vet` 会报 copylocks）。
+
+**易错点**
+
+- 只给写加锁、读不加锁，`-race` 仍然会报数据竞争：读写同时发生也是竞争。
+- 读多写少才适合 RWMutex；写很频繁时 RWMutex 的额外开销反而比 Mutex 大。
+
+=== go-04-2
+--- explain
+**思路**
+
+一把大锁让所有 goroutine 串行。把数据按 key 的哈希分到 16 个**分片**，每个分片有自己的锁，访问不同分片的 goroutine 互不阻塞，锁竞争大约降到原来的 1/16。
+
+**代码讲解**
+
+1. `const shardCount = 16`，`shards [shardCount]*shard`：数组长度必须是常量。存指针是为了避免复制包含锁的结构体。
+2. `NewShardedMap` 里 `for i := range sm.shards` 逐个初始化分片和 map。
+3. `ShardIndex`：`fnv.New32a()` 返回一个 `hash.Hash32`，它实现了 `io.Writer`，`h.Write([]byte(key))` 写入数据，`h.Sum32()` 取结果，再对分片数取模。
+4. `Set`、`Get` 只锁对应的分片；`Get` 用 comma-ok 返回是否存在。
+5. `Len` 依次给每个分片加读锁求和。注意它得到的不是一个“全局一致”的快照：统计过程中其他分片可能被修改，这是分片设计的固有取舍。
+
+**易错点**
+
+- 分片数用 2 的幂时可以用 `h & (n-1)` 代替取模。
+- 不要在持有一个分片锁的同时去锁另一个分片，容易死锁。
+
+**延伸**
+
+`sync.Map` 适合读多写少或 key 集合稳定的场景；通用的高并发 map 常用分片锁。见语法卡片「sync.Map」「sync.Mutex / RWMutex」。
+
+=== go-05-1
+--- explain
+**思路**
+
+map 的遍历顺序是故意随机化的。需要确定顺序时，先把 key 收集到切片里，再排序。
+
+**代码讲解**
+
+1. `slices.Sorted(maps.Keys(m))`：`maps.Keys` 返回一个迭代器（`iter.Seq[string]`），`slices.Sorted` 把迭代器的所有值收集到切片并排序，一行完成（Go 1.23+）。
+2. `RankByValue`：先按 key 排好序，再用 **`slices.SortStableFunc`** 按 value 降序稳定排序。稳定排序保证 value 相同的 key 保持原来的字典序。
+3. `cmp.Compare(m[b], m[a])`：把 a、b 反过来就是降序。
+
+**易错点**
+
+- 用不稳定的 `slices.SortFunc` 时，value 相同的 key 顺序不确定；要么用稳定排序，要么在比较函数里加第二关键字：`cmp.Or(cmp.Compare(m[b], m[a]), strings.Compare(a, b))`。
+- 旧写法：`keys := make([]string, 0, len(m)); for k := range m { keys = append(keys, k) }; sort.Strings(keys)`。
+
+=== go-05-2
+--- explain
+**思路**
+
+map 的元素**不可寻址**：map 扩容时元素会被搬到新的位置，如果允许取地址，旧地址就失效了。所以 `m["a"].X += 1` 编译不通过。两种解决办法：取出整个值、修改、再写回；或者 map 里存指针。
+
+**代码讲解**
+
+1. `Move`：`p, ok := m[key]` 取出的是结构体的**副本**；`p.X += dx` 修改副本；`m[key] = p` 写回 map。
+2. `MovePtr`：value 是 `*Point`，取出的是指针的副本，但指向同一个对象，`p.X += dx` 直接生效，不需要写回。
+3. 两个函数都用 comma-ok 判断 key 是否存在。
+
+**易错点**
+
+- `Move` 里忘了 `m[key] = p`，修改不会生效，而且编译器不会提示。
+- 存指针要注意：多个地方拿到同一个指针并发修改需要同步；另外值类型的 map 对 GC 更友好（指针多会增加扫描成本）。
+
+=== go-06-1
+--- explain
+**思路**
+
+“零值可用”是 Go 的设计习惯：`var mu sync.Mutex`、`var buf bytes.Buffer` 都不需要初始化就能用。自己的类型也可以做到：在第一次写入时**懒初始化**内部的 map。
+
+**代码讲解**
+
+1. `Registry` 只有一个 map 字段，零值时是 nil。
+2. `Add` 用**指针接收者**，因为它可能需要给 `r.items` 赋值；`if r.items == nil { r.items = make(...) }` 是懒初始化。
+3. `Get`：读 nil map 是安全的，返回零值和 false，所以不需要判断。
+4. `NewInt`：`new(int)` 分配一个零值 int 并返回指针，`*p = v` 写入。每次调用都分配新的变量，所以指针不同。
+
+**易错点**
+
+- `Add` 用值接收者时，初始化的是副本的 map，调用方的 `r.items` 仍然是 nil，下次还会重新初始化，数据全部丢失。
+- `new(T)` 和 `&T{}` 等价，日常更常写后者；`new` 主要用在基本类型上，比如 `new(int)`。
+- `make` 只用于切片、map、channel，返回的是值本身而不是指针。
+
+=== go-07-1
+--- explain
+**思路**
+
+`string(b)` 和 `[]byte(s)` 都会复制数据，因为字符串必须不可变。Go 1.20 提供了一组 `unsafe` 函数，可以直接用同一块内存构造另一种类型，实现零拷贝。代价是：**之后绝对不能修改这块内存**，否则字符串“变了”，会破坏 map key、字符串常量等的正确性。
+
+**代码讲解**
+
+1. `unsafe.SliceData(b)` 返回切片底层数组首元素的指针（`*byte`）。
+2. `unsafe.String(ptr, len)` 用指针和长度构造字符串，不复制。
+3. `unsafe.StringData(s)` 返回字符串数据的指针；`unsafe.Slice(ptr, len)` 构造长度和容量都为 len 的切片。
+
+**易错点**
+
+- 对 `StringToBytes` 的结果写入是未定义行为：字符串常量可能在只读内存里，写入会直接崩溃。
+- 零拷贝之后，原切片被修改，字符串也会跟着变。
+- 编译器已经对很多场景做了优化：`m[string(b)]` 查 map、`string(b) == "x"` 比较、`for range []byte(s)` 都不会分配。先用 profile 确认转换确实是瓶颈，再考虑 unsafe。
+
+=== go-08-1
+--- explain
+**思路**
+
+`defer` 在函数**返回前**执行，并且能读写**命名返回值**。所以把“提交还是回滚”的判断放在 defer 里，根据最终的 `err` 决定：无论函数从哪个 return 退出、甚至 panic，都只会走这一个出口，提交和回滚恰好执行一个。
+
+**代码讲解**
+
+1. `func Transfer(...) (err error)`：命名返回值，defer 里的闭包可以读到它最终的值。
+2. `defer func() { if err != nil { tx.Rollback(); return }; tx.Commit() }()`：注意末尾的 `()`，defer 的是一次函数调用。
+3. `for _, step := range steps`：`steps` 是函数切片，`step()` 调用它。
+4. `if err := step(); err != nil { return err }`：这里的 `err` 是 if 里新声明的变量，**遮蔽**了命名返回值；但 `return err` 会把它的值赋给命名返回值，再执行 defer，所以 defer 看到的是正确的错误。
+5. 全部成功 `return nil`。
+
+**易错点**
+
+- 不用命名返回值时，defer 里读不到最终返回的错误。
+- 如果写成裸 `return`（不带值），被遮蔽的内层 err 就不会赋给命名返回值，编译器会报错 `result parameter err not in scope at return`，正是为了防止这个 bug。
+- 生产代码里还会在 defer 里 `recover()`，panic 时也回滚。

@@ -1,0 +1,424 @@
+=== go-01
+--- deep
+**原理展开**
+
+切片表达式 `s[i:j]` 不会复制任何元素，它只是构造了一个新的切片头：指针指向 `&s[i]`，`len = j - i`，`cap = cap(s) - i`。所以子切片能“看到”原切片 j 之后、容量范围之内的元素，这正是 append 覆盖问题的根源。
+
+数组在 Go 里很少直接使用，但有几个场景很合适：
+
+- 固定大小的数据：哈希值 `[32]byte`、IPv4 地址 `[4]byte`、坐标 `[2]int`；
+- 需要作为 map 的 key 或者用 `==` 比较（切片都不行）；
+- 计数表：`[26]int` 比 `map[byte]int` 快很多，而且不需要分配。
+
+**代码示例**
+
+```go
+s := []int{0, 1, 2, 3, 4}
+t := s[1:3]                      // [1 2]，len 2，cap 4
+fmt.Println(len(t), cap(t))      // 2 4
+t = append(t, 99)                // 容量够，写到 s[3]
+fmt.Println(s)                   // [0 1 2 99 4]
+
+u := s[1:3:3]                    // 完整切片表达式，cap 2
+u = append(u, 100)               // 容量不够，分配新数组
+fmt.Println(s)                   // [0 1 2 99 4]，不受影响
+```
+
+**常见追问**
+
+- nil 切片和空切片有什么区别？→ `var s []int` 是 nil（指针为 nil），`[]int{}` 不是 nil，但两者 len、cap 都是 0，range、append 行为一致；区别主要在 JSON 编码（`null` 和 `[]`）和 `s == nil` 判断。
+- 切片可以比较吗？→ 只能和 nil 比较；比较内容用 `slices.Equal`。
+- 函数参数应该传数组还是切片？→ 几乎总是切片；数组会整体复制。
+
+**实战建议**
+
+- 返回内部切片时，想清楚调用方能不能修改它，不能就返回副本（`slices.Clone`）。
+- 从大切片里截取一小段长期保存时要复制，否则整个大数组都无法被 GC 回收。
+- 切片作为结构体字段被多个 goroutine 读写时，切片头本身的读写也需要同步。
+
+=== go-02
+--- deep
+**原理展开**
+
+`append` 发现容量不够时调用 `runtime.growslice`：
+
+1. 按规则算出新容量（需要的长度超过 2 倍直接用；小于 256 翻倍；之后约 1.25 倍 + 192 平滑增长）；
+2. 用 `元素大小 × 新容量` 去内存分配器的 **size class** 表里向上取整，再反推出实际容量；
+3. 分配新数组，把旧元素复制过去（含指针的类型还要处理写屏障），返回新的切片头。
+
+旧数组如果没有其他引用，就等待 GC 回收。所以一次扩容的成本是“分配 + 复制 n 个元素”，频繁扩容会产生大量短命的垃圾。
+
+**代码示例**
+
+```go
+var s []int
+prev := -1
+for i := 0; i < 2000; i++ {
+	s = append(s, i)
+	if cap(s) != prev {
+		fmt.Printf("len=%d cap=%d\n", len(s), cap(s))
+		prev = cap(s)
+	}
+}
+// 输出的容量序列：1 2 4 8 16 32 64 128 256 512 848 1280 1792 2560
+// 512 之后不再是简单的 1.25 倍，因为还要按 size class 取整
+```
+
+**常见追问**
+
+- 为什么不一直翻倍？→ 大切片翻倍会浪费大量内存（最多浪费一半），而且新数组无法复用旧数组释放的空间。
+- `append(s, other...)` 一次追加很多元素时怎么算？→ 需要的长度超过 2 倍容量时，直接按需要的长度（再取整）分配。
+- 扩容后原切片会怎样？→ 原切片仍然指向旧数组，和新切片互不影响。
+
+**实战建议**
+
+- 能预估元素个数时 `make([]T, 0, n)`；不确定时也可以按上限预估，多出来的容量通常比多次扩容便宜。
+- 用 `go test -bench . -benchmem` 观察 `allocs/op`，确认优化有效。
+- 复用切片：`buf = buf[:0]` 保留容量重新填充，适合在循环中反复使用的缓冲区。
+
+=== go-03
+--- deep
+**原理展开**
+
+这道题的本质是“**传值**”：Go 的所有参数都是值传递，切片传递的是切片头（指针、len、cap）的副本。
+
+- 函数里修改元素（`s[0] = 100`）→ 通过指针修改共享的底层数组，调用方能看到；
+- 函数里 `append` → 修改的是副本的 len（以及可能的指针），调用方的切片头没有变化。容量足够时新元素其实已经写进了共享数组，只是调用方的 len 没有覆盖到它。
+
+**代码示例**
+
+```go
+s1 := make([]int, 3, 10)
+add(s1)
+fmt.Println(s1)        // [100 0 0]
+fmt.Println(s1[:4])    // [100 0 0 4]：扩大 len 就能“看到”函数里 append 的元素
+```
+
+这个例子说明数据确实写进去了，只是调用方的长度没有变。
+
+**常见追问**
+
+- map 作为参数时呢？→ map 本身就是指向运行时 hmap 结构的指针，函数里增删元素调用方都能看到；但在函数里 `m = make(...)` 重新赋值不会影响调用方。
+- 怎么让函数修改调用方的切片？→ 返回新切片（推荐，和 `append` 的用法一致）或传 `*[]T`。
+- 字符串作为参数会复制内容吗？→ 不会，只复制 16 字节的字符串头（指针 + 长度）。
+
+**实战建议**
+
+- 函数要改变切片长度时，签名写成 `func f(s []T) []T`，调用写成 `s = f(s)`，一眼就能看出切片可能被替换。
+- 同一个底层数组被多处 append 时极易出 bug，必要时用 `s[:len(s):len(s)]` 限制容量，强制下一次 append 复制。
+
+=== go-04
+--- deep
+**原理展开**
+
+map 的读写会检查哈希表头部的 `flags` 字段：写操作开始时设置 `hashWriting` 标志，结束时清除；其他读写操作发现这个标志已经被设置，就调用 `fatal("concurrent map writes")`（或 `concurrent map read and map write`）。这只是一个**尽力而为**的检测：只有恰好撞上时才会报错，所以没有崩溃并不代表没有问题。
+
+为什么是 fatal 而不是 panic：并发写可能已经破坏了哈希表的内部结构，继续运行可能产生更难排查的错误，所以直接终止进程。
+
+**代码示例**
+
+```go
+// 读多写少：RWMutex
+type Cache struct {
+	mu sync.RWMutex
+	m  map[string]string
+}
+
+func (c *Cache) Get(k string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	v, ok := c.m[k]
+	return v, ok
+}
+
+// 几乎只读、偶尔整体替换：atomic.Pointer + 写时复制
+var cfg atomic.Pointer[map[string]string]
+
+func Lookup(k string) string { return (*cfg.Load())[k] }
+func Replace(m map[string]string) { cfg.Store(&m) }
+```
+
+**常见追问**
+
+- 只读不写的 map 能并发访问吗？→ 可以，所有 goroutine 都只读是安全的（前提是写入在启动这些 goroutine 之前完成）。
+- `sync.Map` 为什么不是默认选择？→ 它的值是 `any`，没有类型安全；在写多或 key 频繁变化的场景下比 `map + Mutex` 更慢。
+- 分片锁的分片数怎么选？→ 一般是 CPU 核数的几倍，取 2 的幂方便用位运算定位。
+
+**实战建议**
+
+- CI 里跑 `go test -race`，并且测试要有真正的并发（多个 goroutine 同时访问）。
+- 优先选择“不共享”：每个 goroutine 处理自己的数据，最后合并结果，比加锁更简单也更快。
+
+=== go-05
+--- deep
+**原理展开**
+
+无序有两个来源：
+
+1. **故意随机化**：每次 `range` 从一个随机的桶、随机的槽位开始遍历。这是 Go 1.0 就引入的，目的是让依赖遍历顺序的代码尽早暴露问题。
+2. **结构性原因**：元素在桶里的位置由哈希值决定，扩容（以及 Go 1.24 的 Swiss Table 实现中的表分裂）会改变元素的位置。
+
+不能取地址也是因为扩容会搬迁元素：如果允许 `&m[k]`，扩容后这个指针就指向了旧的内存。
+
+**代码示例**
+
+```go
+type Point struct{ X, Y int }
+m := map[string]Point{"a": {1, 2}}
+
+// m["a"].X = 10            // 编译错误：cannot assign to struct field m["a"].X in map
+p := m["a"]                  // 取出副本
+p.X = 10
+m["a"] = p                   // 写回
+
+pm := map[string]*Point{"a": {1, 2}}
+pm["a"].X = 10               // 值是指针，可以直接修改
+
+for _, k := range slices.Sorted(maps.Keys(m)) { // 有序遍历（Go 1.23+）
+	fmt.Println(k, m[k])
+}
+```
+
+**常见追问**
+
+- 遍历的时候可以删除元素吗？→ 可以，删除是安全的；遍历时新增的元素可能被遍历到也可能不会。
+- 两次 range 同一个 map，顺序一样吗？→ 不保证一样。
+- `fmt.Println(m)` 为什么是有序的？→ fmt 在打印 map 时专门对 key 排了序（Go 1.12+），方便测试和调试。
+
+**实战建议**
+
+- 测试里不要断言依赖 map 遍历顺序的结果（拼接的字符串、切片），先排序再比较。
+- 需要按插入顺序遍历时，额外维护一个 key 的切片，或者使用有序 map 的第三方实现。
+
+=== go-06
+--- deep
+**原理展开**
+
+`new(T)` 做的事情非常简单：分配一块 `sizeof(T)` 的内存并清零，返回指针。它和 `&T{}` 完全等价，变量最终分配在栈上还是堆上由**逃逸分析**决定，跟用了 new 还是 & 无关。
+
+`make` 是内置的“构造函数”，只用于三种需要初始化内部结构的引用类型：
+
+- `make([]T, len, cap)`：分配底层数组，返回切片头；
+- `make(map[K]V, hint)`：创建哈希表，hint 用来预分配桶；
+- `make(chan T, n)`：创建 channel 结构和环形缓冲区。
+
+**代码示例**
+
+```go
+p := new(int)          // *int，指向 0
+q := &struct{ N int }{} // 和 new(struct{N int}) 一样
+fmt.Println(*p, q.N)    // 0 0
+
+var m map[string]int    // nil map
+fmt.Println(m["x"])     // 0：读 nil map 安全
+// m["x"] = 1           // panic: assignment to entry in nil map
+
+pm := new(map[string]int) // *map[string]int，指向 nil map
+*pm = make(map[string]int)
+(*pm)["x"] = 1
+
+// Go 1.26+：new 可以接收一个表达式，方便给可选的指针字段赋值
+type Req struct{ Limit *int }
+r := Req{Limit: new(10)}
+```
+
+**常见追问**
+
+- 用 `new` 创建的变量一定在堆上吗？→ 不一定，如果指针没有逃逸，编译器会把它分配在栈上。
+- nil channel 有什么用？→ 在 select 里永远不会就绪，可以用来动态“禁用”某个 case。
+- 为什么 map 的零值不能直接使用，而 slice 的零值可以 append？→ append 会在需要时分配新数组并返回；map 的写入需要一个已经存在的哈希表，没有返回值来替换它。
+
+**实战建议**
+
+- 结构体字段是 map 时，在构造函数里 make，或者在第一次写入时懒初始化。
+- 日常代码更常写 `&T{...}`，可以同时初始化字段；`new` 主要用于基本类型的指针。
+
+=== go-07
+--- deep
+**原理展开**
+
+string 的底层是（指针, 长度），[]byte 是（指针, 长度, 容量）。转换需要复制，是因为 string 必须**不可变**：很多地方依赖这一点，比如 map 的 key、字符串常量放在只读内存段、多个字符串共享同一块底层数据（子串）。如果 string 和 []byte 共享内存，修改切片就会“修改”字符串，这些假设全部失效。
+
+编译器做的零拷贝优化都有一个共同点：转换出来的值是**临时的**，在使用期间不会被修改，也不会被保存下来。
+
+**代码示例**
+
+```go
+b := []byte("hello")
+
+// 这些不会分配
+m := map[string]int{"hello": 1}
+_ = m[string(b)]          // map 查找
+_ = string(b) == "hello"  // 比较
+for range []byte("abc") {} // range 遍历
+
+// 这些会分配
+s := string(b)            // 保存下来了
+b[0] = 'H'
+fmt.Println(s)            // hello：s 是独立的副本
+
+// 测量
+allocs := testing.AllocsPerRun(100, func() { _ = string(b) + "!" })
+fmt.Println(allocs)
+```
+
+**常见追问**
+
+- `unsafe.String` 之后修改原切片会怎样？→ 字符串的内容会跟着变，如果这个字符串已经作为 map 的 key，map 就会出错，是未定义行为。
+- `strings.Builder.String()` 为什么不复制？→ 它内部用的就是 unsafe 转换，并且保证之后不会再修改已经返回出去的那部分数据（Builder 只追加不修改）。
+- 小字符串的转换为什么有时候不分配？→ 不逃逸的临时转换，编译器会使用栈上 32 字节的缓冲区。
+
+**实战建议**
+
+- 不要为了“性能”到处使用 unsafe 转换，先用 benchmark 和 pprof 证明转换确实是瓶颈。
+- 处理字节数据时尽量全程使用 `[]byte`（`bytes` 包的函数和 `strings` 几乎一一对应），只在边界处转换一次。
+
+=== go-08
+--- deep
+**原理展开**
+
+defer 的实现经历了三代：
+
+1. 早期：每个 defer 在**堆上**分配一个 `_defer` 记录，挂在 goroutine 的链表上，开销约 50ns；
+2. Go 1.13：大部分 defer 改为在**栈上**分配记录；
+3. Go 1.14：**开放编码**（open-coded defer）：函数里 defer 不超过 8 个、且不在循环里时，编译器直接把 defer 的调用内联到函数的每个返回点，用一个位图记录哪些 defer 需要执行，开销接近普通函数调用。
+
+循环里的 defer 不能开放编码，仍然走运行时的慢路径，这也是不建议在循环里 defer 的原因之一（另一个原因是资源释放被推迟）。
+
+**代码示例**
+
+```go
+func trace(name string) func() {
+	start := time.Now()
+	fmt.Println("enter", name)
+	return func() { fmt.Println("exit", name, time.Since(start)) }
+}
+
+func handle() {
+	defer trace("handle")() // trace("handle") 立即执行，返回的函数被 defer
+	// ...
+}
+
+func write(path string, data []byte) (err error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = cerr // Close 的错误也要报告
+		}
+	}()
+	_, err = f.Write(data)
+	return err
+}
+```
+
+**常见追问**
+
+- `os.Exit` 会执行 defer 吗？→ 不会，`os.Exit` 立即退出进程；`log.Fatal` 内部也是 `os.Exit`。
+- panic 时 defer 会执行吗？→ 会，panic 沿着调用栈展开时依次执行每一层的 defer，这正是 recover 能工作的原因。
+- defer 调用的是方法值时，接收者什么时候求值？→ 和参数一样，在 defer 语句执行时求值。
+
+**实战建议**
+
+- 获取资源后紧接着写 defer 释放：`mu.Lock(); defer mu.Unlock()`，`f, err := Open(); if err != nil {...}; defer f.Close()`。
+- 对写入的文件，Close 的错误不能忽略（数据可能没有成功写入），用命名返回值把它报告出去。
+
+=== go-09
+--- deep
+**原理展开**
+
+panic 发生时，运行时从当前函数开始**逐层展开**调用栈，执行每一层的 defer。如果某个 defer 函数里直接调用了 `recover()`，panic 被停止，`recover` 返回 panic 的值，**这个 defer 所在的函数**正常返回到它的调用者（返回值是命名返回值当时的值）。如果展开到 goroutine 的最顶层还没有被 recover，运行时打印 panic 信息和堆栈，然后以退出码 2 终止整个进程。
+
+“只能在 defer 中直接调用”：recover 需要知道自己是否处在“正在处理 panic 的 defer 调用”中，运行时通过检查调用者的栈帧来判断，多嵌套一层就对不上了。
+
+**代码示例**
+
+```go
+func mustPositive(n int) int {
+	if n <= 0 {
+		panic(fmt.Sprintf("mustPositive: got %d", n))
+	}
+	return n
+}
+
+// 库的内部用 panic 简化深层递归的错误传递，在公开 API 的边界转换成 error
+func Parse(s string) (v int, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if pe, ok := r.(parseError); ok {
+				err = pe
+				return
+			}
+			panic(r) // 不是我们预期的 panic，继续抛出
+		}
+	}()
+	return parseExpr(s), nil
+}
+
+type parseError struct{ msg string }
+
+func (e parseError) Error() string { return e.msg }
+```
+
+标准库的 `encoding/json`、`text/template` 内部就是这样使用 panic 的。
+
+**常见追问**
+
+- recover 之后程序从哪里继续？→ 从包含这个 defer 的函数**返回**，不会回到 panic 的位置继续执行。
+- 可以 panic 一个 error 吗？→ 可以，panic 的参数是 `any`；recover 后可以用类型断言判断。
+- `panic(nil)` 呢？→ Go 1.21 起会变成 `*runtime.PanicNilError`，recover 能正确地拿到非 nil 的值。
+
+**实战建议**
+
+- 业务错误一律返回 error；panic 只用于“程序员的错误”（违反不变量、不可能发生的情况）。
+- 每个后台 goroutine 都要有 recover 兜底，并把堆栈记录到日志里（`debug.Stack()`），否则一个 bug 就能让整个服务崩溃。
+- 不要 recover 之后假装什么都没发生：记录、告警，必要时让进程退出由外部重启。
+
+=== go-10
+--- deep
+**原理展开**
+
+接口在运行时是两个字：
+
+- 非空接口（如 `error`）是 `iface`：`{tab *itab, data unsafe.Pointer}`，`itab` 里记录了动态类型和方法表；
+- 空接口 `any` 是 `eface`：`{_type *_type, data unsafe.Pointer}`。
+
+`err == nil` 比较的是**这两个字是否都为 0**。把 `(*MyErr)(nil)` 赋给 error 时，类型字段被设置为 `*MyErr`，只有数据指针是 nil，所以接口不等于 nil。
+
+**代码示例**
+
+```go
+func find(id int) *NotFoundError {
+	if id > 0 {
+		return nil
+	}
+	return &NotFoundError{ID: id}
+}
+
+func Get(id int) error {
+	// 错误写法：return find(id)
+	// 即使 find 返回 nil，这里得到的 error 也不等于 nil
+	if e := find(id); e != nil {
+		return e
+	}
+	return nil
+}
+
+// 调试时打印动态类型就能看出问题
+var err error = (*NotFoundError)(nil)
+fmt.Printf("%T %v %v\n", err, err, err == nil) // *main.NotFoundError <nil> false
+```
+
+**常见追问**
+
+- 怎么判断接口里装的是不是 nil 指针？→ 类型断言后判断：`if p, ok := err.(*MyErr); ok && p == nil`；通用的写法要用反射 `reflect.ValueOf(x).IsNil()`，但应该从设计上避免这种情况。
+- 为什么 Go 不把这种情况也当成 nil？→ 一个 nil 指针也可能是有效的接收者（方法里可以处理 nil），类型信息仍然有意义。
+- 别的接口类型也有这个问题吗？→ 所有接口都一样，比如返回 `io.Reader` 的函数返回了一个 nil 的 `*bytes.Buffer`。
+
+**实战建议**
+
+- 返回接口类型的函数，在“没有值”的分支里直接写字面量 `return nil`。
+- 函数内部的错误变量用 `error` 类型声明（`var err error`），而不是具体的错误类型。
+- `staticcheck` 等 lint 工具能发现一部分这类问题（SA4023）。

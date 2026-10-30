@@ -1,0 +1,303 @@
+=== web-11-1
+--- explain
+**思路**
+
+所有错误从一个出口返回给客户端，格式统一。内部错误（数据库报错、文件路径）**不能**直接暴露给用户：既不友好，也可能泄露系统信息。所以只有“明确知道可以展示”的 `*AppError` 才把它的信息返回，其他错误一律返回通用信息，详细原因记日志。
+
+**代码讲解**
+
+1. `AppError` 有对外的 `Status`、`Code`、`Message`，以及不导出的 `cause`；`Unwrap()` 返回 cause，日志里可以看到完整的错误链。
+2. `WriteError` 先设好默认值（500 / 50000），再用无条件 switch 依次判断：
+   - `errors.As(err, &ae)`：错误链上有 AppError（即使被 `fmt.Errorf("%w")` 包了几层也能找到）；
+   - `errors.Is(err, context.DeadlineExceeded)`：超时返回 504。
+3. `status, b = ae.Status, body{ae.Code, ae.Message}`：多重赋值同时更新两个变量。
+4. 写响应：先设 Content-Type，再 `WriteHeader`，最后编码 JSON。
+
+**易错点**
+
+- `w.WriteHeader` 必须在 `Header().Set` 之后、写响应体之前。
+- 用 `err.Error()` 作为 message 返回给用户，会把 SQL 语句、内部地址等暴露出去。
+- 错误码的设计常见做法是“HTTP 状态码 + 业务码”，业务码前几位表示模块，方便定位问题。
+
+=== web-11-2
+--- explain
+**思路**
+
+参数校验要**收集所有错误**一次性返回，而不是遇到第一个就返回，前端可以一次标出所有有问题的字段。错误类型 `ValidationErrors` 是切片，实现了 `error` 接口。最关键的陷阱：没有错误时必须 `return nil`，而不是 `return errs`。
+
+**代码讲解**
+
+1. `type ValidationErrors []FieldError`：基于切片定义新类型并实现 `Error()`，用 `strings.Join` 拼接每个字段的错误。
+2. `var errs ValidationErrors`：nil 切片，可以直接 append。
+3. name：先 `TrimSpace`，无条件 switch 判断“为空”和“太长”两种情况（互斥，只报一个）。`utf8.RuneCountInString` 按字符而不是字节计数，中文名不会被误判为太长。
+4. email：`strings.Cut(r.Email, "@")` 拆成两部分，再检查两边不为空、域名里没有第二个 `@`。
+5. `if len(errs) == 0 { return nil }`。
+
+**为什么不能直接 `return errs`**：返回类型是 `error` 接口。`errs` 为 nil 时，接口的值是 nil，但**类型**是 `ValidationErrors`，接口本身不等于 nil，调用方的 `if err != nil` 会判断为有错误（见 GO-10）。
+
+**易错点**
+
+- 用 `len(s)` 统计中文名的长度，一个汉字算 3 个。
+- 生产项目常用 `go-playground/validator` 通过 struct tag 声明校验规则，Gin 的 `binding` 标签就是基于它。
+
+=== web-12-1
+--- explain
+**思路**
+
+每个请求在入口处获得一个 ID：上游已经带了就沿用，没有就生成。ID 放进请求的 context，后续的日志、下游调用都从 context 里取，整条调用链就能用同一个 ID 串起来。
+
+**代码讲解**
+
+1. `type traceKey struct{}`：未导出的 context key 类型，避免和其他包冲突。
+2. `newID`：`crypto/rand.Read` 生成 8 个随机字节，`hex.EncodeToString` 编码成 16 个十六进制字符。
+3. `Trace` 中间件：读请求头 → 没有就生成 → 写回响应头（方便客户端反馈问题时提供）→ `context.WithValue` + `r.WithContext` 把 ID 传下去。
+4. `TraceID`：`id, _ := ctx.Value(traceKey{}).(string)`，取不到时类型断言得到零值空字符串。
+5. `Inject`：调用下游服务前，把 ID 设置到下游请求的头上。
+
+**易错点**
+
+- 用 `math/rand` 生成 ID：可预测，也更容易碰撞。
+- 实际项目通常用 OpenTelemetry，它定义了标准的 `traceparent` 头（W3C Trace Context），自动在 HTTP / gRPC 客户端和服务端之间传递，同时记录每一段调用的耗时。
+- 从外部请求头读取的 ID 要校验长度和字符集，防止日志注入。
+
+=== web-12-2
+--- explain
+**思路**
+
+`slog.Handler` 是一个接口，包装它就能在每条日志输出前做统一处理。嵌入内层 Handler，只重写需要改变的方法：`Handle` 里从 ctx 取出 trace ID 追加到日志记录上。业务代码只要用带 ctx 的方法（`InfoContext`、`ErrorContext`），每条日志就会自动带上 trace_id。
+
+**代码讲解**
+
+1. `type TraceHandler struct { slog.Handler }`：嵌入接口，`Enabled` 方法自动提升，不需要重写。
+2. `Handle(ctx, r)`：`r` 是 `slog.Record` 的值拷贝，`r.AddAttrs` 修改的是副本，不影响其他 Handler；然后调用内层的 `Handle`。
+3. **`WithAttrs` 和 `WithGroup` 必须重写**：`logger.With("user", u)` 会调用 `WithAttrs` 得到一个新 Handler。如果不重写，提升的方法返回的是**内层** Handler，新 logger 就丢掉了 TraceHandler 这层包装，trace_id 不再出现。重写后返回 `TraceHandler{内层的新 Handler}`，保持包装。
+
+**易错点**
+
+- 用 `logger.Info(...)`（不带 ctx）时 ctx 是 `context.Background()`，取不到 trace ID。
+- 嵌入接口是“装饰器”的便捷写法，但所有**返回新对象**的方法都要检查是否需要重写，这是一个常见的坑。
+
+=== web-13-1
+--- explain
+**思路**
+
+上传文件不能 `io.ReadAll`：100 个并发的 1GB 上传就是 100GB 内存。应该**流式处理**：边读边写到目标位置，内存占用只有一个固定大小的缓冲区。同时用 `io.MultiWriter` 把同一份数据写给哈希计算器，不需要读两遍。
+
+**代码讲解**
+
+1. `h := sha256.New()`：哈希也是一个 `io.Writer`。
+2. `io.MultiWriter(w, h)`：写入的数据会同时写到 w 和 h。
+3. `io.LimitReader(r, max+1)`：最多读 `max+1` 个字节。如果真的读到了 `max+1` 个，说明文件超过了限制，而且只多读了一个字节就停止了。
+4. `io.Copy` 返回复制的字节数，`n > max` 时返回 `ErrTooLarge`。
+5. `hex.EncodeToString(h.Sum(nil))` 得到十六进制哈希。
+
+**易错点**
+
+- 用 `io.LimitReader(r, max)`：正好 max 字节和超过 max 字节的文件都只会读到 max 个字节，无法区分。
+- 超限时 w 里已经写入了 max+1 字节，调用方需要删除这个不完整的文件。
+- HTTP 服务里先用 `http.MaxBytesReader(w, r.Body, max)` 限制请求体，`r.ParseMultipartForm` 超过内存限制的部分会写到临时文件，或者用 `r.MultipartReader()` 完全流式地处理。
+
+=== web-13-2
+--- explain
+**思路**
+
+大文件切成固定数量的分片，每个分片单独上传、单独重试。服务端记录已经收到的分片；中断后客户端先查询 `Missing()`，只补传缺失的部分（断点续传）。全部到齐后按顺序拼接，并用整个文件的哈希校验完整性。
+
+**代码讲解**
+
+1. `chunks map[int][]byte`：分片下标 → 数据。
+2. `Put`：先检查下标范围；`bytes.Clone(data)` 复制一份，不保留调用方的缓冲区（调用方可能会复用它）。
+3. `Missing`：从 0 到 total−1 检查哪些不在 map 里，结果天然是升序的。
+4. `Assemble`：有缺失时用 `%v` 把缺失列表放进错误信息；`bytes.Buffer` 依次写入；`sha256.Sum256` 返回 `[32]byte` 数组，`sum[:]` 转成切片再编码。
+
+**易错点**
+
+- 保存调用方传入的切片而不复制：调用方复用缓冲区读取下一个分片时，已保存的分片内容被覆盖。
+- 生产环境分片应该直接写到磁盘或对象存储（S3 的 Multipart Upload），而不是放在内存里；上传状态（已收到哪些分片）要持久化，服务重启后才能续传。
+- 每个分片也可以带自己的哈希，在上传时就发现损坏，只重传那一个分片。
+
+=== web-14-1
+--- explain
+**思路**
+
+RBAC：用户 → 角色 → 权限。角色可以继承其他角色的权限，权限支持通配符。判断权限就是从用户的角色出发，**遍历它和它继承的所有角色**，看有没有一条权限能匹配。继承关系配置错误时可能有环，遍历时要记录访问过的角色。
+
+**代码讲解**
+
+1. 三个 map：角色的权限、角色的父角色、用户的角色。三个方法都是一行 append，用分号风格的单行函数写在一起。
+2. `match(granted, want)`：`*` 匹配一切；完全相等；或者 `资源:*` 匹配同一资源的所有操作。`strings.Cut` 拆出资源和操作。
+3. `Can`：用切片当栈做 DFS。`stack := append([]string(nil), r.users[user]...)` 复制一份，避免之后的 append 修改 `r.users` 的底层数组。
+4. `seen` 记录访问过的角色，遇到环时直接跳过。
+5. 找到匹配就立即返回 true。
+
+**易错点**
+
+- 不处理环：`A 继承 B、B 继承 A` 时无限循环。
+- 直接 `stack := r.users[user]` 然后 append：可能修改到 map 里存的切片（容量足够时）。
+- 权限的判断结果可以缓存，但角色或权限变更时要让缓存失效。更复杂的需求（按数据范围授权，比如“只能看自己部门的订单”）需要 ABAC 或在查询里加过滤条件。
+
+=== web-15-1
+--- explain
+**思路**
+
+配置热更新的三个要求：
+
+1. 读取频繁，要**无锁**：用 `atomic.Pointer` 保存当前配置；
+2. 读取方看到的配置**永远完整**：每次更新都解析出一个新对象，校验通过后整体替换指针，旧对象不修改；
+3. 新配置有问题时**保留旧配置**：解析或校验失败不替换。
+
+**代码讲解**
+
+1. `parse`：JSON 解析 + `Validate()`，任何一步失败都返回错误。
+2. `NewManager`：直接复用 `Reload()` 做初始加载，失败时返回错误（启动时配置不对应该直接失败）。
+3. `Current()`：`m.cur.Load()`，一次原子读。
+4. `Reload`：用 `mu` 串行化（多个触发源同时 Reload 时不会交错）；`bytes.Equal` 比较原始内容，没变化就跳过；成功后 `Store` 新指针并记录原始内容。
+
+**易错点**
+
+- 在原对象上修改字段（`cfg.RateLimit = new`）：读取方可能看到一半新一半旧的配置，还会有数据竞争。
+- 调用方拿到 `*Config` 后不能修改它，因为所有人共享同一个对象。
+- 触发方式：监听文件变化（fsnotify）、配置中心推送（etcd watch、Nacos）、或者收到 SIGHUP 信号。
+
+=== web-16-1
+--- explain
+**思路**
+
+分层：handler（HTTP 协议相关）→ service（业务逻辑）→ repo（数据访问）。service 只依赖**自己定义的接口** `UserRepo`，不依赖具体的数据库实现；时间也通过函数注入。main 函数负责组装依赖，单元测试时传入假实现，不需要真实的数据库。
+
+**代码讲解**
+
+1. `UserRepo` 接口只包含 service 需要的两个方法（接口由使用方定义，越小越好）。
+2. `NewUserService(repo, now)`：构造函数注入依赖。
+3. `Register`：
+   - `strings.TrimSpace` 后用 `utf8.RuneCountInString` 检查长度；`if n := ...; n < 2 || n > 20` 在 if 里声明 n；
+   - 检查重名，repo 出错用 `fmt.Errorf("check name: %w", err)` 包装，上层仍然可以用 `errors.Is` 判断原始错误；
+   - `&User{Name: name, CreatedAt: s.now()}`，`repo.Create(ctx, u)` 传指针，repo 可以回填 ID。
+4. 业务错误用包级的哨兵变量，handler 层可以把它们映射成不同的 HTTP 状态码。
+
+**易错点**
+
+- “先查是否存在再创建”在并发时仍然可能重复，数据库上的唯一索引是必须的；repo 把唯一键冲突转换成 `ErrDuplicate` 更稳妥。
+- 依赖多了以后可以用 Wire（编译期代码生成）或 fx（运行时）做依赖注入，但手写构造函数在大多数项目里已经足够清楚。
+
+=== web-17-1
+--- explain
+**思路**
+
+直接调用 `time.Now()` 的代码，测试“过期”只能真的等待。把“获取当前时间”抽象成接口，生产环境用真实时钟，测试用一个可以手动拨动的假时钟，就能瞬间“快进”几个小时。
+
+**代码讲解**
+
+1. `Clock` 接口只有一个方法 `Now()`。
+2. `realClock struct{}`：空结构体实现，生产代码使用。
+3. `FakeClock`：保存一个时间；`Advance(d)` 用 `c.t.Add(d)` 前进。方法用指针接收者，因为 `Advance` 要修改它。
+4. `TokenStore` 依赖 `Clock` 接口；`Issue` 和 `Valid` 都通过 `s.clock.Now()` 获取时间。
+5. `Valid`：`ok && s.clock.Now().Sub(at) < s.ttl`。
+
+**易错点**
+
+- 只要有一处直接调用了 `time.Now()`，假时钟就失效了，测试会变得时好时坏。
+- 比接口更轻量的做法是注入函数：`now func() time.Time`（本题库的很多任务都是这样做的）。
+- Go 1.24 新增了实验性的 `testing/synctest`（1.25 正式发布）：在“气泡”里运行测试，`time.Sleep` 等会使用虚拟时间，不需要改造代码就能测试定时逻辑。
+
+=== web-18-1
+--- explain
+**思路**
+
+请求结束后连接被放回空闲池，下次复用，省去 TCP 握手（和 TLS 握手）。但 `MaxIdleConnsPerHost` 默认只有 2：10 个并发请求结束时，只有 2 个连接能放回池子，其他 8 个被关闭；下一轮又要新建 8 个连接。高并发调用同一个服务时，这会导致大量的新建连接和 TIME_WAIT。
+
+**代码讲解**
+
+1. `idle map[string][]int`：每个 host 一个空闲连接栈。
+2. `Get`：有空闲就从末尾取（后放回的先用，这样最近使用过的连接更可能还是活的）；没有就新建，`Dialed++`。
+3. `Put`：空闲数达到上限就关闭，`Closed++`；否则放回。
+
+**测试结论**：上限为 2 时，每轮 10 个并发请求，第一轮新建 10 个，之后每轮关闭 8 个、新建 8 个；上限为 10 时总共只建立 10 个连接。
+
+**易错点**
+
+- 调用内部服务时，`MaxIdleConnsPerHost` 应该调到和并发度相当；`MaxIdleConns`（所有 host 的总数，默认 100）也要相应调大。
+- 不读完、不关闭响应体，连接不会被放回池子，再大的池也没用（见「正确使用 http.Client」）。
+- 还有 `MaxConnsPerHost` 限制每个 host 的总连接数（默认不限制）、`IdleConnTimeout` 控制空闲连接存活多久（默认 90 秒）。
+
+=== web-19-1
+--- explain
+**思路**
+
+`encoding/json` 通过反射处理任意类型，每次调用都有反射开销和内存分配。对于 QPS 很高、结构固定的接口，可以手写序列化：直接往 `[]byte` 里 append 字段，配合调用方复用缓冲区，做到零分配。代价是要自己处理字符串转义，结构改变时也要同步修改代码。
+
+**代码讲解**
+
+1. `append(dst, \`{"id":\`...)`：用原始字符串字面量（反引号）写 JSON 片段，不需要转义双引号；`...` 把字符串展开成字节追加。
+2. `strconv.AppendInt`、`strconv.AppendBool`：直接把数字和布尔值写进切片，不产生中间字符串。
+3. `appendString`：按字节扫描，switch 处理需要转义的字符：
+   - 引号和反斜杠前面加 `\`；
+   - 常见控制字符用简写；
+   - 其他小于 0x20 的控制字符写成 `\u00XX`，`hexDigits[c>>4]` 和 `hexDigits[c&0xf]` 分别取高 4 位和低 4 位对应的十六进制字符；
+   - 其他字节原样输出：UTF-8 编码的中文所有字节都 ≥ 0x80，不会被误处理。
+
+**易错点**
+
+- 遗漏转义规则会产生非法 JSON，甚至被注入额外的字段。
+- 先确认 JSON 序列化确实是瓶颈（pprof）再手写；通常用代码生成工具（easyjson、ffjson）或更快的库（`goccy/go-json`、`bytedance/sonic`）是更省事的选择。
+- 关于 fasthttp：它通过大量复用对象实现很高的性能，但 API 和标准库不兼容，请求对象在 handler 返回后不能再使用。大多数业务的瓶颈在数据库和下游调用，标准库 net/http 已经足够。
+
+=== web-20-1
+--- explain
+**思路**
+
+Webhook 接口是公开的，任何人都可以伪造请求。双方共享一个密钥，发送方对“时间戳 + 请求体”计算 HMAC 签名放在请求头里；接收方用同样的密钥重新计算并比较。把时间戳放进签名并检查它和当前时间的差距，可以防止攻击者截获一个合法请求后**重放**。
+
+**代码讲解**
+
+1. `mac`：`hmac.New(sha256.New, secret)`，依次写入 `"<t>."` 和 body。分两次 `Write` 等价于写入拼接后的数据，但不需要额外分配。
+2. 解析头部：按逗号切分，每段 `strings.Cut(..., "=")`；`t` 记录时间戳；`v1` 可能有多个（密钥轮换期间新旧两个签名同时存在），解码成功的都收集起来。
+3. `strconv.ParseInt` 失败或者没有签名 → `ErrBadHeader`。
+4. `d := now.Sub(time.Unix(sec, 0))`：时间差，`d > tolerance || d < -tolerance` 同时拒绝太旧和来自未来的时间戳。
+5. 任意一个签名通过 `hmac.Equal` 常量时间比较即通过。
+
+**易错点**
+
+- 对**原始请求体字节**计算签名，不能先解析 JSON 再重新序列化（字段顺序、空格会变）。
+- 用 `==` 或 `bytes.Equal` 比较签名有时序攻击风险。
+- 时间窗口只能缩小重放的机会；要彻底防止重放，还要记录处理过的事件 ID（幂等）。
+
+=== web-21-1
+--- explain
+**思路**
+
+灰度放量需要**稳定**：同一个用户每次请求的结果必须一样，否则刷新一下功能就消失了。对 `功能名:用户ID` 做哈希再取模 100，得到一个 0～99 的“桶号”，桶号小于放量百分比就命中。
+
+- 放量从 10% 调到 30%：原来桶号 < 10 的用户仍然 < 30，不会被“踢出”灰度；
+- 哈希里包含功能名：不同功能的灰度用户群不同，不会总是同一批用户当“小白鼠”。
+
+**代码讲解**
+
+1. 白名单优先：`allow[user]` 读不存在的 key 返回 false，nil map 也可以安全读取。
+2. `fnv.New32a()`，`Write` 写入 `feature + ":" + user`，`Sum32()` 取 32 位结果。
+3. `int(h.Sum32()%100) < percent`：先在 uint32 上取模，再转成 int 比较。
+
+**易错点**
+
+- 用随机数决定是否命中：同一个用户的结果每次都不同。
+- 只对用户 ID 哈希、不加功能名：所有功能的灰度都落在同一批用户身上。
+- 生产环境的功能开关通常放在配置中心里，支持按用户、地域、版本等多个维度配置规则，并且可以一键关闭（快速回滚）。
+
+=== web-22-1
+--- explain
+**思路**
+
+API 的两种版本标识方式：放在 URL 路径里（`/v2/users`，直观、方便调试和缓存），或者通过 `Accept` 头协商（URL 保持不变）。服务端根据版本号决定响应的结构。判断是否需要升级版本的原则：**新增可选字段是兼容的**，删除字段、改名、改类型、改语义都是不兼容的。
+
+**代码讲解**
+
+1. `Version`：无条件 switch 按优先级判断：路径前缀 → Accept 头 → 默认 1。
+2. `RenderUser` 用**匿名结构体**定义不同版本的响应格式：`struct { ... }{值}` 声明和初始化写在一起，只在这里使用，不需要单独命名类型。
+3. 匿名结构体的字段同样可以带 json tag。
+4. v1 把名和姓拼接起来，`strings.TrimSpace` 处理其中一个为空的情况。
+
+**易错点**
+
+- 在 v1 里直接把 name 改成两个字段，老客户端会读不到 name。
+- 兼容性的另一面：客户端要**忽略不认识的字段**，服务端才能放心地新增字段（Go 的 `encoding/json` 默认就是这样）。
+- 旧版本要有明确的下线计划：通过响应头（如 `Deprecation`、`Sunset`）提前通知调用方。

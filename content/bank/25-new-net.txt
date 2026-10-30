@@ -1,0 +1,784 @@
+网络与 RPC/MQ 新增题目（NET-22 ~ NET-28）的编程任务。
+
+=== net-22-1
+title: 模拟 Kubernetes DNS ndots 与 search 域候选展开规则
+--- desc
+在 Linux / Kubernetes 的 `/etc/resolv.conf` 中，`ndots` 和 `search` 决定了域名解析的查询顺序：
+
+1. 如果输入的 `host` 已经是完全限定域名（以 `'.'` 结尾，如 `"api.example.com."`），去掉末尾的 `'.'` 后只返回这 **1 个**候选域名 `[]string{"api.example.com"}`（不再拼接任何 `search` 域）；
+2. 统计 `host` 中点号 `'.'` 的数量 `dots`：
+   - 如果 `dots < ndots`：**先依次将 `host + "." + domain`（遍历 `searchDomains`）加入候选列表**，最后再将原始 `host` 本身加入列表末尾；
+   - 如果 `dots >= ndots`：**先将原始 `host` 本身放在候选列表第 1 位**，然后再依次追加 `host + "." + domain`。
+
+请实现 `ExpandDNSCandidates(host string, searchDomains []string, ndots int) []string`。
+--- solution
+package main
+
+import "strings"
+
+func ExpandDNSCandidates(host string, searchDomains []string, ndots int) []string {
+	if host == "" {
+		return nil
+	}
+	// @solution
+	if strings.HasSuffix(host, ".") {
+		return []string{strings.TrimSuffix(host, ".")}
+	}
+	dots := strings.Count(host, ".")
+	var out []string
+	if dots >= ndots {
+		out = append(out, host)
+	}
+	for _, dom := range searchDomains {
+		dom = strings.Trim(dom, ".")
+		if dom != "" {
+			out = append(out, host+"."+dom)
+		}
+	}
+	if dots < ndots {
+		out = append(out, host)
+	}
+	return out
+	// @starter
+	// return []string{host} // TODO: 根据末尾 '.' 以及 dots 与 ndots 的大小关系生成候选列表
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestExpandDNSCandidates(t *testing.T) {
+	search := []string{"default.svc.cluster.local", "svc.cluster.local"}
+
+	// 1. K8s 默认 ndots=5：访问 "api.stripe.com" (2 个点 < 5)，会先拼所有 search 域，最后才查原域名！
+	got1 := ExpandDNSCandidates("api.stripe.com", search, 5)
+	want1 := []string{
+		"api.stripe.com.default.svc.cluster.local",
+		"api.stripe.com.svc.cluster.local",
+		"api.stripe.com",
+	}
+	if !slices.Equal(got1, want1) {
+		t.Fatalf("ndots=5 got %v, want %v", got1, want1)
+	}
+
+	// 2. 调优为 ndots=2 后：2 个点 >= 2，直接第 1 个就查 "api.stripe.com"！
+	got2 := ExpandDNSCandidates("api.stripe.com", search, 2)
+	want2 := []string{
+		"api.stripe.com",
+		"api.stripe.com.default.svc.cluster.local",
+		"api.stripe.com.svc.cluster.local",
+	}
+	if !slices.Equal(got2, want2) {
+		t.Fatalf("ndots=2 got %v, want %v", got2, want2)
+	}
+
+	// 3. 末尾带 '.' 的 FQDN：无论 ndots 多大，都不拼 search 域
+	got3 := ExpandDNSCandidates("api.stripe.com.", search, 5)
+	if !slices.Equal(got3, []string{"api.stripe.com"}) {
+		t.Fatalf("FQDN got %v, want [api.stripe.com]", got3)
+	}
+}
+--- explain
+**思路**
+
+这道题把 Kubernetes 中经典的 `ndots:5` 放大 DNS 查询次数问题还原为了纯代码逻辑：先检查是否以 `'.'` 结尾（FQDN 直接去掉末尾点返回单元素切片）；再通过 `strings.Count(host, ".")` 比较点数与 `ndots` 的大小，决定原始 `host` 是排在拼接域名之前还是之后。
+
+**代码讲解**
+
+1. `if strings.HasSuffix(host, ".")`：识别绝对根域名，直接返回 `[]string{strings.TrimSuffix(host, ".")}`。
+2. `dots := strings.Count(host, ".")`：统计点号个数。
+3. 当 `dots >= ndots` 时先把 `host` 放在最前面，当 `dots < ndots` 时把 `host` 放在所有 `searchDomains` 展开项的后面。
+
+**易错点**
+
+- 注意 `dots == ndots` 时（例如 `ndots=2`，域名为 `"api.stripe.com"` 含 2 个点），已经满足阈值，应当优先直接查询原域名。
+
+=== net-23-1
+title: 实现 HTTP ETag 协商缓存（If-None-Match 304）与乐观锁（If-Match 412）校验
+--- desc
+实现两个 HTTP 条件请求核心函数：
+
+1. `MatchETagWeak(headerVal, currentETag string) bool`：
+   - `headerVal` 是客户端请求头 `If-None-Match` 的值（可能为空、可能是 `"*"`、也可能是逗号分隔的多个 ETag 如 `W/"v1", "v2"`）；
+   - 如果 `headerVal` 去除首尾空格后为 `"*"` 且 `currentETag != ""`，返回 `true`；
+   - 否则按逗号拆分每个候选 ETag，进行**弱比较（Weak Comparison）**：去掉候选值和 `currentETag` 开头可能存在的 `"W/"` 前缀后，若两者完全相等（且非空），返回 `true`；
+2. `ServeResourceWithETag(w http.ResponseWriter, r *http.Request, currentETag string, payload []byte)`：
+   - 先设置响应头 `ETag: currentETag`；
+   - 如果是 `GET` 或 `HEAD` 请求：当 `MatchETagWeak(r.Header.Get("If-None-Match"), currentETag)` 为真时，返回 **`304 Not Modified`**（不写响应体）；否则返回 `200 OK` 并写入 `payload`；
+   - 如果是 `PUT` 请求：当请求头包含非空的 `If-Match`，且 `!MatchETagWeak(r.Header.Get("If-Match"), currentETag)` 时，返回 **`412 Precondition Failed`**；否则返回 `200 OK`。
+--- solution
+package main
+
+import (
+	"net/http"
+	"strings"
+)
+
+func MatchETagWeak(headerVal, currentETag string) bool {
+	// @solution
+	headerVal = strings.TrimSpace(headerVal)
+	if headerVal == "" || currentETag == "" {
+		return false
+	}
+	if headerVal == "*" {
+		return true
+	}
+	curNorm := strings.TrimPrefix(strings.TrimSpace(currentETag), "W/")
+	for _, part := range strings.Split(headerVal, ",") {
+		cand := strings.TrimPrefix(strings.TrimSpace(part), "W/")
+		if cand != "" && cand == curNorm {
+			return true
+		}
+	}
+	return false
+	// @starter
+	// return false // TODO: 支持 "*"、逗号分隔列表及忽略 "W/" 前缀的弱比较
+	// @end
+}
+
+func ServeResourceWithETag(w http.ResponseWriter, r *http.Request, currentETag string, payload []byte) {
+	w.Header().Set("ETag", currentETag)
+	// @solution
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+		if MatchETagWeak(r.Header.Get("If-None-Match"), currentETag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		if r.Method == http.MethodGet {
+			_, _ = w.Write(payload)
+		}
+	case http.MethodPut:
+		if im := r.Header.Get("If-Match"); im != "" && !MatchETagWeak(im, currentETag) {
+			http.Error(w, "precondition failed", http.StatusPreconditionFailed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}
+	// @starter
+	// w.WriteHeader(http.StatusOK) // TODO: 处理 GET/HEAD 的 304 和 PUT 的 412
+	// _, _ = w.Write(payload)
+	// @end
+}
+--- test
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestETag304And412(t *testing.T) {
+	if !MatchETagWeak(`"v1", W/"v2"`, `"v2"`) {
+		t.Fatal("expected weak match to succeed")
+	}
+	if !MatchETagWeak(`*`, `"v2"`) {
+		t.Fatal("expected wildcard * to match")
+	}
+
+	// 1. GET 命中 If-None-Match -> 304 且无 body
+	req1 := httptest.NewRequest(http.MethodGet, "/doc", nil)
+	req1.Header.Set("If-None-Match", `W/"v2"`)
+	rec1 := httptest.NewRecorder()
+	ServeResourceWithETag(rec1, req1, `"v2"`, []byte("hello"))
+	if rec1.Code != http.StatusNotModified || rec1.Body.Len() != 0 {
+		t.Fatalf("GET 304: code=%d body=%q", rec1.Code, rec1.Body.String())
+	}
+
+	// 2. PUT 的 If-Match 版本过期 -> 412 Precondition Failed
+	req2 := httptest.NewRequest(http.MethodPut, "/doc", nil)
+	req2.Header.Set("If-Match", `"v1"`)
+	rec2 := httptest.NewRecorder()
+	ServeResourceWithETag(rec2, req2, `"v2"`, []byte("hello"))
+	if rec2.Code != http.StatusPreconditionFailed {
+		t.Fatalf("PUT stale If-Match: code=%d, want 412", rec2.Code)
+	}
+}
+--- explain
+**思路**
+
+`If-None-Match` 用于读缓存校验（匹配说明客户端已有最新版，回 `304 Not Modified` 且不写 body）；`If-Match` 用于写操作并发控制（不匹配说明资源已被他人修改过，回 `412 Precondition Failed` 阻止覆盖）。
+
+**代码讲解**
+
+1. `strings.TrimPrefix(..., "W/")`：将弱 ETag `W/"v2"` 和强 ETag `"v2"` 归一化为 `"v2"` 进行比较。
+2. `w.WriteHeader(http.StatusNotModified)`：注意 304 响应严禁写入响应体，但必须保留 `ETag` 响应头。
+
+**易错点**
+
+- 客户端的 `If-None-Match` 经常包含多个用逗号分隔的历史缓存 ETag（如 `"v1", "v2"`），必须用 `strings.Split` 逐一比对，不能整串直接 `==`。
+
+=== net-24-1
+title: 实现 mTLS 客户端证书链 SAN 白名单校验与热加载器
+race: true
+--- desc
+实现 mTLS 服务端的两个核心安全组件：
+
+1. `CertStore`：使用 `atomic.Pointer[tls.Certificate]` 并发安全地存储当前服务端证书，实现 `Update(c *tls.Certificate)` 和 `GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error)`（若当前未设置证书则返回非 nil 错误）；
+2. `VerifyClientSAN(cs tls.ConnectionState, allowedDNS []string) error`：
+   - 检查 `cs.PeerCertificates` 是否非空（为空返回错误）；
+   - 取叶子证书 `cs.PeerCertificates[0]`（客户端证书本身，注意不是后面的中间 CA 证书！），检查其 `DNSNames` 中是否有任意一个域名在 `allowedDNS` 白名单中（不区分大小写）；
+   - 若匹配则返回 `nil`，否则返回错误。
+--- solution
+package main
+
+import (
+	"crypto/tls"
+	"errors"
+	"strings"
+	"sync/atomic"
+)
+
+type CertStore struct {
+	cur atomic.Pointer[tls.Certificate]
+}
+
+func (s *CertStore) Update(c *tls.Certificate) {
+	// @solution
+	s.cur.Store(c)
+	// @starter
+	// // TODO: 原子更新证书指针
+	// @end
+}
+
+func (s *CertStore) GetCertificate(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	// @solution
+	c := s.cur.Load()
+	if c == nil {
+		return nil, errors.New("no certificate loaded")
+	}
+	return c, nil
+	// @starter
+	// return nil, nil // TODO: 原子读取证书，为 nil 时返回错误
+	// @end
+}
+
+func VerifyClientSAN(cs tls.ConnectionState, allowedDNS []string) error {
+	// @solution
+	if len(cs.PeerCertificates) == 0 {
+		return errors.New("missing peer certificate")
+	}
+	leaf := cs.PeerCertificates[0]
+	for _, dns := range leaf.DNSNames {
+		for _, allow := range allowedDNS {
+			if strings.EqualFold(dns, allow) {
+				return nil
+			}
+		}
+	}
+	return errors.New("client SAN not in allowlist")
+	// @starter
+	// return nil // TODO: 校验 PeerCertificates[0].DNSNames 是否命中 allowedDNS
+	// @end
+}
+--- test
+package main
+
+import (
+	"crypto/tls"
+	"crypto/x509"
+	"testing"
+)
+
+func TestCertStoreAndVerifyClientSAN(t *testing.T) {
+	var store CertStore
+	if _, err := store.GetCertificate(nil); err == nil {
+		t.Fatal("expected error when store is empty")
+	}
+	dummyCert := &tls.Certificate{Certificate: [][]byte{{1, 2, 3}}}
+	store.Update(dummyCert)
+	got, err := store.GetCertificate(nil)
+	if err != nil || got != dummyCert {
+		t.Fatalf("GetCertificate = %v, %v", got, err)
+	}
+
+	// 验证只检查 PeerCertificates[0]（叶子证书），不能误把中间 CA (PeerCertificates[1]) 的 DNSNames 当成客户端身份！
+	leaf := &x509.Certificate{DNSNames: []string{"payment.svc.cluster.local"}}
+	ca := &x509.Certificate{DNSNames: []string{"root-ca.cluster.local"}}
+	cs := tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf, ca}}
+
+	if err := VerifyClientSAN(cs, []string{"order.svc.cluster.local", "PAYMENT.svc.cluster.local"}); err != nil {
+		t.Fatalf("expected allowed SAN to pass, got %v", err)
+	}
+	if err := VerifyClientSAN(cs, []string{"root-ca.cluster.local"}); err == nil {
+		t.Fatal("should only check leaf certificate PeerCertificates[0], not CA cert")
+	}
+	if err := VerifyClientSAN(tls.ConnectionState{}, []string{"payment.svc.cluster.local"}); err == nil {
+		t.Fatal("expected error for empty PeerCertificates")
+	}
+}
+--- explain
+**思路**
+
+1. `atomic.Pointer[tls.Certificate]`（Go 1.19+）让证书热轮换完全无锁，后台协程监听到磁盘证书更新后 `Store(&newCert)`，新握手的连接在 `GetCertificate` 中立刻 `Load()` 到新证书。
+2. 在 TLS 证书链 `cs.PeerCertificates` 中，**下标 `0` 永远是对端的叶子证书（Leaf Certificate）**，下标 `1..N` 是签发它的中间 CA 证书，因此身份授权必须只检查 `cs.PeerCertificates[0].DNSNames`。
+
+**代码讲解**
+
+1. `s.cur.Store(c)` 与 `s.cur.Load()`：零锁争用的原子指针读写。
+2. `leaf := cs.PeerCertificates[0]`：取出客户端叶子证书并比对 `leaf.DNSNames` 与白名单。
+
+**易错点**
+
+- 如果错误地遍历了整个 `cs.PeerCertificates` 切片，会把中间 CA 的名字也当成客户端身份，造成越权漏洞。
+
+=== net-25-1
+title: 实现 HTTP/2 与 gRPC 风格的两级信用流控窗口（Stream 与 Connection 窗口）
+race: true
+--- desc
+模拟 HTTP/2 / gRPC 的两级流控窗口控制器 `FlowController`：
+
+- 同时维护**单流可用窗口 `streamWin`** 和**连接级总可用窗口 `connWin`**；
+- `Send(n int) int`（非阻塞尝试发送至多 `n` 字节）：实际允许立即发送的字节数 `sent` 等于 `min(n, streamWin, connWin)`（若可用窗口 `<= 0` 则返回 `0`）；发送后同时从 `streamWin` 和 `connWin` 中扣减 `sent`；
+- `WindowUpdate(streamDelta, connDelta int)`：收到对端的 `WINDOW_UPDATE` 帧，分别增加 `streamWin += streamDelta` 和 `connWin += connDelta`。
+--- solution
+package main
+
+import "sync"
+
+type FlowController struct {
+	mu        sync.Mutex
+	streamWin int
+	connWin   int
+}
+
+func NewFlowController(initStreamWin, initConnWin int) *FlowController {
+	return &FlowController{
+		streamWin: initStreamWin,
+		connWin:   initConnWin,
+	}
+}
+
+func (fc *FlowController) Send(n int) int {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	// @solution
+	if n <= 0 {
+		return 0
+	}
+	avail := min(fc.streamWin, fc.connWin)
+	if avail <= 0 {
+		return 0
+	}
+	sent := min(n, avail)
+	fc.streamWin -= sent
+	fc.connWin -= sent
+	return sent
+	// @starter
+	// return 0 // TODO: 受限于 min(n, streamWin, connWin) 扣减窗口并返回实际可发送字节数
+	// @end
+}
+
+func (fc *FlowController) WindowUpdate(streamDelta, connDelta int) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	// @solution
+	if streamDelta > 0 {
+		fc.streamWin += streamDelta
+	}
+	if connDelta > 0 {
+		fc.connWin += connDelta
+	}
+	// @starter
+	// // TODO: 补充流窗口和连接窗口额度
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestFlowControllerTwoLevelWindow(t *testing.T) {
+	// 流窗口 64KB，但连接总窗口只剩 40KB
+	fc := NewFlowController(65535, 40000)
+
+	// 尝试发 50KB：受限于连接窗口 40KB，最多只能发 40000 字节
+	if sent := fc.Send(50000); sent != 40000 {
+		t.Fatalf("first Send = %d, want 40000", sent)
+	}
+	// 此时 connWin 为 0，再发应返回 0（触发背压阻塞）
+	if sent := fc.Send(1000); sent != 0 {
+		t.Fatalf("Send when connWin=0 got %d, want 0", sent)
+	}
+
+	// 对端发来连接级 WINDOW_UPDATE (+30000)，此时 streamWin 剩 25535，connWin 变 30000
+	fc.WindowUpdate(0, 30000)
+	// 再发 30000：受限于 streamWin (25535)，只能发 25535
+	if sent := fc.Send(30000); sent != 25535 {
+		t.Fatalf("Send after conn update = %d, want 25535", sent)
+	}
+}
+--- explain
+**思路**
+
+在 HTTP/2 和 gRPC 中，任何 `DATA` 帧的发送必须同时满足 **Stream 窗口**和 **Connection 窗口**的配额限制，因此单次最大可发送字节数为 `min(n, fc.streamWin, fc.connWin)`，发出后两个窗口同步扣减；对端应用层消费数据后通过 `WINDOW_UPDATE` 帧分别补充流级和连接级信用额度。
+
+**代码讲解**
+
+1. `avail := min(fc.streamWin, fc.connWin)`：取两级窗口的木桶短板。
+2. `sent := min(n, avail)`：扣减并返回本次获准发送的字节数。
+
+**易错点**
+
+- 只扣减 `streamWin` 忘了同步扣减 `connWin`，会导致单条连接上的多个并发流突破连接级总缓冲上限。
+
+=== net-26-1
+title: 实现本地消息表（Transactional Outbox）中继投递与幂等去重状态机
+--- desc
+模拟可靠事件投递的完整闭环：生产者端的 **`OutboxRelay`**（本地消息表中继器）与消费者端的 **`IdempotentConsumer`**（幂等去重器）：
+
+1. `OutboxRelay.ProcessPending(now time.Time, publish func(id, payload string) error) (sent int)`：
+   - 按顺序扫描 `records` 中状态为 `"PENDING"` 且 `now >= NextRetryAt` 的记录；
+   - 调用 `publish(r.ID, r.Payload)`：
+     - 如果返回 `nil`：将状态改为 `"SENT"`，`sent++`；
+     - 如果返回错误：`r.Retries++`；若 `r.Retries >= maxRetries`，将状态改为 `"DEAD"`（不再重试）；否则保持 `"PENDING"` 并将 `r.NextRetryAt` 设为 `now.Add(baseBackoff)`。
+2. `IdempotentConsumer.Consume(msgID string, handler func() error) error`：
+   - 如果 `msgID` 已经成功消费过，直接返回 `nil` 且**不重复调用 `handler()`**；
+   - 否则调用 `handler()`：若成功（返回 `nil`），记录 `msgID` 为已消费并返回 `nil`；若失败（返回非 nil 错误），**不记录**为已消费（允许下次重试）并返回该错误。
+--- solution
+package main
+
+import "time"
+
+type OutboxRecord struct {
+	ID          string
+	Payload     string
+	Status      string // "PENDING", "SENT", "DEAD"
+	Retries     int
+	NextRetryAt time.Time
+}
+
+type OutboxRelay struct {
+	records     []*OutboxRecord
+	maxRetries  int
+	baseBackoff time.Duration
+}
+
+func NewOutboxRelay(records []*OutboxRecord, maxRetries int, baseBackoff time.Duration) *OutboxRelay {
+	return &OutboxRelay{records: records, maxRetries: maxRetries, baseBackoff: baseBackoff}
+}
+
+func (o *OutboxRelay) ProcessPending(now time.Time, publish func(id, payload string) error) int {
+	sent := 0
+	// @solution
+	for _, r := range o.records {
+		if r.Status != "PENDING" || now.Before(r.NextRetryAt) {
+			continue
+		}
+		if err := publish(r.ID, r.Payload); err == nil {
+			r.Status = "SENT"
+			sent++
+		} else {
+			r.Retries++
+			if r.Retries >= o.maxRetries {
+				r.Status = "DEAD"
+			} else {
+				r.NextRetryAt = now.Add(o.baseBackoff)
+			}
+		}
+	}
+	// @starter
+	// // TODO: 扫描到期的 PENDING 记录并调用 publish，更新 SENT / DEAD / NextRetryAt
+	// @end
+	return sent
+}
+
+type IdempotentConsumer struct {
+	processed map[string]bool
+}
+
+func NewIdempotentConsumer() *IdempotentConsumer {
+	return &IdempotentConsumer{processed: make(map[string]bool)}
+}
+
+func (c *IdempotentConsumer) Consume(msgID string, handler func() error) error {
+	// @solution
+	if c.processed[msgID] {
+		return nil
+	}
+	if err := handler(); err != nil {
+		return err
+	}
+	c.processed[msgID] = true
+	return nil
+	// @starter
+	// return handler() // TODO: 已成功处理过的 msgID 直接跳过，失败时不标记已处理
+	// @end
+}
+--- test
+package main
+
+import (
+	"errors"
+	"testing"
+	"time"
+)
+
+func TestOutboxRelayAndIdempotentConsumer(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	r1 := &OutboxRecord{ID: "m1", Payload: "p1", Status: "PENDING"}
+	r2 := &OutboxRecord{ID: "m2", Payload: "p2", Status: "PENDING"}
+	relay := NewOutboxRelay([]*OutboxRecord{r1, r2}, 2, 10*time.Second)
+
+	// 第 1 轮：m1 发送成功，m2 发送失败（进入退避 t0+10s）
+	sent := relay.ProcessPending(t0, func(id, _ string) error {
+		if id == "m2" {
+			return errors.New("broker timeout")
+		}
+		return nil
+	})
+	if sent != 1 || r1.Status != "SENT" || r2.Status != "PENDING" || r2.Retries != 1 {
+		t.Fatalf("round 1: sent=%d r1=%+v r2=%+v", sent, r1, r2)
+	}
+
+	// 在 t0+5s 时还没到 m2 的 NextRetryAt (t0+10s)，不应触发重试
+	if s := relay.ProcessPending(t0.Add(5*time.Second), func(string, string) error { return nil }); s != 0 {
+		t.Fatalf("at +5s should skip m2 before NextRetryAt, sent=%d", s)
+	}
+
+	// 在 t0+10s 时 m2 第二次失败，达到 maxRetries=2，状态变为 DEAD
+	relay.ProcessPending(t0.Add(10*time.Second), func(string, string) error {
+		return errors.New("still down")
+	})
+	if r2.Status != "DEAD" {
+		t.Fatalf("expected r2 Status=DEAD after maxRetries, got %s", r2.Status)
+	}
+
+	// 测试消费端幂等：失败后允许重试，成功后重复投递只执行 1 次
+	consumer := NewIdempotentConsumer()
+	calls := 0
+	_ = consumer.Consume("m1", func() error {
+		calls++
+		return errors.New("transient db error")
+	})
+	_ = consumer.Consume("m1", func() error {
+		calls++
+		return nil
+	})
+	_ = consumer.Consume("m1", func() error {
+		calls++
+		return nil
+	})
+	if calls != 2 { // 第 1 次失败 + 第 2 次成功，第 3 次被幂等拦截！
+		t.Fatalf("consumer handler calls = %d, want 2", calls)
+	}
+}
+--- explain
+**思路**
+
+本地消息表模式由两部分配成闭环：发送侧 `OutboxRelay` 只捞取 `Status == "PENDING"` 且已到达退避时间 `NextRetryAt` 的消息投递，超过最大重试次数转为 `"DEAD"`；消费侧 `IdempotentConsumer` 只在 `handler()` 返回 `nil` 时才将 `msgID` 记入去重表，保证失败可重试、成功不重入。
+
+**代码讲解**
+
+1. `if r.Status != "PENDING" || now.Before(r.NextRetryAt)`：跳过已发送、已死信或尚在退避冷却期内的记录。
+2. `if err := handler(); err != nil { return err }`：消费失败直接返回错误，不写 `c.processed[msgID] = true`，等待 MQ 下一次重投。
+
+**易错点**
+
+- 如果在调用 `handler()` **之前**就把 `c.processed[msgID] = true` 写死了，一旦 `handler()` 执行中途因为数据库超时报错，下次重试时就会被误判为“已消费过”直接丢弃消息！
+
+=== net-27-1
+title: 实现 MQ 消费失败的阶梯延迟重试与死信队列（DLQ）分流器
+--- desc
+实现消息消费失败后的分流决策函数 `RouteFailedMessage(msg MQMessage, retryable bool, schedule []time.Duration) RoutingDecision`：
+
+- 如果 `retryable == false`（不可重试的永久性错误，如 JSON 格式损坏），或者 `msg.Attempts >= len(schedule)`（已经用完了所有重试阶梯），直接路由到**死信队列**：返回 `RoutingDecision{ToDLQ: true}`；
+- 否则（可重试且未超限）：返回 `RoutingDecision{ToDLQ: false, Delay: schedule[msg.Attempts], NextAttempts: msg.Attempts + 1}`。
+--- solution
+package main
+
+import "time"
+
+type MQMessage struct {
+	ID       string
+	Attempts int // 已经重试过的次数（首次消费失败时 Attempts 为 0）
+}
+
+type RoutingDecision struct {
+	ToDLQ        bool
+	Delay        time.Duration
+	NextAttempts int
+}
+
+func RouteFailedMessage(msg MQMessage, retryable bool, schedule []time.Duration) RoutingDecision {
+	// @solution
+	if !retryable || msg.Attempts >= len(schedule) {
+		return RoutingDecision{ToDLQ: true, NextAttempts: msg.Attempts}
+	}
+	return RoutingDecision{
+		ToDLQ:        false,
+		Delay:        schedule[msg.Attempts],
+		NextAttempts: msg.Attempts + 1,
+	}
+	// @starter
+	// return RoutingDecision{} // TODO: 判断进死信队列还是按 schedule[msg.Attempts] 延迟重试
+	// @end
+}
+--- test
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+func TestRouteFailedMessage(t *testing.T) {
+	sched := []time.Duration{time.Second, 5 * time.Second, 30 * time.Second}
+
+	// 1. 首次失败 (Attempts=0) 且可重试 -> 延迟 1s，NextAttempts=1
+	d1 := RouteFailedMessage(MQMessage{ID: "1", Attempts: 0}, true, sched)
+	if d1.ToDLQ || d1.Delay != time.Second || d1.NextAttempts != 1 {
+		t.Fatalf("attempt 0: %+v", d1)
+	}
+
+	// 2. 已重试 3 次 (Attempts=3 == len(sched)) 再次失败 -> 进 DLQ
+	d2 := RouteFailedMessage(MQMessage{ID: "1", Attempts: 3}, true, sched)
+	if !d2.ToDLQ {
+		t.Fatalf("attempt 3 should go to DLQ, got %+v", d2)
+	}
+
+	// 3. 不可重试错误（Attempts=0）-> 立即进 DLQ，不浪费重试次数
+	d3 := RouteFailedMessage(MQMessage{ID: "2", Attempts: 0}, false, sched)
+	if !d3.ToDLQ {
+		t.Fatalf("non-retryable error should go straight to DLQ, got %+v", d3)
+	}
+}
+--- explain
+**思路**
+
+将阶梯退避时长列表 `schedule` 的长度作为最大允许重试次数：当 `!retryable` 或 `msg.Attempts >= len(schedule)` 时直接转入死信队列（`ToDLQ: true`）；否则取第 `msg.Attempts` 档延迟时长并将尝试计数加 1。
+
+**代码讲解**
+
+1. `if !retryable || msg.Attempts >= len(schedule)`：统一拦截不可重试错误和超限消息。
+2. `Delay: schedule[msg.Attempts]`：第 0 次失败取 `schedule[0]`（1s），第 1 次失败取 `schedule[1]`（5s）。
+
+**易错点**
+
+- 注意区分“首次消费（`Attempts == 0`）”与“第 1 次重试（`Attempts == 1`）”的下标对应关系。
+
+=== net-28-1
+title: 模拟 QUIC 连接迁移（Connection ID 路由与 PATH_CHALLENGE 地址验证）
+--- desc
+QUIC 通过 `Connection ID (CID)` 标识连接，使客户端在 Wi-Fi 切换到 5G（源 `IP:Port` 改变）时无需断开重连；但为了防止源 IP 伪造反射攻击，服务端必须先通过 `PATH_CHALLENGE` / `PATH_RESPONSE` 验证新地址后才正式切换发送目标地址。
+
+请实现 `QUICConnManager`：
+
+1. `OnPacket(cid string, srcAddr string) (challengeToken string, needChallenge bool, ok bool)`：
+   - 若 `cid` 不存在，返回 `"", false, false`；
+   - 若 `srcAddr` 与当前连接的活跃地址 `ActiveAddr` 相同，无需挑战，返回 `"", false, true`；
+   - 若 `srcAddr != ActiveAddr`（检测到地址变化！），将该连接的待验证地址 `PendingAddr` 设为 `srcAddr`，生成挑战令牌 `PendingToken = "chal:" + cid + ":" + srcAddr`，返回 `PendingToken, true, true`（注意此时 **`ActiveAddr` 仍保持原地址不变**！）；
+2. `OnPathResponse(cid string, srcAddr string, token string) bool`：
+   - 当且仅当 `cid` 存在、`srcAddr == PendingAddr` 且 `token != "" && token == PendingToken` 时验证通过：将 `ActiveAddr` 正式更新为 `srcAddr`，清空 `PendingAddr` 和 `PendingToken`，递增 `Migrations++` 并返回 `true`；否则返回 `false`。
+--- solution
+package main
+
+type QUICConn struct {
+	CID          string
+	ActiveAddr   string
+	PendingAddr  string
+	PendingToken string
+	Migrations   int
+}
+
+type QUICConnManager struct {
+	conns map[string]*QUICConn
+}
+
+func NewQUICConnManager() *QUICConnManager {
+	return &QUICConnManager{conns: make(map[string]*QUICConn)}
+}
+
+func (m *QUICConnManager) Register(cid, initAddr string) {
+	m.conns[cid] = &QUICConn{CID: cid, ActiveAddr: initAddr}
+}
+
+func (m *QUICConnManager) OnPacket(cid, srcAddr string) (challengeToken string, needChallenge bool, ok bool) {
+	// @solution
+	c, exists := m.conns[cid]
+	if !exists {
+		return "", false, false
+	}
+	if c.ActiveAddr == srcAddr {
+		return "", false, true
+	}
+	c.PendingAddr = srcAddr
+	c.PendingToken = "chal:" + cid + ":" + srcAddr
+	return c.PendingToken, true, true
+	// @starter
+	// return "", false, false // TODO: 检查 ActiveAddr 是否变化，变化时记录 PendingAddr 并返回挑战 token
+	// @end
+}
+
+func (m *QUICConnManager) OnPathResponse(cid, srcAddr, token string) bool {
+	// @solution
+	c, exists := m.conns[cid]
+	if !exists || token == "" || c.PendingAddr != srcAddr || c.PendingToken != token {
+		return false
+	}
+	c.ActiveAddr = srcAddr
+	c.PendingAddr = ""
+	c.PendingToken = ""
+	c.Migrations++
+	return true
+	// @starter
+	// return false // TODO: 校验 PendingAddr 与 PendingToken，通过后更新 ActiveAddr 并累加 Migrations
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestQUICConnectionMigration(t *testing.T) {
+	mgr := NewQUICConnManager()
+	mgr.Register("cid-9000", "192.168.1.10:5000") // 初始 Wi-Fi 地址
+
+	// 1. 原地址发包：无需 PATH_CHALLENGE
+	if tok, need, ok := mgr.OnPacket("cid-9000", "192.168.1.10:5000"); !ok || need || tok != "" {
+		t.Fatalf("same addr packet: tok=%q need=%v ok=%v", tok, need, ok)
+	}
+
+	// 2. 切换到 5G 新地址 "100.64.0.8:6000"：触发 PATH_CHALLENGE，且完成验证前 ActiveAddr 不变
+	tok, need, ok := mgr.OnPacket("cid-9000", "100.64.0.8:6000")
+	if !ok || !need || tok == "" {
+		t.Fatalf("new addr should trigger challenge: tok=%q need=%v ok=%v", tok, need, ok)
+	}
+	if mgr.conns["cid-9000"].ActiveAddr != "192.168.1.10:5000" {
+		t.Fatal("ActiveAddr must not change before PATH_RESPONSE verification")
+	}
+
+	// 3. 错误的 token 验证应拒绝
+	if mgr.OnPathResponse("cid-9000", "100.64.0.8:6000", "wrong-token") {
+		t.Fatal("should reject wrong PATH_RESPONSE token")
+	}
+
+	// 4. 正确的 PATH_RESPONSE 验证通过，完成连接迁移！
+	if !mgr.OnPathResponse("cid-9000", "100.64.0.8:6000", tok) {
+		t.Fatal("expected valid PATH_RESPONSE to succeed")
+	}
+	conn := mgr.conns["cid-9000"]
+	if conn.ActiveAddr != "100.64.0.8:6000" || conn.Migrations != 1 {
+		t.Fatalf("after migration: ActiveAddr=%q Migrations=%d", conn.ActiveAddr, conn.Migrations)
+	}
+}
+--- explain
+**思路**
+
+QUIC 连接与底层的 `(IP, Port)` 解耦，靠 `CID` 索引连接对象 `QUICConn`。当收到来自新 `srcAddr` 的包时，先不直接改 `ActiveAddr`（防止攻击者伪造源 IP 诱导服务端向假地址反射大流量），而是暂存到 `PendingAddr` 并下发随机挑战码 `PendingToken`；待客户端从该新地址回传匹配的 `OnPathResponse` 后，才正式将 `ActiveAddr` 切换过去。
+
+**代码讲解**
+
+1. `if c.ActiveAddr == srcAddr`：常规收包快路径，直接放行。
+2. `c.PendingAddr = srcAddr`：记录待验证新路径并生成关联该地址的挑战令牌。
+3. `OnPathResponse`：校验 `c.PendingAddr == srcAddr` 且 `c.PendingToken == token` 后更新 `c.ActiveAddr` 并清空挂起状态。
+
+**易错点**
+
+- 验证成功后记得将 `PendingAddr` 和 `PendingToken` 清空为 `""`，防止同一个挑战令牌被重复重放。

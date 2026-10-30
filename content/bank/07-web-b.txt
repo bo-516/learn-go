@@ -1,0 +1,1418 @@
+Web 平台开发（WEB-12 ~ WEB-22）的编程小任务。
+
+=== web-12-1
+title: trace ID 中间件
+--- desc
+实现全链路追踪的入口：
+
+- `Trace(next)`：从请求头 `X-Request-ID` 读取 ID；没有时用 `crypto/rand` 生成 8 个随机字节，编码成 16 位十六进制字符串。把 ID 放进请求的 context，并写回响应头 `X-Request-ID`；
+- `TraceID(ctx)`：从 context 中取出 ID，没有时返回空字符串；
+- `Inject(ctx, req)`：调用下游时，把 ctx 里的 ID 设置到下游请求的 `X-Request-ID` 头上。
+--- solution
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"net/http"
+)
+
+type traceKey struct{}
+
+func newID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func Trace(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// @solution
+		id := r.Header.Get("X-Request-ID")
+		if id == "" {
+			id = newID()
+		}
+		w.Header().Set("X-Request-ID", id)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), traceKey{}, id)))
+		// @starter
+		// next.ServeHTTP(w, r) // TODO
+		// @end
+	})
+}
+
+func TraceID(ctx context.Context) string {
+	// @solution
+	id, _ := ctx.Value(traceKey{}).(string)
+	return id
+	// @starter
+	// return "" // TODO
+	// @end
+}
+
+func Inject(ctx context.Context, req *http.Request) {
+	// @solution
+	if id := TraceID(ctx); id != "" {
+		req.Header.Set("X-Request-ID", id)
+	}
+	// @starter
+	// // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"regexp"
+	"testing"
+)
+
+func run(hdr string) (seen, resp string) {
+	h := Trace(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { seen = TraceID(r.Context()) }))
+	req := httptest.NewRequest("GET", "/", nil)
+	if hdr != "" {
+		req.Header.Set("X-Request-ID", hdr)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return seen, rec.Header().Get("X-Request-ID")
+}
+
+func TestKeepIncomingID(t *testing.T) {
+	seen, resp := run("abc-123")
+	if seen != "abc-123" || resp != "abc-123" {
+		t.Fatalf("handler 看到 %q，响应头 %q，期望都是 abc-123", seen, resp)
+	}
+}
+
+func TestGenerateID(t *testing.T) {
+	seen, resp := run("")
+	if !regexp.MustCompile(`^[0-9a-f]{16}$`).MatchString(seen) || resp != seen {
+		t.Fatalf("生成的 ID = %q，响应头 %q", seen, resp)
+	}
+	if other, _ := run(""); other == seen {
+		t.Fatal("每个请求应生成不同的 ID")
+	}
+}
+
+func TestInject(t *testing.T) {
+	ctx := context.WithValue(context.Background(), traceKey{}, "t-9")
+	req, _ := http.NewRequest("GET", "http://downstream/api", nil)
+	Inject(ctx, req)
+	if req.Header.Get("X-Request-ID") != "t-9" {
+		t.Fatal("下游请求应带上 trace ID")
+	}
+	if TraceID(context.Background()) != "" {
+		t.Fatal("没有 ID 时返回空字符串")
+	}
+}
+
+=== web-12-2
+title: 让 slog 自动带上 trace_id
+--- desc
+`log/slog`（Go 1.21+）的 Handler 可以包装。实现 `TraceHandler`：嵌入一个 `slog.Handler`，只重写 `Handle` 方法——如果 ctx 里有 trace ID，就给日志记录追加属性 `trace_id`，再交给内层 Handler。
+
+这样业务代码只要用 `logger.InfoContext(ctx, …)`，每条日志都会自动带上 trace_id。
+
+注意：嵌入接口时还要重写 `WithAttrs` 和 `WithGroup`，否则 `logger.With(...)` 返回的 Handler 会丢掉这层包装。
+--- solution
+package main
+
+import (
+	"context"
+	"log/slog"
+)
+
+type traceKey struct{}
+
+func WithTraceID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, traceKey{}, id)
+}
+
+type TraceHandler struct {
+	slog.Handler
+}
+
+// @solution
+func (h TraceHandler) Handle(ctx context.Context, r slog.Record) error {
+	if id, ok := ctx.Value(traceKey{}).(string); ok {
+		r.AddAttrs(slog.String("trace_id", id))
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+func (h TraceHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return TraceHandler{h.Handler.WithAttrs(attrs)}
+}
+
+func (h TraceHandler) WithGroup(name string) slog.Handler {
+	return TraceHandler{h.Handler.WithGroup(name)}
+}
+
+// @starter
+// // TODO: 重写 Handle（以及 WithAttrs、WithGroup）
+// @end
+--- test
+package main
+
+import (
+	"bytes"
+	"context"
+	"log/slog"
+	"strings"
+	"testing"
+)
+
+func newLogger(buf *bytes.Buffer) *slog.Logger {
+	inner := slog.NewTextHandler(buf, &slog.HandlerOptions{
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				return slog.Attr{}
+			}
+			return a
+		},
+	})
+	return slog.New(TraceHandler{inner})
+}
+
+func TestTraceID(t *testing.T) {
+	var buf bytes.Buffer
+	log := newLogger(&buf)
+	log.InfoContext(WithTraceID(context.Background(), "abc123"), "order created", "order_id", 7)
+	if got := strings.TrimSpace(buf.String()); got != `level=INFO msg="order created" order_id=7 trace_id=abc123` {
+		t.Fatalf("日志 = %s", got)
+	}
+}
+
+func TestNoTraceID(t *testing.T) {
+	var buf bytes.Buffer
+	newLogger(&buf).Info("startup")
+	if strings.Contains(buf.String(), "trace_id") {
+		t.Fatal("没有 trace ID 时不应输出 trace_id")
+	}
+}
+
+func TestWith(t *testing.T) {
+	var buf bytes.Buffer
+	log := newLogger(&buf).With("svc", "order")
+	log.InfoContext(WithTraceID(context.Background(), "t1"), "hi")
+	if !strings.Contains(buf.String(), "svc=order") || !strings.Contains(buf.String(), "trace_id=t1") {
+		t.Fatalf("logger.With 之后应仍然带 trace_id：%s", buf.String())
+	}
+}
+
+=== web-13-1
+title: 流式保存上传文件
+--- desc
+实现 `Save(r, w, max)`：把上传内容从 `r` **流式**写入 `w`，同时计算 SHA-256，返回写入的字节数和十六进制哈希。超过 `max` 字节时返回 `ErrTooLarge`。
+
+不能先 `io.ReadAll` 把整个文件读进内存：测试的 reader 会统计被读取了多少字节，超过限制后不应该继续读取整个文件。
+
+提示：`io.LimitReader(r, max+1)` 多读一个字节就能判断是否超限；`io.MultiWriter(w, hasher)` 一份数据同时写到两个地方。
+--- solution
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"io"
+)
+
+var ErrTooLarge = errors.New("file too large")
+
+func Save(r io.Reader, w io.Writer, max int64) (int64, string, error) {
+	// @solution
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(w, h), io.LimitReader(r, max+1))
+	if err != nil {
+		return n, "", err
+	}
+	if n > max {
+		return n, "", ErrTooLarge
+	}
+	return n, hex.EncodeToString(h.Sum(nil)), nil
+	// @starter
+	// data, err := io.ReadAll(r) // TODO: 整个文件读进内存
+	// if err != nil {
+	// 	return 0, "", err
+	// }
+	// if int64(len(data)) > max {
+	// 	return 0, "", ErrTooLarge
+	// }
+	// n, err := w.Write(data)
+	// sum := sha256.Sum256(data)
+	// return int64(n), hex.EncodeToString(sum[:]), err
+	// @end
+}
+--- test
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"io"
+	"strings"
+	"testing"
+)
+
+type countingReader struct {
+	r    io.Reader
+	read int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.read += int64(n)
+	return n, err
+}
+
+func TestSave(t *testing.T) {
+	content := strings.Repeat("hello gopher ", 1000)
+	var out bytes.Buffer
+	n, sum, err := Save(strings.NewReader(content), &out, 1<<20)
+	want := sha256.Sum256([]byte(content))
+	if err != nil || n != int64(len(content)) || sum != hex.EncodeToString(want[:]) || out.String() != content {
+		t.Fatalf("n=%d sum=%s err=%v", n, sum, err)
+	}
+}
+
+func TestTooLarge(t *testing.T) {
+	cr := &countingReader{r: bytes.NewReader(make([]byte, 8<<20))}
+	_, _, err := Save(cr, io.Discard, 1<<20)
+	if !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("超过限制应返回 ErrTooLarge，实际 %v", err)
+	}
+	if cr.read > 1<<20+64<<10 {
+		t.Fatalf("超限后仍然读取了 %d 字节，应该流式处理并及时停止", cr.read)
+	}
+}
+
+func TestExactLimit(t *testing.T) {
+	if _, _, err := Save(strings.NewReader("12345"), io.Discard, 5); err != nil {
+		t.Fatalf("正好等于上限应成功，实际 %v", err)
+	}
+}
+
+=== web-13-2
+title: 分片上传与断点续传
+--- desc
+大文件切成固定数量的分片上传，中断后只补传缺失的分片。实现 `Upload`：
+
+- `NewUpload(total, hash)`：共 `total` 个分片，`hash` 是整个文件的 SHA-256（十六进制）；
+- `Put(i, data)`：保存第 i 个分片（从 0 开始），下标越界返回错误，重复上传覆盖；
+- `Missing()`：返回还没上传的分片下标（升序）——客户端续传前先查询它；
+- `Assemble()`：有缺失返回错误；按顺序拼接后校验哈希，不一致返回错误。
+--- solution
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+)
+
+type Upload struct {
+	total  int
+	hash   string
+	chunks map[int][]byte
+}
+
+func NewUpload(total int, hash string) *Upload {
+	return &Upload{total: total, hash: hash, chunks: map[int][]byte{}}
+}
+
+func (u *Upload) Put(i int, data []byte) error {
+	// @solution
+	if i < 0 || i >= u.total {
+		return fmt.Errorf("chunk %d out of range", i)
+	}
+	u.chunks[i] = bytes.Clone(data)
+	return nil
+	// @starter
+	// return errors.New("TODO")
+	// @end
+}
+
+func (u *Upload) Missing() []int {
+	// @solution
+	var out []int
+	for i := 0; i < u.total; i++ {
+		if _, ok := u.chunks[i]; !ok {
+			out = append(out, i)
+		}
+	}
+	return out
+	// @starter
+	// return nil // TODO
+	// @end
+}
+
+func (u *Upload) Assemble() ([]byte, error) {
+	// @solution
+	if m := u.Missing(); len(m) > 0 {
+		return nil, fmt.Errorf("missing chunks %v", m)
+	}
+	var buf bytes.Buffer
+	for i := 0; i < u.total; i++ {
+		buf.Write(u.chunks[i])
+	}
+	sum := sha256.Sum256(buf.Bytes())
+	if hex.EncodeToString(sum[:]) != u.hash {
+		return nil, errors.New("hash mismatch")
+	}
+	return buf.Bytes(), nil
+	// @starter
+	// return nil, errors.New("TODO")
+	// @end
+}
+--- test
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"slices"
+	"testing"
+)
+
+func TestResumableUpload(t *testing.T) {
+	file := []byte("0123456789abcdefghij")
+	sum := sha256.Sum256(file)
+	u := NewUpload(4, hex.EncodeToString(sum[:]))
+	u.Put(0, file[0:5])
+	u.Put(2, file[10:15])
+	if m := u.Missing(); !slices.Equal(m, []int{1, 3}) {
+		t.Fatalf("Missing = %v，期望 [1 3]", m)
+	}
+	if _, err := u.Assemble(); err == nil {
+		t.Fatal("有缺失分片时不能合并")
+	}
+	u.Put(1, file[5:10])
+	u.Put(3, []byte("XXXXX")) // 传错了
+	if _, err := u.Assemble(); err == nil {
+		t.Fatal("哈希不一致应返回错误")
+	}
+	u.Put(3, file[15:20]) // 重传覆盖
+	got, err := u.Assemble()
+	if err != nil || string(got) != string(file) {
+		t.Fatalf("Assemble = %q, %v", got, err)
+	}
+	if u.Put(4, nil) == nil || u.Put(-1, nil) == nil {
+		t.Fatal("越界的分片下标应返回错误")
+	}
+}
+
+func TestPutCopies(t *testing.T) {
+	data := []byte("abc")
+	sum := sha256.Sum256(data)
+	u := NewUpload(1, hex.EncodeToString(sum[:]))
+	buf := []byte("abc")
+	u.Put(0, buf)
+	buf[0] = 'z' // 调用方复用了缓冲区
+	if _, err := u.Assemble(); err != nil {
+		t.Fatal("Put 应保存数据的副本，不能引用调用方的缓冲区")
+	}
+}
+
+=== web-14-1
+title: 支持继承和通配符的 RBAC
+--- desc
+实现基于角色的权限控制：
+
+- `Grant(role, perms...)`：给角色授予权限，权限格式为 `资源:操作`，如 `order:read`；`order:*` 表示 order 的所有操作，`*` 表示所有权限；
+- `Inherit(child, parent)`：子角色拥有父角色的全部权限，可以多层继承，配置错误时**可能出现环**，不能死循环；
+- `Assign(user, role)`：给用户分配角色（可以多个）；
+- `Can(user, perm)`：用户是否拥有某个权限。
+--- solution
+package main
+
+import "strings"
+
+type RBAC struct {
+	perms   map[string][]string
+	parents map[string][]string
+	users   map[string][]string
+}
+
+func NewRBAC() *RBAC {
+	return &RBAC{perms: map[string][]string{}, parents: map[string][]string{}, users: map[string][]string{}}
+}
+
+func (r *RBAC) Grant(role string, perms ...string) { r.perms[role] = append(r.perms[role], perms...) }
+func (r *RBAC) Inherit(child, parent string)      { r.parents[child] = append(r.parents[child], parent) }
+func (r *RBAC) Assign(user, role string)          { r.users[user] = append(r.users[user], role) }
+
+func match(granted, want string) bool {
+	// @solution
+	if granted == "*" || granted == want {
+		return true
+	}
+	res, act, ok := strings.Cut(granted, ":")
+	wres, _, _ := strings.Cut(want, ":")
+	return ok && act == "*" && res == wres
+	// @starter
+	// return granted == want // TODO: 通配符
+	// @end
+}
+
+func (r *RBAC) Can(user, perm string) bool {
+	// @solution
+	seen := map[string]bool{}
+	stack := append([]string(nil), r.users[user]...)
+	for len(stack) > 0 {
+		role := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if seen[role] {
+			continue
+		}
+		seen[role] = true
+		for _, p := range r.perms[role] {
+			if match(p, perm) {
+				return true
+			}
+		}
+		stack = append(stack, r.parents[role]...)
+	}
+	return false
+	// @starter
+	// for _, role := range r.users[user] { // TODO: 没有处理继承
+	// 	for _, p := range r.perms[role] {
+	// 		if match(p, perm) {
+	// 			return true
+	// 		}
+	// 	}
+	// }
+	// return false
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestRBAC(t *testing.T) {
+	r := NewRBAC()
+	r.Grant("viewer", "order:read", "user:read")
+	r.Grant("operator", "order:*")
+	r.Grant("admin", "*")
+	r.Inherit("operator", "viewer")
+	r.Inherit("lead", "operator")
+	r.Assign("alice", "viewer")
+	r.Assign("bob", "lead")
+	r.Assign("root", "admin")
+
+	cases := []struct {
+		user, perm string
+		want       bool
+	}{
+		{"alice", "order:read", true},
+		{"alice", "order:refund", false},
+		{"bob", "order:refund", true},
+		{"bob", "user:read", true},
+		{"bob", "user:delete", false},
+		{"bob", "orders:read", false},
+		{"root", "anything:at:all", true},
+		{"nobody", "order:read", false},
+	}
+	for _, c := range cases {
+		if got := r.Can(c.user, c.perm); got != c.want {
+			t.Errorf("Can(%s, %s) = %v，期望 %v", c.user, c.perm, got, c.want)
+		}
+	}
+}
+
+func TestCycle(t *testing.T) {
+	r := NewRBAC()
+	r.Inherit("a", "b")
+	r.Inherit("b", "a")
+	r.Grant("b", "x:read")
+	r.Assign("u", "a")
+	if !r.Can("u", "x:read") || r.Can("u", "x:write") {
+		t.Fatal("有环时也要正确判断且不能死循环")
+	}
+}
+
+=== web-15-1
+title: 配置热更新：校验后整体替换
+race: true
+--- desc
+实现配置管理器 `Manager`：
+
+- `NewManager(source)`：从 `source()` 读取 JSON 初始化，初始加载失败返回错误；
+- `Current()`：无锁读取当前配置（`atomic.Pointer`）；
+- `Reload()`：重新读取：内容和上次相同返回 `(false, nil)`；解析失败或 `Validate()` 不通过，**保留旧配置**并返回错误；否则整体替换，返回 `(true, nil)`。
+
+读取方拿到的永远是一个完整的配置对象，不会看到更新了一半的状态。
+--- solution
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"sync"
+	"sync/atomic"
+)
+
+type Config struct {
+	RateLimit int      `json:"rate_limit"`
+	Features  []string `json:"features"`
+}
+
+func (c *Config) Validate() error {
+	if c.RateLimit < 1 || c.RateLimit > 10000 {
+		return errors.New("rate_limit must be in [1, 10000]")
+	}
+	return nil
+}
+
+type Manager struct {
+	cur     atomic.Pointer[Config]
+	source  func() ([]byte, error)
+	mu      sync.Mutex // 串行化 Reload
+	lastRaw []byte
+}
+
+func parse(raw []byte) (*Config, error) {
+	var c Config
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return nil, err
+	}
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func NewManager(source func() ([]byte, error)) (*Manager, error) {
+	m := &Manager{source: source}
+	if _, err := m.Reload(); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (m *Manager) Current() *Config { return m.cur.Load() }
+
+func (m *Manager) Reload() (bool, error) {
+	// @solution
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	raw, err := m.source()
+	if err != nil {
+		return false, err
+	}
+	if m.lastRaw != nil && bytes.Equal(raw, m.lastRaw) {
+		return false, nil
+	}
+	cfg, err := parse(raw)
+	if err != nil {
+		return false, err
+	}
+	m.cur.Store(cfg)
+	m.lastRaw = raw
+	return true, nil
+	// @starter
+	// raw, err := m.source()
+	// if err != nil {
+	// 	return false, err
+	// }
+	// var c Config
+	// json.Unmarshal(raw, &c) // TODO: 没有处理错误和校验，也没有判断内容是否变化
+	// m.cur.Store(&c)
+	// return true, nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"sync"
+	"testing"
+)
+
+func TestReload(t *testing.T) {
+	var mu sync.Mutex
+	raw := `{"rate_limit": 100, "features": ["a"]}`
+	src := func() ([]byte, error) { mu.Lock(); defer mu.Unlock(); return []byte(raw), nil }
+	set := func(s string) { mu.Lock(); raw = s; mu.Unlock() }
+
+	m, err := NewManager(src)
+	if err != nil || m.Current().RateLimit != 100 {
+		t.Fatalf("初始化失败：%v", err)
+	}
+	if changed, err := m.Reload(); changed || err != nil {
+		t.Fatalf("内容没变时 Reload = %v, %v，期望 false, nil", changed, err)
+	}
+
+	set(`{"rate_limit": 0}`)
+	if _, err := m.Reload(); err == nil || m.Current().RateLimit != 100 {
+		t.Fatal("校验失败时应返回错误并保留旧配置")
+	}
+	set(`{bad json`)
+	if _, err := m.Reload(); err == nil || m.Current().RateLimit != 100 {
+		t.Fatal("解析失败时应返回错误并保留旧配置")
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				if c := m.Current(); c.RateLimit != 100 && c.RateLimit != 500 {
+					t.Errorf("读到了不完整的配置：%+v", c)
+				}
+			}
+		}()
+	}
+	set(`{"rate_limit": 500, "features": ["a", "b"]}`)
+	if changed, err := m.Reload(); !changed || err != nil {
+		t.Fatalf("Reload = %v, %v", changed, err)
+	}
+	wg.Wait()
+	if c := m.Current(); c.RateLimit != 500 || len(c.Features) != 2 {
+		t.Fatalf("Current = %+v", c)
+	}
+}
+
+func TestInitialLoadFails(t *testing.T) {
+	if _, err := NewManager(func() ([]byte, error) { return []byte(`{"rate_limit": -1}`), nil }); err == nil {
+		t.Fatal("初始配置不合法时应返回错误")
+	}
+}
+
+=== web-16-1
+title: 面向接口的 service 层
+--- desc
+service 层只依赖它自己定义的 `UserRepo` 接口，具体实现（MySQL、内存）由 main 函数组装后通过构造函数注入；时间也通过函数注入，这样单元测试可以用假的实现。
+
+实现 `UserService.Register(ctx, name)`：
+
+1. 去掉首尾空白后，名字长度必须在 2~20 个字符之间（按 rune 计），否则返回 `ErrInvalidName`；
+2. 调用 `repo.ExistsByName`，已存在返回 `ErrDuplicate`；
+3. 创建 `User`，`CreatedAt` 使用注入的 `now()`，调用 `repo.Create` 保存（repo 会填充 ID），返回这个 User。
+
+repo 返回的错误要用 `%w` 包装后返回。
+--- solution
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+	"unicode/utf8"
+)
+
+var (
+	ErrInvalidName = errors.New("invalid name")
+	ErrDuplicate   = errors.New("name already taken")
+)
+
+type User struct {
+	ID        int64
+	Name      string
+	CreatedAt time.Time
+}
+
+type UserRepo interface {
+	ExistsByName(ctx context.Context, name string) (bool, error)
+	Create(ctx context.Context, u *User) error
+}
+
+type UserService struct {
+	repo UserRepo
+	now  func() time.Time
+}
+
+func NewUserService(repo UserRepo, now func() time.Time) *UserService {
+	return &UserService{repo: repo, now: now}
+}
+
+func (s *UserService) Register(ctx context.Context, name string) (*User, error) {
+	// @solution
+	name = strings.TrimSpace(name)
+	if n := utf8.RuneCountInString(name); n < 2 || n > 20 {
+		return nil, ErrInvalidName
+	}
+	exists, err := s.repo.ExistsByName(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("check name: %w", err)
+	}
+	if exists {
+		return nil, ErrDuplicate
+	}
+	u := &User{Name: name, CreatedAt: s.now()}
+	if err := s.repo.Create(ctx, u); err != nil {
+		return nil, fmt.Errorf("create user: %w", err)
+	}
+	return u, nil
+	// @starter
+	// return nil, errors.New("TODO")
+	// @end
+}
+--- test
+package main
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
+
+type fakeRepo struct {
+	users  map[string]*User
+	nextID int64
+	err    error
+}
+
+func (f *fakeRepo) ExistsByName(_ context.Context, name string) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	_, ok := f.users[name]
+	return ok, nil
+}
+
+func (f *fakeRepo) Create(_ context.Context, u *User) error {
+	f.nextID++
+	u.ID = f.nextID
+	f.users[u.Name] = u
+	return nil
+}
+
+func TestRegister(t *testing.T) {
+	fixed := time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC)
+	repo := &fakeRepo{users: map[string]*User{}}
+	svc := NewUserService(repo, func() time.Time { return fixed })
+
+	u, err := svc.Register(context.Background(), "  gopher ")
+	if err != nil || u.ID != 1 || u.Name != "gopher" || !u.CreatedAt.Equal(fixed) {
+		t.Fatalf("Register = %+v, %v", u, err)
+	}
+	if _, err := svc.Register(context.Background(), "gopher"); !errors.Is(err, ErrDuplicate) {
+		t.Fatalf("重名应返回 ErrDuplicate，实际 %v", err)
+	}
+	for _, bad := range []string{"", " a ", "abcdefghijklmnopqrstu"} {
+		if _, err := svc.Register(context.Background(), bad); !errors.Is(err, ErrInvalidName) {
+			t.Errorf("Register(%q) 应返回 ErrInvalidName，实际 %v", bad, err)
+		}
+	}
+}
+
+func TestRepoErrorWrapped(t *testing.T) {
+	dbErr := errors.New("connection refused")
+	svc := NewUserService(&fakeRepo{users: map[string]*User{}, err: dbErr}, time.Now)
+	if _, err := svc.Register(context.Background(), "gopher"); !errors.Is(err, dbErr) {
+		t.Fatalf("repo 的错误应被包装后返回，实际 %v", err)
+	}
+}
+
+=== web-17-1
+title: 可测试的时间：注入 Clock
+--- desc
+直接调用 `time.Now()` 的代码很难测试「过期」逻辑——总不能在测试里真的等一小时。把时间抽象成接口：
+
+- 实现 `FakeClock`：`Now()` 返回内部保存的时间，`Advance(d)` 让时间前进；
+- 实现 `TokenStore`：`Issue(tok)` 记录签发时间，`Valid(tok)` 判断是否存在且未超过 `ttl`。两者都必须通过 `s.clock.Now()` 获取时间。
+
+测试会用你的 `FakeClock` 把时间快进 2 小时来测试过期。
+--- solution
+package main
+
+import "time"
+
+type Clock interface {
+	Now() time.Time
+}
+
+type realClock struct{}
+
+func (realClock) Now() time.Time { return time.Now() }
+
+type FakeClock struct {
+	t time.Time
+}
+
+func NewFakeClock(t time.Time) *FakeClock { return &FakeClock{t: t} }
+
+// @solution
+func (c *FakeClock) Now() time.Time         { return c.t }
+func (c *FakeClock) Advance(d time.Duration) { c.t = c.t.Add(d) }
+
+// @starter
+// func (c *FakeClock) Now() time.Time         { return time.Time{} } // TODO
+// func (c *FakeClock) Advance(d time.Duration) {}                    // TODO
+// @end
+
+type TokenStore struct {
+	clock  Clock
+	ttl    time.Duration
+	issued map[string]time.Time
+}
+
+func NewTokenStore(clock Clock, ttl time.Duration) *TokenStore {
+	return &TokenStore{clock: clock, ttl: ttl, issued: map[string]time.Time{}}
+}
+
+func (s *TokenStore) Issue(tok string) {
+	// @solution
+	s.issued[tok] = s.clock.Now()
+	// @starter
+	// s.issued[tok] = time.Now() // TODO: 应该用 s.clock
+	// @end
+}
+
+func (s *TokenStore) Valid(tok string) bool {
+	// @solution
+	at, ok := s.issued[tok]
+	return ok && s.clock.Now().Sub(at) < s.ttl
+	// @starter
+	// _, ok := s.issued[tok] // TODO: 没有判断过期
+	// return ok
+	// @end
+}
+--- test
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+func TestFakeClock(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	c := NewFakeClock(start)
+	c.Advance(90 * time.Minute)
+	if !c.Now().Equal(start.Add(90 * time.Minute)) {
+		t.Fatalf("Now = %v", c.Now())
+	}
+}
+
+func TestTokenExpiry(t *testing.T) {
+	clock := NewFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	s := NewTokenStore(clock, time.Hour)
+	s.Issue("t1")
+	if !s.Valid("t1") || s.Valid("nope") {
+		t.Fatal("刚签发的令牌应有效，未签发的无效")
+	}
+	clock.Advance(59 * time.Minute)
+	if !s.Valid("t1") {
+		t.Fatal("59 分钟时仍应有效")
+	}
+	clock.Advance(2 * time.Hour)
+	if s.Valid("t1") {
+		t.Fatal("超过 ttl 后应失效")
+	}
+}
+
+func TestRealClock(t *testing.T) {
+	var c Clock = realClock{}
+	if time.Since(c.Now()) > time.Second {
+		t.Fatal("realClock 应返回当前时间")
+	}
+}
+
+=== web-18-1
+title: 连接池的 MaxIdleConnsPerHost
+--- desc
+`http.Transport` 的 `MaxIdleConnsPerHost` 默认只有 2。用一个简化模型看看它的影响：
+
+- `Get(host)`：有空闲连接就复用（后放回的先用），否则新建一个（`Dialed++`）；
+- `Put(host, conn)`：该 host 的空闲连接数没到上限就放回，否则直接关闭（`Closed++`，对应一个 TIME_WAIT）。
+
+测试模拟每轮 10 个并发请求、共 3 轮：上限为 2 时，每轮都有 8 个连接被关闭又重新建立；上限调到 10 后只建立 10 个连接。
+--- solution
+package main
+
+type Pool struct {
+	maxIdlePerHost int
+	idle           map[string][]int
+	nextID         int
+	Dialed         int
+	Closed         int
+}
+
+func NewPool(maxIdlePerHost int) *Pool {
+	return &Pool{maxIdlePerHost: maxIdlePerHost, idle: map[string][]int{}}
+}
+
+func (p *Pool) Get(host string) int {
+	// @solution
+	if conns := p.idle[host]; len(conns) > 0 {
+		c := conns[len(conns)-1]
+		p.idle[host] = conns[:len(conns)-1]
+		return c
+	}
+	p.nextID++
+	p.Dialed++
+	return p.nextID
+	// @starter
+	// p.nextID++ // TODO: 先尝试复用空闲连接
+	// p.Dialed++
+	// return p.nextID
+	// @end
+}
+
+func (p *Pool) Put(host string, conn int) {
+	// @solution
+	if len(p.idle[host]) >= p.maxIdlePerHost {
+		p.Closed++
+		return
+	}
+	p.idle[host] = append(p.idle[host], conn)
+	// @starter
+	// p.Closed++ // TODO
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func simulate(p *Pool, rounds, concurrent int) {
+	for r := 0; r < rounds; r++ {
+		conns := make([]int, concurrent)
+		for i := range conns {
+			conns[i] = p.Get("api.internal")
+		}
+		for _, c := range conns {
+			p.Put("api.internal", c)
+		}
+	}
+}
+
+func TestDefaultTooSmall(t *testing.T) {
+	p := NewPool(2)
+	simulate(p, 3, 10)
+	if p.Dialed != 26 || p.Closed != 24 {
+		t.Fatalf("MaxIdleConnsPerHost=2：新建 %d 个、关闭 %d 个，期望 26 / 24", p.Dialed, p.Closed)
+	}
+}
+
+func TestTuned(t *testing.T) {
+	p := NewPool(10)
+	simulate(p, 3, 10)
+	if p.Dialed != 10 || p.Closed != 0 {
+		t.Fatalf("MaxIdleConnsPerHost=10：新建 %d 个、关闭 %d 个，期望 10 / 0", p.Dialed, p.Closed)
+	}
+}
+
+func TestPerHost(t *testing.T) {
+	p := NewPool(1)
+	a := p.Get("a")
+	b := p.Get("b")
+	p.Put("a", a)
+	p.Put("b", b)
+	if p.Get("a") != a || p.Get("b") != b || p.Closed != 0 {
+		t.Fatal("空闲连接按 host 分开管理")
+	}
+}
+
+=== web-19-1
+title: 零分配地生成 JSON
+--- desc
+在 QPS 很高的接口上，`encoding/json` 的反射和分配可能成为热点。为固定结构手写序列化：
+
+`AppendJSON(dst, u)` 把 `User` 按 `{"id":1,"name":"bob","admin":false}` 的格式追加到 `dst` 后面。字符串转义规则和 `encoding/json` 一致（本题不涉及 `<>&` 等 HTML 字符）：
+
+- `"` → `\"`，`\` → `\\`；
+- `\n`、`\r`、`\t` → `\n`、`\r`、`\t`；
+- 其他小于 0x20 的控制字符 → `\u00XX`（小写十六进制）；
+- 其余字符（包括中文）原样输出。
+
+调用方提供足够容量的 `dst` 时必须**零分配**。
+--- solution
+package main
+
+import "strconv"
+
+type User struct {
+	ID    int64
+	Name  string
+	Admin bool
+}
+
+const hexDigits = "0123456789abcdef"
+
+func appendString(dst []byte, s string) []byte {
+	dst = append(dst, '"')
+	// @solution
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"' || c == '\\':
+			dst = append(dst, '\\', c)
+		case c == '\n':
+			dst = append(dst, '\\', 'n')
+		case c == '\r':
+			dst = append(dst, '\\', 'r')
+		case c == '\t':
+			dst = append(dst, '\\', 't')
+		case c < 0x20:
+			dst = append(dst, '\\', 'u', '0', '0', hexDigits[c>>4], hexDigits[c&0xf])
+		default:
+			dst = append(dst, c)
+		}
+	}
+	// @starter
+	// dst = append(dst, s...) // TODO: 转义
+	// @end
+	return append(dst, '"')
+}
+
+func AppendJSON(dst []byte, u User) []byte {
+	dst = append(dst, `{"id":`...)
+	dst = strconv.AppendInt(dst, u.ID, 10)
+	dst = append(dst, `,"name":`...)
+	dst = appendString(dst, u.Name)
+	dst = append(dst, `,"admin":`...)
+	dst = strconv.AppendBool(dst, u.Admin)
+	return append(dst, '}')
+}
+--- test
+package main
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestMatchesEncodingJSON(t *testing.T) {
+	names := []string{"bob", `say "hi"`, `back\slash`, "line\nbreak", "tab\there\r", "\x01\x1fctrl", "中文名", ""}
+	for i, name := range names {
+		u := User{ID: int64(i * 1000), Name: name, Admin: i%2 == 0}
+		want, _ := json.Marshal(struct {
+			ID    int64  `json:"id"`
+			Name  string `json:"name"`
+			Admin bool   `json:"admin"`
+		}{u.ID, u.Name, u.Admin})
+		if got := AppendJSON(nil, u); string(got) != string(want) {
+			t.Errorf("AppendJSON(%q)\n得到 %s\n期望 %s", name, got, want)
+		}
+	}
+}
+
+func TestZeroAlloc(t *testing.T) {
+	buf := make([]byte, 0, 256)
+	u := User{ID: 42, Name: "gopher \"go\"", Admin: true}
+	if a := testing.AllocsPerRun(100, func() { buf = AppendJSON(buf[:0], u) }); a != 0 {
+		t.Fatalf("发生了 %.0f 次分配，期望 0", a)
+	}
+}
+
+=== web-20-1
+title: 校验 Webhook 签名并防重放
+--- desc
+回调接口必须验证请求确实来自对方。约定请求头格式为 `t=<unix秒>,v1=<十六进制签名>`，签名内容是 `<t>.<body>`，算法 HMAC-SHA256。密钥轮换期间可能出现多个 `v1=`，任意一个匹配即可。
+
+实现 `Verify(body, header, secret, now, tolerance)`：
+
+- 头部格式错误（缺少 `t` 或 `v1`、时间戳不是整数）→ `ErrBadHeader`；
+- 时间戳和 `now` 相差超过 `tolerance`（过去或未来都算）→ `ErrExpired`，防止旧请求被重放；
+- 没有任何签名匹配 → `ErrSignature`；比较时用 `hmac.Equal`（常量时间）。
+
+`Sign` 已经实现，供测试生成合法的头部。
+--- solution
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"strconv"
+	"strings"
+	"time"
+)
+
+var (
+	ErrBadHeader = errors.New("bad signature header")
+	ErrExpired   = errors.New("timestamp outside tolerance")
+	ErrSignature = errors.New("signature mismatch")
+)
+
+func mac(secret []byte, ts string, body []byte) []byte {
+	m := hmac.New(sha256.New, secret)
+	m.Write([]byte(ts + "."))
+	m.Write(body)
+	return m.Sum(nil)
+}
+
+func Sign(body, secret []byte, t time.Time) string {
+	ts := strconv.FormatInt(t.Unix(), 10)
+	return "t=" + ts + ",v1=" + hex.EncodeToString(mac(secret, ts, body))
+}
+
+func Verify(body []byte, header string, secret []byte, now time.Time, tolerance time.Duration) error {
+	// @solution
+	var ts string
+	var sigs [][]byte
+	for _, part := range strings.Split(header, ",") {
+		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "t":
+			ts = v
+		case "v1":
+			if b, err := hex.DecodeString(v); err == nil {
+				sigs = append(sigs, b)
+			}
+		}
+	}
+	sec, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil || len(sigs) == 0 {
+		return ErrBadHeader
+	}
+	if d := now.Sub(time.Unix(sec, 0)); d > tolerance || d < -tolerance {
+		return ErrExpired
+	}
+	expected := mac(secret, ts, body)
+	for _, s := range sigs {
+		if hmac.Equal(s, expected) {
+			return nil
+		}
+	}
+	return ErrSignature
+	// @starter
+	// return nil // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"errors"
+	"testing"
+	"time"
+)
+
+var secret = []byte("whsec_test")
+
+func TestVerify(t *testing.T) {
+	now := time.Unix(1760320800, 0)
+	body := []byte(`{"event":"paid","order":"A1"}`)
+	h := Sign(body, secret, now.Add(-30*time.Second))
+	if err := Verify(body, h, secret, now, 5*time.Minute); err != nil {
+		t.Fatalf("合法请求被拒绝：%v", err)
+	}
+	cases := []struct {
+		name   string
+		body   []byte
+		header string
+		secret []byte
+		want   error
+	}{
+		{"篡改 body", []byte(`{"event":"paid","order":"A2"}`), h, secret, ErrSignature},
+		{"错误的密钥", body, h, []byte("other"), ErrSignature},
+		{"过旧", body, Sign(body, secret, now.Add(-10*time.Minute)), secret, ErrExpired},
+		{"来自未来", body, Sign(body, secret, now.Add(10*time.Minute)), secret, ErrExpired},
+		{"缺少签名", body, "t=1760320800", secret, ErrBadHeader},
+		{"时间戳非法", body, "t=abc,v1=00", secret, ErrBadHeader},
+		{"空头部", body, "", secret, ErrBadHeader},
+	}
+	for _, c := range cases {
+		if err := Verify(c.body, c.header, c.secret, now, 5*time.Minute); !errors.Is(err, c.want) {
+			t.Errorf("%s：Verify = %v，期望 %v", c.name, err, c.want)
+		}
+	}
+}
+
+func TestKeyRotation(t *testing.T) {
+	now := time.Unix(1760320800, 0)
+	body := []byte("x")
+	oldSig := Sign(body, []byte("old-secret"), now)
+	newSig := Sign(body, secret, now)
+	header := oldSig + "," + newSig[len("t=1760320800,"):]
+	if err := Verify(body, header, secret, now, time.Minute); err != nil {
+		t.Fatalf("多个 v1 中任意一个匹配即可：%v", err)
+	}
+}
+
+=== web-21-1
+title: 稳定的灰度放量
+--- desc
+实现 `InRollout(feature, user, percent, allow)`，判断用户是否命中某个功能的灰度：
+
+1. 用户在白名单 `allow` 中 → 命中；
+2. 否则计算 `bucket = fnv32a(feature + ":" + user) % 100`，`bucket < percent` 时命中。
+
+这样做的好处：同一个用户的结果是**稳定**的（不会刷新一次变一次）；放量从 10% 调到 30% 时，原来 10% 的用户仍然在内；不同功能把 feature 名拼进哈希，命中的用户群互不相同。
+--- solution
+package main
+
+import "hash/fnv"
+
+func InRollout(feature, user string, percent int, allow map[string]bool) bool {
+	// @solution
+	if allow[user] {
+		return true
+	}
+	h := fnv.New32a()
+	h.Write([]byte(feature + ":" + user))
+	return int(h.Sum32()%100) < percent
+	// @starter
+	// return false // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"testing"
+)
+
+func TestDistribution(t *testing.T) {
+	hit := 0
+	for i := 0; i < 10000; i++ {
+		if InRollout("new-checkout", fmt.Sprint("user-", i), 20, nil) {
+			hit++
+		}
+	}
+	if hit < 1700 || hit > 2300 {
+		t.Fatalf("20%% 灰度命中了 %d / 10000", hit)
+	}
+}
+
+func TestStableAndMonotonic(t *testing.T) {
+	for i := 0; i < 2000; i++ {
+		u := fmt.Sprint("u", i)
+		a := InRollout("f", u, 10, nil)
+		if a != InRollout("f", u, 10, nil) {
+			t.Fatal("同一个用户的结果必须稳定")
+		}
+		if a && !InRollout("f", u, 30, nil) {
+			t.Fatalf("%s 在 10%% 时命中，放量到 30%% 后却不命中", u)
+		}
+	}
+}
+
+func TestEdges(t *testing.T) {
+	allow := map[string]bool{"qa-1": true}
+	if !InRollout("f", "qa-1", 0, allow) {
+		t.Fatal("白名单用户始终命中")
+	}
+	if InRollout("f", "u1", 0, nil) || !InRollout("f", "u1", 100, nil) {
+		t.Fatal("0% 全不命中，100% 全命中")
+	}
+	same := 0
+	for i := 0; i < 1000; i++ {
+		u := fmt.Sprint("u", i)
+		if InRollout("feature-a", u, 50, nil) == InRollout("feature-b", u, 50, nil) {
+			same++
+		}
+	}
+	if same > 700 {
+		t.Fatalf("不同功能的灰度人群应基本独立，结果一致的比例 %d/1000", same)
+	}
+}
+
+=== web-22-1
+title: API 版本协商与兼容
+--- desc
+同一个接口同时服务 v1 和 v2 的客户端：
+
+- `Version(r)`：路径以 `/v2/` 开头为 2，以 `/v1/` 开头为 1；否则看 `Accept` 头是否包含 `application/vnd.shop.v2+json`，是则为 2；默认 1；
+- `RenderUser(version, u)`：v1 返回 `{"name":"Ada Lovelace"}`（名和姓用空格连接），v2 返回 `{"first_name":"Ada","last_name":"Lovelace"}`。
+
+把 `name` 拆成两个字段是**不兼容**变更（老客户端读不到 name），所以必须升级版本；如果只是新增一个可选字段，就不需要。
+--- solution
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"strings"
+)
+
+type User struct {
+	FirstName string
+	LastName  string
+}
+
+func Version(r *http.Request) int {
+	// @solution
+	switch {
+	case strings.HasPrefix(r.URL.Path, "/v2/"):
+		return 2
+	case strings.HasPrefix(r.URL.Path, "/v1/"):
+		return 1
+	case strings.Contains(r.Header.Get("Accept"), "application/vnd.shop.v2+json"):
+		return 2
+	}
+	return 1
+	// @starter
+	// return 1 // TODO
+	// @end
+}
+
+func RenderUser(version int, u User) ([]byte, error) {
+	// @solution
+	if version >= 2 {
+		return json.Marshal(struct {
+			FirstName string `json:"first_name"`
+			LastName  string `json:"last_name"`
+		}{u.FirstName, u.LastName})
+	}
+	return json.Marshal(struct {
+		Name string `json:"name"`
+	}{strings.TrimSpace(u.FirstName + " " + u.LastName)})
+	// @starter
+	// return json.Marshal(u) // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"net/http/httptest"
+	"testing"
+)
+
+func TestVersion(t *testing.T) {
+	cases := []struct {
+		path, accept string
+		want         int
+	}{
+		{"/v2/users/1", "", 2},
+		{"/v1/users/1", "application/vnd.shop.v2+json", 1},
+		{"/users/1", "application/vnd.shop.v2+json", 2},
+		{"/users/1", "application/json", 1},
+		{"/users/1", "", 1},
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest("GET", c.path, nil)
+		if c.accept != "" {
+			r.Header.Set("Accept", c.accept)
+		}
+		if got := Version(r); got != c.want {
+			t.Errorf("Version(%s, Accept=%q) = %d，期望 %d", c.path, c.accept, got, c.want)
+		}
+	}
+}
+
+func TestRenderUser(t *testing.T) {
+	u := User{"Ada", "Lovelace"}
+	v1, _ := RenderUser(1, u)
+	v2, _ := RenderUser(2, u)
+	if string(v1) != `{"name":"Ada Lovelace"}` {
+		t.Errorf("v1 = %s", v1)
+	}
+	if string(v2) != `{"first_name":"Ada","last_name":"Lovelace"}` {
+		t.Errorf("v2 = %s", v2)
+	}
+}

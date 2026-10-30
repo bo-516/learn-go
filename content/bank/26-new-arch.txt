@@ -1,0 +1,886 @@
+=== arch-21-1
+title: 实现基于 close(chan) 广播的配置中心长轮询服务端
+race: true
+--- desc
+实现配置中心的核心服务端 `ConfigHub`，支持毫秒级长轮询（Long Polling）推送：
+
+1. `NewConfigHub() *ConfigHub`：初始化配置中心（初始 `version = 0`，`value = ""`）；
+2. `Publish(val string) int64`：
+   - 将版本号自增 1，更新配置值为 `val`；
+   - **关闭旧的广播通道 `notifyCh` 并创建一个新的 `make(chan struct{})`**，从而瞬间唤醒所有正在挂起等待该配置变更的长轮询请求，返回新版本号；
+3. `Watch(ctx context.Context, clientVersion int64) (val string, ver int64, changed bool)`：
+   - 如果当前服务端版本号 **严格大于** `clientVersion`，立即返回 `(curVal, curVer, true)`；
+   - 如果版本号相等（无变更），**先在锁内拿到当前的 `notifyCh` 引用后释放锁**，然后通过 `select` 等待 `notifyCh` 被关闭（有新版本发布）或 `ctx.Done()`（长轮询超时）：
+     - 若被新版本唤醒，返回最新 `(curVal, curVer, true)`；
+     - 若 `ctx` 超时取消，返回 `("", clientVersion, false)`。
+--- solution
+package main
+
+import (
+	"context"
+	"sync"
+)
+
+type ConfigHub struct {
+	mu       sync.RWMutex
+	version  int64
+	value    string
+	notifyCh chan struct{}
+}
+
+func NewConfigHub() *ConfigHub {
+	return &ConfigHub{notifyCh: make(chan struct{})}
+}
+
+func (h *ConfigHub) Publish(val string) int64 {
+	// @solution
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.version++
+	h.value = val
+	close(h.notifyCh)
+	h.notifyCh = make(chan struct{})
+	return h.version
+	// @starter
+	// return 0 // TODO: 更新 version/value，关闭旧 notifyCh 唤醒所有监听者并重建新 notifyCh
+	// @end
+}
+
+func (h *ConfigHub) Watch(ctx context.Context, clientVersion int64) (string, int64, bool) {
+	// @solution
+	h.mu.RLock()
+	if h.version > clientVersion {
+		val, ver := h.value, h.version
+		h.mu.RUnlock()
+		return val, ver, true
+	}
+	ch := h.notifyCh
+	h.mu.RUnlock()
+
+	select {
+	case <-ch:
+		h.mu.RLock()
+		val, ver := h.value, h.version
+		h.mu.RUnlock()
+		return val, ver, true
+	case <-ctx.Done():
+		return "", clientVersion, false
+	}
+	// @starter
+	// return "", clientVersion, false // TODO: 版本落后立即返回，否则挂起等待 notifyCh 或 ctx.Done()
+	// @end
+}
+--- test
+package main
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestConfigHubLongPolling(t *testing.T) {
+	hub := NewConfigHub()
+
+	// 1. 尚无变更时，短超时长轮询应返回 changed=false
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel1()
+	if _, ver, changed := hub.Watch(ctx1, 0); changed || ver != 0 {
+		t.Fatalf("expected timeout unchanged, got ver=%d changed=%v", ver, changed)
+	}
+
+	// 2. 10 个客户端同时挂起长轮询，50ms 后 Publish 一次应瞬间全部唤醒
+	const watchers = 10
+	var wg sync.WaitGroup
+	wg.Add(watchers)
+	for range watchers {
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			val, ver, changed := hub.Watch(ctx, 0)
+			if !changed || ver != 1 || val != "timeout=500ms" {
+				t.Errorf("watcher got (%q, %d, %v), want (timeout=500ms, 1, true)", val, ver, changed)
+			}
+		}()
+	}
+
+	time.Sleep(15 * time.Millisecond)
+	if v := hub.Publish("timeout=500ms"); v != 1 {
+		t.Fatalf("Publish version = %d, want 1", v)
+	}
+	wg.Wait()
+
+	// 3. 版本落后的客户端调用 Watch 应立即返回，无需等待
+	val, ver, changed := hub.Watch(context.Background(), 0)
+	if !changed || ver != 1 || val != "timeout=500ms" {
+		t.Fatalf("immediate watch got (%q, %d, %v)", val, ver, changed)
+	}
+}
+--- explain
+**思路**
+
+利用 Go 中 **`close(ch)` 会立即唤醒所有阻塞在 `<-ch` 上的协程**这一语言原语，可以用一个 `chan struct{}` 零成本地替代复杂的观察者列表维护。每次 `Publish` 时只需关闭旧通道并替换为新通道即可完成百万级长轮询广播。
+
+**代码讲解**
+
+1. 在 `Watch` 中，必须在持有读锁 `h.mu.RLock()` 的期间判断 `h.version > clientVersion` 并读取局部变量 `ch := h.notifyCh`，随后再释放读锁进入 `select`。
+2. 如果先释放读锁再去读 `h.notifyCh`，在并发 `Publish` 时会发生数据竞争（Data Race）或错过信号。
+
+**易错点**
+
+- 切勿在持有锁的状态下执行 `select { case <-ch: }`，否则 `Publish` 尝试获取写锁 `h.mu.Lock()` 时会永久死锁！
+
+=== arch-22-1
+title: 实现分布式定时任务的幂等抢占与分片路由执行器
+race: true
+--- desc
+实现分布式定时任务系统的两个核心原语：
+
+1. `FireDeduplicator`：防止多台调度节点或超时重试在同一周期重复触发任务：
+   - `TryClaim(jobID string, slotUnix int64) bool`：并发安全地抢占 `(jobID, slotUnix)` 执行权。同一周期首次抢占返回 `true`，后续重复抢占返回 `false`；
+2. `FilterShardItems(items []int64, shardIndex, shardTotal int) []int64`：
+   - 分片广播执行器：若 `shardTotal <= 0` 或 `shardIndex < 0` 或 `shardIndex >= shardTotal`，返回 `nil`；
+   - 否则过滤并返回满足 `item % int64(shardTotal) == int64(shardIndex)` 的所有元素（对负数 ID 需先取非负余数或确保按正数取模，本题测试均为正整数 ID）。
+--- solution
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type FireDeduplicator struct {
+	mu      sync.Mutex
+	claimed map[string]struct{}
+}
+
+func NewFireDeduplicator() *FireDeduplicator {
+	return &FireDeduplicator{claimed: make(map[string]struct{})}
+}
+
+func (d *FireDeduplicator) TryClaim(jobID string, slotUnix int64) bool {
+	// @solution
+	key := fmt.Sprintf("%s:%d", jobID, slotUnix)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, exists := d.claimed[key]; exists {
+		return false
+	}
+	d.claimed[key] = struct{}{}
+	return true
+	// @starter
+	// return false // TODO: 保证同一 (jobID, slotUnix) 并发下只有一个调用者返回 true
+	// @end
+}
+
+func FilterShardItems(items []int64, shardIndex, shardTotal int) []int64 {
+	// @solution
+	if shardTotal <= 0 || shardIndex < 0 || shardIndex >= shardTotal {
+		return nil
+	}
+	var out []int64
+	mod := int64(shardTotal)
+	target := int64(shardIndex)
+	for _, id := range items {
+		if id%mod == target {
+			out = append(out, id)
+		}
+	}
+	return out
+	// @starter
+	// return nil // TODO: 按 id % shardTotal == shardIndex 筛选当前分片负责的数据
+	// @end
+}
+--- test
+package main
+
+import (
+	"reflect"
+	"sync"
+	"sync/atomic"
+	"testing"
+)
+
+func TestFireDeduplicatorAndSharding(t *testing.T) {
+	dedup := NewFireDeduplicator()
+	var wins atomic.Int32
+	var wg sync.WaitGroup
+	for range 30 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if dedup.TryClaim("settle_job", 1700000060) {
+				wins.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if wins.Load() != 1 {
+		t.Fatalf("expected exactly 1 scheduler node to claim slot, got %d", wins.Load())
+	}
+	if !dedup.TryClaim("settle_job", 1700000120) {
+		t.Fatal("next time slot should be claimable")
+	}
+
+	items := []int64{1, 2, 3, 4, 5, 6, 7, 8, 9}
+	var merged []int64
+	for idx := range 3 {
+		part := FilterShardItems(items, idx, 3)
+		merged = append(merged, part...)
+	}
+	if len(merged) != len(items) {
+		t.Fatalf("sharded total count = %d, want %d", len(merged), len(items))
+	}
+	if !reflect.DeepEqual(FilterShardItems(items, 0, 3), []int64{3, 6, 9}) {
+		t.Fatalf("shard 0/3 = %v, want [3 6 9]", FilterShardItems(items, 0, 3))
+	}
+	if FilterShardItems(items, 3, 3) != nil {
+		t.Fatal("out-of-range shardIndex should return nil")
+	}
+}
+--- explain
+**思路**
+
+1. **周期唯一抢占键**：定时任务幂等不能只锁 `jobID`，而要把计划触发时间槽 `slotUnix` 拼成 `jobID:slotUnix`，这样既能阻止同一分钟内的多节点重复触发，又不会影响下一分钟的正常调度。
+2. **分片广播**：将全量任务按 `id % shardTotal == shardIndex` 切分给 $N$ 台执行器并行跑，无锁且不重不漏。
+
+**代码讲解**
+
+- `FilterShardItems` 先做参数边界防御（`shardTotal <= 0 || shardIndex < 0 || shardIndex >= shardTotal`），防止除以 0 引发 panic。
+
+**易错点**
+
+- 如果不校验 `shardTotal <= 0` 直接执行 `id % int64(shardTotal)`，当配置错误传入 `0` 时会直接触发运行时 `integer divide by zero` 崩溃。
+
+=== arch-23-1
+title: 实现基于外部版本号（External Version）的乱序免疫 ES 同步消费器
+race: true
+--- desc
+MySQL Binlog 同步到 Elasticsearch 时，受网络重试或全量/增量并发影响，旧版本的消息可能晚于新版本到达。请实现模拟 ES `version_type=external` 的索引状态机 `ExternalVersionIndex`：
+
+1. `Apply(event BinlogEvent) bool`：
+   - `BinlogEvent` 包含 `ID string`、`Version int64`、`Data string`、`Deleted bool`；
+   - **只有当 `event.Version` 严格大于该 `ID` 当前已记录的最新版本号（从未出现过的 `ID` 初始版本视为 `0`）时，才接受本次变更并返回 `true`**；若 `event.Version <= curVersion`，说明是乱序迟到的旧消息或重复消息，直接忽略并返回 `false`；
+   - **重要**：即使 `event.Deleted == true`（删除事件），也**不能物理抹除该 `ID` 的版本号记录（Tombstone 墓碑）**，否则随后迟到的旧版本 `Insert/Update` 事件会因为找不到版本号而死灰复燃！
+2. `Get(id string) (data string, ok bool)`：若文档存在且未处于已删除状态，返回 `(data, true)`，否则返回 `("", false)`。
+--- solution
+package main
+
+import "sync"
+
+type BinlogEvent struct {
+	ID      string
+	Version int64
+	Data    string
+	Deleted bool
+}
+
+type docRecord struct {
+	version int64
+	data    string
+	deleted bool
+}
+
+type ExternalVersionIndex struct {
+	mu   sync.RWMutex
+	docs map[string]docRecord
+}
+
+func NewExternalVersionIndex() *ExternalVersionIndex {
+	return &ExternalVersionIndex{docs: make(map[string]docRecord)}
+}
+
+func (idx *ExternalVersionIndex) Apply(ev BinlogEvent) bool {
+	// @solution
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	cur, exists := idx.docs[ev.ID]
+	if exists && ev.Version <= cur.version {
+		return false
+	}
+	idx.docs[ev.ID] = docRecord{
+		version: ev.Version,
+		data:    ev.Data,
+		deleted: ev.Deleted,
+	}
+	return true
+	// @starter
+	// return false // TODO: 仅当 ev.Version > 当前版本时应用更新，并保留删除墓碑版本号
+	// @end
+}
+
+func (idx *ExternalVersionIndex) Get(id string) (string, bool) {
+	// @solution
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	rec, ok := idx.docs[id]
+	if !ok || rec.deleted {
+		return "", false
+	}
+	return rec.data, true
+	// @starter
+	// return "", false // TODO: 返回未删除文档的内容
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestExternalVersionOutOfOrderAndTombstone(t *testing.T) {
+	idx := NewExternalVersionIndex()
+
+	// 乱序到达：v3 先到，v1/v2 后到
+	if !idx.Apply(BinlogEvent{ID: "order-1", Version: 3, Data: "paid"}) {
+		t.Fatal("v3 should be applied")
+	}
+	if idx.Apply(BinlogEvent{ID: "order-1", Version: 1, Data: "created"}) {
+		t.Fatal("stale v1 must be rejected")
+	}
+	if idx.Apply(BinlogEvent{ID: "order-1", Version: 3, Data: "duplicate"}) {
+		t.Fatal("duplicate v3 must be rejected")
+	}
+	if val, ok := idx.Get("order-1"); !ok || val != "paid" {
+		t.Fatalf("Get = (%q, %v), want (paid, true)", val, ok)
+	}
+
+	// 删除事件 v5 先到，迟到的更新事件 v4 后到 -> 绝不能死灰复燃！
+	if !idx.Apply(BinlogEvent{ID: "order-1", Version: 5, Deleted: true}) {
+		t.Fatal("delete v5 should be applied")
+	}
+	if idx.Apply(BinlogEvent{ID: "order-1", Version: 4, Data: "shipped"}) {
+		t.Fatal("stale v4 after delete v5 must be rejected by tombstone version")
+	}
+	if _, ok := idx.Get("order-1"); ok {
+		t.Fatal("order-1 should remain deleted")
+	}
+}
+--- explain
+**思路**
+
+CDC 实时同步中解决乱序问题的银弹是 **单调版本号拦截（`ev.Version > cur.version`）** 与 **删除墓碑（Tombstone）保留版本号**。
+
+**代码讲解**
+
+1. `if exists && ev.Version <= cur.version { return false }`：无论是重复投递（`==`）还是旧数据乱序晚到（`<`），全部一言不合直接丢弃。
+2. 当收到 `ev.Deleted == true` 时，不能直接 `delete(idx.docs, ev.ID)`，而是存入 `docRecord{version: ev.Version, deleted: true}`。
+
+**易错点**
+
+- 如果在处理 `DELETE` 事件时直接从 `map` 中把 key 删掉了（丢失了版本号 `v5`），那么网络中迟到的 `UPDATE v4` 到达时会误以为这是一个全新文档（版本 `0`），从而让已被删除的数据“诈尸”！（Elasticsearch 底层同样通过 `index.gc_deletes` 在删除后保留一段时间的版本墓碑来解决此问题）。
+
+=== arch-24-1
+title: 实现高并发计数器的内存微批写聚合器（Write-Behind BatchCounter）
+race: true
+--- desc
+在高并发点赞/播放量计数系统中，为了避免每次计数都直接冲击 Redis/MySQL，请实现内存缓冲聚合器 `BatchCounter`：
+
+1. `Add(key string, delta int64)`：
+   - 将增量累加到内存缓冲区 `pending[key]` 中；
+   - 若缓冲区中不同 `key` 的数量达到阈值 `maxKeys`（`len(pending) >= maxKeys`），**立即在锁内触发一次刷盘同步**到后端 `sink(batch map[string]int64)` 并清空缓冲区；
+2. `Flush()`：
+   - 手动将当前缓冲区中所有非空增量刷入后端 `sink`（用于定时 Ticker 触发或优雅停机 `SIGTERM` 时排空余量）；
+   - 若当前缓冲区为空，**不要**调用 `sink`。
+--- solution
+package main
+
+import "sync"
+
+type BatchCounter struct {
+	mu      sync.Mutex
+	maxKeys int
+	pending map[string]int64
+	sink    func(map[string]int64)
+}
+
+func NewBatchCounter(maxKeys int, sink func(map[string]int64)) *BatchCounter {
+	return &BatchCounter{
+		maxKeys: maxKeys,
+		pending: make(map[string]int64),
+		sink:    sink,
+	}
+}
+
+func (c *BatchCounter) Add(key string, delta int64) {
+	// @solution
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pending[key] += delta
+	if len(c.pending) >= c.maxKeys {
+		c.flushLocked()
+	}
+	// @starter
+	// // TODO: 累加到内存 pending，达到 maxKeys 时触发刷盘
+	// @end
+}
+
+func (c *BatchCounter) Flush() {
+	// @solution
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.flushLocked()
+	// @starter
+	// // TODO: 将非空 pending 刷入 sink 并重建 map
+	// @end
+}
+
+func (c *BatchCounter) flushLocked() {
+	if len(c.pending) == 0 {
+		return
+	}
+	batch := c.pending
+	c.pending = make(map[string]int64)
+	c.sink(batch)
+}
+--- test
+package main
+
+import (
+	"sync"
+	"sync/atomic"
+	"testing"
+)
+
+func TestBatchCounterWriteBehind(t *testing.T) {
+	var sinkCalls atomic.Int32
+	var dbMu sync.Mutex
+	db := make(map[string]int64)
+
+	bc := NewBatchCounter(4, func(batch map[string]int64) {
+		sinkCalls.Add(1)
+		dbMu.Lock()
+		for k, v := range batch {
+			db[k] += v
+		}
+		dbMu.Unlock()
+	})
+
+	// 1000 次并发累加同一个热点 key "video:1"，不应触发 maxKeys(4) 刷盘
+	var wg sync.WaitGroup
+	for range 1000 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			bc.Add("video:1", 1)
+		}()
+	}
+	wg.Wait()
+	if sinkCalls.Load() != 0 {
+		t.Fatalf("expected 0 sink calls for single key before Flush, got %d", sinkCalls.Load())
+	}
+
+	// 优雅停机/定时 Flush：1000 次写入被合并成仅仅 1 次后端调用！
+	bc.Flush()
+	if sinkCalls.Load() != 1 || db["video:1"] != 1000 {
+		t.Fatalf("after Flush: sinkCalls=%d, count=%d, want 1, 1000", sinkCalls.Load(), db["video:1"])
+	}
+
+	// 空缓冲区调用 Flush 不应触发 sink
+	bc.Flush()
+	if sinkCalls.Load() != 1 {
+		t.Fatal("empty Flush should not invoke sink")
+	}
+}
+--- explain
+**思路**
+
+内存缓冲聚合（Write-Behind）把同一时间窗口内针对同一个热点 Key 的成千上万次 `+1` 合并为内存 map 中的一次整数加法，只在达到容量上限或定时/停机 `Flush()` 时向后端发起一次批量 `HINCRBY`，可将下游存储压力降低 2~3 个数量级。
+
+**代码讲解**
+
+1. `batch := c.pending; c.pending = make(map[string]int64)`：直接移交旧 map 引用并分配新 map，无需逐个 key 遍历拷贝和删除。
+2. `if len(c.pending) == 0 { return }`：避免在无数据时产生无意义的空网络调用。
+
+**易错点**
+
+- 如果不替换 `c.pending = make(map[string]int64)` 而是在调用 `c.sink(c.pending)` 后继续复用同一个 map，当 `sink` 是异步执行时会引发严重的并发读写 map 崩溃。
+
+=== arch-25-1
+title: 实现站内信“写扩散（个人通知）+ 读扩散（全员公告）”混合未读数计算器
+race: true
+--- desc
+站内信系统中，个人通知采用**写扩散**（直接写入用户个人收件箱），而全员系统公告采用**读扩散**（只写一份全局广播列表，用户读取时按游标拉取）。请实现 `InboxService`：
+
+1. `SendPersonal(userID string)`：给指定用户发送一条个人通知，使其个人未读数 `+1`；
+2. `PublishBroadcast(broadcastID int64)`：发布一条全员系统公告（保证 `broadcastID` 递增）；
+3. `CountUnread(userID string) int`：
+   - 返回该用户的**个人未读数** + **ID 严格大于该用户已读公告游标 `lastAckBroadcastID` 的全员公告数量**；
+4. `MarkAllRead(userID string)`：
+   - 将该用户的个人未读数清零；
+   - 将该用户的 `lastAckBroadcastID` 更新为当前最新的全员公告 ID（若已有公告）。
+--- solution
+package main
+
+import "sync"
+
+type userState struct {
+	personalUnread     int
+	lastAckBroadcastID int64
+}
+
+type InboxService struct {
+	mu         sync.RWMutex
+	users      map[string]*userState
+	broadcasts []int64
+}
+
+func NewInboxService() *InboxService {
+	return &InboxService{users: make(map[string]*userState)}
+}
+
+func (s *InboxService) SendPersonal(userID string) {
+	// @solution
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u := s.getOrCreateUser(userID)
+	u.personalUnread++
+	// @starter
+	// // TODO: 个人通知写扩散，直接增加个人未读数
+	// @end
+}
+
+func (s *InboxService) PublishBroadcast(broadcastID int64) {
+	// @solution
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.broadcasts = append(s.broadcasts, broadcastID)
+	// @starter
+	// // TODO: 全员公告只写一份到全局 broadcasts 列表
+	// @end
+}
+
+func (s *InboxService) CountUnread(userID string) int {
+	// @solution
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var personal int
+	var lastAck int64
+	if u, ok := s.users[userID]; ok {
+		personal = u.personalUnread
+		lastAck = u.lastAckBroadcastID
+	}
+	unreadBroadcasts := 0
+	for _, id := range s.broadcasts {
+		if id > lastAck {
+			unreadBroadcasts++
+		}
+	}
+	return personal + unreadBroadcasts
+	// @starter
+	// return 0 // TODO: 汇总个人未读数 + 大于 lastAckBroadcastID 的全员公告数
+	// @end
+}
+
+func (s *InboxService) MarkAllRead(userID string) {
+	// @solution
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u := s.getOrCreateUser(userID)
+	u.personalUnread = 0
+	if len(s.broadcasts) > 0 {
+		u.lastAckBroadcastID = s.broadcasts[len(s.broadcasts)-1]
+	}
+	// @starter
+	// // TODO: 清零个人未读数，并将游标推进到最新全员公告 ID
+	// @end
+}
+
+func (s *InboxService) getOrCreateUser(userID string) *userState {
+	u, ok := s.users[userID]
+	if !ok {
+		u = &userState{}
+		s.users[userID] = u
+	}
+	return u
+}
+--- test
+package main
+
+import "testing"
+
+func TestHybridInboxUnread(t *testing.T) {
+	svc := NewInboxService()
+
+	// 发布两条全员公告（只写 2 次，无论有几千万用户）
+	svc.PublishBroadcast(101)
+	svc.PublishBroadcast(102)
+	// 给 u1 发一条私信
+	svc.SendPersonal("u1")
+
+	if got := svc.CountUnread("u1"); got != 3 {
+		t.Fatalf("u1 unread = %d, want 3 (1 personal + 2 broadcasts)", got)
+	}
+	if got := svc.CountUnread("u2"); got != 2 {
+		t.Fatalf("u2 unread = %d, want 2 (0 personal + 2 broadcasts)", got)
+	}
+
+	// u1 点击全部已读，并随后又发布了一条新公告 105
+	svc.MarkAllRead("u1")
+	if got := svc.CountUnread("u1"); got != 0 {
+		t.Fatalf("u1 unread after MarkAllRead = %d, want 0", got)
+	}
+
+	svc.PublishBroadcast(105)
+	if got := svc.CountUnread("u1"); got != 1 {
+		t.Fatalf("u1 unread after new broadcast = %d, want 1", got)
+	}
+	if got := svc.CountUnread("u2"); got != 3 {
+		t.Fatalf("u2 unread = %d, want 3", got)
+	}
+}
+--- explain
+**思路**
+
+- **写扩散（Push）**：适合一对一通知，收件人明确，直接修改 `u.personalUnread++`。
+- **读扩散（Pull）**：适合全员系统公告，发公告时只往 `s.broadcasts` 追加一条 ID（$O(1)$ 写入）；读未读数时对比用户的 `lastAckBroadcastID` 游标即可实时合并计算。
+
+**代码讲解**
+
+1. `CountUnread` 对从未发过私信的新用户（不在 `s.users` 中）也能正确返回全部未读公告数（默认 `lastAck = 0`）。
+2. `MarkAllRead` 在将 `personalUnread` 置 0 的同时，把 `lastAckBroadcastID` 推进到 `s.broadcasts[len(s.broadcasts)-1]`。
+
+**易错点**
+
+- 注意在 `MarkAllRead` 中访问 `s.broadcasts[len(s.broadcasts)-1]` 前必须检查 `len(s.broadcasts) > 0`，防止尚未发布任何公告时触发切片越界 panic。
+
+=== arch-26-1
+title: 实现支持本地批量预取（Token Batch Lease）与故障降级的分布式限流客户端
+race: true
+--- desc
+实现集群限流客户端 `BatchRateLimiter`，通过批量向远端中心配额池预取令牌将 Redis 请求量降低数十倍，并在远端故障时自动降级：
+
+1. `Allow() bool`：
+   - 若本地缓存令牌 `localTokens > 0`，直接扣减 1 个本地令牌并返回 `true`（零网络调用！）；
+   - 若 `localTokens == 0`，调用远端接口 `remoteAcquire(batchSize) (granted int, err error)` 批量申请 `batchSize` 个令牌：
+     - 若 `err == nil`：当 `granted > 0` 时，本次请求消耗 1 个令牌，将其余 `granted - 1` 个存入 `localTokens` 并返回 `true`；当 `granted <= 0` 时（全局配额耗尽），返回 `false`；
+     - 若 `err != nil`（中心 Redis 故障）：**自动降级为调用本地兜底限流器 `fallbackAllow() bool`**。
+--- solution
+package main
+
+import "sync"
+
+type BatchRateLimiter struct {
+	mu            sync.Mutex
+	batchSize     int
+	localTokens   int
+	remoteAcquire func(want int) (int, error)
+	fallbackAllow func() bool
+}
+
+func NewBatchRateLimiter(batchSize int, remote func(int) (int, error), fallback func() bool) *BatchRateLimiter {
+	return &BatchRateLimiter{
+		batchSize:     batchSize,
+		remoteAcquire: remote,
+		fallbackAllow: fallback,
+	}
+}
+
+func (l *BatchRateLimiter) Allow() bool {
+	// @solution
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.localTokens > 0 {
+		l.localTokens--
+		return true
+	}
+
+	granted, err := l.remoteAcquire(l.batchSize)
+	if err != nil {
+		return l.fallbackAllow()
+	}
+	if granted <= 0 {
+		return false
+	}
+	l.localTokens = granted - 1
+	return true
+	// @starter
+	// return false // TODO: 优先扣减 localTokens，耗尽时批量预取，远端报错时走 fallbackAllow
+	// @end
+}
+--- test
+package main
+
+import (
+	"errors"
+	"sync/atomic"
+	"testing"
+)
+
+func TestBatchRateLimiterLeaseAndFallback(t *testing.T) {
+	var remoteCalls atomic.Int32
+	remoteQuota := 12
+
+	limiter := NewBatchRateLimiter(
+		5,
+		func(want int) (int, error) {
+			remoteCalls.Add(1)
+			if remoteQuota <= 0 {
+				return 0, nil
+			}
+			take := min(want, remoteQuota)
+			remoteQuota -= take
+			return take, nil
+		},
+		func() bool { return true },
+	)
+
+	// 连续 12 次请求应全部通过，但因为每次预取 5 个（5 + 5 + 2），远端只被调用了 3 次！
+	for i := range 12 {
+		if !limiter.Allow() {
+			t.Fatalf("request %d should be allowed", i)
+		}
+	}
+	if remoteCalls.Load() != 3 {
+		t.Fatalf("remoteCalls = %d, want 3 (batch lease reduced network RTTs)", remoteCalls.Load())
+	}
+
+	// 第 13 次请求配额耗尽，应返回 false
+	if limiter.Allow() {
+		t.Fatal("13th request should be rejected when quota is 0")
+	}
+
+	// 模拟远端 Redis 宕机报错，应无缝降级到 fallbackAllow
+	fallbackCalled := false
+	errLimiter := NewBatchRateLimiter(
+		5,
+		func(int) (int, error) { return 0, errors.New("redis connection refused") },
+		func() bool {
+			fallbackCalled = true
+			return true
+		},
+	)
+	if !errLimiter.Allow() || !fallbackCalled {
+		t.Fatal("expected fallback limiter to be used when remote fails")
+	}
+}
+--- explain
+**思路**
+
+每次请求都去调中心 Redis 会带来不可接受的网络 RTT 和热点分片瓶颈。每次申请一批令牌（如 `batchSize = 50`）缓存在本地内存，能把 98% 的限流判定变成纳秒级内存操作；同时对 `err != nil` 做本地单机限流降级（Fail-Open / Local Fallback），确保限流基础设施挂掉时不会拖垮核心业务。
+
+**代码讲解**
+
+1. 当 `localTokens > 0` 时直接 `l.localTokens--` 返回 `true`。
+2. 当远端返回 `granted` 个令牌（例如申请 5 个，中心池只剩 2 个，返回 `granted = 2`）时，当前请求立即用掉 1 个，剩余 `granted - 1` 个存入 `l.localTokens`。
+
+**易错点**
+
+- 注意中心配额池剩余令牌不足 `batchSize` 时可能返回 `0 < granted < batchSize`，不能写死 `l.localTokens = l.batchSize - 1`，而必须用实际批复的 `granted - 1`！
+
+=== arch-27-1
+title: 实现订单表的冷热数据分离判定与跨冷热库无缝游标分页查询
+race: true
+--- desc
+百亿级订单表完成冷热分离后，请实现两个核心数据访问函数（订单切片均已按创建时间从新到旧降序排列）：
+
+1. `PartitionHotCold(orders []Order, cutoffUnix int64) (hot, cold []Order)`：
+   - 归档判定规则：只有当订单创建时间 `CreatedAt < cutoffUnix` **且** 处于终态（`Status == "COMPLETED"` 或 `Status == "CLOSED"`）时，才归入冷库 `cold`；
+   - 其余订单（创建时间在阈值内，或者虽然是很久以前创建但至今仍处于 `"PENDING"` / `"REFUNDING"` 等非终态）一律保留在热库 `hot`；
+2. `QueryOrdersPage(hot, cold []Order, cursorTime int64, limit int) []Order`：
+   - 查询创建时间 **严格小于** `cursorTime` 的最多 `limit` 条订单（按时间从新到旧）；
+   - **优先从 `hot` 中筛选**满足 `CreatedAt < cursorTime` 的订单；若 `hot` 中找出的条数不足 `limit`，再继续从 `cold` 中筛选补齐到 `limit` 条。
+--- solution
+package main
+
+type Order struct {
+	ID        string
+	CreatedAt int64
+	Status    string
+}
+
+func isTerminalStatus(status string) bool {
+	return status == "COMPLETED" || status == "CLOSED"
+}
+
+func PartitionHotCold(orders []Order, cutoffUnix int64) (hot, cold []Order) {
+	// @solution
+	for _, o := range orders {
+		if o.CreatedAt < cutoffUnix && isTerminalStatus(o.Status) {
+			cold = append(cold, o)
+		} else {
+			hot = append(hot, o)
+		}
+	}
+	return hot, cold
+	// @starter
+	// return nil, nil // TODO: 区分热数据与可归档的终态冷数据
+	// @end
+}
+
+func QueryOrdersPage(hot, cold []Order, cursorTime int64, limit int) []Order {
+	// @solution
+	if limit <= 0 {
+		return nil
+	}
+	out := make([]Order, 0, limit)
+	for _, o := range hot {
+		if o.CreatedAt < cursorTime {
+			out = append(out, o)
+			if len(out) == limit {
+				return out
+			}
+		}
+	}
+	for _, o := range cold {
+		if o.CreatedAt < cursorTime {
+			out = append(out, o)
+			if len(out) == limit {
+				return out
+			}
+		}
+	}
+	return out
+	// @starter
+	// return nil // TODO: 先查热库，不足 limit 条时无缝拼接冷库数据
+	// @end
+}
+--- test
+package main
+
+import (
+	"reflect"
+	"testing"
+)
+
+func TestOrderHotColdArchiveAndPagination(t *testing.T) {
+	all := []Order{
+		{ID: "o5", CreatedAt: 500, Status: "PENDING"},
+		{ID: "o4", CreatedAt: 400, Status: "COMPLETED"},
+		{ID: "o3", CreatedAt: 250, Status: "REFUNDING"}, // 超过 300 阈值但非终态，必须留热库！
+		{ID: "o2", CreatedAt: 200, Status: "COMPLETED"}, // 终态老订单 -> 冷库
+		{ID: "o1", CreatedAt: 100, Status: "CLOSED"},    // 终态老订单 -> 冷库
+	}
+
+	hot, cold := PartitionHotCold(all, 300)
+	if len(hot) != 3 || len(cold) != 2 {
+		t.Fatalf("len(hot)=%d len(cold)=%d, want 3, 2", len(hot), len(cold))
+	}
+
+	// 第一页（cursor=600, limit=2）：完全由热库命中 [o5, o4]
+	page1 := QueryOrdersPage(hot, cold, 600, 2)
+	if !reflect.DeepEqual(page1, []Order{all[0], all[1]}) {
+		t.Fatalf("page1 = %v", page1)
+	}
+
+	// 第二页（cursor=400, limit=2）：跨越冷热边界！热库出 [o3]，不够 2 条自动从冷库补 [o2]
+	page2 := QueryOrdersPage(hot, cold, 400, 2)
+	if !reflect.DeepEqual(page2, []Order{all[2], all[3]}) {
+		t.Fatalf("page2 across hot/cold = %v, want [o3, o2]", page2)
+	}
+}
+--- explain
+**思路**
+
+1. **冷热分离铁律**：绝不能仅仅按 `created_at < cutoff` 一刀切归档！如果把半年前下单但目前正在处理“售后退款中（`REFUNDING`）”的订单挪到了只读/低速冷库，在线业务更新订单状态时就会报错找不到订单。因此**只有进入终态（已完成/已关闭）的历史老订单才能归档到冷库**。
+2. **联邦游标分页**：优先查热库，热库条数满足 `limit` 时根本不需要访问冷库；只有用户一直往下翻页使热库余量不足 `limit` 时，才自动拼接冷库结果。
+
+**代码讲解**
+
+- `QueryOrdersPage` 先扫 `hot`，若 `len(out) == limit` 立即提前返回（短路冷库查询），否则继续扫 `cold` 补齐剩余条数。
+
+**易错点**
+
+- 切记判断 `o.CreatedAt < cutoffUnix && isTerminalStatus(o.Status)` 两个条件缺一不可。

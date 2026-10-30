@@ -1,0 +1,262 @@
+=== go-08-2
+--- explain
+**思路**
+
+两个规则：
+
+1. 多个 defer 按**后进先出**执行，所以第 n−1 个注册的最先执行，`out` 依次追加 n−1、…、0。
+2. `return x` 的执行过程是：先把 x 赋给命名返回值 `result`，然后执行 defer，最后才真正返回。所以 defer 能修改 `result`。
+
+**代码讲解**
+
+1. `for i := range n { defer func() { out = append(out, i) }() }`：Go 1.22 起每次迭代的 `i` 都是新变量，闭包捕获到的分别是 0、1、2……
+2. `return nil`：先把 `out` 设为 nil，然后 defer 依次往里 append，最终返回 `[n-1, …, 0]`。
+3. `DoubleOnReturn`：`return x` 把 `result` 设为 x，defer 执行 `result *= 2`。
+
+**易错点**
+
+- 写成 `defer func(v int) { ... }(i)` 也可以，参数在 defer 语句执行时就求值；如果写成 `defer fmt.Println(i)`，打印的也是注册时的值。
+- 在 Go 1.22 之前，闭包捕获的循环变量 `i` 是同一个变量，所有 defer 都会追加最后的值 n。
+- 匿名返回值（`func f() int`）时 defer 改不了返回结果，因为 `return x` 已经把值复制到了一个看不见的位置。
+
+=== go-09-1
+--- explain
+**思路**
+
+`recover()` 只在 **defer 的函数里直接调用**时才能捕获 panic，捕获后当前函数正常结束。结合命名返回值，就能在 defer 里把 panic 转成一个 error 返回给调用方。
+
+**代码讲解**
+
+1. `func SafeCall(fn func()) (err error)`：命名返回值是关键，defer 里给 `err` 赋值才能传出去。
+2. `if r := recover(); r != nil`：没有 panic 时 `recover()` 返回 nil。
+3. `fmt.Errorf("panic: %v", r)`：panic 的值可能是任何类型（字符串、error、runtime.Error），用 `%v` 格式化。
+4. `fn()` 正常返回时走到 `return nil`。
+
+**易错点**
+
+- 把 recover 放在一个被 defer 函数**调用**的辅助函数里（`defer func() { helper() }()`，helper 里 recover）是无效的。
+- `panic(nil)` 在 Go 1.21 之前会让 `recover()` 返回 nil，无法区分“没有 panic”；1.21 起会变成 `*runtime.PanicNilError`。
+- 如果 panic 的值本身是 error，可以用 `%w` 保留它：先 `if e, ok := r.(error); ok { err = fmt.Errorf("panic: %w", e) }`。
+
+=== go-09-2
+--- explain
+**思路**
+
+recover 只能捕获**当前 goroutine** 的 panic。子 goroutine 里没有被捕获的 panic 会直接让整个进程崩溃，主 goroutine 的 recover 救不了它。所以每个可能 panic 的后台 goroutine 都要在自己内部 recover。这个 `Go` 函数就是很多项目里“安全启动 goroutine”的封装。
+
+**代码讲解**
+
+1. `done := make(chan struct{})`：返回只读的 `<-chan struct{}`，调用方只能等待，不能关闭。
+2. 在 goroutine 里注册了两个 defer，执行顺序是**后进先出**：
+   - 先执行 recover 的那个，调用 `onPanic(r)`；
+   - 再执行 `close(done)`。
+   这样 `done` 关闭时，`onPanic` 一定已经执行完了，调用方可以放心地检查结果。
+3. `fn()` 正常返回时，recover 返回 nil，直接关闭 `done`。
+
+**易错点**
+
+- 两个 defer 的顺序反了，调用方可能在 `onPanic` 执行前就收到了 done 信号。
+- recover 之后要记录日志和堆栈（`debug.Stack()`），否则问题被悄悄吞掉，很难排查。
+
+=== go-10-1
+--- explain
+**思路**
+
+接口值由**动态类型**和**动态值**两部分组成，只有两者都为空时接口才等于 nil。把一个值为 nil 的 `*ValidationError` 赋给 `error`，接口里的类型是 `*ValidationError`、值是 nil，所以 `err != nil` 为真。修复方法：没有错误时**直接返回字面量 nil**，而不是返回一个 nil 指针变量。
+
+**代码讲解**
+
+1. `func (e *ValidationError) Error() string`：指针接收者实现了 `error` 接口。
+2. 不合法时 `return &ValidationError{Field: "age"}`。
+3. 合法时 `return nil`：这里的 nil 被直接转换成 `error` 接口的零值（类型和值都为空）。
+
+**易错点**
+
+- 典型的错误写法：`var e *ValidationError; if bad { e = &ValidationError{...} }; return e`。只要函数的返回类型是接口，就不要返回具体类型的 nil 指针变量。
+- 用 `fmt.Printf("%T %v", err, err)` 可以看到问题：输出 `*main.ValidationError <nil>`。
+
+=== go-11-1
+--- explain
+**思路**
+
+值接收者的方法拿到的是接收者的**副本**，修改不会影响原值。`Inc` 要修改计数，必须用指针接收者。改完之后要注意**方法集**规则：`Counter` 类型的方法集只包含值接收者方法，`*Counter` 包含全部方法，所以只有 `*Counter` 实现了 `Incrementer`。
+
+**代码讲解**
+
+1. `func (c *Counter) Inc() { c.n++ }`：通过指针修改字段，`c.n` 是 `(*c).n` 的简写。
+2. `func (c Counter) Value() int`：只读方法用值接收者也可以。不过按 Go 的惯例，**一个类型只要有一个方法用了指针接收者，最好全部统一成指针接收者**。
+3. `NewIncrementer() Incrementer { return &Counter{} }`：返回指针，满足接口。
+
+**易错点**
+
+- 返回 `Counter{}` 会编译报错：`Counter does not implement Incrementer (method Inc has pointer receiver)`。
+- 为什么 `var c Counter; c.Inc()` 能编译？因为 c 是**可寻址**的变量，编译器自动改写成 `(&c).Inc()`。但接口里存的值不可寻址，所以接口不能自动帮你取地址。
+
+=== go-12-1
+--- explain
+**思路**
+
+闭包捕获的是**变量**而不是值。如果循环变量在 for 语句外面声明，所有闭包共享同一个变量，循环结束后它等于 n。Go 1.22 起，**在 for 语句里声明**的循环变量每次迭代都是新变量，所以把声明移进 for 语句就修好了。
+
+**代码讲解**
+
+1. `for i := 0; i < n; i++`：i 在 for 语句里用 `:=` 声明，每次迭代都是独立的 i（要求 go.mod 里的 go 版本 ≥ 1.22）。
+2. `fs = append(fs, func(x int) int { return x * i })`：每个闭包捕获各自的 i。
+
+**易错点**
+
+- 起始代码的写法 `var i int; for i = 0; i < n; i++` 在任何版本里都是共享同一个 i。
+- 1.22 之前的老代码里常见的修复写法：在循环体里 `i := i`（用同名变量复制一份），或者把 i 作为参数传给一个立即调用的函数。看到这些写法时要知道它们的来历。
+
+=== go-12-2
+--- explain
+**思路**
+
+Go 1.23 的迭代器就是一个函数：它接收 `yield` 回调，每产出一个值就调用一次 `yield(v)`。`for v := range seq` 时，循环体会被编译器包装成这个 `yield`；循环体执行 `break` 时，`yield` 返回 false，迭代器必须立刻停止。
+
+**代码讲解**
+
+1. `func Countdown(n int) iter.Seq[int]`：`iter.Seq[int]` 就是 `func(yield func(int) bool)` 的类型别名（泛型类型）。
+2. 返回一个闭包，闭包捕获 n。
+3. `for i := n; i > 0; i--` 依次产出。
+4. `if !yield(i) { return }`：调用方 break 了，立即返回。
+
+**易错点**
+
+- 忽略 yield 的返回值、继续调用，运行时会 panic：`range function continued iteration after function for loop body returned false`。
+- 迭代器是惰性的：调用 `Countdown(3)` 时什么都不会发生，`range` 时才开始执行。
+
+**延伸**
+
+标准库里已经有很多迭代器：`maps.Keys`、`maps.All`、`slices.Values`、`slices.Backward`、`strings.SplitSeq`（1.24）。配合 `slices.Collect(seq)` 可以把迭代器收集成切片。
+
+=== go-13-1
+--- explain
+**思路**
+
+能用 `==` 比较的类型（`comparable`）才能做 map 的 key：数字、字符串、指针、channel、接口、数组，以及**字段全部可比较的结构体**。切片、map、函数都不行。
+
+**代码讲解**
+
+1. `Dedup[T comparable]`：泛型约束 `comparable` 保证 T 能做 map 的 key。
+2. `seen := make(map[T]struct{}, len(s))`：用空结构体做集合。
+3. `out := make([]T, 0, len(s))`：**新建**结果切片，不修改入参（题目要求）。
+4. 第一次见到才追加，保留了第一次出现的顺序。
+5. `CountPoints`：`Point` 的两个字段都是 int，可以直接做 key；`m[p]++` 利用零值计数。
+
+**易错点**
+
+- 用 `s[:0]` 复用入参的空间（原地去重）效率更高，但会修改调用方的数据，这里不允许。
+- 结构体里只要有一个切片字段，就不能做 key，也不能用 `==` 比较（编译错误）。
+
+=== go-13-2
+--- explain
+**思路**
+
+`map[any]int` 的 key 类型是接口，编译器只要求“接口类型是可比较的”，但接口里**实际装的值**是否可比较要到运行时才知道。装进去的是 `[]int` 时，计算哈希会 panic。用 `recover` 把这种运行时 panic 转换成错误。
+
+**代码讲解**
+
+1. 命名返回值 `(err error)` + `defer` + `recover()`：和「把 panic 转换成 error」一样的模式。
+2. `m[k] = v`：k 不可哈希时 panic，值是一个 `runtime.Error`，内容为 `hash of unhashable type []int`。
+3. 正常插入返回 nil。
+
+**易错点**
+
+- 这类 panic 在编译期发现不了；设计 API 时尽量用具体的 key 类型或泛型约束 `comparable`，而不是 `any`。
+- 两个接口值用 `==` 比较时也有同样的问题：动态类型相同且不可比较（比如都是切片）会 panic。
+
+=== go-14-1
+--- explain
+**思路**
+
+`struct{}` 大小为 0，`map[T]struct{}` 只存 key，是 Go 里最常见的集合写法。再用泛型和自定义类型包装一下，就得到一个可以复用的 `Set[T]`。
+
+**代码讲解**
+
+1. `type Set[T comparable] map[T]struct{}`：基于 map 定义一个泛型类型，可以给它加方法。
+2. `NewSet[T comparable](items ...T)`：可变参数，`make(Set[T], len(items))` 预估容量。
+3. 方法用**值接收者**也能修改内容：map 本身就是引用，`s[v] = struct{}{}` 修改的是同一个哈希表。
+4. `Has` 用 comma-ok；`Remove` 用内置 `delete`，key 不存在也不报错。
+5. `Intersect`：先交换让 `small` 是较小的集合，只遍历小集合，在大集合里查，复杂度 O(min(m, n))。
+
+**易错点**
+
+- 值接收者能修改 map 的内容，但不能让 `s` 指向一个新的 map（比如 `s = make(...)` 只改了副本）。
+- 零值 `var s Set[int]` 是 nil map，`Add` 会 panic；所以提供了 `NewSet`。
+
+=== go-14-2
+--- explain
+**思路**
+
+`close` 一个 channel 会让**所有**正在等待和之后来等待的接收者立即返回，是天然的“广播”。channel 只传信号不传数据，所以元素类型用 `struct{}`。但重复 close 会 panic，用 `sync.Once` 保证只关闭一次。
+
+**代码讲解**
+
+1. `Gate` 包含 `ch chan struct{}` 和 `once sync.Once`。
+2. `NewGate` 返回指针：结构体里有 `sync.Once`，不能被复制。
+3. `Wait()` 返回 `<-chan struct{}`：调用方写 `<-g.Wait()` 阻塞等待，或者放进 `select`。
+4. `Open()`：`g.once.Do(func() { close(g.ch) })`，并发调用也只会关闭一次。
+
+**易错点**
+
+- 用 `select { case <-g.ch: default: close(g.ch) }` 判断“是否已关闭再关闭”并不安全：两个 goroutine 可能同时走到 default。
+- 这个模式就是 `context.Context` 的 `Done()` 的实现原理。
+
+=== go-15-1
+--- explain
+**思路**
+
+在结构体里**嵌入接口**，外层类型就自动拥有了接口的所有方法（调用会转发给内层的值）。只需要重写想改变的方法，其他方法直接复用，这就是“装饰器”模式在 Go 里的写法。
+
+**代码讲解**
+
+1. `type LoggedStore struct { Store; Logs []string }`：只写类型不写字段名就是嵌入，字段名默认就是类型名 `Store`。
+2. `l.Get(...)` 会被提升为 `l.Store.Get(...)`，不需要写任何代码。
+3. 重写 `Set`：先记录日志，再调用 `l.Store.Set(key, value)`。必须写全 `l.Store.Set`，写成 `l.Set` 会递归调用自己，栈溢出。
+
+**易错点**
+
+- 嵌入不是继承：`MemStore` 的方法里调用 `s.Set` 时，调用的是 `MemStore` 自己的 `Set`，不会“多态”地调用 `LoggedStore.Set`。
+- 嵌入的接口字段如果是 nil，调用提升的方法会 panic；构造时要记得赋值：`&LoggedStore{Store: NewMemStore()}`。
+
+=== go-16-1
+--- explain
+**思路**
+
+错误链：每一层用 `%w` 包装或实现 `Unwrap()`，上层就能用 `errors.Is` 找到底层的哨兵错误，用 `errors.As` 取出某种类型的错误。只要有一层没有 Unwrap，链就断了。
+
+**代码讲解**
+
+1. `var ErrNotFound = errors.New("not found")`：包级哨兵错误，调用方用 `errors.Is(err, ErrNotFound)` 判断。
+2. `fmt.Errorf("find user %d: %w", id, ErrNotFound)`：`%w` 包装，错误信息里带上上下文。
+3. `QueryError` 是自定义错误类型，`Error()` 拼接信息，`Unwrap() error { return e.Err }` 让 `errors.Is/As` 能继续往里找。
+4. `LoadProfile` 出错时返回 `&QueryError{...}`。
+
+最终的链：`*QueryError` → `fmt.Errorf` 包装的错误 → `ErrNotFound`。
+
+**易错点**
+
+- 用 `%v` 代替 `%w`：信息一样，但 `errors.Is` 找不到 `ErrNotFound`。
+- 忘了实现 `Unwrap`，`errors.Is(err, ErrNotFound)` 在 `QueryError` 这一层就停了。
+- 错误信息惯例：小写开头，不加标点，用冒号连接各层上下文。
+
+=== go-16-2
+--- explain
+**思路**
+
+`errors.Is` 判断错误链上**有没有某个错误值**，`errors.As` 判断错误链上**有没有某种类型**的错误，并把它取出来。两者都会沿着 `Unwrap()` 遍历整个链，包括 `errors.Join` 和多个 `%w` 产生的“树状”错误。
+
+**代码讲解**
+
+1. 先处理 `err == nil`。
+2. `errors.Is(err, ErrTimeout) || errors.Is(err, context.DeadlineExceeded)`：timeout 优先判断。
+3. `var he *HTTPError` 然后 `errors.As(err, &he)`：第二个参数是**指向目标类型变量的指针**，找到时会把链上的 `*HTTPError` 赋给 `he`。
+4. 无条件 `switch` 判断状态码区间。
+5. 都不满足返回 `"unknown"`。
+
+**易错点**
+
+- `errors.As(err, he)`（少了 `&`）会 panic：第二个参数必须是非 nil 指针。
+- 直接类型断言 `err.(*HTTPError)` 只能检查最外层，被包装后就失效了。
+- Go 1.20 起 `Unwrap() []error` 可以返回多个错误，`errors.Join(a, b)` 和 `fmt.Errorf("%w; %w", a, b)` 都会产生这种错误，`Is/As` 会深度优先遍历所有分支。

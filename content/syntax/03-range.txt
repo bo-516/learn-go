@@ -1,0 +1,232 @@
+=== range-slice
+name: range 遍历切片 / 数组
+group: range 遍历
+--- body
+`for i, v := range s` 同时拿到下标和元素的**副本**。只要下标写 `for i := range s`，只要元素写 `for _, v := range s`。
+
+**写法**
+
+```go
+for i, v := range nums { }
+for i := range nums { }       // 只要下标
+for _, v := range nums { }    // 只要值
+for range nums { }            // 只是循环 len 次
+```
+
+**例子**
+
+```go
+func twoSum(nums []int, target int) []int {
+	seen := map[int]int{}
+	for i, n := range nums {
+		if j, ok := seen[target-n]; ok {
+			return []int{j, i}
+		}
+		seen[n] = i
+	}
+	return nil
+}
+```
+
+**注意**
+
+- `v` 是元素的**拷贝**，修改 `v` 不会改变切片。要修改元素写 `s[i] = ...`；元素是大结构体时用下标访问 `&s[i]` 也能避免拷贝。
+- `range` 开始时就确定了长度，循环中 `append` 不会让循环变长。
+- Go 1.22 起每次迭代的 `i`、`v` 是新变量，在闭包、goroutine 里捕获它们是安全的。
+- 遍历数组 `range arr` 时会先**复制整个数组**；大数组用 `range &arr` 或 `range arr[:]`。
+
+=== range-map
+name: range 遍历 map
+group: range 遍历
+--- body
+`for k, v := range m` 遍历 map 的键值对。**遍历顺序是随机的**，每次运行都可能不同。
+
+**写法**
+
+```go
+for k, v := range m { }
+for k := range m { }   // 只要键
+```
+
+**例子：按 key 排序后输出**
+
+```go
+keys := make([]string, 0, len(m))
+for k := range m {
+	keys = append(keys, k)
+}
+slices.Sort(keys) // 需要稳定顺序时先排序
+for _, k := range keys {
+	fmt.Println(k, m[k])
+}
+```
+
+Go 1.23 起也可以写 `slices.Sorted(maps.Keys(m))`。
+
+**注意**
+
+- 不要依赖 map 遍历顺序（测试里断言输出顺序会时好时坏）。
+- 遍历时 `delete` 当前或其他键是安全的；遍历时**新增**的键可能被遍历到也可能不会。
+- 并发读写 map 会直接 fatal（不是 panic，无法 recover），需要加锁或用 `sync.Map`。
+
+=== range-string
+name: range 遍历字符串
+group: range 遍历
+--- body
+`for i, r := range s` 按 **UTF-8 解码**遍历字符串：`i` 是这个字符在字节序列中的**起始字节下标**，`r` 是 `rune`（Unicode 码点）。
+
+**写法**
+
+```go
+for i, r := range "Go语言" {
+	fmt.Println(i, string(r))
+}
+// 0 G
+// 1 o
+// 2 语   ← 中文占 3 个字节
+// 5 言
+```
+
+**对比按字节遍历**
+
+```go
+for i := 0; i < len(s); i++ {
+	b := s[i] // byte，中文会被拆成 3 个字节
+}
+```
+
+**例子：统计字符个数**
+
+```go
+func countRunes(s string) int {
+	n := 0
+	for range s {
+		n++
+	}
+	return n // 等价于 utf8.RuneCountInString(s)
+}
+```
+
+**注意**
+
+- `len(s)` 是字节数，不是字符数。
+- 遇到非法 UTF-8 字节时，`r` 是 `utf8.RuneError`（U+FFFD），`i` 前进 1 个字节。
+- 题目只包含 ASCII（如小写字母）时，按字节遍历 `s[i]` 更快也更简单。
+
+=== range-chan
+name: range 读取 channel
+group: range 遍历
+--- body
+`for v := range ch` 不断从 channel 接收值，**直到 channel 被关闭且缓冲区读空**才退出循环。它是消费者最常用的写法。
+
+**写法**
+
+```go
+for v := range ch {
+	handle(v)
+}
+```
+
+**例子：生产者-消费者**
+
+```go
+ch := make(chan int)
+go func() {
+	defer close(ch)       // 生产者负责关闭，range 才能结束
+	for i := 0; i < 3; i++ {
+		ch <- i
+	}
+}()
+for v := range ch {
+	fmt.Println(v)        // 0 1 2
+}
+```
+
+**注意**
+
+- **没有人 close，range 就永远阻塞**：所有 goroutine 都在等时会报 `all goroutines are asleep - deadlock!`，否则就是 goroutine 泄漏。
+- 只能有一个“关闭者”，通常是发送方；多个发送方时用 `sync.WaitGroup` 等它们都结束后再关闭。
+- `range ch` 只返回一个值（没有下标）。
+- 需要同时响应取消信号时，用 `for { select { ... } }` 代替 `range`。
+
+=== range-int
+name: range 整数（Go 1.22+）
+group: range 遍历
+--- body
+Go 1.22 起可以直接 `range` 一个整数 `n`，得到 `0, 1, ..., n-1`，是 `for i := 0; i < n; i++` 的简写。
+
+**写法**
+
+```go
+for i := range 10 { }  // i 从 0 到 9
+for range 3 { }        // 只是重复 3 次
+```
+
+**例子**
+
+```go
+var wg sync.WaitGroup
+for i := range 5 {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fmt.Println(i) // 1.22 起每次迭代都是新的 i，不需要传参
+	}()
+}
+wg.Wait()
+```
+
+**注意**
+
+- 需要 `go.mod` 里 `go` 版本 ≥ 1.22。
+- `n` 小于等于 0 时循环一次也不执行。
+- `i` 的类型和 `n` 相同：`range int64(5)` 得到 `int64`。
+
+=== range-func
+name: range 迭代器函数（Go 1.23+）
+group: range 遍历
+--- body
+Go 1.23 起，`range` 可以遍历特定签名的**函数**（迭代器）。标准库 `iter` 包定义了 `iter.Seq[V]`（`func(yield func(V) bool)`）和 `iter.Seq2[K, V]`。
+
+**写法**
+
+```go
+// 定义一个迭代器：每产出一个值就调用 yield，yield 返回 false 表示调用方 break 了
+func Count(n int) iter.Seq[int] {
+	return func(yield func(int) bool) {
+		for i := 0; i < n; i++ {
+			if !yield(i) {
+				return
+			}
+		}
+	}
+}
+
+for v := range Count(3) { } // 0 1 2
+```
+
+**例子：遍历链表**
+
+```go
+func (l *List) All() iter.Seq[int] {
+	return func(yield func(int) bool) {
+		for n := l.head; n != nil; n = n.next {
+			if !yield(n.val) {
+				return
+			}
+		}
+	}
+}
+
+for v := range list.All() {
+	if v > 10 {
+		break // 会让 yield 返回 false
+	}
+}
+```
+
+**注意**
+
+- **yield 返回 false 后必须立即停止**，继续调用会 panic。
+- 标准库里已经有很多迭代器：`maps.Keys(m)`、`slices.Values(s)`、`slices.Sorted(seq)`、`strings.SplitSeq`（1.24）等。
+- 迭代器适合“惰性产出 + 可提前停止”的场景，普通情况下返回切片更直白。

@@ -1,0 +1,605 @@
+Go 语言基础新增题目（GO-30 ~ GO-35）的编程任务。
+
+=== go-30-1
+title: 实现自定义 range 迭代器与惰性过滤
+--- desc
+使用 Go 1.23 的 `iter.Seq[T]` 实现两个惰性迭代器函数：
+
+1. `RangeStep(start, stop, step int) iter.Seq[int]`：从 `start` 开始，每次增加 `step`（`step > 0`），生成所有严格小于 `stop` 的整数；如果调用方在 `for range` 中提前 `break`，迭代器必须立即停止；
+2. `FilterSeq[T any](seq iter.Seq[T], keep func(T) bool) iter.Seq[T]`：对输入序列 `seq` 进行惰性过滤，只产出满足 `keep(v) == true` 的元素。
+
+例如：`slices.Collect(FilterSeq(RangeStep(1, 10, 2), func(x int) bool { return x > 3 }))` 应返回 `[]int{5, 7, 9}`。
+--- solution
+package main
+
+import "iter"
+
+func RangeStep(start, stop, step int) iter.Seq[int] {
+	return func(yield func(int) bool) {
+		if step <= 0 {
+			return
+		}
+		// @solution
+		for v := start; v < stop; v += step {
+			if !yield(v) {
+				return
+			}
+		}
+		// @starter
+		// // TODO: 从 start 到 stop（不含）按 step 步进调用 yield，注意检查 yield 返回值
+		// @end
+	}
+}
+
+func FilterSeq[T any](seq iter.Seq[T], keep func(T) bool) iter.Seq[T] {
+	return func(yield func(T) bool) {
+		// @solution
+		for v := range seq {
+			if keep(v) && !yield(v) {
+				return
+			}
+		}
+		// @starter
+		// // TODO: 遍历 seq，只将满足 keep(v) 的元素传给 yield
+		// @end
+	}
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestRangeStepAndFilter(t *testing.T) {
+	got := slices.Collect(RangeStep(1, 10, 2))
+	if !slices.Equal(got, []int{1, 3, 5, 7, 9}) {
+		t.Fatalf("RangeStep(1,10,2) = %v, want [1 3 5 7 9]", got)
+	}
+
+	filtered := slices.Collect(FilterSeq(RangeStep(1, 10, 2), func(x int) bool {
+		return x > 3
+	}))
+	if !slices.Equal(filtered, []int{5, 7, 9}) {
+		t.Fatalf("FilterSeq = %v, want [5 7 9]", filtered)
+	}
+}
+
+func TestRangeStepEarlyBreak(t *testing.T) {
+	count := 0
+	seq := FilterSeq(RangeStep(0, 1000, 1), func(x int) bool {
+		count++
+		return x%2 == 0
+	})
+	var picked []int
+	for v := range seq {
+		picked = append(picked, v)
+		if len(picked) == 3 {
+			break
+		}
+	}
+	if !slices.Equal(picked, []int{0, 2, 4}) {
+		t.Fatalf("picked = %v, want [0 2 4]", picked)
+	}
+	if count != 5 { // 0, 1, 2, 3, 4 共检查 5 次后立刻因 break 停止，不应遍历到 1000
+		t.Fatalf("expected lazy evaluation to stop at 5 checks, got %d", count)
+	}
+}
+--- explain
+**思路**
+
+`iter.Seq[T]` 的类型定义是 `func(yield func(T) bool)`。编写迭代器就是返回一个接收 `yield` 的闭包：每算出一个值就调用 `yield(v)`，一旦 `yield(v)` 返回 `false`（代表外层 `for range` 执行了 `break` 或 `return`），就立刻 `return` 终止生产。
+
+**代码讲解**
+
+1. `for v := start; v < stop; v += step`：按步长递增生成序列，完全不需要预先分配切片。
+2. `if !yield(v) { return }`：把当前值推给消费方，若消费方不再需要后续元素则立即退出。
+3. `for v := range seq`：`FilterSeq` 自身直接用 `for range` 消费上游迭代器 `seq`，遇到满足 `keep(v)` 的元素再调用下游的 `yield(v)`，形成零分配的惰性流水线。
+
+**易错点**
+
+- 忽略 `yield(v)` 的返回值直接继续循环，在调用方 `break` 时会导致运行时直接 panic（`range function continued iteration after function for loop body returned false`）。
+
+=== go-30-2
+title: 用 maps 与 slices 迭代器函数聚合并排序键值
+--- desc
+实现 `TopKeysByMinValue(m map[string]int, minVal int) []string`：
+
+找出 `m` 中所有值 `>= minVal` 的键，并按字典序升序返回。练习使用 Go 1.23 的 `maps.All`（或遍历）配合自定义 `iter.Seq[string]` 与 `slices.Sorted` 一步完成收集和排序。
+--- solution
+package main
+
+import (
+	"maps"
+	"slices"
+)
+
+func TopKeysByMinValue(m map[string]int, minVal int) []string {
+	// @solution
+	seq := func(yield func(string) bool) {
+		for k, v := range maps.All(m) {
+			if v >= minVal && !yield(k) {
+				return
+			}
+		}
+	}
+	return slices.Sorted(seq)
+	// @starter
+	// return nil // TODO: 筛选出 v >= minVal 的 key 并按字典序排序返回
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestTopKeysByMinValue(t *testing.T) {
+	scores := map[string]int{
+		"charlie": 85,
+		"alice":   92,
+		"bob":     70,
+		"david":   85,
+	}
+	got := TopKeysByMinValue(scores, 85)
+	want := []string{"alice", "charlie", "david"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	if empty := TopKeysByMinValue(scores, 100); len(empty) != 0 {
+		t.Fatalf("expected empty slice, got %v", empty)
+	}
+}
+--- explain
+**思路**
+
+将符合条件的键包装为一个 `iter.Seq[string]` 迭代器函数，直接传给 `slices.Sorted(seq)`，`slices.Sorted` 会消费该迭代器收集所有元素并原地完成升序排序。
+
+**代码讲解**
+
+1. `for k, v := range maps.All(m)`：`maps.All(m)` 返回 `iter.Seq2[K, V]` 键值对迭代器。
+2. `if v >= minVal && !yield(k)`：只将达标的键 `k` 推给 `yield`。
+3. `slices.Sorted(seq)`：Go 1.23 新增标准库函数，接收 `iter.Seq[E]`（要求 `E` 满足 `cmp.Ordered`）并返回排好序的 `[]E`。
+
+**易错点**
+
+- 当没有任何键满足条件时，`slices.Sorted` 返回 `nil`（长度为 0 的空切片），用 `len(res) == 0` 或 `slices.Equal` 判断即可。
+
+=== go-31-1
+title: 用类型定义避免 MarshalJSON 无限递归
+--- desc
+结构体 `Account` 包含公开的 `ID`、`Name` 和敏感字段 `APIKey`。
+
+请为 `Account` 实现 `MarshalJSON() ([]byte, error)` 方法：输出 JSON 对象包含原有的 `"id"`、`"name"` 字段，隐藏原始 `APIKey`，并额外增加一个布尔字段 `"has_key"`（当 `APIKey != ""` 时为 `true`，否则为 `false`）。
+
+例如：`Account{ID: 7, Name: "dev", APIKey: "secret"}` 序列化为 `{"id":7,"name":"dev","has_key":true}`。
+--- solution
+package main
+
+import "encoding/json"
+
+type Account struct {
+	ID     int    `json:"id"`
+	Name   string `json:"name"`
+	APIKey string `json:"-"`
+}
+
+func (a Account) MarshalJSON() ([]byte, error) {
+	// @solution
+	type plainAccount Account // 类型定义：剥离 MarshalJSON 方法，防止递归调用
+	return json.Marshal(struct {
+		plainAccount
+		HasKey bool `json:"has_key"`
+	}{
+		plainAccount: plainAccount(a),
+		HasKey:       a.APIKey != "",
+	})
+	// @starter
+	// // TODO: 使用 type plainAccount Account 组合新结构体并调用 json.Marshal
+	// return nil, nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestAccountMarshalJSON(t *testing.T) {
+	a1 := Account{ID: 7, Name: "dev", APIKey: "sk-12345"}
+	b1, err := json.Marshal(a1)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+	want1 := `{"id":7,"name":"dev","has_key":true}`
+	if string(b1) != want1 {
+		t.Fatalf("got %s, want %s", b1, want1)
+	}
+
+	a2 := Account{ID: 8, Name: "guest", APIKey: ""}
+	b2, err := json.Marshal(a2)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+	want2 := `{"id":8,"name":"guest","has_key":false}`
+	if string(b2) != want2 {
+		t.Fatalf("got %s, want %s", b2, want2)
+	}
+}
+--- explain
+**思路**
+
+在自定义 `MarshalJSON()` 时，如果直接把 `a` 或 `type alias = Account` 放进匿名结构体再调用 `json.Marshal`，因为匿名嵌入的 `Account` 仍然拥有 `MarshalJSON()` 方法，外层匿名结构体就会继承该方法并无限递归调用自己导致栈溢出。使用**类型定义** `type plainAccount Account` 会创造一个拥有相同字段和 struct tag、但**没有任何方法**的新类型，从而安全复用标准库的默认字段序列化。
+
+**代码讲解**
+
+1. `type plainAccount Account`：在函数内部定义局部新类型，剥离 `Account` 的方法集。
+2. 构造匿名结构体嵌入 `plainAccount` 并新增 `HasKey bool` 字段，`encoding/json` 会把嵌入结构体的导出字段平铺到同一层 JSON 对象中。
+3. `plainAccount(a)`：因为底层类型完全一致，可以直接显式类型转换。
+
+**易错点**
+
+- 千万不能写成 `type plainAccount = Account`（多了等号变成类型别名），类型别名不会剥离方法集，运行时会无限递归导致栈溢出。
+
+=== go-32-1
+title: 函数类型实现接口与装饰器链
+--- desc
+定义文本处理器接口 `Processor` 和对应的函数类型适配器 `ProcessorFunc`：
+
+1. 为 `ProcessorFunc` 实现 `Process(s string) string` 方法，使其满足 `Processor` 接口；
+2. 实现 `Chain(base Processor, middlewares ...func(Processor) Processor) Processor`：按顺序将 `middlewares` 包裹在 `base` 外层（使得 `middlewares[0]` 最先执行，类似于洋葱模型：`middlewares[0](middlewares[1](...(base)))`）。
+--- solution
+package main
+
+type Processor interface {
+	Process(s string) string
+}
+
+type ProcessorFunc func(s string) string
+
+// @solution
+func (f ProcessorFunc) Process(s string) string {
+	return f(s)
+}
+
+func Chain(base Processor, middlewares ...func(Processor) Processor) Processor {
+	p := base
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		p = middlewares[i](p)
+	}
+	return p
+}
+
+// @starter
+// func (f ProcessorFunc) Process(s string) string {
+// 	return "" // TODO: 调用函数自身
+// }
+//
+// func Chain(base Processor, middlewares ...func(Processor) Processor) Processor {
+// 	return base // TODO: 从后往前包裹 middlewares，让 middlewares[0] 在最外层
+// }
+// @end
+--- test
+package main
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestProcessorFuncAndChain(t *testing.T) {
+	base := ProcessorFunc(strings.ToUpper)
+	trimMW := func(next Processor) Processor {
+		return ProcessorFunc(func(s string) string {
+			return next.Process(strings.TrimSpace(s))
+		})
+	}
+	wrapMW := func(next Processor) Processor {
+		return ProcessorFunc(func(s string) string {
+			return "[" + next.Process(s) + "]"
+		})
+	}
+
+	// 执行顺序：先 trimMW 去掉两端空格 -> 再 wrapMW 在外侧加方括号，内部调用 base 转大写
+	p := Chain(base, trimMW, wrapMW)
+	if got := p.Process("  hello go  "); got != "[HELLO GO]" {
+		t.Fatalf("got %q, want %q", got, "[HELLO GO]")
+	}
+
+	// 反过来：先 wrapMW 加方括号（空格被包在括号内） -> 再 trimMW（括号外无空格）
+	p2 := Chain(base, wrapMW, trimMW)
+	if got := p2.Process("  hello go  "); got != "[HELLO GO]" {
+		t.Fatalf("got %q, want %q", got, "[HELLO GO]")
+	}
+
+	prefixA := func(next Processor) Processor {
+		return ProcessorFunc(func(s string) string { return next.Process("a:" + s) })
+	}
+	prefixB := func(next Processor) Processor {
+		return ProcessorFunc(func(s string) string { return next.Process("b:" + s) })
+	}
+	p3 := Chain(base, prefixA, prefixB)
+	if got := p3.Process("x"); got != "B:A:X" {
+		t.Fatalf("got %q, want %q", got, "B:A:X")
+	}
+}
+--- explain
+**思路**
+
+這就是 `net/http.Handler` 与 `http.HandlerFunc` 的完整浓缩模型：为函数类型 `ProcessorFunc` 实现接口方法 `Process`，方法体内直接调用 `f(s)`；而在 `Chain` 中，为了保证 `middlewares[0]` 在最外层最先收到输入，需要从切片末尾 `len(middlewares)-1` 倒序向前包裹。
+
+**代码讲解**
+
+1. `func (f ProcessorFunc) Process(s string) string { return f(s) }`：让任何 `func(string) string` 函数只需通过 `ProcessorFunc(fn)` 转型就能当作 `Processor` 接口使用。
+2. `for i := len(middlewares) - 1; i >= 0; i--`：倒序包裹后，`middlewares[0]` 位于最外层，调用 `p.Process(s)` 时最先进入 `middlewares[0]`，再由它调用 `middlewares[1]`，最后到达 `base`。
+
+**易错点**
+
+- 如果正序循环 `for _, mw := range middlewares { p = mw(p) }`，那么最后一个中间件 `middlewares[len-1]` 反而会被包在最外层最先执行，与直觉相反。
+
+=== go-33-1
+title: 解析语义化版本与主版本导入路径校验
+--- desc
+根据 Go Module 的语义化导入版本规则（Semantic Import Versioning）：
+
+- 版本号格式为 `vMAJOR.MINOR.PATCH`（例如 `"v1.4.2"`、`"v0.3.0"`、`"v2.1.0"`），三个数字均为非负整数；
+- 当 `MAJOR` 为 `0` 或 `1` 时，模块路径**不能**带有 `/v0` 或 `/v1` 后缀（例如 `"example.com/pkg"` 合法，`"example.com/pkg/v1"` 非法）；
+- 当 `MAJOR >= 2` 时，模块路径末尾**必须**以 `"/v" + MAJOR` 结尾（例如 `version="v2.1.0"` 时，路径必须是 `"example.com/pkg/v2"`）。
+
+请实现 `CheckModulePath(modPath, version string) bool`，校验给定的模块路径和版本号是否合法且匹配。
+--- solution
+package main
+
+import (
+	"strconv"
+	"strings"
+)
+
+func CheckModulePath(modPath, version string) bool {
+	// @solution
+	if modPath == "" || !strings.HasPrefix(version, "v") {
+		return false
+	}
+	parts := strings.Split(version[1:], ".")
+	if len(parts) != 3 {
+		return false
+	}
+	nums := make([]int, 3)
+	for i, p := range parts {
+		if p == "" {
+			return false
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 || strconv.Itoa(n) != p {
+			return false
+		}
+		nums[i] = n
+	}
+	major := nums[0]
+	if major >= 2 {
+		wantSuffix := "/v" + strconv.Itoa(major)
+		return strings.HasSuffix(modPath, wantSuffix) && len(modPath) > len(wantSuffix)
+	}
+	if strings.HasSuffix(modPath, "/v0") || strings.HasSuffix(modPath, "/v1") {
+		return false
+	}
+	// 检查是否误带了其他 /vN 后缀
+	if idx := strings.LastIndex(modPath, "/v"); idx >= 0 {
+		if n, err := strconv.Atoi(modPath[idx+2:]); err == nil && n >= 2 {
+			return false
+		}
+	}
+	return true
+	// @starter
+	// return false // TODO: 解析 vMAJOR.MINOR.PATCH 并校验 modPath 的 /vN 后缀规则
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestCheckModulePath(t *testing.T) {
+	cases := []struct {
+		path string
+		ver  string
+		want bool
+	}{
+		{"github.com/foo/bar", "v0.1.2", true},
+		{"github.com/foo/bar", "v1.24.0", true},
+		{"github.com/foo/bar/v1", "v1.0.0", false},
+		{"github.com/foo/bar/v0", "v0.1.0", false},
+		{"github.com/foo/bar", "v2.0.0", false},
+		{"github.com/foo/bar/v2", "v2.0.0", true},
+		{"github.com/foo/bar/v3", "v2.0.0", false},
+		{"github.com/foo/bar/v2", "v1.5.0", false},
+		{"github.com/foo/bar", "1.2.3", false},
+		{"github.com/foo/bar", "v1.2", false},
+		{"/v2", "v2.0.0", false},
+	}
+	for _, tc := range cases {
+		if got := CheckModulePath(tc.path, tc.ver); got != tc.want {
+			t.Errorf("CheckModulePath(%q, %q) = %v, want %v", tc.path, tc.ver, got, tc.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+按照 Go Module 的 SIV（语义化导入版本）规范分两步校验：先校验 `version` 是否严格符合 `vX.Y.Z` 三个非负整数段；再根据主版本号 `major` 判断 `modPath` 的后缀——`major >= 2` 必须以 `/v{major}` 结尾，`major <= 1` 则不能带有 `/v0`、`/v1` 或任何 `/vN` 版本后缀。
+
+**代码讲解**
+
+1. `strings.Split(version[1:], ".")`：去掉开头的 `"v"` 后必须恰好切成 3 段，并用 `strconv.Atoi` 转换及 `strconv.Itoa(n) != p` 过滤掉类似 `"01"` 或 `"+1"` 的非规范数字。
+2. `major >= 2`：构造 `wantSuffix := "/v" + strconv.Itoa(major)`，检查 `strings.HasSuffix` 且前缀部分非空。
+3. `major <= 1`：拒绝以 `/v0`、`/v1` 或 `/vN`（$N \ge 2$）结尾的路径。
+
+**易错点**
+
+- `v1.x.y` 和 `v0.x.y` 的模块路径**禁止**写 `/v1` 或 `/v0` 后缀，只有从 `v2.0.0` 开始才需要加 `/v2`。
+
+=== go-34-1
+title: 按字符（rune）安全截断 UTF-8 字符串并加省略号
+--- desc
+实现 `EllipsisRunes(s string, maxRunes int) string`：
+
+- 如果字符串 `s` 的 Unicode 字符（`rune`）个数不超过 `maxRunes`，原样返回 `s`；
+- 如果超过 `maxRunes`，保留前 `maxRunes` 个完整的 `rune` 并在末尾拼接 `"..."`（3 个英文点）；
+- 要求直接利用 `for i := range s` 找到字节边界截取子串，避免将整个大字符串转换为 `[]rune(s)`。
+--- solution
+package main
+
+func EllipsisRunes(s string, maxRunes int) string {
+	// @solution
+	if maxRunes <= 0 {
+		if s == "" {
+			return ""
+		}
+		return "..."
+	}
+	count := 0
+	for i := range s {
+		if count == maxRunes {
+			return s[:i] + "..."
+		}
+		count++
+	}
+	return s
+	// @starter
+	// if len(s) > maxRunes {
+	// 	return s[:maxRunes] + "..." // TODO: 直接按字节切片会把多字节汉字截出乱码！
+	// }
+	// return s
+	// @end
+}
+--- test
+package main
+
+import (
+	"unicode/utf8"
+	"testing"
+)
+
+func TestEllipsisRunes(t *testing.T) {
+	cases := []struct {
+		s    string
+		max  int
+		want string
+	}{
+		{"Go语言编程", 4, "Go语言..."},
+		{"Go语言编程", 6, "Go语言编程"},
+		{"Go语言编程", 10, "Go语言编程"},
+		{"你好世界", 2, "你好..."},
+		{"🚀🔥✨🎉", 2, "🚀🔥..."},
+		{"hello", 0, "..."},
+		{"", 0, ""},
+	}
+	for _, tc := range cases {
+		got := EllipsisRunes(tc.s, tc.max)
+		if got != tc.want {
+			t.Errorf("EllipsisRunes(%q, %d) = %q, want %q", tc.s, tc.max, got, tc.want)
+		}
+		if !utf8.ValidString(got) {
+			t.Errorf("EllipsisRunes(%q, %d) produced invalid UTF-8: %q", tc.s, tc.max, got)
+		}
+	}
+}
+--- explain
+**思路**
+
+`for i := range s` 按 UTF-8 字符遍历字符串时，`i` 是当前字符在 `s` 中的**起始字节偏移量**。当我们数到第 `maxRunes` 个字符（从 0 开始计数，即 `count == maxRunes`）时，此时的 `i` 恰好就是前 `maxRunes` 个字符结束的字节位置！直接返回 `s[:i] + "..."` 既不会劈裂任何多字节字符，又省去了 `[]rune(s)` 的内存分配。
+
+**代码讲解**
+
+1. 处理 `maxRunes <= 0` 的边界情况：非空字符串截断 0 个字符后只剩 `"..."`。
+2. `for i := range s`：每次迭代代表走过 1 个完整的 Unicode 码点，`count` 记录已走过的字符数。
+3. 当 `count == maxRunes` 时，说明前面已经走过了 `maxRunes` 个字符，当前下标 `i` 正好是切分点，返回 `s[:i] + "..."`。
+4. 循环自然结束还没达到 `maxRunes`，说明总字符数 `<= maxRunes`，直接原样返回 `s`。
+
+**易错点**
+
+- 起始代码直接写 `s[:maxRunes]` 按字节下标截断，遇到 3 字节的汉字或 4 字节的 Emoji 时会把字符从中间劈开，导致 `utf8.ValidString` 校验失败。
+
+=== go-35-1
+title: 使用 iota 位掩码实现权限集合运算
+--- desc
+使用 `1 << iota` 定义文件权限位标志 `Permission`（`PermRead = 1`、`PermWrite = 2`、`PermExec = 4`），并为其实现三个位运算方法：
+
+1. `Grant(p Permission) Permission`：授予权限 `p`（按位或 `|`），返回新权限值；
+2. `Revoke(p Permission) Permission`：移除权限 `p`（按位清除 `&^`），返回新权限值；
+3. `HasAll(p Permission) bool`：检查是否**同时具备** `p` 中指定的所有权限位（例如 `perm.HasAll(PermRead | PermWrite)` 要求读和写位都为 1）。
+--- solution
+package main
+
+type Permission uint8
+
+const (
+	PermRead Permission = 1 << iota
+	PermWrite
+	PermExec
+)
+
+func (cur Permission) Grant(p Permission) Permission {
+	// @solution
+	return cur | p
+	// @starter
+	// return cur // TODO: 添加权限位 p
+	// @end
+}
+
+func (cur Permission) Revoke(p Permission) Permission {
+	// @solution
+	return cur &^ p
+	// @starter
+	// return cur // TODO: 使用 Go 的位清除运算符 &^ 移除权限位 p
+	// @end
+}
+
+func (cur Permission) HasAll(p Permission) bool {
+	// @solution
+	return cur&p == p
+	// @starter
+	// return false // TODO: 判断 p 中的所有位是否都在 cur 中置位
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestPermissionBitmask(t *testing.T) {
+	if PermRead != 1 || PermWrite != 2 || PermExec != 4 {
+		t.Fatalf("unexpected iota values: %d %d %d", PermRead, PermWrite, PermExec)
+	}
+	var p Permission
+	p = p.Grant(PermRead | PermWrite)
+	if !p.HasAll(PermRead) || !p.HasAll(PermWrite) || !p.HasAll(PermRead|PermWrite) {
+		t.Fatalf("expected Read and Write granted, got %03b", p)
+	}
+	if p.HasAll(PermRead | PermExec) {
+		t.Fatalf("HasAll(Read|Exec) should be false when Exec is not set")
+	}
+	p = p.Revoke(PermWrite)
+	if p.HasAll(PermWrite) || !p.HasAll(PermRead) {
+		t.Fatalf("after Revoke(Write), got %03b", p)
+	}
+}
+--- explain
+**思路**
+
+利用 `1 << iota` 将每个独立权限映射到二进制的不同比特位（`001`、`010`、`100`），通过按位或（`|`）添加标志、按位清除（`&^`，Go 特有的 AND NOT 运算符）移除标志、以及 `cur&p == p` 判断掩码包含关系。
+
+**代码讲解**
+
+1. `Grant`：`cur | p` 把 `p` 中为 1 的比特位置为 1。
+2. `Revoke`：`cur &^ p` 等价于 `cur & (^p)`，把 `p` 中为 1 的比特位在 `cur` 中清零，其余位保持不变。
+3. `HasAll`：`cur&p == p` 要求 `p` 中所有为 1 的位在 `cur` 中也全部为 1（注意不能写成 `cur&p != 0`，那只是判断“包含其中任意一个权限 `HasAny`”）。
+
+**易错点**
+
+- 判断组合权限 `HasAll(PermRead | PermExec)` 时，若誤写成 `cur&p != 0`，只要拥有 `PermRead` 就会错误地返回 `true`。

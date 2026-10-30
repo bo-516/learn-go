@@ -1,0 +1,257 @@
+=== code-19
+cat: code
+group: 找 bug
+level: 2
+title: 下面使用并发协程批量拉取用户信息并汇总到切片的代码有哪些 bug？
+tags: 代码审查, 并发Bug, Context阴影, 切片竞态, Panic恢复
+tasks: code-19-1
+--- answer
+审视以下业务中极其高频的“并发扇出拉取并汇总结果”代码：
+
+```go
+func FetchAllUsers(parentCtx context.Context, uids []int64) ([]User, error) {
+    ctx, cancel := context.WithCancel(parentCtx)
+    defer cancel()
+
+    var results []User
+    errCh := make(chan error) // Bug 1: 无缓冲 channel 导致协程永久泄漏！
+
+    for _, uid := range uids {
+        go func() {
+            u, err := fetchOne(ctx, uid)
+            if err != nil {
+                cancel()
+                errCh <- err // 只有第一个错误被读走，其余报错协程永久卡死在这里！
+                return
+            }
+            results = append(results, u) // Bug 2: 多协程并发 append 同一个切片，严重 Data Race 丢数据！
+        }()
+    }
+    // Bug 3: 没有 WaitGroup 等待成功协程结束，且怎么知道什么时候全部成功？
+    ...
+}
+```
+
+**三大致命 Bug 与标准修复方案**
+
+1. **Bug 1：`results = append(results, u)` 并发写切片导致数据竞争（Data Race）与静默丢数据**
+   - 多个协程同时触发 `append` 时，会同时读取相同的 `len` 往同一个底层数组槽位写数据（互相覆盖），或者在扩容时发生内存破坏。
+   - **修复**：**预分配定长切片 `results := make([]User, len(uids))`，每个协程按自己的专属下标 `results[i] = u` 直接赋值**！由于不同协程写的是底层数组互不重叠的独立内存地址，**连锁（Mutex）都不需要加**，而且天然保持了结果与输入 `uids` 的顺序严格一致！
+2. **Bug 2：无缓冲 `errCh` 引发大规模 Goroutine 泄漏**
+   - 当 10 个协程同时报错向无缓冲 `errCh` 发送错误，而主协程只接收了第一个错误就 `return` 退出时，剩下 9 个协程会永远阻塞在 `errCh <- err` 上泄漏。
+   - **修复**：使用 `sync.Once` 记录首个错误（或 `errCh := make(chan error, 1)` 配合 `select { case errCh <- err: default: }` 非阻塞写入）。
+3. **Bug 3：用 `context.WithCancel` 派生了 `ctx`，下游 `fetchOne` 内部若误传了外层 `parentCtx` 则无法快速取消**
+   - 必须向子调用传入派生出的 `ctx`，并在任一任务报错时立刻调用 `cancel()` 中断其余尚在传输中的慢请求。
+--- deep
+### 为什么“预分配切片 + 按独立下标写入”在 Go 内存模型下是 100% 并发安全的？
+
+很多初级工程师担心：“两个协程同时写同一个切片 `results[0] = u0` 和 `results[1] = u1`，不加锁真的不会触发 `-race` 报警吗？”
+
+```
+results := make([]User, 3)
+
+切片头 (Slice Header, 只读不变)
+┌──────┬─────┬─────┐
+│ Data │ Len │ Cap │
+└──┬───┴─────┴─────┘
+   │
+   ▼ 底层数组（每个元素在内存中是独立的对象/机器字）
+┌──────────────┬──────────────┬──────────────┐
+│  results[0]  │  results[1]  │  results[2]  │
+└──────▲───────┴──────▲───────┴──────▲───────┘
+       │              │              │
+   Goroutine 0    Goroutine 1    Goroutine 2
+```
+
+根据 Go Memory Model：
+- 只要切片本身的长度/容量不再改变（不调用 `append`），每个元素 `results[i]` 在编译器和 CPU 眼中就是一个完全独立的变量；
+- 协程 $i$ 只写 `results[i]`，最后由 `wg.Wait()` 建立 Happens-Before 同步屏障，主协程在 `wg.Wait()` 之后读取整个 `results`，不仅 **`go test -race` 零告警**，而且消灭了锁竞争和重新排序的开销！
+
+=== code-20
+cat: code
+group: 并发
+level: 2
+title: 实现一个并发 MapReduce 词频统计器：分片并发统计并归并结果
+tags: 手写代码, MapReduce, 并发编程, 分治, 归并
+tasks: code-20-1
+--- answer
+在多核 CPU 上统计海量文本或日志的词频（或聚合指标）时，如果让多个 Worker 协程同时往同一个全局 `map[string]int`（加一把 `sync.Mutex`）里累加，锁竞争会让多核并行退化成比单线程还慢的串行执行！
+
+**核心设计思想：无锁局部 Map 阶段 + 单线程 Reduce 归并阶段**
+1. **数据分片（Split）**：将输入文档切片 `docs` 均匀切分为 `workers` 个子批次（或通过任务通道分发）。
+2. **并行 Map 阶段（零共享状态）**：每个 Worker 协程在自己的栈/本地堆上创建一个**完全私有的 `localMap := make(map[string]int)`**，在处理自己负责的文档期间**不需要加任何锁**，全速统计词频。
+3. **汇总 Reduce 阶段**：等所有 Worker 完成本地统计后（`wg.Wait()`），主协程将这 `workers` 个 `localMap` 累加归并到最终的 `finalMap` 中。
+--- deep
+### 共享锁 Map vs 分片 MapReduce 性能对比
+
+```
+❌ 反模式（全局锁共享 Map）：
+Worker 1 ──┐
+Worker 2 ──┼──► 争抢同一把 sync.Mutex ──► globalMap[word]++  (90% CPU 耗在锁自旋与上下文切换)
+Worker 3 ──┘
+
+✅ 正道（MapReduce 局部无锁聚合）：
+Worker 1 ──► localMap_1[word]++ (纯无锁内存操作) ──┐
+Worker 2 ──► localMap_2[word]++ (纯无锁内存操作) ──┼──► wg.Wait() ──► Reduce 合并到 finalMap
+Worker 3 ──► localMap_3[word]++ (纯无锁内存操作) ──┘
+```
+
+### 工程实现细节
+
+1. **Worker 数量自适应**：当输入 `len(docs) == 0` 时直接返回空 map；当 `workers > len(docs)` 时，将实际启动的协程数收敛为 `len(docs)`，避免启动空转协程。
+2. **分词规整**：使用 `strings.Fields( strings.ToLower(doc) )` 按空白字符切分并统一转为小写。
+
+=== code-21
+cat: code
+group: 数据结构
+level: 3
+title: 实现一个基于最小堆的带过期时间键值存储（TTL Map）
+tags: 手写代码, 最小堆, container/heap, TTL缓存, 惰性删除
+tasks: code-21-1
+--- answer
+实现带过期时间的内存键值缓存（TTL Map）时，如果只用哈希表，清理过期 Key 就必须全表遍历（$O(N)$）；如果结合 **`map` + 最小堆（`container/heap`，按 `expireAt` 升序排列）**，就能在 $O(\log K)$ 时间内精准弹出最早过期的 Key！
+
+**核心数据结构设计**
+1. **哈希表 `items map[string]ttlEntry`**：存储每个 `key` 当前最新的 `value`、`expireAt` 和单调递增的更新版本号 `ver`（或直接比对 `expireAt`）。
+2. **最小堆 `expHeap`**：存储 `(key, expireAt, ver)`，堆顶永远是全表**最早即将过期**的条目。
+3. **为什么需要惰性驱逐（Lazy Deletion on Heap）或版本号比对？**
+   - 当同一个 `key` 被重复 `Set(key, newVal, newTTL)` 延长了过期时间，或者被主动 `Delete(key)` 删除时，如果去最小堆里遍历查找旧节点修改会退化成 $O(N)$（除非维护双向下标映射）。
+   - 更简洁高效的工程技巧是：`Set` 时直接往堆里 `Push` 一个带新版本号 `ver` 的节点；当清理函数 `Cleanup(now)` 从堆顶弹出一个过期节点 `top` 时，比对 `items[top.key].ver == top.ver`：若相等则真正从 `items` 中删除；若不等说明该堆节点是被覆盖过的旧影子，直接丢弃即可！
+--- deep
+### 最小堆 + 版本号影子跳过（Shadow Node Lazy Removal）图解
+
+假设依次执行：
+1. `Set("k1", "v1", expire=10)` -> `items["k1"] = {val:"v1", exp:10, ver:1}`，堆中压入 `(k1, exp:10, ver:1)`
+2. `Set("k1", "v2", expire=50)` -> `items["k1"] = {val:"v2", exp:50, ver:2}`，堆中压入 `(k1, exp:50, ver:2)`
+
+```
+此时时间到了 t = 20，调用 Cleanup(20)：
+1. 查看堆顶：发现是 (k1, exp:10, ver:1)，满足 exp(10) <= now(20)，将其从堆中 Pop 出来；
+2. 查哈希表 items["k1"]：发现当前最新的 ver 是 2 (而弹出的堆节点 ver 是 1，1 != 2)；
+3. 说明这个 exp=10 的节点已经是过时的历史影子，直接忽略！items["k1"] (exp=50) 安然无恙！
+```
+
+这种 **“Map 存最新权威状态（带 `ver`）+ 最小堆只增不改、弹出时校验 `ver`”** 的写法，比维护复杂的 `heap.Fix` 索引数组代码量少一半，且绝不会出现下标错乱 bug，是面试白板手写带堆数据结构的黄金技巧！
+
+=== code-22
+cat: code
+group: 数据结构
+level: 3
+title: 实现一个支持路径参数（:id）和通配符（*filepath）的 HTTP Trie 路由器
+tags: 手写代码, 前缀树, Trie, HTTP路由, Gin原理
+tasks: code-22-1
+--- answer
+主流高性能 Go Web 框架（如 Gin、Echo、Chi）的路由核心都是基于 **前缀树（Trie / Radix Tree）**，能够在 $O(L)$（$L$ 为 URL 路径段数，与注册的总路由数 $N$ 无关）时间内完成匹配并提取路径参数。
+
+**1. 三类路由节点的匹配优先级（从高到低）**
+按 `/` 将路径切分为段（Segments，如 `/users/42/profile` -> `["users", "42", "profile"]`），每一层节点包含：
+1. **静态子节点（Static Children，`map[string]*node`）**：精确匹配路径段（如 `"users"`），优先级最高；
+2. **参数子节点（Param Child，`:name`）**：匹配当前层的任意单个非空段（如 `:id` 匹配 `"42"`），并将 `params["id"] = "42"` 存入参数表；
+3. **通配符子节点（Catch-All Wildcard，`*name`）**：只能出现在路由末尾（如 `/static/*filepath`），直接吞掉剩余的所有路径段（如 `"css/main.css"`），优先级最低。
+
+**2. 回溯匹配（Backtracking）**
+- 例如同时注册了 `/users/new` 和 `/users/:id/settings`：
+- 当请求 `/users/new/settings` 时，第一段匹配 `"users"`，第二段优先走静态节点 `"new"`，但往下发现 `"new"` 下面没有 `"settings"` 子节点！此时必须**回溯**尝试同层的 `:id` 参数节点（将 `"new"` 作为 `:id` 的值），继续往下成功匹配 `"settings"`。
+--- deep
+### 路由前缀树（Trie）结构图解
+
+注册以下 4 条路由后生成的 Trie 树：
+- `GET /users/list`
+- `GET /users/:id`
+- `GET /users/:id/orders`
+- `GET /files/*filepath`
+
+```
+                       [Root]
+                      /      \
+                "users"      "files"
+                 /    \          \
+            "list"   ":id"     "*filepath" (Handler4)
+          (Handler1) (Handler2)
+                        \
+                      "orders"
+                     (Handler3)
+```
+
+### 递归 DFS + 回溯实现要点
+
+用递归函数 `match(n *node, segs []string, idx int, params map[string]string) string` 实现匹配既清晰又天然支持回溯：
+1. **递归基**：当 `idx == len(segs)` 时，若 `n.handler != ""` 则匹配成功返回；若该节点下挂有 `*wildcard` 子节点且其允许匹配空后缀，也可按规则处理。
+2. **第 1 顺位尝试静态子树**：若 `child, ok := n.static[segs[idx]]`，递归尝试 `match(child, segs, idx+1, params)`，成功则直接返回。
+3. **第 2 顺位尝试 `:param` 子树**：若 `n.paramChild != nil`，递归尝试，若成功则记录 `params[n.paramChild.paramName] = segs[idx]` 并返回。
+4. **第 3 顺位尝试 `*wildcard` 子树**：若 `n.wildChild != nil`，将 `strings.Join(segs[idx:], "/")` 赋给 `params[n.wildChild.paramName]` 并直接返回 `n.wildChild.handler`。
+
+=== code-23
+cat: code
+group: 并发
+level: 3
+title: 实现一个支持优先级的并发任务调度器（高优先级任务优先执行）
+tags: 手写代码, 优先级队列, 协程池, sync.Cond, 最小堆
+tasks: code-23-1
+--- answer
+普通的 Go Channel（`chan Task`）是严格 FIFO（先进先出）的，无法实现“当队列积压时，后提交的 VIP 高优任务插队到普通任务之前先被 Worker 执行”。
+
+**核心实现方案：`sync.Mutex` + `sync.Cond` + 最大堆/最小堆（`container/heap`）**
+1. **为什么不能直接用 Channel 当等待队列？**
+   因为任务一旦塞进 Channel 缓冲区，顺序就被焊死了。因此必须把等待队列放在一个受 `sync.Mutex` 保护的**优先级堆（Priority Queue）**中。
+2. **如何保证相同优先级下先进先出（Stable FIFO）？**
+   在每个任务结构体中附带一个自增序号 `seq int64`。堆的比较规则 `Less(i, j)` 定义为：
+   - 若 `Priority` 不同：`Priority` 数值更大（高优）的排在堆顶；
+   - 若 `Priority` 相同：`seq` 更小（先提交）的排在堆顶！
+3. **Worker 协程如何阻塞等待与优雅退出？**
+   - Worker 循环中：加锁 -> `for pq.Len() == 0 && !closed { cond.Wait() }`；
+   - 若 `pq.Len() == 0 && closed`，说明调度器已关闭且队列已排空，Worker 释放锁并退出；
+   - 否则调用 `heap.Pop(&pq)` 弹出当前最高优的任务，释放锁并执行！
+--- deep
+### 为什么高优插队必须在 Worker 繁忙时才体现？
+
+在编写单元测试验证优先级调度器时，有一个非常经典的并发常识：
+- 如果池子里有 4 个空闲 Worker，你依次提交 `Low1, Low2, High1`，因为前两个任务提交的瞬间立刻就被空闲 Worker 抢走开始执行了，所以 `High1` 不可能穿越时空去阻止已经在跑的 `Low1`。
+- **正确的测试与工作模型**：先用一个正在执行的阻塞任务占住 Worker（令 `concurrency = 1`），然后在队列中依次积压 `Low(p=1)`、`Medium(p=5)`、`High(p=10)` 三个待执行任务；当第一个阻塞任务完成后，Worker 必定按照 **`High(10) -> Medium(5) -> Low(1)`** 的严格优先级顺序依次拉取执行！
+
+```
+Worker (正在执行首个任务 T0)
+  │
+  │ 此时连续 Submit 三个任务进入堆队列：
+  │   Submit(p=1, seq=1) -> Submit(p=10, seq=2) -> Submit(p=5, seq=3)
+  ▼
+T0 执行完毕，Worker 从堆中依次 Pop：
+  1st Pop -> p=10 (High)
+  2nd Pop -> p=5  (Medium)
+  3rd Pop -> p=1  (Low)
+```
+
+=== code-24
+cat: code
+group: 工程
+level: 3
+title: 实现一个支持轮询负载均衡、被动故障剔除与健康恢复的网关路由池
+tags: 手写代码, 负载均衡, 反向代理, 故障剔除, 健康检查
+tasks: code-24-1
+--- answer
+生产级反向代理或 RPC 客户端负载均衡器（如 Nginx `max_fails` / `fail_timeout` 或 Envoy Outlier Detection）不仅要能**原子轮询（Round-Robin）**分发流量，还必须具备**被动故障熔断剔除**与**主动/冷却期探测恢复**能力。
+
+**核心状态机设计**
+为每个后端节点 `Backend` 维护：
+- `Addr string`：后端地址
+- `failCount int`：连续失败次数
+- `deadUntil time.Time`：被熔断剔除的截止时间（冷却期）
+
+**三大核心操作**
+1. **`Next(now time.Time) (string, bool)`（加权/轮询选点）**：
+   - 从上次轮询位置 `idx` 开始最多遍历一圈 $N$ 个节点；
+   - 若某节点处于正常状态，或者其熔断冷却期已过（`now.After(b.deadUntil)` 或 `!now.Before(b.deadUntil)`），则选中该节点并返回；
+   - 若整圈所有节点都处于熔断冷却期内，返回 `("", false)`。
+2. **`ReportFailure(addr string, now time.Time)`（被动故障剔除）**：
+   - 将该节点的 `failCount++`；
+   - 一旦 `failCount >= maxFails`（例如连续失败 3 次），立即将其标记为熔断剔除：`deadUntil = now.Add(failTimeout)`。
+3. **`ReportSuccess(addr string)`（成功恢复）**：
+   - 将该节点的 `failCount` 清零，并将 `deadUntil` 重置为零值。
+--- deep
+### Nginx `max_fails` 与 `fail_timeout` 的工程精髓
+
+为什么不能“只要某台后端报错 1 次就立刻永久踢掉”？
+1. **防网络偶发毛刺误杀（`maxFails` 阈值）**：偶发 1 次超时可能是客户端参数问题或单包抖动，只有**连续**失败达到 `maxFails`（如 3 次）才判定为节点故障，一旦中间有 1 次成功就立刻将 `failCount` 归零。
+2. **冷却期半开自愈（`deadUntil = now + failTimeout`）**：节点被剔除 `failTimeout`（如 10 秒）后，无需额外部署中心探测器，当 `now >= deadUntil` 时，`Next(now)` 会自动放行一次请求过去试探（类似断路器的 Half-Open 状态）：
+   - 如果节点已经重启恢复，调用 `ReportSuccess` 彻底满血回归；
+   - 如果依然报错，再次触发 `ReportFailure` 继续延长下一个周期的 `deadUntil`！

@@ -1,0 +1,433 @@
+=== db-12
+--- deep
+**原理展开**
+
+InnoDB 的死锁检测：每当一个事务要等待锁时，检查**等待图**（事务 → 它等待的锁的持有者）是否会形成环，形成环就选一个“代价最小”（修改的行数最少）的事务回滚。检测本身的复杂度和等待者数量相关，在大量并发更新同一行的场景（热点行）下，死锁检测可能消耗大量 CPU，这时有的系统会关闭 `innodb_deadlock_detect`，依赖 `innodb_lock_wait_timeout` 超时。
+
+读懂死锁日志：`LATEST DETECTED DEADLOCK` 列出两个事务，每个事务有 `HOLDS THE LOCK(S)`（持有的锁）和 `WAITING FOR THIS LOCK TO BE GRANTED`（等待的锁），锁的描述里有索引名、锁类型（`lock_mode X locks rec but not gap` 是记录锁，`locks gap before rec` 是间隙锁，`insert intention` 是插入意向锁）和具体的记录值。
+
+**代码示例**
+
+```go
+// 识别死锁错误并有限次数重试整个事务
+func withRetry(ctx context.Context, attempts int, fn func() error) error {
+	var err error
+	for i := range attempts {
+		if err = fn(); err == nil {
+			return nil
+		}
+		var me *mysql.MySQLError
+		if !errors.As(err, &me) || (me.Number != 1213 && me.Number != 1205) { // 死锁 / 锁等待超时
+			return err
+		}
+		time.Sleep(time.Duration(i+1) * 20 * time.Millisecond)
+	}
+	return err
+}
+
+// 批量更新前排序，保证所有事务以相同的顺序加锁
+slices.Sort(ids)
+for _, id := range ids {
+	tx.ExecContext(ctx, "UPDATE stock SET qty = qty - 1 WHERE id = ?", id)
+}
+```
+
+**常见追问**
+
+- 死锁和锁等待超时有什么区别？→ 死锁是循环等待，被立即检测并回滚（1213）；锁等待超时是等了太久（默认 50 秒，1205），可能只是某个事务持有锁时间太长。
+- 被回滚的事务需要应用做什么？→ 整个事务已经回滚，应用要从头重试整个事务，而不只是重试最后一条语句。
+- 只有一条 UPDATE 语句也会死锁吗？→ 会，比如两条语句按不同的索引顺序扫描、锁住了相同的记录。
+
+**实战建议**
+
+- 开启 `innodb_print_all_deadlocks`，定期分析死锁日志，找出反复出现的模式并从根本上修复。
+- 热点行（如秒杀库存）用排队、合并更新或者把扣减放到 Redis 里，避免大量事务竞争同一行。
+
+=== db-13
+--- deep
+**原理展开**
+
+**并行复制**的演进：
+
+- 5.6：按**库**并行，不同库的事务可以并行重放，单库内仍然串行；
+- 5.7：基于**组提交**（LOGICAL_CLOCK），主库上同一组提交的事务一定没有冲突，从库可以并行重放；
+- 8.0：基于 **WRITESET**，记录每个事务修改的行的哈希，没有修改相同行的事务都可以并行，即使主库上它们不是同一组提交的。
+
+**半同步复制**：主库提交时等待至少一个从库确认收到 binlog（写入 relay log）后才返回给客户端，主库崩溃时，至少有一个从库有最新的数据。`AFTER_SYNC`（无损半同步）模式下，等待发生在引擎提交之前，避免了“主库提交了、从库没收到、切换后数据丢失”的情况。
+
+**代码示例**
+
+```sql
+-- 查看复制状态和延迟
+SHOW REPLICA STATUS\G
+-- Seconds_Behind_Source: 落后的秒数（估算值，大事务时不准确）
+-- Retrieved_Gtid_Set / Executed_Gtid_Set：收到的和已执行的事务
+
+-- 等待从库执行到某个 GTID（写后读的强一致方案）
+SELECT WAIT_FOR_EXECUTED_GTID_SET('3E11FA47-71CA-11E1-9E33-C80AA9429562:1-77', 1);
+```
+
+```go
+// 写后读：在 ctx 中标记“必须读主库”
+type primaryKey struct{}
+
+func ForcePrimary(ctx context.Context) context.Context {
+	return context.WithValue(ctx, primaryKey{}, true)
+}
+
+func (r *Repo) dbFor(ctx context.Context) *sql.DB {
+	if v, _ := ctx.Value(primaryKey{}).(bool); v {
+		return r.primary
+	}
+	return r.replica
+}
+```
+
+**常见追问**
+
+- `Seconds_Behind_Source` 为什么不可靠？→ 它是用当前正在重放的事务的时间戳计算的，一个执行了 10 分钟的大事务在重放开始时显示 0，结束时突然跳到 600。更准确的方式是在主库定期写心跳表，从库读取比较（pt-heartbeat）。
+- 主从切换时要注意什么？→ 确认新主库已经应用了所有 relay log；用 GTID 让其他从库自动找到正确的复制位置。
+- 读写分离的一致性问题有哪些解法？→ 关键读走主库、写后短时间内路由到主库、GTID 等待、在缓存中标记最近写过的 key。
+
+**实战建议**
+
+- 监控复制延迟，设置告警；从库延迟超过阈值时，读请求自动切回主库。
+- 批量删除或更新拆成小批次，每批之间留间隔，避免从库延迟突增。
+
+=== db-14
+--- deep
+**原理展开**
+
+Online DDL 的三种算法：
+
+- **INSTANT**：只修改数据字典的元数据，不动数据文件（加列、修改默认值、改列名等），瞬间完成；
+- **INPLACE**：在引擎内部重建或修改索引，期间允许并发的 DML（变更会先记录在一个在线日志里，最后应用），但最后有一个短暂的排他锁阶段；
+- **COPY**：建新表、复制数据、交换，期间阻塞写入（只有少数变更需要，比如修改列类型）。
+
+**MDL（元数据锁）**：所有 DML 和查询都会持有表的 MDL 读锁，DDL 需要 MDL 写锁。MDL 的等待队列是公平的：DDL 在等写锁时，后来的 MDL 读锁请求也要排在它后面，于是一个长查询 + 一个等待中的 DDL = 整张表的所有请求都被阻塞。
+
+**代码示例**
+
+```sql
+-- 指定算法：不支持时直接报错，而不是悄悄退化成锁表的方式
+ALTER TABLE orders ADD COLUMN remark VARCHAR(255) NULL, ALGORITHM=INSTANT;
+ALTER TABLE orders ADD INDEX idx_shop_ctime (shop_id, created_at), ALGORITHM=INPLACE, LOCK=NONE;
+
+-- 执行前检查长事务
+SELECT trx_id, trx_started, trx_query FROM information_schema.innodb_trx
+WHERE trx_started < NOW() - INTERVAL 10 SECOND;
+
+-- 限制 DDL 等待 MDL 的时间，拿不到锁就快速失败
+SET SESSION lock_wait_timeout = 5;
+```
+
+**常见追问**
+
+- gh-ost 和 pt-osc 的区别？→ pt-osc 用触发器同步增量数据，触发器在主库的同一个事务里执行，增加主库负担；gh-ost 读取 binlog 异步同步，可以暂停、限流，对主库影响更小。
+- 加索引会影响主从复制吗？→ 会，从库重放 DDL 时同样需要很长时间，期间复制延迟会持续增加。
+- 删除大表要注意什么？→ `DROP TABLE` 删除大文件时可能造成 IO 尖刺和短暂卡顿，可以先 `RENAME`，再分批删除数据或者用硬链接的方式慢慢删除文件。
+
+**实战建议**
+
+- DDL 变更走审核流程，明确指定 ALGORITHM 和 LOCK，在低峰期执行。
+- 使用在线改表工具时设置限流参数（根据从库延迟、主库负载自动暂停）。
+
+=== db-15
+--- deep
+**原理展开**
+
+分片后的查询分为三类：
+
+- **带分片键的查询**：路由到一个分片，和单库一样高效；
+- **不带分片键的查询**：需要查询所有分片再合并（广播），分片越多越慢；
+- **跨分片的操作**：JOIN、分布式事务、全局排序分页。
+
+所以分片键的选择决定了大部分查询能否命中单个分片。不能命中的查询维度，常见的做法是**异构索引**：按另一个维度冗余一份数据（比如订单按 user_id 分片，另外按 shop_id 冗余一份，或者只冗余一张 `shop_id → order_id` 的映射表），或者同步到 ES 做检索。
+
+**代码示例**
+
+```go
+// 预分 1024 个逻辑分片，映射到物理库；扩容时只迁移逻辑分片，修改映射表
+const logicalShards = 1024
+
+type Router struct {
+	shardToDB [logicalShards]int // 逻辑分片 → 物理库编号
+	dbs       []*sql.DB
+}
+
+func (r *Router) DB(userID int64) (*sql.DB, string) {
+	shard := int(userID % logicalShards)
+	table := fmt.Sprintf("orders_%04d", shard)
+	return r.dbs[r.shardToDB[shard]], table
+}
+```
+
+**常见追问**
+
+- 跨分片的分页怎么做？→ 每个分片各取前 `offset + limit` 条，在内存中归并排序后取需要的部分，offset 越大代价越大；更好的方式是游标分页或者交给搜索引擎。
+- 分布式事务怎么处理？→ 尽量通过分片键设计避免；无法避免时用 Saga、TCC、本地消息表实现最终一致。
+- 扩容时怎么迁移数据？→ 双写 + 历史数据迁移 + 校验 + 切换读 + 停止旧写，或者使用支持在线迁移的中间件。
+
+**实战建议**
+
+- 分库分表是不可逆的大工程，先穷尽单库优化（索引、归档、缓存、读写分离）。
+- 一开始就预留足够的逻辑分片数，后续扩容只需要调整映射，不需要重新哈希所有数据。
+
+=== db-16
+--- deep
+**原理展开**
+
+InnoDB 执行 `count(*)` 时，会选择**最小的索引**来扫描（二级索引的叶子只有索引列和主键，比聚簇索引的叶子小得多），逐行判断可见性后计数。MySQL 8.0.13 起，对没有 WHERE 条件的 `count(*)`，InnoDB 可以用多线程并行扫描聚簇索引。但无论怎样，都是 O(行数) 的操作。
+
+带条件的 `count(*)` 和普通查询一样，取决于条件能否走索引；能用覆盖索引时只扫描索引，不回表。
+
+**代码示例**
+
+```go
+// 计数表：和业务数据在同一个事务里更新，保证一致
+func createOrder(ctx context.Context, tx *sql.Tx, o Order) error {
+	if _, err := tx.ExecContext(ctx, "INSERT INTO orders (...) VALUES (...)", o.ID /* ... */); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO order_counts (shop_id, n) VALUES (?, 1)
+		 ON DUPLICATE KEY UPDATE n = n + 1`, o.ShopID)
+	return err
+}
+```
+
+计数表的同一行在高并发下也会成为热点，可以把一个店铺的计数拆成多行（`shop_id, slot`），更新时随机选一个 slot，查询时求和。
+
+**常见追问**
+
+- 用 Redis 计数时怎么保证不丢？→ 定期用数据库的真实值校准；或者通过 binlog 订阅（Canal）异步更新计数。
+- `SHOW TABLE STATUS` 的 Rows 有多准？→ 基于采样，误差可能达到 40%～50%，只适合展示“大约有多少”。
+- `count(col)` 和 `count(*)` 的结果为什么可能不同？→ `count(col)` 不统计 col 为 NULL 的行。
+
+**实战建议**
+
+- 和产品确认是否真的需要精确的总数，很多场景下“约 1.2 万条”或者“999+”就够了。
+- 精确计数用计数表，并且在同一个事务里维护。
+
+=== db-17
+--- deep
+**原理展开**
+
+`database/sql` 连接池的工作方式：
+
+- 获取连接：有空闲连接就直接用；没有并且未达到 MaxOpenConns 就新建；达到上限就**排队等待**（这就是 WaitCount 的来源）；
+- 归还连接：空闲连接数未达到 MaxIdleConns 就放回空闲列表，否则关闭；
+- 后台清理：一个 goroutine 定期关闭超过 ConnMaxLifetime 或 ConnMaxIdleTime 的连接。
+
+被服务端断开的连接（超时、重启、代理切换）在下次使用时才会发现，驱动返回 `driver.ErrBadConn`，`database/sql` 会自动重试一次（换一个连接），所以偶尔的断连不会暴露给业务；但事务中的语句不能自动重试。
+
+**代码示例**
+
+```go
+// 把连接池指标导出到 Prometheus
+func registerDBMetrics(db *sql.DB, name string) {
+	prometheus.MustRegister(collectors.NewDBStatsCollector(db, name))
+}
+
+// 简单的日志版本
+go func() {
+	for range time.Tick(30 * time.Second) {
+		s := db.Stats()
+		if s.WaitCount > 0 {
+			slog.Warn("db pool waiting", "in_use", s.InUse, "wait_count", s.WaitCount,
+				"wait_duration", s.WaitDuration, "max_open", s.MaxOpenConnections)
+		}
+	}
+}()
+```
+
+**常见追问**
+
+- `sql.Open` 会建立连接吗？→ 不会，只是验证参数；要立即检查数据库是否可用，调用 `db.PingContext`。
+- 连接数是不是越大越好？→ 不是，数据库同时处理的查询数有限（大致和 CPU 核数相关），连接太多只会增加排队和上下文切换。
+- 为什么要设置 ConnMaxIdleTime？→ 流量高峰过后释放多余的空闲连接，减少数据库端的资源占用。
+
+**实战建议**
+
+- 每个服务的连接池配置写进配置文件，部署实例数变化时同步检查总连接数。
+- 关注 WaitDuration：持续增长时先查慢查询和连接泄漏，最后才考虑调大连接池。
+
+=== db-18
+--- deep
+**原理展开**
+
+`*sql.Rows` 持有它的连接，直到以下任一情况发生才归还：
+
+- `rows.Next()` 返回 false（读完了或者出错）；
+- 调用了 `rows.Close()`；
+- ctx 被取消（driver 会中断查询，rows 会被自动关闭）。
+
+`QueryRow` 返回的 `*sql.Row` 在调用 `Scan` 时读取第一行并关闭，所以必须调用 Scan，否则连接也会泄漏。
+
+连接泄漏的“症状”通常是：服务运行一段时间后，所有数据库操作突然变得极慢或超时，`db.Stats().InUse` 等于 MaxOpenConns，而数据库端看到的连接大多处于 `Sleep` 状态（连接被占着但没有在执行查询）。
+
+**代码示例**
+
+```go
+// 正确：只需要一行
+var name string
+err := db.QueryRowContext(ctx, "SELECT name FROM users WHERE id = ?", id).Scan(&name)
+if errors.Is(err, sql.ErrNoRows) {
+	return "", ErrNotFound
+}
+
+// 正确：需要专用连接时（比如设置会话变量）
+conn, err := db.Conn(ctx)
+if err != nil {
+	return err
+}
+defer conn.Close() // 归还连接池
+_, err = conn.ExecContext(ctx, "SET SESSION sql_mode = 'STRICT_ALL_TABLES'")
+```
+
+**常见追问**
+
+- 怎么在测试中发现连接泄漏？→ 把 MaxOpenConns 设为 1，泄漏一次后下一次操作就会卡住；或者测试结束后检查 `db.Stats().InUse == 0`。
+- `rows.Close()` 会返回错误吗？→ 会，但一般可以忽略；遍历的错误在 `rows.Err()` 里。
+- `sqlx`、`GORM` 也会泄漏吗？→ 这些库封装了 rows 的处理，正常使用不会泄漏；但使用它们的 `Rows()` 等底层接口时同样要注意关闭。
+
+**实战建议**
+
+- 代码规范：`Query` 之后的下一行就是错误检查，再下一行就是 `defer rows.Close()`。
+- 使用 `sqlclosecheck`、`rowserrcheck` 这类 linter 自动检查。
+
+=== db-19
+--- deep
+**原理展开**
+
+`database/sql` 的事务把**一个连接**独占给了 `*sql.Tx`：所有 `tx.Exec` / `tx.Query` 都在这个连接上执行，直到 Commit 或 Rollback 才归还。这意味着：
+
+- 事务内用 `db.Exec` 会从池里拿另一个连接执行，这条语句不在事务里；
+- 事务持续的时间就是连接被占用的时间，长事务会消耗连接池；
+- 同一个事务不能在多个 goroutine 里并发使用（同一个连接上不能同时执行多条语句）。
+
+ctx 被取消时，`database/sql` 会自动回滚事务；`BeginTx` 的 ctx 会影响整个事务，不只是 Begin 这一步。
+
+**代码示例**
+
+```go
+// 让 repository 方法既能在事务内也能在事务外使用：接收一个公共接口
+type DBTX interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+type OrderRepo struct{}
+
+func (OrderRepo) Create(ctx context.Context, q DBTX, o Order) error {
+	_, err := q.ExecContext(ctx, "INSERT INTO orders (id, amount) VALUES (?, ?)", o.ID, o.Amount)
+	return err
+}
+
+// *sql.DB 和 *sql.Tx 都实现了 DBTX
+err := WithTx(ctx, db, func(tx *sql.Tx) error {
+	if err := repo.Create(ctx, tx, order); err != nil {
+		return err
+	}
+	return stockRepo.Deduct(ctx, tx, order.SKU, 1)
+})
+```
+
+**常见追问**
+
+- 嵌套事务怎么办？→ `database/sql` 不支持嵌套事务，可以用 `SAVEPOINT` 模拟，或者在设计上保证只在最外层开启事务。
+- 只读查询需要事务吗？→ 一般不需要；需要多条查询看到一致的快照时，可以开启只读事务（`&sql.TxOptions{ReadOnly: true}`）。
+- 事务提交失败了数据是什么状态？→ 不确定：可能是网络在提交后断开（实际已提交），也可能真的失败了。需要幂等的设计来应对这种情况。
+
+**实战建议**
+
+- 所有事务都通过统一的 `WithTx` 封装执行，避免遗漏回滚。
+- 在事务开始前完成所有的外部调用和计算，事务内只做数据库操作。
+
+=== db-20
+--- deep
+**原理展开**
+
+GORM 的很多“坑”来自它的设计：
+
+- **零值问题**：用结构体做更新条件或更新内容时，GORM 无法区分“没有设置”和“设置为零值”，所以默认忽略零值字段；
+- **链式调用的状态**：`*gorm.DB` 在链式调用时会克隆一个新的 Statement，但在某些情况下（比如已经执行过的 db 实例再次链式调用）条件会累积；`Session` 方法创建一个“干净”的新会话；
+- **钩子和默认行为**：Create / Update 会自动更新 `CreatedAt`、`UpdatedAt`，自动处理关联（`Save` 时可能连关联对象一起保存），这些“魔法”在复杂场景下容易出意外。
+
+**代码示例**
+
+```go
+// 零值更新的三种正确写法
+db.Model(&user).Updates(map[string]any{"status": 0, "nickname": ""})
+db.Model(&user).Select("status", "nickname").Updates(User{Status: 0, Nickname: ""})
+db.Model(&user).Update("status", 0)
+
+// 复用查询条件：用 Session 避免条件累积
+base := db.Model(&Order{}).Where("shop_id = ?", shopID).Session(&gorm.Session{})
+var total int64
+base.Count(&total)
+var page []Order
+base.Order("id DESC").Limit(20).Find(&page)
+
+// 避免 N+1
+var orders []Order
+db.Preload("Items").Where("user_id = ?", uid).Find(&orders) // 两条 SQL，而不是 1 + N 条
+
+// 打印生成的 SQL（调试用）
+db.Debug().Where("id = ?", 1).First(&user)
+```
+
+**常见追问**
+
+- 软删除的数据怎么查询？→ `db.Unscoped().Where(...).Find(&users)`。
+- GORM 的性能怎么样？→ 有反射开销，比原生 `database/sql` 慢一些；性能敏感的查询可以用 `Raw` 写原生 SQL，或者使用 sqlc 这类从 SQL 生成代码的工具。
+- 怎么防止误操作全表更新？→ GORM 默认就会拦截没有 WHERE 的 Update / Delete，返回 `ErrMissingWhereClause`。
+
+**实战建议**
+
+- 开启慢查询日志和 SQL 日志（开发环境），定期审查生成的 SQL。
+- 复杂查询直接写 SQL，ORM 适合简单的增删改查。
+
+=== db-21
+--- deep
+**原理展开**
+
+占位符为什么能防注入：参数和 SQL 结构是**分开传递**的。
+
+- **服务端预处理**（`interpolateParams=false`，go-sql-driver/mysql 的默认值）：先发送带 `?` 的 SQL 给数据库编译，再单独发送参数，数据库永远把参数当作值，不会当作 SQL 的一部分；
+- **客户端插值**（`interpolateParams=true`）：驱动在客户端把参数转义后拼进 SQL，减少一次网络往返，转义由驱动保证正确（但要求连接的字符集是安全的）。
+
+无论哪种方式，前提都是**参数通过占位符传递**。只要有任何一部分 SQL 是用户输入拼接出来的，就可能被注入。
+
+**代码示例**
+
+```go
+// 动态 IN 列表：生成对应数量的占位符，值仍然作为参数
+func inQuery(ids []int64) (string, []any) {
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	return "SELECT id, name FROM users WHERE id IN (" + ph + ")", args
+}
+
+// LIKE 查询：通配符也要转义，否则用户输入 % 会匹配所有数据
+func likeArg(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return "%" + r.Replace(s) + "%"
+}
+rows, err := db.QueryContext(ctx, "SELECT id FROM products WHERE name LIKE ?", likeArg(keyword))
+```
+
+**常见追问**
+
+- 预处理语句会影响性能吗？→ 每次查询多一次往返（Prepare + Execute）；频繁执行的语句可以用 `db.Prepare` 复用，或者开启客户端插值。
+- 只做了输入过滤（比如去掉单引号）可以吗？→ 不可靠，各种编码、注释、宽字节技巧都可能绕过。
+- NoSQL 有注入问题吗？→ 有，比如 MongoDB 的查询如果直接使用用户提交的 JSON 对象，攻击者可以注入 `{"$gt": ""}` 这样的操作符。
+
+**实战建议**
+
+- 代码评审时重点检查所有 `fmt.Sprintf` / 字符串拼接生成 SQL 的地方。
+- 使用 `gosec` 等静态分析工具（规则 G201、G202 检查 SQL 字符串拼接）。

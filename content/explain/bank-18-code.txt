@@ -1,0 +1,403 @@
+=== code-01-1
+--- explain
+**思路**
+
+原题代码的两个问题：
+
+1. channel 无缓冲，超时返回后没人接收，执行 `slowCall` 的 goroutine 永远阻塞在 `ch <- ...` 上，每次超时就泄漏一个 goroutine；
+2. 自己用 `time.After` 计时，没有基于传入的 ctx：上游取消时不会停止，`slowCall` 也不知道截止时间，超时后仍然在白白工作。
+
+**代码讲解**
+
+1. `ctx, cancel := context.WithTimeout(ctx, timeout)` + `defer cancel()`：超时和上游取消都会让这个 ctx 结束。
+2. `ch := make(chan string, 1)`：**缓冲为 1**，即使没人接收，goroutine 也能完成发送并退出。
+3. `slowCall(ctx)`：把 ctx 传下去，下游可以感知取消、提前结束。
+4. `select`：结果先到就返回结果；`ctx.Done()` 先到就返回 `ctx.Err()`（`DeadlineExceeded` 或 `Canceled`）。
+
+**易错点**
+
+- 只加缓冲不传 ctx：不泄漏了，但下游超时后仍然在执行（浪费资源，可能还持有数据库连接）。
+- 只传 ctx 不加缓冲：如果下游不响应 ctx（比如某个不支持 context 的库），仍然会泄漏。两个修复都要做。
+
+=== code-02-1
+--- explain
+**思路**
+
+值接收者的方法拿到的是接收者的**副本**。结构体里的 `sync.Mutex` 也被复制了，每次调用锁的都是一把新锁，goroutine 之间根本没有互斥。而 map 字段复制的只是“引用”，所有副本指向同一个哈希表，于是多个 goroutine 无锁地并发写 map，直接崩溃。
+
+**代码讲解**
+
+1. 所有方法改成**指针接收者** `(c *Counter)`，锁和 map 都是同一份。
+2. `NewCounter` 返回 `*Counter`，并初始化 map。
+3. `Get` 也要加锁：读和写并发也是数据竞争。
+
+**易错点**
+
+- 包含锁的结构体**绝不能被复制**：不要按值传参、不要放在 `[]Counter` 里用 `for _, c := range` 遍历、不要作为 map 的值类型。
+- `go vet` 的 copylocks 检查能发现这类问题：`passes lock by value: Counter contains sync.Mutex`。
+- 一个类型只要有方法需要修改状态或者包含锁，就把所有方法都写成指针接收者。
+
+=== code-03-1
+--- explain
+**思路**
+
+`defer` 在**函数返回**时才执行，而不是在循环的每一轮结束时。循环里 `defer f.Close()`，处理一万个文件时，一万个文件都一直开着，直到函数结束，很快就会 `too many open files`。修复方法：把每一轮的逻辑放进一个函数里，defer 就在每一轮结束时执行。
+
+**代码讲解**
+
+1. `if err := func() error { ... }(); err != nil`：定义一个匿名函数并**立即调用**，它的返回值直接用在 if 的初始化语句里。
+2. 匿名函数内部：打开 → 出错返回 → `defer f.Close()` → `return process(f)`。匿名函数返回时文件就关闭了。
+3. 闭包直接使用循环变量 `p`（Go 1.22 起每次迭代都是新变量）。
+
+**易错点**
+
+- 不用 defer、在循环末尾直接 `f.Close()`：`process` 出错提前 return 或者 panic 时，文件就不会被关闭。
+- 抽成一个具名函数 `processOne(path)` 更清楚，效果相同。
+- `Close()` 的错误这里被忽略了；对**写入**的文件，Close 的错误可能意味着数据没有落盘，应该检查（见语法卡片「命名返回值」中的例子）。
+
+=== code-04-1
+--- explain
+**思路**
+
+原题代码的三个问题：`wg.Add(1)` 写在 goroutine 里（`Wait` 可能提前返回）；多个 goroutine 并发 `append` 同一个切片（数据竞争，结果会丢失）；忽略错误，也不限制并发数。修复：
+
+- 预分配结果切片，每个 goroutine 只写自己的下标；
+- 用信号量限制并发数；
+- 第一个错误发生时记录它并取消 ctx，让其他请求尽快停止（这就是 errgroup 的行为）。
+
+**代码讲解**
+
+1. `ctx, cancel := context.WithCancel(ctx)`：出错时调用 cancel；`defer cancel()` 保证函数返回时释放。
+2. `wg.Add(1)` 在 `go` 之前。
+3. 获取信号量放在 select 里，同时监听 `ctx.Done()`：已经出错时，排队中的 goroutine 不再发起请求。
+4. `once.Do(...)`：只记录第一个错误，`fmt.Errorf("fetch %s: %w", u, err)` 保留原始错误链。
+5. `results[i] = body`：写不同的下标不是数据竞争。
+6. `wg.Wait()` 之后读取 `firstErr` 是安全的：WaitGroup 保证了 goroutine 里的写入对 Wait 之后可见。
+
+**易错点**
+
+- 用一个 `chan error` 收集错误时要注意缓冲大小，否则后面出错的 goroutine 会阻塞。
+- 实际项目直接用 `golang.org/x/sync/errgroup`：`g, ctx := errgroup.WithContext(ctx); g.SetLimit(limit); g.Go(...)`。
+
+=== code-05-1
+--- explain
+**思路**
+
+两个 goroutine 交替执行，就像传球：只有拿到“球”（从自己的 channel 收到信号）的一方才能打印，打印完把球传给对方。两个**无缓冲** channel 保证了严格的交替：发送方要等对方接收才能继续。
+
+**代码讲解**
+
+1. `oddTurn`、`evenTurn` 两个无缓冲 channel。
+2. 奇数 goroutine：`for i := 1; i <= n; i += 2`，等 `oddTurn` → 打印 → 如果还有下一个数（`i+1 <= n`）就把球传给偶数。
+3. 偶数 goroutine 对称。
+4. 主 goroutine 发出第一个信号 `oddTurn <- struct{}{}` 开球，然后 `wg.Wait()`。
+5. 最后一个数打印后**不再传球**：如果传了，对方的循环已经结束，没人接收，就会永远阻塞（无缓冲）。
+
+**易错点**
+
+- 不判断 `i+1 <= n` 就传球：n 是奇数时，奇数 goroutine 最后一次发送会永远阻塞，`wg.Wait()` 死锁。
+- 用一个共享变量 + 锁 + 忙等待也能实现，但会空转浪费 CPU；用 `sync.Cond` 也可以，但 channel 的写法最清楚。
+
+=== code-05-2
+--- explain
+**思路**
+
+推广到三个 goroutine：准备三个 channel，第 i 个 goroutine 等待 `turns[i]`，打印后通知下一个 `turns[(i+1)%3]`，形成一个环。主 goroutine 给第一个发信号开始。
+
+**代码讲解**
+
+1. `turns := make([]chan struct{}, 3)` 然后逐个 `make`：切片里的 channel 默认是 nil，必须初始化。
+2. `for i, l := range letters` 启动三个 goroutine，每个循环 `rounds` 次。
+3. `<-turns[i]` → `print(l)` → `turns[(i+1)%3] <- struct{}{}`，取模让 C 之后回到 A。
+4. **最后一轮的最后一个（C）**打印完直接 return，不再通知 A：A 的循环已经结束，没人接收。
+5. `rounds > 0` 时才开球。
+
+**易错点**
+
+- 忘记最后一次不发送：C 永远阻塞在发送上，`wg.Wait()` 死锁。
+- 这类题的通用模式：N 个 goroutine、N 个 channel 围成一个环，信号沿着环传递。
+
+=== code-06-1
+--- explain
+**思路**
+
+worker 池的关键难点是**关闭**：`Shutdown` 要关闭任务 channel 让 worker 退出，但关闭的同时可能还有 goroutine 在 `Submit` 里往 channel 发送，向已关闭的 channel 发送会 panic。用读写锁解决：`Submit` 持读锁检查标记并发送（多个 Submit 可以并发），`Shutdown` 持写锁设置标记并关闭 channel（会等待所有持读锁的 Submit 完成）。
+
+**代码讲解**
+
+1. `NewPool` 启动 workers 个 goroutine，`for task := range p.tasks` 消费。
+2. `Submit`：读锁内检查 `closed`，已关闭返回 `ErrClosed`；否则发送（队列满时阻塞）。
+3. `Shutdown`：写锁内设置 `closed` 并 `close(p.tasks)`，`if !p.closed` 保证重复调用不会重复关闭。
+4. 关闭后 worker 会把缓冲里剩余的任务处理完再退出。用一个 goroutine 执行 `p.wg.Wait()` 然后关闭 `done`，主流程用 select 同时等待 `done` 和 `ctx.Done()`，支持超时。
+
+**易错点**
+
+- `Submit` 在队列满时阻塞会一直持有读锁，`Shutdown` 获取写锁时要等它发送成功；只要 worker 还在运行，队列迟早会有空位，不会死锁。
+- `Shutdown` 超时返回时，后台那个等待的 goroutine 仍然在运行，等所有任务完成后才会退出。
+- 不要用 `recover` 捕获“向已关闭的 channel 发送”的 panic 来实现关闭，那是在掩盖设计问题。
+
+=== code-07-1
+--- explain
+**思路**
+
+并发执行所有调用，用一个 channel 收集结果。主 goroutine 依次接收：遇到错误**立即返回**（defer 里的 cancel 会通知其他调用停止）；同时监听 ctx 的超时。结果 channel 的缓冲等于调用数，即使提前返回，剩下的 goroutine 也能把结果放进缓冲然后退出，不会泄漏。
+
+**代码讲解**
+
+1. `context.WithTimeout` 设置整体超时，`defer cancel()`：无论从哪里返回，都会取消其余调用。
+2. 局部类型 `result` 带上下标 `i`：结果是乱序到达的，靠下标放回正确的位置。
+3. `ch := make(chan result, len(calls))`：足够的缓冲。
+4. `for range calls` 接收 n 次，每次 select：拿到结果就检查错误；超时就返回 `ctx.Err()`。
+
+**易错点**
+
+- 缓冲不够：提前返回后，后完成的 goroutine 阻塞在发送上，泄漏。
+- 超时后返回的是 `context.DeadlineExceeded`，调用方可以用 `errors.Is` 判断。
+- 如果下游不响应 ctx，取消后它们仍会运行到结束，但因为有缓冲，最终都能退出。
+
+=== code-08-1
+--- explain
+**思路**
+
+令牌桶：以固定速率往桶里放令牌，桶满了就不再放；请求要拿到令牌才能通过。空闲时令牌会积攒（最多 burst 个），所以允许一定程度的**突发**，长期平均速率又被限制在 rate。实现时不需要定时器，每次请求时根据经过的时间**计算**应该补充多少令牌。
+
+**代码讲解**
+
+1. 初始 `tokens: float64(burst)`：桶是满的。令牌数用 float64，因为经过的时间可能只补充了“半个”令牌。
+2. `AllowN`：加锁 → 补充令牌 `min(b.burst, b.tokens + 经过秒数 × rate)` → 更新 `last` → 令牌不够返回 false（不扣减）→ 够就扣减。
+3. `Allow()` 直接调用 `AllowN(1)`。
+4. `now` 通过函数注入，测试可以精确控制时间。
+
+**易错点**
+
+- 补充时忘记以 burst 封顶：长时间空闲后会积攒大量令牌，突发流量远超预期。
+- 令牌不够时也扣减（变成负数）：相当于“预支”，这是另一种语义（`rate.Limiter` 的 `Reserve` 就是这样，并告诉你要等多久）。
+- 标准扩展库：`golang.org/x/time/rate`，`limiter.Allow()`、`limiter.Wait(ctx)`（阻塞等待令牌）。
+
+=== code-09-1
+--- explain
+**思路**
+
+固定窗口计数在窗口边界处有问题：上一个窗口最后 1 秒和下一个窗口第 1 秒各放过 limit 个，2 秒内放过了 2 倍的请求。**滑动窗口计数器**用两个相邻窗口的计数近似一个滑动的窗口：当前窗口已经过去了 x%，就假设上一个窗口的请求里有 (1 − x%) 落在滑动窗口内，估算值 = `prev × (1 − x%) + cur`。只需要两个计数器，内存 O(1)。
+
+**代码讲解**
+
+1. 切换窗口：距离当前窗口起点超过一个窗口长度时，`prev` 取当前计数（相邻）或者 0（中间空了整整一个窗口），`cur` 归零，新起点 `now.Truncate(s.window)` 对齐到窗口边界。
+2. `if elapsed := ...; elapsed >= s.window`：if 的初始化语句里计算经过的时间。
+3. `weight := 1 - float64(now.Sub(s.curStart))/float64(s.window)`：`time.Duration` 转成 float64 再相除。
+4. 估算值达到 limit 就拒绝，否则 `cur++`。
+
+**易错点**
+
+- 这是一个**近似**算法（假设上一个窗口的请求是均匀分布的），实践中误差很小，是很多网关采用的方案。
+- 精确的滑动日志：记录每个请求的时间戳（Redis ZSET，ZREMRANGEBYSCORE 删除窗口外的，ZCARD 计数），内存和请求量成正比。
+- 初始时 `curStart` 是零值时间，第一次调用必然触发窗口切换，`prev` 被设为 0。
+
+=== code-10-1
+--- explain
+**思路**
+
+singleflight 合并同一个 key 的并发调用：第一个调用者真正执行 fn，后来者等待并共享结果。用 map 记录“正在进行的调用”，每个调用有一个 WaitGroup，后来者 `Wait` 等它完成。`Forget` 用于让后续的调用不再共享正在进行的这次（比如发现结果可能已经过期）。
+
+**代码讲解**
+
+1. 加锁后检查 map；零值的 Group 可以直接使用（懒初始化 map）。
+2. 已有调用：**先解锁再 Wait**（持锁等待会阻塞所有 key 的调用），返回共享的结果和 `shared = true`。
+3. 没有：创建 `call`，`wg.Add(1)`，放进 map，解锁，执行 fn，`wg.Done()` 唤醒等待者。
+4. 删除记录时检查 `g.m[key] == c`：如果中途调用了 `Forget`，并且之后又有新的调用占用了这个 key，不能把**新的**记录删掉。
+5. 命名返回值 `(v any, err error, shared bool)` 让三个返回值的含义清楚。
+
+**易错点**
+
+- 不检查 `g.m[key] == c` 就删除：会删掉 Forget 之后新创建的记录，导致新一轮的合并失效。
+- fn panic 时，`wg.Done()` 不会执行，等待者会永远阻塞；真实的 `x/sync/singleflight` 处理了 panic 和 `runtime.Goexit` 的情况。
+- 共享的结果如果是指针或切片，所有调用者拿到的是同一个对象，修改它要小心。
+
+=== code-11-1
+--- explain
+**思路**
+
+发布订阅：每个订阅者一个带缓冲的 channel，按主题分组保存。发布时**非阻塞**地发给该主题的所有订阅者，某个订阅者处理得慢（缓冲满了）就丢弃给它的这条消息，不能拖慢发布者和其他订阅者。关键是保证“关闭后不再发送”：所有发送都在读锁里进行，所有关闭都在写锁里进行。
+
+**代码讲解**
+
+1. `subs map[string]map[int]chan string`：主题 → (订阅 ID → channel)。用 ID 而不是切片下标，取消订阅时可以直接删除。
+2. `Subscribe`：已关闭时返回一个已关闭的 channel（订阅者的 `for range` 会立即结束）。返回的取消函数是一个闭包，捕获了 topic 和 id；`if c, ok := ...; ok` 保证重复调用不会重复关闭。
+3. `Publish`：读锁内遍历，`select { case ch <- msg: n++; default: }` 非阻塞发送。
+4. `Close`：写锁内关闭所有 channel，并清空订阅表，之后 Publish 找不到订阅者，返回 0。
+
+**易错点**
+
+- 在读锁里关闭 channel：另一个持读锁的 Publish 可能正在向它发送，panic。
+- 返回 `<-chan string`（只读）：订阅者不能关闭它，也不能往里发送。
+- 丢消息是这个设计的取舍；不能丢消息时，要么给订阅者足够大的缓冲，要么让慢订阅者断开（见「广播 Hub」一题），或者使用持久化的消息队列。
+
+=== code-12-1
+--- explain
+**思路**
+
+优雅停止的关键是**关闭顺序**：
+
+1. 收到退出信号（ctx 取消）后，生产者停止生产；
+2. 所有生产者都退出后，由一个**协调者**关闭任务 channel（只有它知道“不会再有人发送了”）；
+3. 消费者用 `for range` 把**已经入队**的任务全部处理完，然后退出；
+4. Run 等所有消费者退出后返回。
+
+**代码讲解**
+
+1. 生产者：`produce(ctx)` 返回 false 表示没有更多任务。发送放在 select 里同时监听 `ctx.Done()`：消费者都在忙、队列满了的时候，生产者不会因为阻塞在发送上而无法退出。
+2. 协调者：`go func() { prod.Wait(); close(jobs) }()`。必须在单独的 goroutine 里：主 goroutine 还要去启动消费者，如果在这里同步等待生产者，消费者还没启动，生产者会阻塞在发送上，死锁。
+3. 消费者：`for job := range jobs`，channel 关闭且读空后退出。
+4. `cons.Wait()` 后返回。
+
+**易错点**
+
+- 生产者自己关闭 channel：其他生产者还在发送，panic。
+- 消费者也监听 ctx 并直接退出：已经入队的任务会被丢掉。是否需要“处理完再退出”取决于业务，这道题要求处理完。
+- 每个生产者最多丢失一个任务：已经 produce 出来、但因为 ctx 取消没有送进队列的那一个。
+
+=== code-13-1
+--- explain
+**思路**
+
+fan-in：为每个输入 channel 启动一个转发 goroutine，把数据转发到同一个输出 channel。所有转发 goroutine 都结束（所有输入都关闭了）之后，才能关闭输出，所以用 WaitGroup + 一个单独的关闭 goroutine。
+
+**代码讲解**
+
+1. `func Merge[T any](chs ...<-chan T) <-chan T`：泛型 + 可变参数，任意元素类型、任意数量的输入。
+2. 每个输入一个 goroutine：`for v := range ch { out <- v }`。
+3. `go func() { wg.Wait(); close(out) }()`：Merge 本身不能阻塞，立即返回输出 channel，关闭的工作交给后台 goroutine。
+4. 没有输入时：WaitGroup 计数为 0，`wg.Wait()` 立即返回，输出马上被关闭，正好满足要求。
+
+**易错点**
+
+- 在某个转发 goroutine 里关闭输出：其他转发 goroutine 还在发送，panic。
+- 在 Merge 里同步 `wg.Wait()`：调用方还没开始读取，转发 goroutine 阻塞在发送上，死锁。
+- 完整的版本还应该接收一个 ctx：下游不再读取时，转发 goroutine 可以退出（发送放进 select）。
+- 不同输入之间的数据没有顺序保证。
+
+=== code-13-2
+--- explain
+**思路**
+
+和归并排序的“合并”一样：分别缓存两边当前读到的值，每次输出较小的那个，再从那一边补读一个。用 `v, ok := <-ch` 判断某一边是否已经读完（channel 已关闭）。
+
+**代码讲解**
+
+1. 开始时各读一个：`va, okA := <-a`、`vb, okB := <-b`。
+2. `for okA || okB`：还有任何一边没读完就继续。
+3. 输出 a 的条件：`okA && (!okB || va <= vb)`，即 a 还有数据，并且 b 已经读完或者 a 的值更小（相等时取 a，保持稳定）。
+4. 输出后从同一边补读：`va, okA = <-a`。
+5. `defer close(out)`：两边都读完后关闭输出。
+
+**易错点**
+
+- 某一边读完后，`<-a` 会不停地返回零值和 false，必须用 ok 判断，不能只看值。
+- 每次循环都从两边各读一个再比较：较大的那个值就丢了。
+- 推广到 K 路合并时用最小堆（见「拉模式：合并多个有序 Feed」）。
+
+=== code-14-1
+--- explain
+**思路**
+
+LRU（最近最少使用）缓存：map 负责 O(1) 查找，双向链表负责维护使用顺序（头部最近使用，尾部最久未使用）。访问时把元素移到头部，容量满了淘汰尾部。注意 **`Get` 也会修改链表**（移到头部），所以不能用读锁，必须用互斥锁。
+
+**代码讲解**
+
+1. `items map[string]*list.Element`：key → 链表节点；节点的 `Value` 存 `*entry`，entry 里保存 key，淘汰时才能从 map 里删除。
+2. `Get`：命中时 `MoveToFront`，`e.Value.(*entry).val` 类型断言后取值。
+3. `Put`：已存在就更新值并移到头部；不存在就 `PushFront` 并放进 map，超过容量时取 `Back()` 淘汰。
+4. 所有方法都用同一把 Mutex。
+
+**易错点**
+
+- `Get` 用读锁：多个 goroutine 同时 `MoveToFront` 会破坏链表结构。
+- 一把锁在高并发下会成为瓶颈，常见的优化是**分片**（按 key 哈希到多个 LRU），或者用更适合并发的近似算法（如 Ristretto 用的 TinyLFU、CLOCK）。
+- 见语法卡片「container/list 双向链表」里同样的例子。
+
+=== code-15-1
+--- explain
+**思路**
+
+过期删除的两种策略结合（和 Redis 一样）：**惰性删除**（读到过期的条目时删除），**定期删除**（后台 goroutine 定时扫描清理，防止不再被访问的条目一直占用内存）。后台 goroutine 必须能被停止，否则每创建一个缓存就泄漏一个 goroutine。
+
+**代码讲解**
+
+1. `NewTTLCache` 启动后台 goroutine：Ticker 定时调用 `cleanup()`，收到 `stop` 信号就退出；退出时 `close(c.done)`。
+2. `cleanup`：加锁遍历，删除过期条目（range 中删除是安全的）。
+3. `Get`：`!c.now().Before(it.expire)` 即“当前时间 ≥ 过期时间”，过期就删除并返回不存在。
+4. `Stop`：`c.once.Do(func() { close(c.stop) })` 保证可以重复调用；然后 `<-c.done` **等后台 goroutine 真正退出**再返回。
+
+**易错点**
+
+- 只关闭 stop 不等 done：调用方以为已经停止了，后台 goroutine 可能还在执行最后一次清理。
+- 条目很多时，一次清理全部会长时间持有锁。Redis 的做法是每次只随机抽查一部分，过期比例高才继续。
+- `sync.Once` 加 channel 是实现“可重复调用的关闭”的常用组合。
+
+=== code-16-1
+--- explain
+**思路**
+
+重试的三个要点：
+
+1. 只重试**暂时性**的错误；
+2. **指数退避**：每次等待时间翻倍，给下游恢复的时间，并设置上限；
+3. **随机抖动**：避免大量客户端在同一时刻重试（惊群）。Equal Jitter：等待 `backoff/2 + 随机(0, backoff/2)`，既保证有一个最小的等待，又分散开。
+
+**代码讲解**
+
+1. `retryable`：`var te interface{ Timeout() bool }` 声明一个**匿名接口类型**的变量，`errors.As(err, &te)` 会在错误链上找实现了这个方法的错误（`net.Error` 就实现了它）；再检查 `ErrUnavailable`。
+2. 循环最多 `attempts` 次：成功返回 nil；不可重试或者已经是最后一次，直接返回错误（最后一次失败后不再等待）。
+3. `d := backoff/2 + time.Duration(randN(int64(backoff/2)+1))`：`time.Duration` 和 int64 之间要显式转换。
+4. `sleep` 返回错误（ctx 被取消）时，用 `errors.Join` 同时返回最后一次的业务错误和 ctx 错误，调用方用 `errors.Is` 能匹配其中任何一个。
+5. `backoff = min(backoff*2, maxDelay)`。
+
+**易错点**
+
+- 用 `time.Sleep` 等待：ctx 被取消后仍然要睡完，无法及时退出。`TimerSleep` 用 select 同时等待定时器和 ctx。
+- 随机数和 sleep 都通过参数注入，测试可以验证每次的等待时长，而不需要真的等待。
+- 还要配合**重试预算**（见「重试策略与重试预算」）防止重试风暴。
+
+=== code-17-1
+--- explain
+**思路**
+
+日志中间件需要知道 handler 写了什么状态码，但 `http.ResponseWriter` 没有提供读取状态码的方法。办法是**包装**它：嵌入原始的 ResponseWriter，重写 `WriteHeader` 记录状态码，其他方法自动转发。panic 恢复用 defer + recover，同样在 defer 里记录日志，保证每个请求都恰好记录一次。
+
+**代码讲解**
+
+1. `recorder` 嵌入 `http.ResponseWriter`，`Header()` 等方法自动提升。
+2. `WriteHeader`：只记录第一次的状态码（重复调用无效），然后转发。
+3. `Write`：handler 没调用 WriteHeader 直接写响应体时，状态码是 200；先调用自己的 WriteHeader 记录下来。
+4. 中间件：`rec := &recorder{ResponseWriter: w, status: http.StatusOK}`，把 rec 传给下一个 handler。
+5. defer 里先 recover：panic 时如果还没写过响应头，返回 500；日志的状态码设为 500。然后统一填写状态码、耗时并记录。
+
+**易错点**
+
+- 包装 ResponseWriter 会“隐藏”原始对象实现的其他接口（`http.Flusher`、`http.Hijacker`），流式响应和 WebSocket 可能失效。Go 1.20 的 `http.ResponseController` 通过 `Unwrap() http.ResponseWriter` 方法解决这个问题，包装类型应该实现它。
+- 已经写出部分响应后再 panic，状态码无法修改了，客户端会收到一个不完整的响应。
+- `http.ErrAbortHandler` 这种特殊的 panic 用来主动中止请求，严谨的 recover 中间件会把它重新抛出。
+
+=== code-18-1
+--- explain
+**思路**
+
+熔断器的三种状态：
+
+- **关闭**：正常调用，统计连续失败次数，达到阈值就打开；
+- **打开**：直接返回错误，不调用下游（让下游有时间恢复，也让调用方快速失败）；冷却时间过后进入半开；
+- **半开**：只放行一个**探测**请求，成功说明下游恢复了，关闭熔断器；失败就重新打开。
+
+**代码讲解**
+
+1. `State` 用 iota 定义三个常量。
+2. `Do` 分三步：`allow()` 判断是否放行 → 调用 fn（**不持有锁**，下游可能很慢）→ `record(err)` 记录结果。两个辅助方法各自加锁。
+3. `allow`：打开状态下检查冷却时间，到期就切换到半开并放行这一个探测（`probing = true`）；半开状态下已经有探测在进行，其他请求都拒绝。
+4. `record` 用无条件 switch：半开时成功 → 关闭并清零；半开时失败 → 重新打开并重新计时；关闭时成功清零、失败计数，达到阈值打开。
+5. 多重赋值同时更新多个字段：`b.state, b.failures, b.probing = Closed, 0, false`。
+
+**易错点**
+
+- 调用 fn 时持有锁：所有请求被串行化，熔断器自己成了瓶颈。
+- 半开时不限制探测数量：下游刚恢复就被大量请求再次打垮。
+- 生产环境通常用**滑动窗口内的错误率**（而不是连续失败次数）作为打开条件，并要求窗口内有最少的请求数，避免低流量时一两次失败就熔断。常用的库有 `sony/gobreaker`。

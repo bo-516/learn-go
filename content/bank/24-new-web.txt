@@ -1,0 +1,863 @@
+Web 与 HTTP 服务新增题目（WEB-23 ~ WEB-29）的编程任务。
+
+=== web-23-1
+title: 解析 HTTP Range 请求头并构造 206 Partial Content 响应
+--- desc
+实现 `ParseSingleRange(rangeHeader string, size int64) (start, end int64, ok bool)`：
+
+解析形如 `"bytes=start-end"`、`"bytes=start-"` 或后缀形式 `"bytes=-suffixLen"` 的单区间 HTTP `Range` 请求头（文件的总字节数为 `size > 0`），返回闭区间 `[start, end]`（其中 `0 <= start <= end < size`）：
+
+1. 必须以 `"bytes="` 开头，且包含 `'-'`；
+2. `"bytes=100-499"`：`start = 100, end = 499`；如果 `end >= size`，按 HTTP 规范自动截断为 `end = size - 1`；若 `start >= size` 或 `start > end`，返回 `false`；
+3. `"bytes=100-"`（省略 `end`）：从 `start = 100` 一直到文件末尾 `end = size - 1`（要求 `0 <= start < size`）；
+4. `"bytes=-200"`（省略 `start` 的后缀范围）：取文件最后 `200` 个字节，即 `start = max(0, size - 200), end = size - 1`（要求后缀长度 `> 0`）。
+--- solution
+package main
+
+import (
+	"strconv"
+	"strings"
+)
+
+func ParseSingleRange(rangeHeader string, size int64) (start, end int64, ok bool) {
+	if size <= 0 || !strings.HasPrefix(rangeHeader, "bytes=") {
+		return 0, 0, false
+	}
+	spec := strings.TrimPrefix(rangeHeader, "bytes=")
+	// @solution
+	left, right, found := strings.Cut(spec, "-")
+	if !found || (left == "" && right == "") {
+		return 0, 0, false
+	}
+	if left == "" {
+		// 后缀格式 bytes=-suffix
+		suffix, err := strconv.ParseInt(right, 10, 64)
+		if err != nil || suffix <= 0 {
+			return 0, 0, false
+		}
+		start = max(int64(0), size-suffix)
+		return start, size - 1, true
+	}
+	s, err := strconv.ParseInt(left, 10, 64)
+	if err != nil || s < 0 || s >= size {
+		return 0, 0, false
+	}
+	if right == "" {
+		return s, size - 1, true
+	}
+	e, err := strconv.ParseInt(right, 10, 64)
+	if err != nil || e < s {
+		return 0, 0, false
+	}
+	if e >= size {
+		e = size - 1
+	}
+	return s, e, true
+	// @starter
+	// _ = spec // TODO: 解析 start-end、start- 和 -suffix 三种格式
+	// return 0, 0, false
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestParseSingleRange(t *testing.T) {
+	const size = 1000
+	cases := []struct {
+		hdr       string
+		wantStart int64
+		wantEnd   int64
+		wantOK    bool
+	}{
+		{"bytes=0-499", 0, 499, true},
+		{"bytes=500-999", 500, 999, true},
+		{"bytes=500-2000", 500, 999, true}, // 超出 size 截断到 size-1
+		{"bytes=800-", 800, 999, true},
+		{"bytes=-200", 800, 999, true},
+		{"bytes=-5000", 0, 999, true},
+		{"bytes=1000-1200", 0, 0, false}, // start >= size (416)
+		{"bytes=500-400", 0, 0, false},   // start > end
+		{"bytes=-0", 0, 0, false},
+		{"bytes=-", 0, 0, false},
+		{"items=0-10", 0, 0, false},
+	}
+	for _, tc := range cases {
+		s, e, ok := ParseSingleRange(tc.hdr, size)
+		if ok != tc.wantOK || (ok && (s != tc.wantStart || e != tc.wantEnd)) {
+			t.Errorf("ParseSingleRange(%q, %d) = (%d, %d, %v), want (%d, %d, %v)",
+				tc.hdr, size, s, e, ok, tc.wantStart, tc.wantEnd, tc.wantOK)
+		}
+	}
+}
+--- explain
+**思路**
+
+用 `strings.Cut(spec, "-")` 将 `"bytes="` 之后的部分拆为 `left` 和 `right`：
+- 当 `left == ""` 时，是请求文件尾部的后缀范围 `bytes=-N`，起点为 `max(0, size - N)`，终点为 `size - 1`；
+- 当 `left != ""` 时，先解析 `start` 并确认 `0 <= start < size`；若 `right == ""` 则终点为 `size - 1`，否则解析 `end`、确认 `end >= start` 并将超出文件末尾的 `end` 截断为 `size - 1`。
+
+**代码讲解**
+
+1. `left, right, found := strings.Cut(spec, "-")`：清晰区分横杠左右两部分。
+2. `start = max(int64(0), size-suffix)`：如果请求的尾部字节数超过了整个文件大小，则返回整个文件 `[0, size-1]`。
+3. `if e >= size { e = size - 1 }`：RFC 9110 规定，当请求的 `end` 超过资源长度时，自动截断到最后一个字节 `size - 1`。
+
+**易错点**
+
+- 注意 `start == size` 是越界请求（因为字节下标最大是 `size - 1`），应返回 `false`（对应 HTTP `416 Range Not Satisfiable`）。
+
+=== web-24-1
+title: 实现标准 SSE（Server-Sent Events）事件格式化与流式写出 Handler
+--- desc
+实现 SSE 服务端推送的核心逻辑：
+
+1. `FormatSSE(id, event, data string) string`：
+   - 如果 `id != ""`，输出一行 `"id: " + id + "\n"`；
+   - 如果 `event != ""`，输出一行 `"event: " + event + "\n"`；
+   - 将 `data` 按 `"\n"` 拆分为多行，**每一行**都输出为 `"data: " + line + "\n"`（即使 `data` 为空字符串 `""` 也要输出一行 `"data: \n"`）；
+   - 最后额外追加一个换行符 `"\n"` 标志事件结束；
+2. `ServeSSE(w http.ResponseWriter, r *http.Request, messages []string)`：设置 `Content-Type: text/event-stream` 和 `Cache-Control: no-cache` 响应头，依次将每条消息用 `FormatSSE(strconv.Itoa(i+1), "msg", m)` 写入 `w` 并调用 `http.NewResponseController(w).Flush()`。
+--- solution
+package main
+
+import (
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+)
+
+func FormatSSE(id, event, data string) string {
+	var sb strings.Builder
+	// @solution
+	if id != "" {
+		sb.WriteString("id: ")
+		sb.WriteString(id)
+		sb.WriteByte('\n')
+	}
+	if event != "" {
+		sb.WriteString("event: ")
+		sb.WriteString(event)
+		sb.WriteByte('\n')
+	}
+	for _, line := range strings.Split(data, "\n") {
+		sb.WriteString("data: ")
+		sb.WriteString(line)
+		sb.WriteByte('\n')
+	}
+	sb.WriteByte('\n')
+	// @starter
+	// // TODO: 按 SSE 规范格式化 id、event、多行 data 及结尾空行
+	// @end
+	return sb.String()
+}
+
+func ServeSSE(w http.ResponseWriter, r *http.Request, messages []string) {
+	// @solution
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	rc := http.NewResponseController(w)
+	for i, m := range messages {
+		_, _ = io.WriteString(w, FormatSSE(strconv.Itoa(i+1), "msg", m))
+		_ = rc.Flush()
+	}
+	// @starter
+	// // TODO: 设置 SSE 响应头，逐条写入 FormatSSE 并调用 Flush
+	// @end
+}
+--- test
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestFormatSSEAndServe(t *testing.T) {
+	got := FormatSSE("42", "token", "line1\nline2")
+	want := "id: 42\nevent: token\ndata: line1\ndata: line2\n\n"
+	if got != want {
+		t.Fatalf("FormatSSE = %q, want %q", got, want)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	rec := httptest.NewRecorder()
+	ServeSSE(rec, req, []string{"hello", "world"})
+
+	if ct := rec.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+	}
+	if !rec.Flushed {
+		t.Fatal("expected ResponseWriter to be flushed")
+	}
+	wantBody := "id: 1\nevent: msg\ndata: hello\n\nid: 2\nevent: msg\ndata: world\n\n"
+	if rec.Body.String() != wantBody {
+		t.Fatalf("body = %q, want %q", rec.Body.String(), wantBody)
+	}
+}
+--- explain
+**思路**
+
+SSE 规范规定每条事件由若干 `field: value\n` 行加上末尾的一个空行 `\n` 构成。如果 `data` 本身包含换行符 `\n`，必须拆成多个连续的 `data: ...\n` 行，否则数据里的 `\n\n` 会破坏协议边界甚至造成 SSE 注入。
+
+**代码讲解**
+
+1. `for _, line := range strings.Split(data, "\n")`：当 `data` 为 `"a\nb"` 时生成两行 `data: a\n` 和 `data: b\n`；当 `data` 为 `""` 时 `strings.Split("", "\n")` 返回 `[]string{""}`，恰好生成一行 `data: \n`。
+2. `rc := http.NewResponseController(w)`：Go 1.20+ 标准方式，调用 `rc.Flush()` 立即刷新响应流。
+
+**易错点**
+
+- 忘记在事件最后多写一个 `\n`（形成 `\n\n` 双换行），客户端的 `EventSource` 会认为事件还没结束而一直缓冲不触发回调。
+
+=== web-25-1
+title: 实现 OAuth 2.0 PKCE（RFC 7636）S256 挑战码生成与安全校验
+--- desc
+在 OAuth 2.0 授权码 + PKCE（RFC 7636）流程中：
+
+1. 客户端生成随机的 `verifier`（要求长度在 `43 ～ 128` 字节之间，且只允许包含字母 `A-Z`、`a-z`、数字 `0-9` 以及四个特殊字符 `'-'`、`'.'`、`'@'` 之外的 `'_'`、`'~'`，即 RFC 7636 规定的 `[A-Z] / [a-z] / [0-9] / "-" / "." / "_" / "~"`）；
+2. `S256Challenge(verifier string) string`：对 `verifier` 计算 SHA-256 哈希，并使用**无填充的 Base64URL 编码（`base64.RawURLEncoding`）**返回 `code_challenge`；
+3. `VerifyPKCE(verifier, challenge string) bool`：首先校验 `verifier` 的长度（`43 <= len <= 128`）和字符集合法性；然后计算其 `S256Challenge` 并使用常量时间比较 `subtle.ConstantTimeCompare` 判断是否与 `challenge` 完全一致。
+--- solution
+package main
+
+import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+)
+
+func isValidVerifierChar(b byte) bool {
+	return (b >= 'A' && b <= 'Z') ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= '0' && b <= '9') ||
+		b == '-' || b == '.' || b == '_' || b == '~'
+}
+
+func S256Challenge(verifier string) string {
+	// @solution
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+	// @starter
+	// return "" // TODO: 计算 SHA256 并使用 base64.RawURLEncoding 编码
+	// @end
+}
+
+func VerifyPKCE(verifier, challenge string) bool {
+	// @solution
+	if len(verifier) < 43 || len(verifier) > 128 {
+		return false
+	}
+	for i := 0; i < len(verifier); i++ {
+		if !isValidVerifierChar(verifier[i]) {
+			return false
+		}
+	}
+	expected := S256Challenge(verifier)
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(challenge)) == 1
+	// @starter
+	// return false // TODO: 校验 verifier 长度与字符集，并用 subtle.ConstantTimeCompare 比对 challenge
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestPKCES256(t *testing.T) {
+	// RFC 7636 Appendix B 官方标准测试向量：
+	verifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	wantChallenge := "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+
+	if got := S256Challenge(verifier); got != wantChallenge {
+		t.Fatalf("S256Challenge = %q, want %q", got, wantChallenge)
+	}
+	if !VerifyPKCE(verifier, wantChallenge) {
+		t.Fatal("VerifyPKCE should return true for valid RFC 7636 vector")
+	}
+	// 长度不足 43 应拒绝
+	short := "too_short_verifier"
+	if VerifyPKCE(short, S256Challenge(short)) {
+		t.Fatal("should reject verifier shorter than 43 chars")
+	}
+	// 包含非法字符 '$' 应拒绝
+	badChar := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEj$k"
+	if VerifyPKCE(badChar, S256Challenge(badChar)) {
+		t.Fatal("should reject verifier containing invalid char '$'")
+	}
+}
+--- explain
+**思路**
+
+按照 RFC 7636 规范，`S256` 挑战码是对 `verifier` 的 ASCII 字节做 `sha256.Sum256`，然后用不带 `'='` 填充符的 URL 安全 Base64（`base64.RawURLEncoding`）编码；校验时先检查 `43 <= len(verifier) <= 128` 及合法字符集，再用 `subtle.ConstantTimeCompare` 比较。
+
+**代码讲解**
+
+1. `sha256.Sum256([]byte(verifier))`：返回 `[32]byte` 固定长度数组，用 `sum[:]` 转为切片传给 `base64.RawURLEncoding.EncodeToString`。
+2. `subtle.ConstantTimeCompare([]byte(expected), []byte(challenge)) == 1`：恒定时间比较，防御时序侧信道攻击。
+
+**易错点**
+
+- 误用带 `'='` 填充的 `base64.URLEncoding` 或标准 `base64.StdEncoding`（含 `'+'` 和 `'/'`）会导致生成的 `code_challenge` 与标准 OAuth2 服务不兼容（RFC 7636 测试向量末尾没有 `'='`）。
+
+=== web-26-1
+title: 实现基于 Sec-Fetch-Site 与 Origin 的现代无状态 CSRF 防护中间件
+--- desc
+参考 Go 1.25 `http.CrossOriginProtection` 的设计，实现无状态跨源请求防护中间件 `CSRFProtect(trustedOrigins []string, next http.Handler) http.Handler`：
+
+1. 对于安全只读方法（`GET`、`HEAD`、`OPTIONS`），直接放行调用 `next.ServeHTTP(w, r)`；
+2. 对于状态修改方法（如 `POST`、`PUT`、`DELETE`）：
+   - 如果请求头包含 `Sec-Fetch-Site`：
+     - 值为 `"same-origin"` 或 `"none"` 时直接放行；
+     - 值为其他值（如 `"cross-site"` 或 `"same-site"`）时，只有当 `r.Header.Get("Origin")` 在 `trustedOrigins` 白名单中才放行，否则返回 `403 Forbidden`；
+   - 如果请求头**没有** `Sec-Fetch-Site`：
+     - 检查 `Origin` 头：若 `Origin` 为空则放行（如非浏览器 CLI 客户端）；若非空，则要求 `Origin` 在 `trustedOrigins` 中，或者解析 `Origin` URL 后的 `u.Host` 与 `r.Host`（不区分大小写）相等，否则返回 `403 Forbidden`。
+--- solution
+package main
+
+import (
+	"net/http"
+	"net/url"
+	"strings"
+)
+
+func CSRFProtect(trustedOrigins []string, next http.Handler) http.Handler {
+	trusted := make(map[string]bool, len(trustedOrigins))
+	for _, o := range trustedOrigins {
+		trusted[o] = true
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// @solution
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			next.ServeHTTP(w, r)
+			return
+		}
+		origin := r.Header.Get("Origin")
+		switch r.Header.Get("Sec-Fetch-Site") {
+		case "same-origin", "none":
+			next.ServeHTTP(w, r)
+			return
+		case "":
+			if origin != "" && !trusted[origin] {
+				u, err := url.Parse(origin)
+				if err != nil || !strings.EqualFold(u.Host, r.Host) {
+					http.Error(w, "forbidden", http.StatusForbidden)
+					return
+				}
+			}
+			next.ServeHTTP(w, r)
+			return
+		default:
+			if !trusted[origin] {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			next.ServeHTTP(w, r)
+		}
+		// @starter
+		// // TODO: 按规则校验安全方法、Sec-Fetch-Site 与 Origin 头
+		// next.ServeHTTP(w, r)
+		// @end
+	})
+}
+--- test
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestCSRFProtect(t *testing.T) {
+	okHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	h := CSRFProtect([]string{"https://partner.example.com"}, okHandler)
+
+	cases := []struct {
+		name     string
+		method   string
+		host     string
+		secFetch string
+		origin   string
+		wantCode int
+	}{
+		{"cross-site GET allowed", http.MethodGet, "api.app.com", "cross-site", "https://evil.com", http.StatusOK},
+		{"same-origin POST allowed", http.MethodPost, "api.app.com", "same-origin", "", http.StatusOK},
+		{"cross-site POST blocked", http.MethodPost, "api.app.com", "cross-site", "https://evil.com", http.StatusForbidden},
+		{"same-site subdomain POST blocked", http.MethodPost, "api.app.com", "same-site", "https://sub.app.com", http.StatusForbidden},
+		{"trusted cross-site POST allowed", http.MethodPost, "api.app.com", "cross-site", "https://partner.example.com", http.StatusOK},
+		{"fallback matching Origin allowed", http.MethodPost, "api.app.com", "", "https://api.app.com", http.StatusOK},
+		{"fallback mismatched Origin blocked", http.MethodPost, "api.app.com", "", "https://evil.com", http.StatusForbidden},
+	}
+
+	for _, tc := range cases {
+		req := httptest.NewRequest(tc.method, "https://"+tc.host+"/transfer", nil)
+		req.Host = tc.host
+		if tc.secFetch != "" {
+			req.Header.Set("Sec-Fetch-Site", tc.secFetch)
+		}
+		if tc.origin != "" {
+			req.Header.Set("Origin", tc.origin)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != tc.wantCode {
+			t.Errorf("%s: code = %d, want %d", tc.name, rec.Code, tc.wantCode)
+		}
+	}
+}
+--- explain
+**思路**
+
+利用浏览器自动附加且 JS 不可篡改的 `Sec-Fetch-Site` 与 `Origin` 请求头：安全方法直接放行；非安全方法先看 `Sec-Fetch-Site`（`"same-origin"` 和 `"none"` 放行，`"cross-site"` 和 `"same-site"` 必须在白名单内），缺失 `Sec-Fetch-Site` 时回退比对 `Origin` 的 `Host` 与请求的 `r.Host`。
+
+**代码讲解**
+
+1. `switch r.Method`：`GET`、`HEAD`、`OPTIONS` 快速放行。
+2. `switch r.Header.Get("Sec-Fetch-Site")`：连 `"same-site"`（同站不同源的兄弟子域名）默认也拦截，比单纯靠 `SameSite` Cookie 防护更严密。
+3. `u, err := url.Parse(origin)`：回退校验 `strings.EqualFold(u.Host, r.Host)`。
+
+**易错点**
+
+- 注意 `Origin` 头包含协议前缀（如 `"https://api.app.com"`），而 `r.Host` 只有主机名和可选端口（`"api.app.com"`），因此必须先用 `url.Parse(origin)` 取出 `u.Host` 再和 `r.Host` 比较。
+
+=== web-27-1
+title: 实现配合 Kubernetes 滚动发布的就绪探针摘流与在途请求排空器
+race: true
+--- desc
+实现服务生命周期协调器 `DrainCoordinator`：
+
+- `ReadyHandler(w http.ResponseWriter, r *http.Request)`：正常时返回 `200 OK`；一旦开始调用 `Drain(ctx)`，**立即**对所有后续探针请求返回 `503 Service Unavailable`；
+- `Wrap(next http.Handler) http.Handler`：包装业务 Handler，跟踪当前正在处理中的在途请求数量；
+- `Drain(ctx context.Context) error`：将服务标记为未就绪（让 `/readyz` 变 503），并阻塞等待所有正在处理中的在途请求全部完成（若在途请求数为 0 则立即返回 `nil`；若等待期间 `ctx` 超时取消，返回 `ctx.Err()`）。
+--- solution
+package main
+
+import (
+	"context"
+	"net/http"
+	"sync"
+	"sync/atomic"
+)
+
+type DrainCoordinator struct {
+	draining atomic.Bool
+	mu       sync.Mutex
+	inflight int
+	doneCh   chan struct{}
+}
+
+func NewDrainCoordinator() *DrainCoordinator {
+	return &DrainCoordinator{doneCh: make(chan struct{})}
+}
+
+func (d *DrainCoordinator) ReadyHandler(w http.ResponseWriter, r *http.Request) {
+	// @solution
+	if d.draining.Load() {
+		http.Error(w, "draining", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	// @starter
+	// w.WriteHeader(http.StatusOK) // TODO: draining 时返回 503
+	// @end
+}
+
+func (d *DrainCoordinator) Wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// @solution
+		d.mu.Lock()
+		d.inflight++
+		d.mu.Unlock()
+		defer func() {
+			d.mu.Lock()
+			d.inflight--
+			if d.draining.Load() && d.inflight == 0 {
+				select {
+				case <-d.doneCh:
+				default:
+					close(d.doneCh)
+				}
+			}
+			d.mu.Unlock()
+		}()
+		next.ServeHTTP(w, r)
+		// @starter
+		// next.ServeHTTP(w, r) // TODO: 跟踪 inflight 请求数并在归零时通知 Drain
+		// @end
+	})
+}
+
+func (d *DrainCoordinator) Drain(ctx context.Context) error {
+	// @solution
+	d.mu.Lock()
+	d.draining.Store(true)
+	if d.inflight == 0 {
+		select {
+		case <-d.doneCh:
+		default:
+			close(d.doneCh)
+		}
+	}
+	d.mu.Unlock()
+
+	select {
+	case <-d.doneCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	// @starter
+	// return nil // TODO: 标记 draining 并等待 inflight 归零或 ctx 超时
+	// @end
+}
+--- test
+package main
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
+
+func TestDrainCoordinator(t *testing.T) {
+	dc := NewDrainCoordinator()
+	reqStarted := make(chan struct{})
+	releaseReq := make(chan struct{})
+
+	slowHandler := dc.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(reqStarted)
+		<-releaseReq
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// 1. 初始状态探针应返回 200
+	rec1 := httptest.NewRecorder()
+	dc.ReadyHandler(rec1, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("initial readyz = %d, want 200", rec1.Code)
+	}
+
+	// 2. 启动一个在途慢请求
+	go func() {
+		slowHandler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/work", nil))
+	}()
+	<-reqStarted
+
+	// 3. 开始 Drain：探针应立即变为 503，且 Drain 应等待慢请求完成
+	drainDone := make(chan error, 1)
+	go func() {
+		drainDone <- dc.Drain(context.Background())
+	}()
+
+	time.Sleep(15 * time.Millisecond)
+	rec2 := httptest.NewRecorder()
+	dc.ReadyHandler(rec2, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec2.Code != http.StatusServiceUnavailable {
+		t.Fatalf("readyz during drain = %d, want 503", rec2.Code)
+	}
+
+	select {
+	case <-drainDone:
+		t.Fatal("Drain should not finish while inflight request is still running")
+	default:
+	}
+
+	// 4. 放行慢请求，Drain 应立即完成
+	close(releaseReq)
+	if err := <-drainDone; err != nil {
+		t.Fatalf("Drain err = %v", err)
+	}
+}
+--- explain
+**思路**
+
+用原子布尔值 `draining` 控制就绪探针状态，用互斥锁保护在途计数 `inflight` 和完成信号通道 `doneCh`。当收到停机指令调用 `Drain` 时，立刻将 `draining` 置为 `true`（让负载均衡健康检查摘流），若此时 `inflight == 0` 立即关闭 `doneCh`，否则由最后一个完成的在途请求在 `defer` 中将 `inflight` 减至 0 时关闭 `doneCh`。
+
+**代码讲解**
+
+1. `ReadyHandler`：无锁读取 `d.draining.Load()`，在排空阶段立即返回 `503 Service Unavailable`。
+2. `Wrap`：请求进入时 `d.inflight++`，用 `defer` 确保即使业务 handler 发生 panic 也会递减 `d.inflight--` 并在归零时关闭 `d.doneCh`。
+3. `Drain`：在锁内将 `draining` 设为 `true` 并检查当前是否已经没有在途请求，然后 `select` 等待 `<-d.doneCh` 或 `<-ctx.Done()`。
+
+**易错点**
+
+- 递减 `d.inflight--` 必须写在 `defer` 中，否则业务请求一旦 panic 会导致 `inflight` 永远无法归零，`Drain` 卡死直到超时。
+
+=== web-28-1
+title: 从 X-Forwarded-For 安全提取真实客户端 IP 并清理伪造内部头
+--- desc
+在 API 网关中，必须防止客户端伪造 `X-Forwarded-For` 绕过限流，并防止客户端伪造 `X-Internal-*` 内部身份头绕过鉴权。
+
+请实现两个网关安全函数：
+
+1. `ExtractClientIP(xffHeader string, remoteAddr string, trustedProxies map[string]bool) string`：
+   - 先从 `remoteAddr`（可能带端口如 `"10.0.0.1:54321"`，也可能已是纯 IP `"10.0.0.1"`）提取出直连对端 IP `directIP`；
+   - 如果直连对端 `directIP` **不在** `trustedProxies` 受信代理集合中，说明请求没有经过受信网关（客户端直连且可能伪造了 `X-Forwarded-For`），直接返回 `directIP`；
+   - 如果 `directIP` 在 `trustedProxies` 中，将 `xffHeader` 按逗号拆分为 IP 列表，**从右往左**遍历：跳过所有在 `trustedProxies` 中的代理 IP，返回**第一个不在 `trustedProxies` 中的非空 IP**；若全部都是受信代理（或 `xffHeader` 为空），返回最左侧的第一个非空 IP（或回退返回 `directIP`）。
+2. `SanitizeInternalHeaders(h http.Header, internalPrefix string)`：删除 `h` 中所有键名（不区分大小写）以 `internalPrefix`（如 `"X-Internal-"`）开头的请求头。
+--- solution
+package main
+
+import (
+	"net"
+	"net/http"
+	"strings"
+)
+
+func ExtractClientIP(xffHeader string, remoteAddr string, trustedProxies map[string]bool) string {
+	directIP := remoteAddr
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		directIP = host
+	}
+	// @solution
+	if !trustedProxies[directIP] || strings.TrimSpace(xffHeader) == "" {
+		return directIP
+	}
+	parts := strings.Split(xffHeader, ",")
+	var ips []string
+	for _, p := range parts {
+		if ip := strings.TrimSpace(p); ip != "" {
+			ips = append(ips, ip)
+		}
+	}
+	if len(ips) == 0 {
+		return directIP
+	}
+	for i := len(ips) - 1; i >= 0; i-- {
+		if !trustedProxies[ips[i]] {
+			return ips[i]
+		}
+	}
+	return ips[0]
+	// @starter
+	// return directIP // TODO: 从右向左剔除 trustedProxies，返回第一个非受信客户端 IP
+	// @end
+}
+
+func SanitizeInternalHeaders(h http.Header, internalPrefix string) {
+	// @solution
+	prefixLower := strings.ToLower(internalPrefix)
+	for k := range h {
+		if strings.HasPrefix(strings.ToLower(k), prefixLower) {
+			delete(h, k)
+		}
+	}
+	// @starter
+	// // TODO: 删除所有以 internalPrefix 开头（不区分大小写）的 Header
+	// @end
+}
+--- test
+package main
+
+import (
+	"net/http"
+	"testing"
+)
+
+func TestExtractClientIPAndSanitize(t *testing.T) {
+	trusted := map[string]bool{
+		"10.0.0.1": true, // 边缘 LB
+		"10.0.0.2": true, // 内部 Ingress
+	}
+
+	// 1. 攻击者伪造了 X-Forwarded-For: 1.1.1.1，真实 IP 是 203.0.113.50，经过了 10.0.0.1 和 10.0.0.2
+	// XFF 链为: "1.1.1.1, 203.0.113.50, 10.0.0.1"，remoteAddr 是 10.0.0.2:40000
+	// 从右往左跳过 10.0.0.1，第一个非受信 IP 是真实的 203.0.113.50（而不是伪造的 1.1.1.1！）
+	got := ExtractClientIP("1.1.1.1, 203.0.113.50, 10.0.0.1", "10.0.0.2:40000", trusted)
+	if got != "203.0.113.50" {
+		t.Fatalf("got %q, want 203.0.113.50", got)
+	}
+
+	// 2. 客户端绕过代理直接连后端（remoteAddr 不在 trustedProxies 中），必须忽略它伪造的 XFF！
+	got2 := ExtractClientIP("1.1.1.1", "198.51.100.9:12345", trusted)
+	if got2 != "198.51.100.9" {
+		t.Fatalf("untrusted remoteAddr should ignore XFF, got %q", got2)
+	}
+
+	// 3. 清理客户端伪造的内部头
+	hdr := http.Header{
+		"X-Internal-User-Id": []string{"admin"},
+		"x-internal-role":    []string{"superuser"},
+		"X-Request-Id":       []string{"req-1"},
+	}
+	SanitizeInternalHeaders(hdr, "X-Internal-")
+	if len(hdr) != 1 || hdr.Get("X-Request-Id") != "req-1" {
+		t.Fatalf("unexpected headers after sanitize: %v", hdr)
+	}
+}
+--- explain
+**思路**
+
+`X-Forwarded-For` 的每一跳代理都会把上一跳的源 IP **追加到列表末尾**。因此列表最左边的内容是客户端可以任意伪造的，只有最右边由我们自己的受信代理追加的 IP 才可信。从右向左扫描，跳过受信代理 IP 后遇到的第一个 IP 就是客户端真实 IP。
+
+**代码讲解**
+
+1. `if !trustedProxies[directIP]`：如果连最后一跳直连我们的机器都不是受信代理，那么整个 `X-Forwarded-For` 头都是客户端自己瞎编的，直接返回 `directIP`。
+2. `for i := len(ips) - 1; i >= 0; i--`：从右向左遍历，找到第一个 `!trustedProxies[ips[i]]` 立即返回。
+3. `SanitizeInternalHeaders`：不区分大小写检查前缀并从 `http.Header` map 中删除。
+
+**易错点**
+
+- 直接取 `strings.Split(xff, ",")[0]` 是最常见的网关安全漏洞，攻击者只需加一行请求头就能伪装成任意内网 IP。
+
+=== web-29-1
+title: 实现 log/slog 的 LogValuer 敏感字段脱敏与高频日志采样器
+--- desc
+实现两个生产级日志能力：
+
+1. 为结构体 `LoginAudit` 实现 `slog.LogValuer` 接口（`LogValue() slog.Value`）：
+   - 返回一个 `slog.GroupValue`；
+   - 包含原样的 `"user"` 字段（`slog.String("user", a.User)`）；
+   - `"phone"` 字段脱敏：若长度为 11 位，将中间 4 位替换为 `"****"`（如 `"138****5678"`），否则统一替换为 `"****"`；
+   - `"token"` 字段固定替换为 `"[REDACTED]"`。
+2. 实现窗口日志采样器 `LogSampler.Allow(key string, now time.Time) bool`：在每个固定时长 `window`（按 `now.Truncate(window)` 对齐）内，同一个 `key` 的前 `firstN` 条日志全部返回 `true`；超过 `firstN` 条后，每 `thereafterM` 条只放行 1 条（例如 `firstN=3, thereafterM=10` 时，第 1, 2, 3 条放行，随后第 13, 23, 33... 条放行）。
+--- solution
+package main
+
+import (
+	"log/slog"
+	"sync"
+	"time"
+)
+
+type LoginAudit struct {
+	User  string
+	Phone string
+	Token string
+}
+
+func (a LoginAudit) LogValue() slog.Value {
+	// @solution
+	phone := "****"
+	if len(a.Phone) == 11 {
+		phone = a.Phone[:3] + "****" + a.Phone[7:]
+	}
+	return slog.GroupValue(
+		slog.String("user", a.User),
+		slog.String("phone", phone),
+		slog.String("token", "[REDACTED]"),
+	)
+	// @starter
+	// return slog.GroupValue() // TODO: 返回包含 user、脱敏 phone 和 [REDACTED] token 的 GroupValue
+	// @end
+}
+
+type sampleBucket struct {
+	winStart time.Time
+	count    int
+}
+
+type LogSampler struct {
+	mu          sync.Mutex
+	window      time.Duration
+	firstN      int
+	thereafterM int
+	buckets     map[string]*sampleBucket
+}
+
+func NewLogSampler(window time.Duration, firstN, thereafterM int) *LogSampler {
+	return &LogSampler{
+		window:      window,
+		firstN:      firstN,
+		thereafterM: thereafterM,
+		buckets:     make(map[string]*sampleBucket),
+	}
+}
+
+func (s *LogSampler) Allow(key string, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// @solution
+	win := now.Truncate(s.window)
+	b, ok := s.buckets[key]
+	if !ok || !b.winStart.Equal(win) {
+		b = &sampleBucket{winStart: win, count: 0}
+		s.buckets[key] = b
+	}
+	b.count++
+	if b.count <= s.firstN {
+		return true
+	}
+	if s.thereafterM <= 0 {
+		return false
+	}
+	return (b.count-s.firstN)%s.thereafterM == 0
+	// @starter
+	// return true // TODO: 前 firstN 次返回 true，之后每 thereafterM 次返回一次 true
+	// @end
+}
+--- test
+package main
+
+import (
+	"bytes"
+	"log/slog"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestLoginAuditLogValuer(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	audit := LoginAudit{User: "alice", Phone: "13812345678", Token: "secret-jwt-token"}
+	logger.Info("login", "audit", audit)
+
+	out := buf.String()
+	if strings.Contains(out, "secret-jwt-token") || strings.Contains(out, "13812345678") {
+		t.Fatalf("sensitive info leaked in log: %s", out)
+	}
+	if !strings.Contains(out, "138****5678") || !strings.Contains(out, "[REDACTED]") {
+		t.Fatalf("expected masked phone and REDACTED token, got: %s", out)
+	}
+}
+
+func TestLogSampler(t *testing.T) {
+	sampler := NewLogSampler(time.Second, 3, 5)
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	var allowed []int
+	for i := 1; i <= 15; i++ {
+		if sampler.Allow("db_timeout", t0.Add(10*time.Millisecond)) {
+			allowed = append(allowed, i)
+		}
+	}
+	// 前 3 次 (1, 2, 3) 放行，之后每 5 次放行 1 次 (8, 13)
+	want := []int{1, 2, 3, 8, 13}
+	if len(allowed) != len(want) {
+		t.Fatalf("allowed = %v, want %v", allowed, want)
+	}
+	for i := range want {
+		if allowed[i] != want[i] {
+			t.Fatalf("allowed = %v, want %v", allowed, want)
+		}
+	}
+
+	// 进入下一个 1s 窗口，计数器重置，第 1 次再次放行
+	if !sampler.Allow("db_timeout", t0.Add(time.Second)) {
+		t.Fatal("should allow again in new time window")
+	}
+}
+--- explain
+**思路**
+
+1. 当类型实现了 `slog.LogValuer` 接口时，`slog` 在格式化该对象前会自动调用其 `LogValue() slog.Value` 方法，用返回的 `slog.GroupValue` 替代原始结构体，从根源上保证任何地方打印 `LoginAudit` 都不会泄露密码和手机号。
+2. 采样器按 `now.Truncate(s.window)` 对齐时间窗口，窗口内计数 `b.count <= s.firstN` 全放行，超出后仅当 `(b.count - s.firstN) % s.thereafterM == 0` 时放行。
+
+**代码讲解**
+
+1. `slog.GroupValue(...)`：构造内嵌的结构化属性组。
+2. `win := now.Truncate(s.window)`：将任意时间戳规整到所在窗口的起始时刻，窗口变化时自动归零计数。
+3. `(b.count-s.firstN)%s.thereafterM == 0`：超出 `firstN` 后的第 `thereafterM`、`2*thereafterM` 条放行。
+
+**易错点**
+
+- 注意当 `s.thereafterM <= 0`（表示超出 `firstN` 后彻底静默，不再抽样）时要先判断返回 `false`，避免除零 panic。

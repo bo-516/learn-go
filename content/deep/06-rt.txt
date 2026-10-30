@@ -1,0 +1,777 @@
+=== rt-01
+--- deep
+**原理展开**
+
+几个关键的细节：
+
+- **G 的状态**：`_Grunnable`（在队列里等待）、`_Grunning`（正在某个 M 上运行）、`_Gwaiting`（阻塞在 channel、锁、网络等）、`_Gsyscall`（在系统调用中）、`_Gdead`（结束，可以被复用）。结束的 G 会被放回 P 的空闲列表复用，减少分配。
+- **自旋线程**：没有 G 可运行的 M 不会立即休眠，而是“自旋”一小会儿去其他 P 偷任务。运行时会限制自旋的 M 不超过忙碌 P 数的一半，在“快速响应新任务”和“浪费 CPU”之间平衡。
+- **新建的 G 放在哪**：`go f()` 创建的 G 放进当前 P 的 `runnext`，原来 runnext 里的 G 被踢到本地队列尾部；本地队列满了（256 个）就把一半移到全局队列。
+- **M0 和 G0**：每个 M 都有一个特殊的 g0，使用系统栈，调度代码就运行在 g0 上。
+
+**代码示例**
+
+```go
+// 观察 GOMAXPROCS 对 CPU 密集型任务的影响
+func busy(n int) {
+	var wg sync.WaitGroup
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			x := 0
+			for i := 0; i < 2e8; i++ {
+				x += i
+			}
+			_ = x
+		}()
+	}
+	wg.Wait()
+}
+
+func main() {
+	for _, p := range []int{1, 2, 4, 8} {
+		runtime.GOMAXPROCS(p)
+		start := time.Now()
+		busy(8)
+		fmt.Println(p, time.Since(start)) // P 增加时耗时近似线性下降（直到达到物理核数）
+	}
+}
+```
+
+**常见追问**
+
+- P 的数量可以运行时修改吗？→ 可以调用 `runtime.GOMAXPROCS(n)`，会触发一次 STW。
+- 为什么本地队列是 256？→ 固定大小的环形队列可以用无锁的方式实现，256 是经验值。
+- work stealing 会偷 runnext 吗？→ 一般不会立刻偷，给 runnext 的 G 一个短暂的保护期，保持它和唤醒者在同一个 P 上的局部性。
+
+**实战建议**
+
+- 用 `go tool trace` 观察 P 的利用率和 goroutine 的调度等待时间，比猜测更可靠。
+- CPU 密集型任务的并发度设置为 GOMAXPROCS 左右即可，再多只会增加调度开销。
+
+=== rt-02
+--- deep
+**原理展开**
+
+**协作式抢占**：编译器在函数入口插入栈检查（比较 SP 和 `g.stackguard0`）。运行时想抢占一个 G 时，把它的 stackguard0 设为一个特殊值 `stackPreempt`，下一次函数调用时检查失败，进入 `morestack`，发现是抢占请求而不是栈不够，于是让出。所以没有函数调用的循环永远不会被抢占。
+
+**异步抢占**（Go 1.14+）：sysmon 发现某个 G 运行超过 10ms，向它所在的线程发送 `SIGURG`。信号处理函数检查当前的指令位置是否是“异步安全点”（GC 能正确找到所有指针的位置），是的话就修改信号上下文，让线程从信号返回后跳到 `asyncPreempt`，保存所有寄存器并让出。选择 SIGURG 是因为它几乎不被其他程序使用，并且默认被忽略。
+
+**代码示例**
+
+```go
+func main() {
+	runtime.GOMAXPROCS(1)
+	go func() {
+		for {} // 没有函数调用的死循环
+	}()
+	time.Sleep(10 * time.Millisecond)
+	fmt.Println("main 仍然能执行") // Go 1.14+：能打印；之前：永远卡住
+}
+```
+
+```bash
+# 关闭异步抢占（排查与信号相关的问题时使用）
+GODEBUG=asyncpreemptoff=1 ./app
+```
+
+**常见追问**
+
+- 异步抢占会打断系统调用吗？→ 会导致慢速系统调用返回 `EINTR`，Go 标准库已经处理了重试；cgo 调用的 C 库可能需要自己处理。
+- 运行中的 G 什么时候会主动让出？→ 阻塞操作、`runtime.Gosched()`、函数调用时发现被标记了抢占、GC 需要它暂停时。
+- 抢占对性能有影响吗？→ 发生频率很低（10ms 一次），开销可以忽略。
+
+**实战建议**
+
+- 不要依赖调度时机写逻辑（比如“这个 goroutine 一定会先执行”），用同步原语表达顺序。
+- 排查“某个 goroutine 长时间占用 CPU”时，CPU profile 和 trace 里都能看到。
+
+=== rt-03
+--- deep
+**原理展开**
+
+CFS 带宽控制的工作方式：`cpu.max` 设置为 `200000 100000` 表示每 100ms 的周期内最多使用 200ms 的 CPU 时间（即 2 核）。64 个线程同时运行时，可能在前 3ms 就用完了 200ms 的配额，剩下 97ms 所有线程都被暂停。从应用的角度看，请求处理到一半突然停顿了近 100ms。
+
+GOMAXPROCS 过大的其他影响：GC 的后台标记 worker 数量是 GOMAXPROCS 的 25%，64 个 P 就是 16 个标记 worker，会迅速耗尽配额；空闲的 P 上的自旋 M 也会消耗 CPU 时间。
+
+**代码示例**
+
+```go
+// Go 1.25 之前的常见做法
+import _ "go.uber.org/automaxprocs"
+
+// 启动时打印实际的设置，确认生效
+func main() {
+	slog.Info("runtime", "gomaxprocs", runtime.GOMAXPROCS(0), "numcpu", runtime.NumCPU())
+}
+```
+
+```bash
+# 查看容器的限流情况
+cat /sys/fs/cgroup/cpu.max      # 200000 100000
+cat /sys/fs/cgroup/cpu.stat     # nr_throttled、throttled_usec
+```
+
+**常见追问**
+
+- Kubernetes 的 CPU request 和 limit 哪个影响 GOMAXPROCS？→ limit（对应 cgroup 的 cpu.max）；只设置 request 时没有 quota，Go 会使用节点的核数。
+- limit 是小数（比如 1.5 核）怎么办？→ Go 1.25 向上取整到 2，并且最小为 2（GOMAXPROCS=1 时 GC 只能占用唯一的 P，影响很大）。
+- IO 密集型服务要不要把 GOMAXPROCS 调大？→ 一般不需要，网络 IO 不占用 P；文件 IO 和 cgo 阻塞时运行时会自动启动新的线程。
+
+**实战建议**
+
+- 容器化部署的 Go 服务，确认 GOMAXPROCS 与 CPU limit 匹配（Go 1.25+ 自动，之前用 automaxprocs）。
+- 监控 `container_cpu_cfs_throttled_periods_total`，限流比例持续超过几个百分点时要调整。
+
+=== rt-04
+--- deep
+**原理展开**
+
+**系统调用的两种路径**：
+
+- `syscall.Syscall`（可能阻塞的）会调用 `entersyscall`：把 P 的状态改为 `_Psyscall`，但不立即交出 P。sysmon 每轮检查处于 syscall 状态超过 20µs（且有其他工作要做）的 P，把它“抢走”（`retake` → `handoffp`）交给其他 M。系统调用返回时 `exitsyscall` 先尝试拿回原来的 P，失败就去拿空闲的 P，再失败就把 G 放到全局队列。
+- `syscall.RawSyscall`（确定很快返回的）不通知调度器。
+
+**netpoller**：Linux 上是 epoll（BSD 上 kqueue，Windows 上 IOCP）。每个网络 fd 有一个 `pollDesc` 记录在等读、等写的 G。调度器在 `findRunnable` 和 sysmon 里调用 `netpoll`，把就绪的 G 批量放回运行队列。
+
+**代码示例**
+
+```go
+// 网络 IO：看起来是阻塞的同步代码，实际不占线程
+func handle(conn net.Conn) {
+	defer conn.Close()
+	buf := make([]byte, 4096)
+	for {
+		n, err := conn.Read(buf) // 数据未就绪时 G 挂起在 netpoller 上
+		if err != nil {
+			return
+		}
+		conn.Write(buf[:n])
+	}
+}
+
+// 文件 IO：每个阻塞的读取都占用一个线程
+// 大量并发读慢盘时，用信号量限制并发
+var diskSem = make(chan struct{}, 16)
+
+func readFile(path string) ([]byte, error) {
+	diskSem <- struct{}{}
+	defer func() { <-diskSem }()
+	return os.ReadFile(path)
+}
+```
+
+**常见追问**
+
+- 为什么文件 IO 不用 epoll？→ Linux 上普通文件总是报告“就绪”，epoll 对它没有意义；io_uring 可以做真正的异步文件 IO，但 Go 标准库还没有使用。
+- 管道和终端走 netpoller 吗？→ 支持非阻塞的 fd（管道、终端、socket）都可以，`os.File` 会尝试把它们注册到 netpoller。
+- 网络 IO 的超时是怎么实现的？→ deadline 由运行时定时器实现，到期时唤醒挂在 pollDesc 上的 G，读写返回超时错误。
+
+**实战建议**
+
+- 大量磁盘 IO 的服务要监控线程数，并限制并发。
+- 网络代码放心使用“一个连接一个 goroutine”的简单模型，除非连接数达到百万级。
+
+=== rt-05
+--- deep
+**原理展开**
+
+栈检查的实现：每个函数入口比较栈指针 SP 和 `g.stackguard0`，SP 小于它（栈向下增长）时调用 `runtime.morestack`。叶子函数且栈帧很小（不超过 128 字节左右的“红区”）时，编译器会省略检查。
+
+**扩容**（`newstack` → `copystack`）：分配 2 倍大小的新栈，复制旧栈内容，然后**调整所有指向栈内的指针**：栈帧里的指针（通过编译器生成的栈帧指针位图找到）、`defer`、`panic` 记录、channel 等待队列里的 sudog 等。这是 Go 能够移动栈的前提：编译器知道栈上每个位置是否是指针。
+
+Go 1.19 起，运行时根据之前 goroutine 平均使用的栈大小来决定新 goroutine 的初始栈，减少频繁扩容。
+
+**代码示例**
+
+```go
+// 观察栈增长的开销
+func depth(n int) int {
+	if n == 0 {
+		return 0
+	}
+	var pad [64]byte // 增大每层栈帧
+	_ = pad
+	return depth(n-1) + 1
+}
+
+func BenchmarkDeepRecursion(b *testing.B) {
+	for range b.N {
+		done := make(chan struct{})
+		go func() { // 新 goroutine 从小栈开始，要多次扩容
+			depth(10000)
+			close(done)
+		}()
+		<-done
+	}
+}
+```
+
+**常见追问**
+
+- 栈扩容有上限吗？→ 64 位系统默认 1GB，可以用 `debug.SetMaxStack` 调整。
+- 栈会缩容吗？→ GC 时检查，使用不到 1/4 时缩小一半，避免空闲的 goroutine 长期占用大栈。
+- 栈上分配的大对象会怎样？→ 超过一定大小（如 64KB）的局部变量会被直接放到堆上，避免栈过大。
+
+**实战建议**
+
+- 递归深度由输入决定的算法（解析嵌套 JSON、遍历用户提供的树），要么限制深度，要么改成显式栈。
+- 看到 `goroutine stack exceeds 1000000000-byte limit`，几乎一定是无限递归，栈信息里会看到同一个函数重复出现。
+
+=== rt-06
+--- deep
+**原理展开**
+
+一个 GC 周期的阶段：
+
+1. **清扫终止**（STW）：确保上一轮的清扫已经完成，开启写屏障；
+2. **并发标记**：后台标记 worker 占用约 25% 的 CPU（GOMAXPROCS × 25%），从根出发扫描；分配内存的 goroutine 可能被要求辅助标记；
+3. **标记终止**（STW）：关闭写屏障，做最后的清理；
+4. **并发清扫**：后台和分配路径上逐步回收白色对象所在的空间。
+
+Go 选择**不分代、不移动**：不移动对象意味着不需要读屏障，也不需要更新指针，和 cgo、unsafe 的配合更简单；不分代是因为 Go 的逃逸分析让大量短命对象直接分配在栈上，分代的收益没有 Java 那么大，而写屏障的开销会更高。
+
+**代码示例**
+
+```bash
+GODEBUG=gctrace=1 ./app
+# gc 12 @3.201s 2%: 0.020+1.8+0.031 ms clock, ...
+# 关注 STW 时间（第 1、3 项）和 GC 占用的 CPU 比例
+```
+
+```go
+// 用 runtime/metrics 观察 GC 的关键指标
+samples := []metrics.Sample{
+	{Name: "/gc/cycles/total:gc-cycles"},
+	{Name: "/gc/heap/allocs:bytes"},
+	{Name: "/cpu/classes/gc/total:cpu-seconds"},
+}
+metrics.Read(samples)
+for _, s := range samples {
+	fmt.Println(s.Name, s.Value.Uint64())
+}
+```
+
+**常见追问**
+
+- 根对象包括哪些？→ 全局变量、所有 goroutine 的栈、寄存器、运行时内部的一些结构（如 finalizer 队列）。
+- 标记期间新分配的对象是什么颜色？→ 直接标黑，本轮不会被回收。
+- GC 会扫描不含指针的对象吗？→ 不会，noscan 的 span 里的对象只需要标记、不需要扫描内容，这是减少指针能降低 GC 开销的原因。
+
+**实战建议**
+
+- GC 的成本主要取决于**存活对象的大小和指针数量**（标记阶段）以及**分配速率**（触发频率），优化也从这两方面入手。
+- 不要在代码里调用 `runtime.GC()` 来“优化内存”。
+
+=== rt-07
+--- deep
+**原理展开**
+
+GC 节奏器（pacer）的目标：在堆增长到目标值时**恰好**完成标记。它会根据上一轮的分配速率和扫描速率估计什么时候开始 GC，并动态调整辅助标记的力度。
+
+GOMEMLIMIT 的作用方式：运行时把“总内存使用量”（堆 + 栈 + 运行时元数据等）和上限比较，接近上限时降低堆目标，让 GC 更早触发；同时 scavenger 会更积极地把空闲内存归还给操作系统。为了避免存活对象超过上限时陷入无休止的 GC（死亡螺旋），GC 占用的 CPU 被限制在约 50%，超过后宁可超出内存上限。
+
+**代码示例**
+
+```go
+// 运行时调整（也可以用环境变量）
+debug.SetGCPercent(200)            // GOGC=200
+debug.SetMemoryLimit(3 << 30)      // GOMEMLIMIT=3GiB
+
+// 读取当前设置
+fmt.Println(debug.SetGCPercent(-1)) // 返回旧值的同时会修改，读取后要改回来
+```
+
+```yaml
+# Kubernetes：内存 limit 4Gi，GOMEMLIMIT 设为约 85%
+env:
+  - name: GOMEMLIMIT
+    value: "3400MiB"
+  - name: GOGC
+    value: "200"
+```
+
+**常见追问**
+
+- GOGC=100 意味着内存最多是存活堆的两倍吗？→ 大致是，但还有栈、元数据、未归还的空闲内存，RSS 通常会更高一些。
+- GOGC 调大一定好吗？→ 用内存换 CPU；内存充足、GC 占用 CPU 高时有效；对延迟敏感的服务，GC 次数少但单次标记的对象更多，需要实测。
+- 怎么知道设置有没有效果？→ 对比调整前后的 GC 频率（gctrace、`/gc/cycles`）、GC CPU 占比和 RSS。
+
+**实战建议**
+
+- 容器环境标配：GOMEMLIMIT 设为内存 limit 的 80%～90%。
+- 先减少不必要的分配，再考虑调参；调参只是在内存和 CPU 之间做取舍。
+
+=== rt-08
+--- deep
+**原理展开**
+
+GC 的总成本可以粗略地看作：**GC 频率 × 每次 GC 的成本**。
+
+- 频率由**分配速率**和**堆目标**决定：分配越快、目标越小，GC 越频繁；
+- 每次的成本主要由**存活对象中指针的数量**决定（标记阶段要追踪每个指针）。
+
+所以三类优化分别对应：减少分配（降频率）、减少指针（降单次成本）、调大目标（降频率，用内存换）。
+
+**代码示例**
+
+```go
+// 减少指针：用下标代替指针组织大量对象
+type Node struct {
+	Val         int
+	Left, Right int32 // 子节点在 nodes 切片里的下标，-1 表示没有
+}
+
+type Tree struct {
+	nodes []Node // 整个切片不含指针，GC 不需要扫描它的内容
+}
+
+// 对比：每个节点都是一个独立的堆对象，GC 要逐个追踪
+type PNode struct {
+	Val         int
+	Left, Right *PNode
+}
+
+// 大缓存：值序列化到大块 []byte 中，map 只存偏移量
+type ByteCache struct {
+	index map[uint64]uint32 // key 哈希 → 在 data 中的偏移，不含指针
+	data  []byte
+}
+```
+
+**常见追问**
+
+- 怎么找到分配热点？→ `go tool pprof -sample_index=alloc_space http://.../debug/pprof/allocs`，看累计分配最多的函数。
+- `map[string]*User` 和 `map[int64]User` 对 GC 的影响有什么不同？→ 前者的 key（字符串）和 value 都含指针；后者 key 不含指针，value 如果没有指针字段，整个 map 的桶都不需要扫描。
+- 内存压舱石为什么不再需要？→ 它的作用是抬高堆目标、减少 GC 频率，GOMEMLIMIT + 调大 GOGC 能更精确地达到同样的效果。
+
+**实战建议**
+
+- 优化前后用相同的压测流量对比 GC 频率、GC CPU 占比、p99 延迟，用数据证明效果。
+- 优先处理分配量最大的前几个调用点，通常能解决大部分问题。
+
+=== rt-09
+--- deep
+**原理展开**
+
+分配一个小对象的快速路径（`mallocgc`）：
+
+1. 根据大小找到 size class，根据是否含指针选择 scan / noscan 的 span class；
+2. 从当前 P 的 mcache 里对应的 span 中找下一个空闲槽位（span 用位图 `allocBits` 记录哪些槽位已分配，用 `allocCache` 加速查找）；
+3. span 满了，从 mcentral 换一个有空闲槽位的 span（需要加锁）；
+4. mcentral 也没有，从 mheap 分配新的页组成 span；mheap 不够时向操作系统申请新的 arena。
+
+绝大多数分配只走第 2 步，无锁，耗时十几纳秒。
+
+**代码示例**
+
+```go
+// 观察 size class 对容量的影响
+for _, n := range []int{1, 3, 5, 9, 17, 33} {
+	s := make([]byte, 0)
+	s = append(s, make([]byte, n)...)
+	fmt.Printf("需要 %2d 字节，实际 cap %d\n", n, cap(s))
+}
+// 需要  1 字节，实际 cap 8
+// 需要  3 字节，实际 cap 8
+// 需要  5 字节，实际 cap 8
+// 需要  9 字节，实际 cap 16
+// 需要 17 字节，实际 cap 24
+// 需要 33 字节，实际 cap 48
+```
+
+**常见追问**
+
+- tiny 分配器为什么要求不含指针？→ 多个对象共享一个 16 字节的块，GC 没法区分块里哪部分是指针。
+- 大对象为什么要单独处理？→ 大对象占用整页，直接从 mheap 分配专属的 span，回收时整个 span 归还。
+- Go 的分配器会产生碎片吗？→ 会有内部碎片（size class 取整）和外部碎片（span 里只要有一个存活对象就不能整体释放），但因为按 size class 隔离，碎片问题通常不严重。
+
+**实战建议**
+
+- 结构体的大小正好超过某个 size class 时（比如 33 字节），浪费会比较明显，大量实例时可以通过字段调整让它落进更小的 class。
+- `runtime/metrics` 的 `/gc/heap/allocs-by-size:bytes` 可以看到各个大小区间的分配分布。
+
+=== rt-10
+--- deep
+**原理展开**
+
+Go 进程的内存可以分成几层：
+
+- `HeapInuse`：正在使用的 span；`HeapIdle`：空闲的 span；`HeapReleased`：空闲且已经归还给操作系统的部分；
+- `StackInuse`：goroutine 的栈；
+- `Sys`：Go 运行时向操作系统申请的总量（包括堆、栈、元数据）；
+- RSS：操作系统看到的驻留内存，还包括 cgo 分配的内存、二进制本身的代码段、mmap 的文件。
+
+**scavenger** 在后台把空闲的页通过 `madvise` 归还给操作系统，它的速度受控，目标是让 RSS 不超过“堆目标的 110%”左右；设置了 GOMEMLIMIT 时会更积极。
+
+**代码示例**
+
+```go
+func memReport() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	mb := func(b uint64) uint64 { return b >> 20 }
+	fmt.Printf("HeapInuse=%dMB HeapIdle=%dMB HeapReleased=%dMB StackInuse=%dMB Sys=%dMB NumGC=%d\n",
+		mb(m.HeapInuse), mb(m.HeapIdle), mb(m.HeapReleased), mb(m.StackInuse), mb(m.Sys), m.NumGC)
+}
+```
+
+```bash
+# 对比 RSS
+ps -o rss= -p <pid>
+# 或者
+grep -E 'VmRSS|RssAnon|RssFile' /proc/<pid>/status
+```
+
+**常见追问**
+
+- 怎么区分“真正的泄漏”和“没有归还”？→ 看 `HeapInuse` 的趋势：持续增长是泄漏；稳定但 RSS 高，是空闲内存没有归还或者非 Go 内存。
+- heap profile 的 `inuse_space` 和 `alloc_space` 有什么区别？→ 前者是当前存活的对象（找泄漏），后者是累计分配（找分配热点）。
+- 容器里看到的内存为什么比 RSS 大？→ 容器的内存统计（cgroup）还包括页缓存（读写文件产生的缓存），可能导致误判 OOM 风险。
+
+**实战建议**
+
+- 同时监控 RSS、`go_memstats_heap_inuse_bytes`、`go_goroutines`，三者结合判断内存去了哪里。
+- 怀疑泄漏时间隔一段时间抓两份 heap profile，用 `go tool pprof -base old.pb.gz new.pb.gz` 对比增长的部分。
+
+=== rt-11
+--- deep
+**原理展开**
+
+M 的创建时机：
+
+- 有可运行的 G、有空闲的 P，但没有空闲的 M 时（比如其他 M 都阻塞在系统调用里），`startm` 创建新的 M；
+- sysmon 抢走阻塞在系统调用中的 P 后，需要一个 M 来运行这个 P。
+
+M 创建后很少被销毁（只有在 `LockOSThread` 的 goroutine 退出时、或者特殊情况下会退出线程），空闲的 M 放在空闲列表中休眠。所以一次突发的阻塞调用高峰会让线程数永久升高。
+
+**代码示例**
+
+```go
+// threadcreate profile：看线程是在哪里被创建的
+// go tool pprof http://localhost:6060/debug/pprof/threadcreate
+
+// 模拟：大量并发的阻塞系统调用
+func main() {
+	var wg sync.WaitGroup
+	for range 500 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			syscall.Nanosleep(&syscall.Timespec{Sec: 1}, nil) // 阻塞的系统调用，占住线程
+		}()
+	}
+	time.Sleep(100 * time.Millisecond)
+	out, _ := exec.Command("sh", "-c", fmt.Sprintf("ls /proc/%d/task | wc -l", os.Getpid())).Output()
+	fmt.Println("threads:", strings.TrimSpace(string(out))) // 约 500
+	wg.Wait()
+}
+```
+
+（`time.Sleep` 不会占线程，它由运行时的定时器实现；这里特意用了系统调用。）
+
+**常见追问**
+
+- `runtime.LockOSThread` 有什么用？→ 把 goroutine 绑定在当前线程上，用于需要线程局部状态的 C 库（如 OpenGL）、切换网络命名空间等；忘记 Unlock 的 goroutine 退出时，线程也会随之退出。
+- 线程多了有什么坏处？→ 每个线程有自己的栈（默认 8MB 虚拟内存，实际使用的较少）、内核调度开销，达到上限时进程直接崩溃。
+- DNS 解析为什么会创建线程？→ 使用 cgo 解析器（调用 libc 的 getaddrinfo）时，每个并发的解析占用一个线程；纯 Go 解析器不会。
+
+**实战建议**
+
+- 监控线程数（`process_threads` 或 `/proc/<pid>/status` 的 Threads），设置告警。
+- 对文件 IO、cgo 等阻塞调用限制并发数（见「限制阻塞调用的并发数」任务）。
+
+=== rt-12
+--- deep
+**原理展开**
+
+gctrace 每一项都可以对应到 GC 的阶段和成本：
+
+- **两个 STW**：正常应该在 1ms 以内。如果很长，可能是某个 goroutine 长时间无法被抢占（Go 1.14 之前的紧密循环），或者 GOMAXPROCS 很大、需要停下的线程很多；
+- **并发标记的 CPU 时间**中的三项：辅助（assist）是业务 goroutine 被拉去做的，后台（background）是专门的标记 worker 做的，空闲（idle）是利用空闲的 P 做的；
+- **堆的三个数**：开始 → 结束的差值是标记期间新分配的量；结束 → 存活的差值是本轮回收的量；
+- **goal** 和开始时的堆比较：开始时的堆远小于 goal，说明是定时触发（2 分钟）或者手动触发的。
+
+**代码示例**
+
+```bash
+GODEBUG=gctrace=1 ./app 2>&1 | grep '^gc ' | awk '{print $5}' | sort -n | tail
+# 第 5 列是 GC CPU 占比，快速看最高值
+
+# 统计每秒的 GC 次数
+GODEBUG=gctrace=1 ./app 2>&1 | grep '^gc ' | awk '{print int($3)}' | uniq -c
+```
+
+**常见追问**
+
+- `gctrace` 能在生产环境开吗？→ 开销很小，可以短时间开启；更好的方式是把 `runtime/metrics` 导出到监控系统长期观察。
+- 存活堆一直增长说明什么？→ 可能是泄漏，也可能是缓存在逐渐填满，需要结合 heap profile 判断。
+- `scvg` 开头的行是什么？→ 旧版本 scavenger 的输出，Go 1.19 起改为 `GODEBUG=scavtrace=1` 单独控制。
+
+**实战建议**
+
+- 关注三个指标：GC 频率、GC CPU 占比、辅助标记占比。辅助标记高时优先降低分配速率。
+- 用 `go tool trace` 查看具体的 GC 事件与请求延迟的对应关系。
+
+=== rt-13
+--- deep
+**原理展开**
+
+sysmon 的循环大致是：休眠（20µs 起，连续空闲时逐步加倍到 10ms）→ 检查网络轮询 → `retake`（抢占运行太久的 G、抢走阻塞在系统调用里的 P）→ 检查是否需要强制 GC → 继续循环。
+
+它不需要 P，所以即使所有 P 都被占用（比如所有 G 都在死循环），sysmon 仍然能运行，这正是异步抢占能够实现的基础。所有 P 都空闲时，sysmon 也会进入更长时间的休眠，减少空闲进程的 CPU 消耗。
+
+**代码示例**
+
+```go
+// sysmon 的强制 GC：即使没有分配，最长 2 分钟也会 GC 一次
+// 可以从 gctrace 里看到间隔约 120 秒的 GC，堆大小远小于 goal
+func main() {
+	debug.SetGCPercent(100)
+	data := make([]byte, 100<<20)
+	_ = data
+	select {} // 什么都不做，2 分钟后会看到一次强制 GC
+}
+```
+
+```bash
+GODEBUG=gctrace=1 ./idle
+# gc 2 @120.004s 0%: ...（forced）
+```
+
+**常见追问**
+
+- 为什么需要定时强制 GC？→ 分配很少的程序可能很久都达不到 GC 目标，期间空闲内存一直不会被回收和归还。
+- sysmon 会影响性能吗？→ 它的工作量很小，空闲时休眠时间长，开销可以忽略。
+- 抢占系统调用中的 P 有什么条件？→ 系统调用持续超过 20µs，且（有其他可运行的 G，或者没有空闲的 P，或者持续超过 10ms）。
+
+**实战建议**
+
+- 理解 sysmon 有助于解释一些现象：空闲进程每 2 分钟一次 GC、紧密循环在 10ms 后被抢占、阻塞系统调用后线程数增加。
+
+=== rt-14
+--- deep
+**原理展开**
+
+每个 P 的定时器堆是一个**四叉**最小堆：每个节点有 4 个孩子，树的高度只有二叉堆的一半，插入和删除需要的比较次数更少，缓存也更友好。
+
+定时器的状态机比较复杂（等待、运行、修改、删除……），因为它可能被多个 goroutine 并发地 Stop / Reset。Go 1.23 对定时器做了大幅重构：定时器只在被某个 channel 操作（select、接收）引用时才放进堆里，不被引用的定时器可以被直接回收；channel 改为同步语义。
+
+调度器在 `findRunnable` 中检查当前 P 的堆顶是否到期；空闲时 M 会休眠到最近一个定时器的到期时间（通过 netpoll 的超时参数实现）。
+
+**代码示例**
+
+```go
+// 简单的时间轮：一个 Ticker 驱动，O(1) 添加和过期
+type Wheel struct {
+	slots []map[string]struct{}
+	pos   int
+}
+
+func (w *Wheel) Add(id string, ticks int) {
+	w.slots[(w.pos+ticks)%len(w.slots)][id] = struct{}{}
+}
+
+func (w *Wheel) Run(ctx context.Context, tick time.Duration, expire func(id string)) {
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			w.pos = (w.pos + 1) % len(w.slots)
+			for id := range w.slots[w.pos] {
+				expire(id)
+			}
+			w.slots[w.pos] = map[string]struct{}{}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+```
+
+**常见追问**
+
+- 定时器的精度是多少？→ 受调度影响，通常在亚毫秒级；系统繁忙时可能延迟更多，不适合做硬实时的任务。
+- 一个 P 上的定时器会被其他 P 执行吗？→ 会，空闲的 P 在窃取任务时也会检查其他 P 的定时器。
+- `time.Now()` 有开销吗？→ 很小（通过 vDSO 读取时钟，几十纳秒），但在极高频的循环里也会显现，可以批量处理时只取一次。
+
+**实战建议**
+
+- 大量短期定时器（每个请求一个超时）用 context 即可，运行时已经优化得很好；百万级的长期心跳用时间轮。
+- Ticker 的回调处理时间不要超过间隔，否则会丢 tick。
+
+=== rt-15
+--- deep
+**原理展开**
+
+辅助标记的“记账”：每个 G 有一个 `gcAssistBytes` 余额。标记期间每次分配都从余额中扣除；余额为负时，G 必须先做相应数量的扫描工作（按“每分配 1 字节需要扫描多少字节”的比例）。为了减少频繁中断，一次至少做一定量的工作，多做的部分存为余额。后台标记 worker 完成的工作也会存入一个全局信用池，辅助时可以先从全局信用中“借”。
+
+为什么会产生延迟抖动：一个正在处理请求的 G，在某次分配时突然被要求扫描几百 KB 的对象，这段时间完全不在执行业务逻辑。
+
+**代码示例**
+
+```bash
+# trace 中查看辅助标记
+curl -o trace.out 'http://localhost:6060/debug/pprof/trace?seconds=5'
+go tool trace trace.out
+# 在 goroutine 的时间线上可以看到 "GC (mark assist)" 片段
+```
+
+```go
+// 避免突发的大批量分配：分批处理，并复用缓冲区
+func importAll(r io.Reader) error {
+	dec := json.NewDecoder(r)
+	batch := make([]Record, 0, 1000)
+	for dec.More() {
+		var rec Record
+		if err := dec.Decode(&rec); err != nil {
+			return err
+		}
+		batch = append(batch, rec)
+		if len(batch) == cap(batch) {
+			if err := save(batch); err != nil {
+				return err
+			}
+			batch = batch[:0] // 复用
+		}
+	}
+	return save(batch)
+}
+```
+
+**常见追问**
+
+- 怎么量化辅助标记的影响？→ gctrace 的 cpu 段第二项（assist），或者 `runtime/metrics` 的 `/cpu/classes/gc/mark/assist:cpu-seconds`。
+- 后台标记为什么跟不上？→ 后台 worker 只占用 25% 的 CPU，分配速率超过扫描速率时就要靠辅助来补。
+- 调大 GOGC 为什么能缓解？→ 堆目标更大，从开始标记到达到目标之间的“余量”更多，节奏器需要的辅助更少。
+
+**实战建议**
+
+- p99 延迟和 GC 周期的时间吻合时，检查辅助标记的占比。
+- 最有效的手段永远是降低分配速率。
+
+=== rt-16
+--- deep
+**原理展开**
+
+传统标记算法的内存访问模式：从工作队列里取出一个对象，扫描它的所有指针，把指向的对象加入队列。相邻处理的两个对象可能在内存里相隔很远，每次访问都可能是缓存未命中；多个标记 worker 共享工作队列，还有同步开销。
+
+Green Tea 的做法：当发现一个小对象需要标记时，不立即扫描它，而是把它所在的 **span** 加入队列，并在 span 的元数据里记录哪些对象需要扫描。之后处理这个 span 时，一次性扫描其中所有被标记的对象。同一个 span 里的对象在内存上是连续的，扫描时缓存命中率高；而且等待的时间越长，同一个 span 里积累的待扫描对象越多，批量效果越好。
+
+**代码示例**
+
+```bash
+# Go 1.25 中试用
+GOEXPERIMENT=greenteagc go build -o app-greentea ./cmd/app
+
+# 对比 GC CPU 开销
+GODEBUG=gctrace=1 ./app 2>&1 | tail -20
+GODEBUG=gctrace=1 ./app-greentea 2>&1 | tail -20
+
+# Go 1.26 默认启用，需要时可以关闭
+GOEXPERIMENT=nogreenteagc go build ./cmd/app
+```
+
+**常见追问**
+
+- 对所有程序都有提升吗？→ 对大量小对象的程序收益最大；大对象仍然用原来的方式扫描；个别工作负载可能没有明显变化。
+- 为什么以前没有这样做？→ 现代 CPU 的核心数越来越多、内存带宽和延迟相对计算越来越慢，减少内存访问的价值越来越大。
+- 它会改变 GC 的语义吗？→ 不会，仍然是并发、非移动的三色标记，只是改变了扫描的顺序和批量方式。
+
+**实战建议**
+
+- 升级 Go 版本时关注 GC CPU 占比和延迟的变化，用同样的压测流量对比。
+- 减少分配和指针仍然是最根本的优化，新算法只是让同样的工作做得更快。
+
+=== rt-17
+--- deep
+**原理展开**
+
+`SetFinalizer` 的问题来自它的语义：finalizer 函数接收对象本身作为参数，所以运行 finalizer 时对象必须“复活”（重新变成可达），要到下一轮 GC 才能真正释放；如果对象在一个循环引用里，finalizer 的执行顺序无法确定，所以带 finalizer 的对象只要在环里就永远不会被回收。
+
+`AddCleanup(ptr, cleanup, arg)` 的清理函数只接收一个**单独的参数**（比如 fd），不接收对象本身，所以对象不可达时可以立即释放，清理函数之后在后台执行。一个对象可以有多个 cleanup，也能处理循环引用。
+
+**代码示例**
+
+```go
+// 用 cleanup 发现资源泄漏：开发和测试环境打印警告
+type Conn struct {
+	fd      int
+	closed  bool
+	cleanup runtime.Cleanup
+}
+
+func Dial() *Conn {
+	c := &Conn{fd: open()}
+	stack := string(debug.Stack()) // 记录创建位置，方便定位泄漏
+	c.cleanup = runtime.AddCleanup(c, func(fd int) {
+		slog.Warn("连接没有被关闭", "fd", fd, "created_at", stack)
+		closeFD(fd) // 兜底关闭
+	}, c.fd)
+	return c
+}
+
+func (c *Conn) Close() error {
+	if c.closed {
+		return nil
+	}
+	c.closed = true
+	c.cleanup.Stop()
+	return closeFD(c.fd)
+}
+```
+
+**常见追问**
+
+- cleanup 在哪个 goroutine 执行？→ 在运行时的一个专门的 goroutine 里按顺序执行，所以它必须很快，不能阻塞。
+- 进程退出时会执行 cleanup 吗？→ 不保证。
+- 为什么 `os.File` 还在用 finalizer？→ 兼容性原因；它的作用就是兜底，防止忘记 Close 导致 fd 泄漏。
+
+**实战建议**
+
+- 资源的生命周期由代码显式管理（`defer x.Close()`），cleanup / finalizer 只用于诊断和兜底。
+- 不要在 cleanup 里访问会被并发修改的共享状态，除非做了同步。
+
+=== rt-18
+--- deep
+**原理展开**
+
+schedtrace 的每一项对应调度器的一个计数：
+
+- `gomaxprocs` / `idleprocs`：P 的总数和空闲数；
+- `threads` / `idlethreads` / `spinningthreads`：M 的总数、空闲（休眠）的、正在自旋找任务的；
+- `runqueue`：全局队列长度；方括号里是每个 P 的本地队列长度。
+
+一个健康的、负载适中的服务：idleprocs 有一定余量，队列都很短。CPU 饱和时：idleprocs 为 0，队列持续很长，goroutine 要排队很久才能运行，表现为延迟升高但 CPU 已经 100%。
+
+**代码示例**
+
+```go
+// 调度延迟直方图：goroutine 从可运行到真正运行等了多久
+s := []metrics.Sample{{Name: "/sched/latencies:seconds"}}
+metrics.Read(s)
+h := s[0].Value.Float64Histogram()
+// 计算 p99 后上报到监控（见「读取 runtime/metrics 的 GC 暂停分布」任务）
+
+// 当前可运行和运行中的 goroutine 数（Go 1.25+ 新增的指标）
+// /sched/goroutines/runnable:goroutines
+// /sched/goroutines/running:goroutines
+```
+
+```bash
+GODEBUG=schedtrace=1000,scheddetail=1 ./app 2>&1 | head -60
+# 每个 P 的状态、当前运行的 G，每个 M 绑定的 P 和 G，每个 G 的状态和等待原因
+```
+
+**常见追问**
+
+- 调度延迟高说明什么？→ CPU 不够用（P 都很忙），或者 GOMAXPROCS 太小，或者存在长时间不让出的 goroutine。
+- trace 里的 "Scheduler wait" 是什么？→ goroutine 处于可运行状态、但还没有被调度到 P 上执行的时间。
+- 本地队列长度不均衡怎么办？→ 工作窃取会自动平衡；长期不均衡说明某些 goroutine 产生了大量新的 goroutine。
+
+**实战建议**
+
+- 把 `/sched/latencies:seconds` 的分位数加入监控，它能直接反映“CPU 是否够用”，比 CPU 使用率更能说明对延迟的影响。
+- schedtrace 输出量大，只在排查时短时间使用。

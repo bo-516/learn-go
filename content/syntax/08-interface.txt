@@ -1,0 +1,317 @@
+=== interface-def
+name: 定义接口
+group: 接口与泛型
+--- body
+接口是一组**方法签名**的集合，描述“能做什么”。Go 里的接口通常很小（1～3 个方法），名字常以 `-er` 结尾。
+
+**写法**
+
+```go
+type Shape interface {
+	Area() float64
+	Perimeter() float64
+}
+
+type Store interface {
+	Get(ctx context.Context, key string) (string, error)
+	Set(ctx context.Context, key, val string) error
+}
+
+// 组合接口
+type ReadCloser interface {
+	io.Reader
+	io.Closer
+}
+```
+
+**例子：为了测试而抽象依赖**
+
+```go
+type Clock interface{ Now() time.Time }
+
+type realClock struct{}
+
+func (realClock) Now() time.Time { return time.Now() }
+
+type fakeClock struct{ t time.Time }
+
+func (f fakeClock) Now() time.Time { return f.t }
+
+func isExpired(c Clock, deadline time.Time) bool {
+	return c.Now().After(deadline) // 测试时传 fakeClock，结果可控
+}
+```
+
+**注意**
+
+- Go 社区惯例：**接口由使用方定义**（“accept interfaces, return structs”），不要为每个结构体都预先写一个接口。
+- 接口越小越容易实现和复用：`io.Reader` 只有一个方法，却被几百个类型实现。
+- 接口值由“动态类型 + 动态值”两部分组成，两部分都为 nil 时接口才等于 nil，见「错误类型」里的 nil 接口陷阱。
+
+=== interface-impl
+name: 隐式实现接口
+group: 接口与泛型
+--- body
+Go 的类型**不需要声明** `implements`：只要实现了接口要求的全部方法，就自动满足这个接口。这让你可以给已有类型（甚至别人的类型）定义新接口。
+
+**写法**
+
+```go
+type Stringer interface{ String() string }
+
+type Point struct{ X, Y int }
+
+func (p Point) String() string { return fmt.Sprintf("(%d,%d)", p.X, p.Y) }
+
+var s Stringer = Point{1, 2} // Point 自动实现了 Stringer
+fmt.Println(s)               // (1,2)：fmt 会调用 String()
+
+// 编译期检查某类型实现了接口（常见写法）
+var _ Stringer = Point{}
+var _ http.Handler = (*Server)(nil)
+```
+
+**例子：sort.Interface**
+
+```go
+type byLen []string
+
+func (s byLen) Len() int           { return len(s) }
+func (s byLen) Less(i, j int) bool { return len(s[i]) < len(s[j]) }
+func (s byLen) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+
+sort.Sort(byLen(words))
+```
+
+**注意**
+
+- 用**指针接收者**实现的方法，只有 `*T` 满足接口：`var _ Stringer = &T{}` 可以，`T{}` 不行（报 `method has pointer receiver`）。
+- 实现了 `String() string` 后，`fmt.Println` 会自动使用；在 `String()` 里再用 `%v` 打印自身会无限递归。
+- 实现 `Error() string` 就是一个 `error`。
+
+=== any
+name: any / 空接口 interface{}
+group: 接口与泛型
+--- body
+`any` 是 `interface{}` 的别名（Go 1.18+），没有任何方法要求，所以**任何类型的值**都能放进去。取出来使用时需要类型断言或类型 switch。
+
+**写法**
+
+```go
+var x any = 42
+x = "hello"
+x = []int{1, 2}
+
+items := []any{1, "a", true}
+m := map[string]any{"name": "Tom", "age": 18} // 常见于解析任意 JSON
+func Println(a ...any)                         // fmt 的参数就是 ...any
+```
+
+**例子**
+
+```go
+func describe(v any) string {
+	switch x := v.(type) {
+	case int:
+		return "int " + strconv.Itoa(x)
+	case string:
+		return "string " + x
+	default:
+		return fmt.Sprintf("other %T", x)
+	}
+}
+```
+
+**注意**
+
+- 用了 `any` 就失去了编译期类型检查，能用具体类型或泛型时优先不用 `any`。
+- 把值放进 `any` 可能导致分配（值逃逸到堆上），热点路径要注意。
+- `json.Unmarshal` 到 `any` 时，数字统一变成 `float64`，对象变成 `map[string]any`，数组变成 `[]any`。
+- `[]string` 不能直接当 `[]any` 用，需要逐个转换。
+
+=== type-assert
+name: 类型断言 x.(T)
+group: 接口与泛型
+--- body
+`x.(T)` 从接口值 `x` 里取出具体类型 `T` 的值。用 `v, ok := x.(T)` 形式时断言失败不会 panic，`ok` 为 false。`T` 也可以是另一个接口，用来检查“是否还实现了某些方法”。
+
+**写法**
+
+```go
+s := x.(string)          // 失败会 panic
+s, ok := x.(string)      // 安全写法
+if f, ok := w.(http.Flusher); ok {
+	f.Flush()            // 可选能力：实现了就用
+}
+```
+
+**例子：检查可选接口**
+
+```go
+type Closer interface{ Close() error }
+
+func shutdown(services []any) {
+	for _, s := range services {
+		if c, ok := s.(Closer); ok {
+			_ = c.Close()
+		}
+	}
+}
+```
+
+**注意**
+
+- 只有**接口类型的值**才能做类型断言，对 `int`、结构体变量写 `x.(T)` 会编译报错。
+- 判断错误类型时优先用 `errors.As`，它能穿透包装链；直接 `err.(*MyErr)` 只看最外层。
+- 单返回值形式在类型不匹配时 panic，除非你非常确定类型，否则都用 comma-ok 形式。
+
+=== type-switch
+name: 类型 switch
+group: 接口与泛型
+--- body
+`switch v := x.(type)` 按接口值的**动态类型**分支，每个 case 里 `v` 自动是对应的具体类型。
+
+**写法**
+
+```go
+switch v := x.(type) {
+case nil:
+	// x 是 nil 接口
+case int, int64:
+	// 多个类型时 v 仍是 any
+case string:
+	// v 是 string
+case error:
+	// v 是 error（接口也可以作为 case）
+default:
+	// v 和 x 同类型
+}
+```
+
+**例子：计算 JSON 数据的深度**
+
+```go
+func depth(v any) int {
+	switch x := v.(type) {
+	case map[string]any:
+		d := 0
+		for _, e := range x {
+			d = max(d, depth(e))
+		}
+		return d + 1
+	case []any:
+		d := 0
+		for _, e := range x {
+			d = max(d, depth(e))
+		}
+		return d + 1
+	default:
+		return 0
+	}
+}
+```
+
+**注意**
+
+- `.(type)` 只能用在 switch 里。
+- case 的顺序有意义：接口类型的 case（如 `error`）要放在会被它覆盖的具体类型后面。
+- 如果分支很多而且经常新增类型，考虑改成给各类型定义一个公共接口方法（多态），比类型 switch 更易扩展。
+
+=== generics
+name: 泛型函数与泛型类型
+group: 接口与泛型
+--- body
+Go 1.18 起支持泛型：在函数名或类型名后用方括号声明**类型参数**，并用约束限制它能是哪些类型。
+
+**写法**
+
+```go
+func Map[T, U any](s []T, f func(T) U) []U {
+	out := make([]U, 0, len(s))
+	for _, v := range s {
+		out = append(out, f(v))
+	}
+	return out
+}
+
+type Stack[T any] struct{ items []T }
+
+func (s *Stack[T]) Push(v T) { s.items = append(s.items, v) }
+
+func (s *Stack[T]) Pop() (T, bool) {
+	var zero T                 // 泛型里取零值的写法
+	if len(s.items) == 0 {
+		return zero, false
+	}
+	v := s.items[len(s.items)-1]
+	s.items = s.items[:len(s.items)-1]
+	return v, true
+}
+```
+
+**使用**
+
+```go
+lens := Map([]string{"a", "bb"}, func(s string) int { return len(s) }) // 自动推导 T、U
+var st Stack[int]   // 泛型类型使用时要写出类型参数
+st.Push(1)
+```
+
+**注意**
+
+- 方法**不能有自己的类型参数**，只能用类型上声明的：`func (s *Stack[T]) Map[U any]()` 不合法。
+- `T` 的零值写 `var zero T`；不能写 `nil` 或 `0`。
+- 只有约束允许的操作才能用：`any` 约束下不能用 `<`、`+`，需要 `cmp.Ordered` 等约束。
+- 标准库的 `slices`、`maps`、`sync.OnceValue`、`atomic.Pointer[T]` 都是泛型，优先用它们。
+
+=== constraint
+name: 类型约束
+group: 接口与泛型
+--- body
+约束就是接口，但可以额外写**类型集合**：`int | float64` 表示“只能是这些类型之一”，`~int` 表示“底层类型是 int 的所有类型”。
+
+**写法**
+
+```go
+type Number interface {
+	~int | ~int64 | ~float64
+}
+
+func Sum[T Number](nums []T) T {
+	var s T
+	for _, n := range nums {
+		s += n          // 约束里的类型都支持 +，所以可以用
+	}
+	return s
+}
+
+// 常用的现成约束
+any            // 任意类型
+comparable     // 可以用 == 比较（能做 map key）
+cmp.Ordered    // 可以用 < > 比较：整数、浮点、字符串
+```
+
+**例子：泛型集合**
+
+```go
+type Set[T comparable] map[T]struct{}
+
+func (s Set[T]) Add(v T)           { s[v] = struct{}{} }
+func (s Set[T]) Has(v T) bool      { _, ok := s[v]; return ok }
+
+func MaxOf[T cmp.Ordered](a ...T) T {
+	m := a[0]
+	for _, v := range a[1:] {
+		if v > m {
+			m = v
+		}
+	}
+	return m
+}
+```
+
+**注意**
+
+- 带类型集合（`|`、`~`）的接口**只能做约束**，不能当普通变量的类型。
+- 不写 `~` 时 `type Celsius float64` 这种自定义类型不满足 `float64` 约束。
+- 约束里还可以要求方法：`interface{ ~int; String() string }`。

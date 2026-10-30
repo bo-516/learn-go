@@ -1,0 +1,2546 @@
+问题定位与性能排查（PERF-01 ~ PERF-28）的编程小任务。很多排查工具的输出都要靠解析来自动化，这里大量练习字符串处理。
+
+=== perf-01-1
+title: 解析 /proc/loadavg 判断负载趋势
+--- desc
+`uptime` 的数据来自 `/proc/loadavg`，形如 `0.52 0.58 0.59 3/467 12345`：1/5/15 分钟平均负载、当前可运行任务数/总任务数、最近的 PID。
+
+- `ParseLoadAvg(s)`：解析出这些字段，格式不对返回错误；
+- `Trend()`：`L1 > L15 × 1.2` 为 `"rising"`（负载在上升，问题正在发生），`L1 < L15 × 0.8` 为 `"falling"`，否则 `"steady"`；
+- `Overloaded(cores)`：1 分钟负载是否超过 CPU 核数。
+--- solution
+package main
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+type LoadAvg struct {
+	L1, L5, L15     float64
+	Running, Total  int
+	LastPID         int
+}
+
+func ParseLoadAvg(s string) (LoadAvg, error) {
+	var l LoadAvg
+	// @solution
+	f := strings.Fields(s)
+	if len(f) != 5 {
+		return l, fmt.Errorf("unexpected format %q", s)
+	}
+	var err error
+	if l.L1, err = strconv.ParseFloat(f[0], 64); err != nil {
+		return l, err
+	}
+	if l.L5, err = strconv.ParseFloat(f[1], 64); err != nil {
+		return l, err
+	}
+	if l.L15, err = strconv.ParseFloat(f[2], 64); err != nil {
+		return l, err
+	}
+	run, total, ok := strings.Cut(f[3], "/")
+	if !ok {
+		return l, fmt.Errorf("bad task field %q", f[3])
+	}
+	if l.Running, err = strconv.Atoi(run); err != nil {
+		return l, err
+	}
+	if l.Total, err = strconv.Atoi(total); err != nil {
+		return l, err
+	}
+	l.LastPID, err = strconv.Atoi(f[4])
+	return l, err
+	// @starter
+	// return l, fmt.Errorf("TODO")
+	// @end
+}
+
+func (l LoadAvg) Trend() string {
+	// @solution
+	switch {
+	case l.L1 > l.L15*1.2:
+		return "rising"
+	case l.L1 < l.L15*0.8:
+		return "falling"
+	}
+	return "steady"
+	// @starter
+	// return "" // TODO
+	// @end
+}
+
+func (l LoadAvg) Overloaded(cores int) bool { return l.L1 > float64(cores) }
+--- test
+package main
+
+import "testing"
+
+func TestParseLoadAvg(t *testing.T) {
+	l, err := ParseLoadAvg("0.52 0.58 0.59 3/467 12345\n")
+	want := LoadAvg{0.52, 0.58, 0.59, 3, 467, 12345}
+	if err != nil || l != want {
+		t.Fatalf("got %+v, %v", l, err)
+	}
+	for _, bad := range []string{"", "1 2 3", "1 2 3 4 5", "a 2 3 1/2 3"} {
+		if _, err := ParseLoadAvg(bad); err == nil {
+			t.Errorf("ParseLoadAvg(%q) 应返回错误", bad)
+		}
+	}
+}
+
+func TestTrend(t *testing.T) {
+	cases := map[string]string{
+		"12.5 6.1 3.0 20/900 1": "rising",
+		"1.0 3.0 5.0 1/900 1":   "falling",
+		"4.0 4.1 3.9 4/900 1":   "steady",
+	}
+	for in, want := range cases {
+		l, _ := ParseLoadAvg(in)
+		if got := l.Trend(); got != want {
+			t.Errorf("%q: Trend = %s，期望 %s", in, got, want)
+		}
+	}
+	l, _ := ParseLoadAvg("12.5 6.1 3.0 20/900 1")
+	if !l.Overloaded(8) || l.Overloaded(16) {
+		t.Fatal("Overloaded 判断不对")
+	}
+}
+
+=== perf-02-1
+title: 模拟内核计算 load average
+--- desc
+Linux 每 5 秒统计一次「活跃任务数」——**R（可运行）和 D（不可中断睡眠，通常在等 IO）状态**的任务都算——然后用指数衰减更新 1/5/15 分钟负载：
+
+`load = load × e + active × (1 − e)`，其中 `e = exp(−5 / 周期秒数)`（周期分别为 60、300、900）。
+
+- `ActiveTasks(states)`：统计状态为 `R` 或 `D` 的任务数——这就是为什么大量进程卡在磁盘 IO 时，CPU 不忙但负载很高；
+- `(*Load).Update(active)`：做一次更新。
+--- solution
+package main
+
+import "math"
+
+func ActiveTasks(states []string) int {
+	// @solution
+	n := 0
+	for _, s := range states {
+		if s == "R" || s == "D" {
+			n++
+		}
+	}
+	return n
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+
+type Load struct {
+	L1, L5, L15 float64
+}
+
+func decay(load float64, active int, period float64) float64 {
+	e := math.Exp(-5 / period)
+	return load*e + float64(active)*(1-e)
+}
+
+func (l *Load) Update(active int) {
+	// @solution
+	l.L1 = decay(l.L1, active, 60)
+	l.L5 = decay(l.L5, active, 300)
+	l.L15 = decay(l.L15, active, 900)
+	// @starter
+	// // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"math"
+	"testing"
+)
+
+func TestActiveTasks(t *testing.T) {
+	states := []string{"R", "S", "D", "D", "S", "Z", "R", "I"}
+	if n := ActiveTasks(states); n != 4 {
+		t.Fatalf("ActiveTasks = %d，期望 4（R 和 D）", n)
+	}
+}
+
+func TestLoad(t *testing.T) {
+	var l Load
+	for i := 0; i < 12; i++ { // 一分钟，活跃任务一直是 4
+		l.Update(4)
+	}
+	near := func(a, b float64) bool { return math.Abs(a-b) < 1e-6 }
+	if !near(l.L1, 4*(1-math.Exp(-1))) || !near(l.L5, 4*(1-math.Exp(-0.2))) || !near(l.L15, 4*(1-math.Exp(-60.0/900))) {
+		t.Fatalf("一分钟后负载 = %+v", l)
+	}
+	for i := 0; i < 2000; i++ {
+		l.Update(4)
+	}
+	if math.Abs(l.L15-4) > 1e-3 {
+		t.Fatalf("长时间之后应趋近 4，实际 %v", l.L15)
+	}
+}
+
+=== perf-03-1
+title: 从 /proc/stat 计算 CPU 使用率
+--- desc
+`top` 里的 us、sy、wa 等百分比，是对 `/proc/stat` 里 `cpu` 行的**两次采样做差**算出来的。这一行的字段依次是 user、nice、system、idle、iowait、irq、softirq、steal（单位是时钟滴答）。
+
+- `ParseCPULine(line)`：解析前 8 个数字；
+- `Percent(a, b)`：返回两次采样之间各项占总增量的百分比：`us`（user + nice）、`sy`、`wa`、`si`（softirq）、`st`、`idle`。
+--- solution
+package main
+
+import (
+	"errors"
+	"strconv"
+	"strings"
+)
+
+type CPUTimes struct {
+	User, Nice, System, Idle, IOWait, IRQ, SoftIRQ, Steal uint64
+}
+
+func (c CPUTimes) total() uint64 {
+	return c.User + c.Nice + c.System + c.Idle + c.IOWait + c.IRQ + c.SoftIRQ + c.Steal
+}
+
+func ParseCPULine(line string) (CPUTimes, error) {
+	var c CPUTimes
+	// @solution
+	f := strings.Fields(line)
+	if len(f) < 9 || f[0] != "cpu" {
+		return c, errors.New("not a cpu line")
+	}
+	ptrs := []*uint64{&c.User, &c.Nice, &c.System, &c.Idle, &c.IOWait, &c.IRQ, &c.SoftIRQ, &c.Steal}
+	for i, p := range ptrs {
+		v, err := strconv.ParseUint(f[i+1], 10, 64)
+		if err != nil {
+			return c, err
+		}
+		*p = v
+	}
+	return c, nil
+	// @starter
+	// return c, errors.New("TODO")
+	// @end
+}
+
+func Percent(a, b CPUTimes) map[string]float64 {
+	// @solution
+	total := float64(b.total() - a.total())
+	pct := func(x, y uint64) float64 { return float64(y-x) / total * 100 }
+	return map[string]float64{
+		"us":   pct(a.User+a.Nice, b.User+b.Nice),
+		"sy":   pct(a.System, b.System),
+		"wa":   pct(a.IOWait, b.IOWait),
+		"si":   pct(a.SoftIRQ, b.SoftIRQ),
+		"st":   pct(a.Steal, b.Steal),
+		"idle": pct(a.Idle, b.Idle),
+	}
+	// @starter
+	// return nil // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"math"
+	"testing"
+)
+
+func TestCPU(t *testing.T) {
+	a, err := ParseCPULine("cpu  4705 150 1120 16250 520 0 30 10 0 0")
+	if err != nil || a.User != 4705 || a.Steal != 10 {
+		t.Fatalf("ParseCPULine = %+v, %v", a, err)
+	}
+	b, _ := ParseCPULine("cpu  5305 200 1320 16650 720 0 130 50 0 0")
+	// 增量：user 600 nice 50 system 200 idle 400 iowait 200 irq 0 softirq 100 steal 40 → 总 1590
+	p := Percent(a, b)
+	want := map[string]float64{"us": 650.0 / 1590 * 100, "sy": 200.0 / 1590 * 100, "wa": 200.0 / 1590 * 100,
+		"si": 100.0 / 1590 * 100, "st": 40.0 / 1590 * 100, "idle": 400.0 / 1590 * 100}
+	for k, v := range want {
+		if math.Abs(p[k]-v) > 1e-9 {
+			t.Errorf("%s = %.3f%%，期望 %.3f%%", k, p[k], v)
+		}
+	}
+	if _, err := ParseCPULine("cpu0 1 2 3"); err == nil {
+		t.Error("格式不对应返回错误")
+	}
+}
+
+=== perf-04-1
+title: 找出最耗 CPU 的线程
+--- desc
+`ps -L -o tid,pcpu,comm -p <pid>` 会列出进程的每个线程及其 CPU 使用率：
+
+```text
+  TID %CPU COMMAND
+ 4101 85.3 app
+ 4102  0.1 app
+```
+
+实现 `TopThreads(output, n)`：解析输出（跳过表头），按 CPU 从高到低返回前 n 个线程（CPU 相同按 TID 升序）。
+
+注意：对 Java 可以把线程 ID 转成十六进制去 jstack 里找；但 **Go 的 goroutine 会在线程之间迁移**，线程 ID 对应不到具体的 goroutine，定位到「哪个进程、是否单线程打满」之后，要用 CPU profile 找热点函数。
+--- solution
+package main
+
+import (
+	"cmp"
+	"slices"
+	"strconv"
+	"strings"
+)
+
+type Thread struct {
+	TID int
+	CPU float64
+	Cmd string
+}
+
+func TopThreads(output string, n int) ([]Thread, error) {
+	// @solution
+	var out []Thread
+	for i, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		f := strings.Fields(line)
+		if i == 0 || len(f) < 3 {
+			continue
+		}
+		tid, err := strconv.Atoi(f[0])
+		if err != nil {
+			return nil, err
+		}
+		cpu, err := strconv.ParseFloat(f[1], 64)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, Thread{tid, cpu, strings.Join(f[2:], " ")})
+	}
+	slices.SortFunc(out, func(a, b Thread) int {
+		return cmp.Or(cmp.Compare(b.CPU, a.CPU), cmp.Compare(a.TID, b.TID))
+	})
+	return out[:min(n, len(out))], nil
+	// @starter
+	// return nil, nil // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+const psOut = `  TID %CPU COMMAND
+ 4101 85.3 app
+ 4102  0.1 app
+ 4110 12.0 app
+ 4111 12.0 app
+ 4120  3.2 app worker
+`
+
+func TestTopThreads(t *testing.T) {
+	got, err := TopThreads(psOut, 3)
+	want := []Thread{{4101, 85.3, "app"}, {4110, 12.0, "app"}, {4111, 12.0, "app"}}
+	if err != nil || !slices.Equal(got, want) {
+		t.Fatalf("TopThreads = %v, %v", got, err)
+	}
+	all, _ := TopThreads(psOut, 100)
+	if len(all) != 5 || all[3].Cmd != "app worker" {
+		t.Fatalf("all = %v", all)
+	}
+	if _, err := TopThreads("TID %CPU COMMAND\nabc 1.0 x", 1); err == nil {
+		t.Fatal("非法 TID 应返回错误")
+	}
+}
+
+=== perf-05-1
+title: 根据 /proc/meminfo 判断内存压力
+--- desc
+`free` 里最该看的是 **available**（还能分配给新程序的内存，包含可回收的缓存），而不是 free。
+
+- `ParseMeminfo(text)`：解析 `/proc/meminfo`（`MemTotal:       32768000 kB` 这样的行），返回 `字段名 → kB`；
+- `Pressure(m)`：返回 `availPct = MemAvailable / MemTotal × 100`，`swapPct = (SwapTotal − SwapFree) / SwapTotal × 100`（没有 swap 时为 0），以及是否紧张：`availPct < 10` 或 `swapPct > 50`。
+--- solution
+package main
+
+import (
+	"strconv"
+	"strings"
+)
+
+func ParseMeminfo(text string) (map[string]uint64, error) {
+	m := map[string]uint64{}
+	// @solution
+	for _, line := range strings.Split(text, "\n") {
+		key, rest, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		f := strings.Fields(rest)
+		if len(f) == 0 {
+			continue
+		}
+		v, err := strconv.ParseUint(f[0], 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		m[strings.TrimSpace(key)] = v
+	}
+	// @starter
+	// // TODO
+	// @end
+	return m, nil
+}
+
+func Pressure(m map[string]uint64) (availPct, swapPct float64, tight bool) {
+	// @solution
+	availPct = float64(m["MemAvailable"]) / float64(m["MemTotal"]) * 100
+	if m["SwapTotal"] > 0 {
+		swapPct = float64(m["SwapTotal"]-m["SwapFree"]) / float64(m["SwapTotal"]) * 100
+	}
+	return availPct, swapPct, availPct < 10 || swapPct > 50
+	// @starter
+	// return 0, 0, false // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"math"
+	"testing"
+)
+
+const healthy = `MemTotal:       32000000 kB
+MemFree:         1200000 kB
+MemAvailable:   18000000 kB
+Buffers:          200000 kB
+Cached:         17000000 kB
+SwapTotal:             0 kB
+SwapFree:              0 kB
+HugePages_Total:       0
+`
+
+func TestMeminfo(t *testing.T) {
+	m, err := ParseMeminfo(healthy)
+	if err != nil || m["MemTotal"] != 32000000 || m["HugePages_Total"] != 0 || m["Cached"] != 17000000 {
+		t.Fatalf("ParseMeminfo = %v, %v", m, err)
+	}
+	avail, swap, tight := Pressure(m)
+	if math.Abs(avail-56.25) > 1e-9 || swap != 0 || tight {
+		t.Fatalf("free 只有 1.2G 但 available 很充足：avail=%.2f swap=%.2f tight=%v", avail, swap, tight)
+	}
+}
+
+func TestTight(t *testing.T) {
+	m, _ := ParseMeminfo("MemTotal: 1000 kB\nMemAvailable: 200 kB\nSwapTotal: 1000 kB\nSwapFree: 300 kB\n")
+	if _, swap, tight := Pressure(m); swap != 70 || !tight {
+		t.Fatalf("swap 用了 70%%，应判断为紧张：swap=%.1f tight=%v", swap, tight)
+	}
+	m, _ = ParseMeminfo("MemTotal: 1000 kB\nMemAvailable: 50 kB\n")
+	if _, _, tight := Pressure(m); !tight {
+		t.Fatal("available 只剩 5%，应判断为紧张")
+	}
+}
+
+=== perf-06-1
+title: 解析 iostat 并诊断磁盘
+--- desc
+`iostat -x` 的列在不同版本里顺序不同，应该**按表头的列名**取值，而不是写死下标。实现：
+
+- `ParseIostat(output)`：返回每个设备的 `Device{Name, Fields}`，`Fields` 是「列名 → 数值」；
+- `Diagnose(d, ssd)`：按顺序检查：`aqu-sz > 1` → `"queueing"`；`r_await` 或 `w_await` 超过阈值（SSD 为 5ms，机械盘为 20ms）→ `"slow-io"`；`%util > 90` 且**不是** SSD → `"saturated"`（SSD 可以并行处理请求，100% util 不一定饱和）。
+--- solution
+package main
+
+import (
+	"errors"
+	"strconv"
+	"strings"
+)
+
+type Device struct {
+	Name   string
+	Fields map[string]float64
+}
+
+func ParseIostat(output string) ([]Device, error) {
+	// @solution
+	var header []string
+	var out []Device
+	for _, line := range strings.Split(output, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 {
+			continue
+		}
+		if f[0] == "Device" || f[0] == "Device:" {
+			header = f
+			continue
+		}
+		if header == nil {
+			continue
+		}
+		if len(f) != len(header) {
+			return nil, errors.New("column count mismatch")
+		}
+		d := Device{Name: f[0], Fields: map[string]float64{}}
+		for i := 1; i < len(f); i++ {
+			v, err := strconv.ParseFloat(f[i], 64)
+			if err != nil {
+				return nil, err
+			}
+			d.Fields[header[i]] = v
+		}
+		out = append(out, d)
+	}
+	return out, nil
+	// @starter
+	// return nil, errors.New("TODO")
+	// @end
+}
+
+func Diagnose(d Device, ssd bool) []string {
+	var out []string
+	// @solution
+	limit := 20.0
+	if ssd {
+		limit = 5
+	}
+	if d.Fields["aqu-sz"] > 1 {
+		out = append(out, "queueing")
+	}
+	if d.Fields["r_await"] > limit || d.Fields["w_await"] > limit {
+		out = append(out, "slow-io")
+	}
+	if !ssd && d.Fields["%util"] > 90 {
+		out = append(out, "saturated")
+	}
+	// @starter
+	// // TODO
+	// @end
+	return out
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+const out = `Linux 6.1.0 (host)  10/13/2026  _x86_64_  (16 CPU)
+
+Device            r/s     w/s     rkB/s     wkB/s   r_await w_await aqu-sz  %util
+nvme0n1         120.00  850.00   4800.00  61200.00    0.35    2.10   1.80  98.40
+sda               2.00   10.00     16.00    120.00   12.50   48.00   0.60  95.00
+sdb               1.00    1.00      4.00      4.00    3.00    4.00   0.01   0.50
+`
+
+func TestIostat(t *testing.T) {
+	devs, err := ParseIostat(out)
+	if err != nil || len(devs) != 3 {
+		t.Fatalf("ParseIostat = %v, %v", devs, err)
+	}
+	if devs[0].Name != "nvme0n1" || devs[0].Fields["wkB/s"] != 61200 || devs[1].Fields["w_await"] != 48 {
+		t.Fatalf("字段解析不对：%+v", devs[0])
+	}
+	if got := Diagnose(devs[0], true); !slices.Equal(got, []string{"queueing"}) {
+		t.Errorf("NVMe 的 %%util 接近 100%% 不代表饱和：%v", got)
+	}
+	if got := Diagnose(devs[1], false); !slices.Equal(got, []string{"slow-io", "saturated"}) {
+		t.Errorf("机械盘：%v", got)
+	}
+	if got := Diagnose(devs[2], false); len(got) != 0 {
+		t.Errorf("健康的盘：%v", got)
+	}
+}
+
+=== perf-07-1
+title: 从 /proc/net/snmp 计算重传率
+--- desc
+`/proc/net/snmp` 里 TCP 的统计是两行：第一行是字段名，第二行是对应的值，都以 `Tcp:` 开头。
+
+- `ParseTCP(text)`：找到这两行，返回「字段名 → 值」（值可能是负数，比如 `MaxConn` 为 -1）；
+- `RetransRate(before, after)`：两次采样之间的重传率 = `ΔRetransSegs / ΔOutSegs × 100`。一般超过 1% 就值得关注。
+--- solution
+package main
+
+import (
+	"errors"
+	"strconv"
+	"strings"
+)
+
+func ParseTCP(text string) (map[string]int64, error) {
+	// @solution
+	var rows [][]string
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "Tcp:") {
+			rows = append(rows, strings.Fields(line)[1:])
+		}
+	}
+	if len(rows) != 2 || len(rows[0]) != len(rows[1]) {
+		return nil, errors.New("Tcp section not found")
+	}
+	m := map[string]int64{}
+	for i, name := range rows[0] {
+		v, err := strconv.ParseInt(rows[1][i], 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		m[name] = v
+	}
+	return m, nil
+	// @starter
+	// return nil, errors.New("TODO")
+	// @end
+}
+
+func RetransRate(before, after map[string]int64) float64 {
+	// @solution
+	out := after["OutSegs"] - before["OutSegs"]
+	if out <= 0 {
+		return 0
+	}
+	return float64(after["RetransSegs"]-before["RetransSegs"]) / float64(out) * 100
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"math"
+	"testing"
+)
+
+const snap1 = `Ip: Forwarding DefaultTTL
+Ip: 1 64
+Tcp: RtoAlgorithm RtoMin RtoMax MaxConn ActiveOpens PassiveOpens AttemptFails EstabResets CurrEstab InSegs OutSegs RetransSegs InErrs OutRsts InCsumErrors
+Tcp: 1 200 120000 -1 1000 2000 10 5 300 500000 400000 1200 0 50 0
+Udp: InDatagrams NoPorts
+Udp: 10 0
+`
+
+const snap2 = `Tcp: RtoAlgorithm RtoMin RtoMax MaxConn ActiveOpens PassiveOpens AttemptFails EstabResets CurrEstab InSegs OutSegs RetransSegs InErrs OutRsts InCsumErrors
+Tcp: 1 200 120000 -1 1100 2100 10 5 310 600000 450000 2700 0 60 0
+`
+
+func TestRetrans(t *testing.T) {
+	a, err := ParseTCP(snap1)
+	if err != nil || a["MaxConn"] != -1 || a["RetransSegs"] != 1200 {
+		t.Fatalf("ParseTCP = %v, %v", a, err)
+	}
+	b, _ := ParseTCP(snap2)
+	if r := RetransRate(a, b); math.Abs(r-3) > 1e-9 {
+		t.Fatalf("重传率 = %.2f%%，期望 3%%", r)
+	}
+	if _, err := ParseTCP("Udp: a\nUdp: 1\n"); err == nil {
+		t.Fatal("没有 Tcp 段应返回错误")
+	}
+}
+
+=== perf-08-1
+title: 在独立的管理端口上暴露 pprof
+--- desc
+`import _ "net/http/pprof"` 会把 `/debug/pprof/*` 注册到 `http.DefaultServeMux` 上——如果业务服务也用 DefaultServeMux，pprof 就被暴露到了公网。
+
+实现 `AdminHandler(token)`：
+
+- 新建一个 `ServeMux`，手动注册 `pprof.Index`（`/debug/pprof/`）、`pprof.Cmdline`、`pprof.Profile`、`pprof.Symbol`、`pprof.Trace`；
+- 外面包一层鉴权：请求头必须是 `Authorization: Bearer <token>`，否则返回 401。
+
+这个 handler 应该只监听在内网地址上（如 `127.0.0.1:6060`）。
+--- solution
+package main
+
+import (
+	"net/http"
+	"net/http/pprof"
+)
+
+func AdminHandler(token string) http.Handler {
+	// @solution
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+	// @starter
+	// return http.NotFoundHandler() // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestPprof(t *testing.T) {
+	h := AdminHandler("s3cret")
+	req := httptest.NewRequest("GET", "/debug/pprof/goroutine?debug=1", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "goroutine profile:") {
+		t.Fatalf("goroutine profile：%d %.80s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest("GET", "/debug/pprof/cmdline", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("cmdline：%d", rec.Code)
+	}
+}
+
+func TestUnauthorized(t *testing.T) {
+	h := AdminHandler("s3cret")
+	for _, auth := range []string{"", "Bearer wrong", "s3cret"} {
+		req := httptest.NewRequest("GET", "/debug/pprof/", nil)
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != 401 {
+			t.Errorf("Authorization=%q 应返回 401，实际 %d", auth, rec.Code)
+		}
+	}
+}
+
+=== perf-09-1
+title: 把正则编译移出热路径
+--- desc
+CPU profile 显示热点在 `regexp.compile`：下面的 `IsValidEmail` 每次调用都重新编译正则表达式，编译比匹配贵得多，还会产生大量分配，进一步加重 GC。
+
+把正则提到包级变量里只编译一次（`regexp.MustCompile` 适合在包初始化时使用，表达式写错会直接 panic）。测试会检查每次调用的分配次数。
+--- solution
+package main
+
+import "regexp"
+
+var emailRe = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
+
+func IsValidEmail(s string) bool {
+	return emailRe.MatchString(s)
+}
+--- starter
+package main
+
+import "regexp"
+
+func IsValidEmail(s string) bool {
+	re := regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`) // 每次调用都编译
+	return re.MatchString(s)
+}
+--- test
+package main
+
+import "testing"
+
+func TestIsValidEmail(t *testing.T) {
+	cases := map[string]bool{"gopher@go.dev": true, "a.b+tag@mail.example.com": true, "no-at": false, "x@y": false, "": false}
+	for in, want := range cases {
+		if got := IsValidEmail(in); got != want {
+			t.Errorf("IsValidEmail(%q) = %v，期望 %v", in, got, want)
+		}
+	}
+}
+
+var sink bool
+
+func TestAllocs(t *testing.T) {
+	IsValidEmail("warm@up.com")
+	if a := testing.AllocsPerRun(100, func() { sink = IsValidEmail("gopher@go.dev") }); a > 2 {
+		t.Fatalf("每次调用分配 %.0f 次，正则应该只编译一次", a)
+	}
+}
+
+=== perf-10-1
+title: 避免子串和子切片持有大块内存
+--- desc
+heap profile 显示几 KB 的日志行占着几百 MB：`s[:i]` 得到的子串和原字符串**共享底层内存**，只要子串还被缓存着，整个大字符串都不能被回收。切片同理。
+
+- `FirstLine(s)`：返回第一行（不含换行符），结果会被长期缓存，必须是**独立的副本**（`strings.Clone`）；
+- `Header(b)`：返回前 16 个字节（不足 16 返回全部），同样必须是独立的副本，而且容量不能远大于长度。
+--- solution
+package main
+
+import (
+	"bytes"
+	"strings"
+)
+
+func FirstLine(s string) string {
+	line, _, _ := strings.Cut(s, "\n")
+	// @solution
+	return strings.Clone(line)
+	// @starter
+	// return line // TODO: 和 s 共享内存
+	// @end
+}
+
+func Header(b []byte) []byte {
+	h := b[:min(16, len(b))]
+	// @solution
+	return bytes.Clone(h)
+	// @starter
+	// return h // TODO: 和 b 共享底层数组
+	// @end
+}
+--- test
+package main
+
+import (
+	"strings"
+	"testing"
+	"unsafe"
+)
+
+func TestFirstLine(t *testing.T) {
+	big := "ERROR timeout calling stock\n" + strings.Repeat("x", 1<<20)
+	line := FirstLine(big)
+	if line != "ERROR timeout calling stock" {
+		t.Fatalf("FirstLine = %q", line)
+	}
+	if unsafe.StringData(line) == unsafe.StringData(big) {
+		t.Fatal("返回的子串仍然引用着 1MB 的原字符串")
+	}
+	if FirstLine("single") != "single" {
+		t.Fatal("没有换行时返回全部")
+	}
+}
+
+func TestHeader(t *testing.T) {
+	packet := make([]byte, 1<<20)
+	copy(packet, "MAGIC-0001-HEADER-and-payload")
+	h := Header(packet)
+	if string(h) != "MAGIC-0001-HEADE" {
+		t.Fatalf("Header = %q", h)
+	}
+	if &h[0] == &packet[0] || cap(h) > 64 {
+		t.Fatalf("返回的切片仍然引用着原数组（cap=%d）", cap(h))
+	}
+	if string(Header([]byte("short"))) != "short" {
+		t.Fatal("不足 16 字节时返回全部")
+	}
+}
+
+=== perf-11-1
+title: 解析 goroutine dump 定位泄漏
+--- desc
+`/debug/pprof/goroutine?debug=2` 和 `runtime.Stack(buf, true)` 的输出由一个个 goroutine 块组成：
+
+```text
+goroutine 18 [chan receive, 10 minutes]:
+runtime.gopark(...)
+	/usr/local/go/src/runtime/proc.go:435 +0xce
+main.worker(0xc000020180)
+	/app/main.go:21 +0x25
+created by main.main in goroutine 1
+	/app/main.go:30 +0x45
+```
+
+实现：
+
+- `States(dump)`：统计每个状态的 goroutine 数（方括号里逗号之前的部分，如 `chan receive`）；
+- `TopFunc(dump)`：统计每个 goroutine **第一个业务函数**（跳过以 `runtime.`、`sync.`、`internal/`、`time.` 开头的帧；函数名去掉括号及之后的参数），返回「函数 → 数量」——找到数量最多的那个，就找到了泄漏点。
+
+测试会启动 5 个阻塞的 goroutine，用真实的 `runtime.Stack` 输出来检验。
+--- solution
+package main
+
+import "strings"
+
+var skip = []string{"runtime.", "sync.", "internal/", "time."}
+
+func blocks(dump string) [][]string {
+	var out [][]string
+	for _, b := range strings.Split(strings.TrimSpace(dump), "\n\n") {
+		lines := strings.Split(b, "\n")
+		if len(lines) > 0 && strings.HasPrefix(lines[0], "goroutine ") {
+			out = append(out, lines)
+		}
+	}
+	return out
+}
+
+func States(dump string) map[string]int {
+	m := map[string]int{}
+	// @solution
+	for _, b := range blocks(dump) {
+		head := b[0]
+		start, end := strings.IndexByte(head, '['), strings.IndexByte(head, ']')
+		if start < 0 || end < start {
+			continue
+		}
+		state, _, _ := strings.Cut(head[start+1:end], ",")
+		m[state]++
+	}
+	// @starter
+	// // TODO
+	// @end
+	return m
+}
+
+func TopFunc(dump string) map[string]int {
+	m := map[string]int{}
+	// @solution
+	for _, b := range blocks(dump) {
+	frames:
+		for _, line := range b[1:] {
+			if strings.HasPrefix(line, "\t") || strings.HasPrefix(line, "created by ") {
+				continue
+			}
+			for _, p := range skip {
+				if strings.HasPrefix(line, p) {
+					continue frames
+				}
+			}
+			fn := line
+			if i := strings.LastIndexByte(fn, '('); i > 0 {
+				fn = fn[:i]
+			}
+			m[fn]++
+			break
+		}
+	}
+	// @starter
+	// // TODO
+	// @end
+	return m
+}
+--- test
+package main
+
+import (
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+func leakyWorker(ch chan int) {
+	<-ch
+}
+
+func TestRealDump(t *testing.T) {
+	ch := make(chan int)
+	defer close(ch)
+	for i := 0; i < 5; i++ {
+		go leakyWorker(ch)
+	}
+	time.Sleep(20 * time.Millisecond)
+	buf := make([]byte, 1<<20)
+	dump := string(buf[:runtime.Stack(buf, true)])
+
+	// 测试二进制里被测包的函数名带的是模块路径（play.leakyWorker），而不是 main.leakyWorker
+	n := 0
+	for fn, c := range TopFunc(dump) {
+		if strings.HasSuffix(fn, ".leakyWorker") {
+			n += c
+		}
+	}
+	if n != 5 {
+		t.Fatalf("应找到 5 个阻塞在 leakyWorker 的 goroutine，实际 %d\n%v", n, TopFunc(dump))
+	}
+	if n := States(dump)["chan receive"]; n < 5 {
+		t.Fatalf("chan receive 状态的 goroutine = %d，期望至少 5 个", n)
+	}
+}
+
+func TestSampleDump(t *testing.T) {
+	dump := `goroutine 1 [running]:
+main.main()
+	/app/main.go:10 +0x1d
+
+goroutine 18 [chan receive, 10 minutes]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:435 +0xce
+main.(*Server).worker(0xc000020180)
+	/app/main.go:21 +0x25
+created by main.main in goroutine 1
+	/app/main.go:30 +0x45
+
+goroutine 19 [semacquire]:
+sync.runtime_Semacquire(0xc0000140d8?)
+	/usr/local/go/src/runtime/sema.go:71 +0x25
+sync.(*WaitGroup).Wait(0x0?)
+	/usr/local/go/src/sync/waitgroup.go:118 +0x48
+main.flush()
+	/app/main.go:40 +0x30
+`
+	st := States(dump)
+	if st["running"] != 1 || st["chan receive"] != 1 || st["semacquire"] != 1 {
+		t.Fatalf("States = %v", st)
+	}
+	top := TopFunc(dump)
+	if top["main.(*Server).worker"] != 1 || top["main.flush"] != 1 || top["main.main"] != 1 {
+		t.Fatalf("TopFunc = %v", top)
+	}
+}
+
+=== perf-12-1
+title: 分阶段计时，找出时间花在哪
+--- desc
+CPU 不高但接口很慢，说明时间花在了「等待」上。给请求的各个阶段打点计时，是最直接的办法（链路追踪的 span 也是同样的思路）。
+
+实现 `Timer`：
+
+- `Start(stage)` 开始计时并返回一个结束函数，配合 `defer t.Start("db")()` 使用；同一个阶段可以出现多次，耗时累加；
+- `Report()`：按总耗时从大到小返回 `"阶段=耗时"`（耗时相同按名字），耗时用 `time.Duration` 的字符串形式。
+
+时间通过注入的 `now` 获取。
+--- solution
+package main
+
+import (
+	"cmp"
+	"maps"
+	"slices"
+	"time"
+)
+
+type Timer struct {
+	now    func() time.Time
+	totals map[string]time.Duration
+}
+
+func NewTimer(now func() time.Time) *Timer {
+	return &Timer{now: now, totals: map[string]time.Duration{}}
+}
+
+func (t *Timer) Start(stage string) func() {
+	// @solution
+	start := t.now()
+	return func() { t.totals[stage] += t.now().Sub(start) }
+	// @starter
+	// return func() {} // TODO
+	// @end
+}
+
+func (t *Timer) Report() []string {
+	// @solution
+	stages := slices.Collect(maps.Keys(t.totals))
+	slices.SortFunc(stages, func(a, b string) int {
+		return cmp.Or(cmp.Compare(t.totals[b], t.totals[a]), cmp.Compare(a, b))
+	})
+	out := make([]string, len(stages))
+	for i, s := range stages {
+		out[i] = s + "=" + t.totals[s].String()
+	}
+	return out
+	// @starter
+	// return nil // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+	"time"
+)
+
+func TestTimer(t *testing.T) {
+	now := time.Unix(0, 0)
+	clock := func() time.Time { return now }
+	sleep := func(d time.Duration) { now = now.Add(d) }
+
+	tm := NewTimer(clock)
+	handle := func() {
+		defer tm.Start("total")()
+		func() {
+			defer tm.Start("auth")()
+			sleep(5 * time.Millisecond)
+		}()
+		for i := 0; i < 3; i++ {
+			func() {
+				defer tm.Start("db")()
+				sleep(40 * time.Millisecond)
+			}()
+		}
+		func() {
+			defer tm.Start("render")()
+			sleep(5 * time.Millisecond)
+		}()
+	}
+	handle()
+	want := []string{"total=130ms", "db=120ms", "auth=5ms", "render=5ms"}
+	if got := tm.Report(); !slices.Equal(got, want) {
+		t.Fatalf("Report = %v\n期望 %v", got, want)
+	}
+}
+
+=== perf-13-1
+title: 用 runtime/trace 标注任务和区域
+--- desc
+`go tool trace` 能看到每个 goroutine 在每个时刻在做什么。给代码加上**任务**（task）和**区域**（region）标注后，可以在 trace 里按请求查看耗时分布。
+
+实现 `Process(ctx, items, handle)`：
+
+1. 用 `trace.NewTask(ctx, "batch-import")` 创建一个任务，结束时调用 `task.End()`；
+2. 对每个 item，用 `trace.WithRegion(ctx, "import-item", func() { … })` 包住 `handle(item)`；
+3. 在区域内用 `trace.Log(ctx, "item", item)` 记录正在处理哪一个。
+
+测试会开启 trace，把结果写到内存里，检查里面有没有这些标注。
+--- solution
+package main
+
+import (
+	"context"
+	"runtime/trace"
+)
+
+func Process(ctx context.Context, items []string, handle func(string)) {
+	// @solution
+	ctx, task := trace.NewTask(ctx, "batch-import")
+	defer task.End()
+	for _, it := range items {
+		trace.WithRegion(ctx, "import-item", func() {
+			trace.Log(ctx, "item", it)
+			handle(it)
+		})
+	}
+	// @starter
+	// for _, it := range items { // TODO: 加上 task、region 和 log
+	// 	handle(it)
+	// }
+	// @end
+}
+--- test
+package main
+
+import (
+	"bytes"
+	"context"
+	"runtime/trace"
+	"slices"
+	"testing"
+)
+
+func TestTraceAnnotations(t *testing.T) {
+	var buf bytes.Buffer
+	if err := trace.Start(&buf); err != nil {
+		t.Skip("trace 已在运行：", err)
+	}
+	var handled []string
+	Process(context.Background(), []string{"order-7781", "order-7782"}, func(s string) { handled = append(handled, s) })
+	trace.Stop()
+
+	if !slices.Equal(handled, []string{"order-7781", "order-7782"}) {
+		t.Fatalf("handled = %v", handled)
+	}
+	for _, want := range []string{"batch-import", "import-item", "order-7781"} {
+		if !bytes.Contains(buf.Bytes(), []byte(want)) {
+			t.Errorf("trace 输出里找不到 %q", want)
+		}
+	}
+}
+
+=== perf-14-1
+title: 读取 runtime/metrics 的 GC 暂停分布
+--- desc
+`runtime/metrics` 提供了 GC 暂停时间的直方图（`/sched/pauses/total/gc:seconds`），可以直接导出到监控系统，用来判断延迟毛刺是不是 GC 引起的。
+
+直方图类型是 `metrics.Float64Histogram`：`Counts[i]` 是落在 `[Buckets[i], Buckets[i+1])` 区间的样本数，所以 `len(Buckets) == len(Counts) + 1`，边界可能是 ±Inf。
+
+- `Quantile(h, q)`：返回第一个累计计数达到 `q × 总数` 的桶的**上界**；上界为 +Inf 时返回下界；没有样本返回 0；
+- `GCPauses()`：用 `metrics.Read` 读取真实的直方图。
+--- solution
+package main
+
+import (
+	"math"
+	"runtime/metrics"
+)
+
+func Quantile(h *metrics.Float64Histogram, q float64) float64 {
+	// @solution
+	var total uint64
+	for _, c := range h.Counts {
+		total += c
+	}
+	if total == 0 {
+		return 0
+	}
+	rank := q * float64(total)
+	var cum uint64
+	for i, c := range h.Counts {
+		cum += c
+		if c > 0 && float64(cum) >= rank {
+			if upper := h.Buckets[i+1]; !math.IsInf(upper, 1) {
+				return upper
+			}
+			return h.Buckets[i]
+		}
+	}
+	return h.Buckets[len(h.Buckets)-1]
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+
+func GCPauses() *metrics.Float64Histogram {
+	// @solution
+	s := []metrics.Sample{{Name: "/sched/pauses/total/gc:seconds"}}
+	metrics.Read(s)
+	if s[0].Value.Kind() != metrics.KindFloat64Histogram {
+		return &metrics.Float64Histogram{}
+	}
+	return s[0].Value.Float64Histogram()
+	// @starter
+	// return &metrics.Float64Histogram{} // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"math"
+	"runtime"
+	"runtime/metrics"
+	"testing"
+)
+
+func TestQuantile(t *testing.T) {
+	h := &metrics.Float64Histogram{
+		Buckets: []float64{0, 0.0001, 0.0005, 0.001, 0.01, math.Inf(1)},
+		Counts:  []uint64{50, 40, 8, 1, 1},
+	}
+	cases := map[float64]float64{0.5: 0.0001, 0.9: 0.0005, 0.98: 0.001, 0.99: 0.01, 1: 0.01}
+	for q, want := range cases {
+		if got := Quantile(h, q); got != want {
+			t.Errorf("Quantile(%v) = %v，期望 %v", q, got, want)
+		}
+	}
+	if Quantile(&metrics.Float64Histogram{Buckets: []float64{0, 1}, Counts: []uint64{0}}, 0.5) != 0 {
+		t.Error("没有样本返回 0")
+	}
+}
+
+func TestRealGCPauses(t *testing.T) {
+	for i := 0; i < 3; i++ {
+		runtime.GC()
+	}
+	h := GCPauses()
+	var n uint64
+	for _, c := range h.Counts {
+		n += c
+	}
+	if n == 0 || len(h.Buckets) != len(h.Counts)+1 {
+		t.Fatalf("应读到真实的 GC 暂停直方图（样本数 %d）", n)
+	}
+	if p := Quantile(h, 0.99); p <= 0 || p > 1 {
+		t.Fatalf("p99 GC 暂停 = %v 秒，不合理", p)
+	}
+}
+
+=== perf-15-1
+title: 写一个基准测试
+--- desc
+优化之前先写基准测试，用数据说话。实现两部分：
+
+1. `Join(parts, sep)`：用 `strings.Builder` 拼接（先 `Grow` 到准确的长度），每次调用最多 1 次分配；
+2. `BenchmarkJoin(b *testing.B)`：对包级变量 `parts` 调用 `Join(parts, ",")`，并调用 `b.ReportAllocs()`。循环可以写成 `for i := 0; i < b.N; i++`，Go 1.24+ 也可以写 `for b.Loop()`。
+
+基准测试函数放在普通的 .go 文件里也可以（这里为了让你能直接编辑）。测试会用 `testing.Benchmark` 运行你的基准测试，检查它确实在调用 `Join`（每次操作的耗时不能接近 0），并且每次操作最多 1 次分配。
+
+平时运行：`go test -bench=Join -benchmem -count=10`，再用 `benchstat` 比较优化前后的结果。
+--- solution
+package main
+
+import (
+	"strings"
+	"testing"
+)
+
+var parts = strings.Fields(strings.Repeat("alpha beta gamma delta ", 25))
+
+func Join(parts []string, sep string) string {
+	// @solution
+	if len(parts) == 0 {
+		return ""
+	}
+	n := len(sep) * (len(parts) - 1)
+	for _, p := range parts {
+		n += len(p)
+	}
+	var b strings.Builder
+	b.Grow(n)
+	b.WriteString(parts[0])
+	for _, p := range parts[1:] {
+		b.WriteString(sep)
+		b.WriteString(p)
+	}
+	return b.String()
+	// @starter
+	// s := ""
+	// for i, p := range parts {
+	// 	if i > 0 {
+	// 		s += sep
+	// 	}
+	// 	s += p
+	// }
+	// return s
+	// @end
+}
+
+var sink string
+
+func BenchmarkJoin(b *testing.B) {
+	// @solution
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		sink = Join(parts, ",")
+	}
+	// @starter
+	// // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestJoin(t *testing.T) {
+	if got := Join(parts, ","); got != strings.Join(parts, ",") {
+		t.Fatal("Join 结果不对")
+	}
+	if Join(nil, ",") != "" || Join([]string{"x"}, ",") != "x" {
+		t.Fatal("边界情况")
+	}
+}
+
+func TestBenchmark(t *testing.T) {
+	r := testing.Benchmark(BenchmarkJoin)
+	if r.N == 0 {
+		t.Fatal("基准测试没有运行")
+	}
+	if r.NsPerOp() < 20 {
+		t.Fatalf("每次操作只要 %dns，看起来没有调用 Join(parts, \",\")", r.NsPerOp())
+	}
+	if a := r.AllocsPerOp(); a > 1 {
+		t.Fatalf("每次操作 %d 次分配，期望最多 1 次", a)
+	}
+	t.Logf("BenchmarkJoin: %s %s", r.String(), r.MemString())
+}
+
+=== perf-16-1
+title: 周期采集 profile 并保留最近几份
+race: true
+--- desc
+持续性能剖析的核心很简单：定期采集一份 profile，保留最近的若干份，出问题时回看。实现 `Collector`：
+
+- `Run(ctx, interval, capture)`：每隔 `interval` 调用一次 `capture()`，只保留最近 `keep` 份；`ctx` 取消时返回。用 `time.Ticker`，退出前 `Stop`；
+- `Latest()`：返回保存的 profile（从旧到新），返回的切片不能和内部共享，可以被并发调用。
+--- solution
+package main
+
+import (
+	"context"
+	"slices"
+	"sync"
+	"time"
+)
+
+type Collector struct {
+	mu       sync.Mutex
+	keep     int
+	profiles [][]byte
+}
+
+func NewCollector(keep int) *Collector { return &Collector{keep: keep} }
+
+func (c *Collector) Run(ctx context.Context, interval time.Duration, capture func() []byte) {
+	// @solution
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			p := capture()
+			c.mu.Lock()
+			c.profiles = append(c.profiles, p)
+			if len(c.profiles) > c.keep {
+				c.profiles = slices.Delete(c.profiles, 0, len(c.profiles)-c.keep)
+			}
+			c.mu.Unlock()
+		case <-ctx.Done():
+			return
+		}
+	}
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (c *Collector) Latest() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.profiles)
+}
+--- test
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestCollector(t *testing.T) {
+	c := NewCollector(3)
+	ctx, cancel := context.WithCancel(context.Background())
+	var n atomic.Int32
+	done := make(chan struct{})
+	go func() {
+		c.Run(ctx, 5*time.Millisecond, func() []byte { return []byte(fmt.Sprint(n.Add(1))) })
+		close(done)
+	}()
+	for n.Load() < 8 {
+		_ = c.Latest() // 并发读取
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("ctx 取消后 Run 应返回")
+	}
+	got := c.Latest()
+	last := n.Load()
+	if len(got) != 3 || string(got[2]) != fmt.Sprint(last) || string(got[0]) != fmt.Sprint(last-2) {
+		t.Fatalf("应保留最近 3 份（%d 之前的 3 份），实际 %q", last, got)
+	}
+}
+
+=== perf-17-1
+title: 抓取所有 goroutine 的调用栈
+--- desc
+进程卡死、连 pprof 都访问不了时，`kill -QUIT` 会让运行时打印所有 goroutine 的调用栈。在代码里也可以主动抓取：`runtime.Stack(buf, true)`。
+
+问题是**不知道需要多大的缓冲区**：`runtime.Stack` 只会写满 `buf`，超出的部分直接截断。实现 `DumpGoroutines()`：从 64KB 开始，如果返回的长度等于缓冲区大小（说明可能被截断了），就把缓冲区翻倍重试。
+
+测试会创建 2000 个阻塞的 goroutine，dump 远大于 64KB。
+--- solution
+package main
+
+import "runtime"
+
+func DumpGoroutines() string {
+	// @solution
+	buf := make([]byte, 64<<10)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return string(buf[:n])
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	// @starter
+	// buf := make([]byte, 64<<10)
+	// n := runtime.Stack(buf, true) // TODO: 缓冲区不够时会被截断
+	// return string(buf[:n])
+	// @end
+}
+--- test
+package main
+
+import (
+	"strings"
+	"testing"
+	"time"
+)
+
+func parked(ch chan struct{}) { <-ch }
+
+func TestDump(t *testing.T) {
+	ch := make(chan struct{})
+	defer close(ch)
+	for i := 0; i < 2000; i++ {
+		go parked(ch)
+	}
+	time.Sleep(20 * time.Millisecond)
+	dump := DumpGoroutines()
+	if n := strings.Count(dump, ".parked("); n < 2000 {
+		t.Fatalf("只找到 %d 个 parked（dump 长度 %d），输出被截断了", n, len(dump))
+	}
+}
+
+=== perf-18-1
+title: 用内存预算做背压，防止 OOM
+race: true
+--- desc
+OOM 经常是突发的：一批大请求同时把数据加载进内存。与其等着被 OOM Killer 杀掉，不如给「处理中的数据量」设一个上限，超过就快速拒绝（返回 503，让客户端稍后重试）。
+
+实现 `Budget`：
+
+- `TryAcquire(n)`：占用 n 字节，占用后总量不超过 `limit` 时成功返回 true，否则返回 false 且不占用；
+- `Release(n)`：释放；
+- `Used()`：当前占用量。
+--- solution
+package main
+
+import "sync"
+
+type Budget struct {
+	mu    sync.Mutex
+	limit int64
+	used  int64
+}
+
+func NewBudget(limit int64) *Budget { return &Budget{limit: limit} }
+
+func (b *Budget) TryAcquire(n int64) bool {
+	// @solution
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.used+n > b.limit {
+		return false
+	}
+	b.used += n
+	return true
+	// @starter
+	// b.mu.Lock()
+	// defer b.mu.Unlock()
+	// b.used += n // TODO: 没有检查上限
+	// return true
+	// @end
+}
+
+func (b *Budget) Release(n int64) {
+	b.mu.Lock()
+	b.used -= n
+	b.mu.Unlock()
+}
+
+func (b *Budget) Used() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.used
+}
+--- test
+package main
+
+import (
+	"sync"
+	"sync/atomic"
+	"testing"
+)
+
+func TestBudget(t *testing.T) {
+	b := NewBudget(100)
+	if !b.TryAcquire(60) || b.TryAcquire(50) || !b.TryAcquire(40) {
+		t.Fatal("TryAcquire 判断不对")
+	}
+	b.Release(60)
+	if b.Used() != 40 {
+		t.Fatalf("Used = %d", b.Used())
+	}
+	if b.TryAcquire(1000) {
+		t.Fatal("超过总量的请求永远不能成功")
+	}
+}
+
+func TestConcurrentPeak(t *testing.T) {
+	b := NewBudget(1 << 20)
+	var peak atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				n := int64(64 << 10)
+				if b.TryAcquire(n) {
+					if u := b.Used(); u > peak.Load() {
+						peak.Store(u)
+					}
+					b.Release(n)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if peak.Load() > 1<<20 || b.Used() != 0 {
+		t.Fatalf("峰值 %d 超过预算，或最终占用 %d 不为 0", peak.Load(), b.Used())
+	}
+}
+
+=== perf-19-1
+title: 统计进程打开的 fd 类型
+--- desc
+出现 `too many open files` 时，先看进程打开了哪些 fd。`ls -l /proc/<pid>/fd` 的输出：
+
+```text
+lrwx------ 1 app app 64 Oct 13 10:00 0 -> /dev/null
+lrwx------ 1 app app 64 Oct 13 10:00 5 -> socket:[123456]
+lr-x------ 1 app app 64 Oct 13 10:00 7 -> pipe:[4567]
+lrwx------ 1 app app 64 Oct 13 10:00 9 -> anon_inode:[eventpoll]
+l-wx------ 1 app app 64 Oct 13 10:00 12 -> /var/log/app.log
+```
+
+- `CountFDs(output)`：按 `->` 后面的目标分类：`socket:` 开头为 `socket`，`pipe:` 为 `pipe`，`anon_inode:` 为 `anon_inode`，其他为 `file`；跳过 `total` 这类不含 `->` 的行；
+- `Check(counts, limit)`：总数超过上限的 80% 时返回一条告警，指出数量最多的类型，格式为 `"fd usage 85% (mostly socket)"`；否则返回空字符串。socket 占多数通常意味着连接泄漏。
+--- solution
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+func CountFDs(output string) map[string]int {
+	m := map[string]int{}
+	// @solution
+	for _, line := range strings.Split(output, "\n") {
+		_, target, ok := strings.Cut(line, " -> ")
+		if !ok {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(target, "socket:"):
+			m["socket"]++
+		case strings.HasPrefix(target, "pipe:"):
+			m["pipe"]++
+		case strings.HasPrefix(target, "anon_inode:"):
+			m["anon_inode"]++
+		default:
+			m["file"]++
+		}
+	}
+	// @starter
+	// // TODO
+	// @end
+	return m
+}
+
+func Check(counts map[string]int, limit int) string {
+	// @solution
+	total, top := 0, ""
+	for k, v := range counts {
+		total += v
+		if top == "" || v > counts[top] || (v == counts[top] && k < top) {
+			top = k
+		}
+	}
+	pct := total * 100 / limit
+	if pct <= 80 {
+		return ""
+	}
+	return fmt.Sprintf("fd usage %d%% (mostly %s)", pct, top)
+	// @starter
+	// return "" // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"maps"
+	"strings"
+	"testing"
+)
+
+const lsOut = `total 0
+lrwx------ 1 app app 64 Oct 13 10:00 0 -> /dev/null
+lrwx------ 1 app app 64 Oct 13 10:00 5 -> socket:[123456]
+lrwx------ 1 app app 64 Oct 13 10:00 6 -> socket:[123457]
+lr-x------ 1 app app 64 Oct 13 10:00 7 -> pipe:[4567]
+lrwx------ 1 app app 64 Oct 13 10:00 9 -> anon_inode:[eventpoll]
+l-wx------ 1 app app 64 Oct 13 10:00 12 -> /var/log/app.log
+`
+
+func TestCountFDs(t *testing.T) {
+	got := CountFDs(lsOut)
+	want := map[string]int{"socket": 2, "pipe": 1, "anon_inode": 1, "file": 2}
+	if !maps.Equal(got, want) {
+		t.Fatalf("CountFDs = %v", got)
+	}
+	if Check(got, 1024) != "" {
+		t.Fatal("远低于上限时不应告警")
+	}
+}
+
+func TestCheck(t *testing.T) {
+	var b strings.Builder
+	for i := 0; i < 850; i++ {
+		fmt.Fprintf(&b, "lrwx------ 1 a a 64 Oct 13 10:00 %d -> socket:[%d]\n", i+10, i)
+	}
+	for i := 0; i < 20; i++ {
+		fmt.Fprintf(&b, "lrwx------ 1 a a 64 Oct 13 10:00 %d -> /data/f%d\n", i+900, i)
+	}
+	if got := Check(CountFDs(b.String()), 1024); got != "fd usage 84% (mostly socket)" {
+		t.Fatalf("Check = %q", got)
+	}
+}
+
+=== perf-20-1
+title: 解析 strace -c 的统计
+--- desc
+`strace -c -f -p <pid>` 会统计每个系统调用的次数和耗时：
+
+```text
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 62.50    0.050000          50      1000           write
+ 25.00    0.020000          10      2000       100 read
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.080000                  5000       100 total
+```
+
+注意 `errors` 列可能是空的，所以字段数不固定。实现：
+
+- `ParseStrace(output)`：跳过表头、分隔线和 `total` 行，返回每个系统调用的 `Name`、`Seconds`、`Calls`、`Errors`；
+- `Top(rows, n)`：按耗时从大到小取前 n 个。
+
+如果 `write` 调用次数很多、每次耗时却很短，说明在做大量的小块写入，可以用 `bufio` 合并。
+--- solution
+package main
+
+import (
+	"cmp"
+	"slices"
+	"strconv"
+	"strings"
+)
+
+type Syscall struct {
+	Name    string
+	Seconds float64
+	Calls   int
+	Errors  int
+}
+
+func ParseStrace(output string) ([]Syscall, error) {
+	var out []Syscall
+	// @solution
+	for _, line := range strings.Split(output, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 5 || strings.HasPrefix(f[0], "-") || f[0] == "%" || f[len(f)-1] == "total" {
+			continue
+		}
+		var s Syscall
+		var err error
+		s.Name = f[len(f)-1]
+		if s.Seconds, err = strconv.ParseFloat(f[1], 64); err != nil {
+			return nil, err
+		}
+		if s.Calls, err = strconv.Atoi(f[3]); err != nil {
+			return nil, err
+		}
+		if len(f) == 6 {
+			if s.Errors, err = strconv.Atoi(f[4]); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, s)
+	}
+	// @starter
+	// // TODO
+	// @end
+	return out, nil
+}
+
+func Top(rows []Syscall, n int) []Syscall {
+	s := slices.Clone(rows)
+	slices.SortStableFunc(s, func(a, b Syscall) int { return cmp.Compare(b.Seconds, a.Seconds) })
+	return s[:min(n, len(s))]
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+const straceOut = `% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 12.50    0.010000           5      2000           epoll_wait
+ 62.50    0.050000          50      1000           write
+ 25.00    0.020000          10      2000       100 read
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.080000                  5000       100 total
+`
+
+func TestParseStrace(t *testing.T) {
+	rows, err := ParseStrace(straceOut)
+	want := []Syscall{{"epoll_wait", 0.01, 2000, 0}, {"write", 0.05, 1000, 0}, {"read", 0.02, 2000, 100}}
+	if err != nil || !slices.Equal(rows, want) {
+		t.Fatalf("ParseStrace = %v, %v", rows, err)
+	}
+	if top := Top(rows, 2); top[0].Name != "write" || top[1].Name != "read" {
+		t.Fatalf("Top = %v", top)
+	}
+}
+
+=== perf-21-1
+title: 修复没关闭响应体导致的 CLOSE_WAIT
+--- desc
+服务端关闭空闲连接后，客户端这边的连接进入 CLOSE_WAIT，直到客户端程序调用 Close。下面的 `Status` 只取了状态码，**没有关闭 resp.Body**：连接既不能放回连接池复用，也不会被关闭，越积越多。
+
+修复：`defer resp.Body.Close()`，并把剩余的 Body 读掉（最多读一小段，`io.Copy(io.Discard, io.LimitReader(...))`），这样连接才能被复用。测试会统计服务端看到的新连接数：20 次顺序调用，正确的实现只会建立 1 个连接。
+--- solution
+package main
+
+import (
+	"io"
+	"net/http"
+)
+
+func Status(client *http.Client, url string) (int, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	return resp.StatusCode, nil
+}
+--- starter
+package main
+
+import "net/http"
+
+func Status(client *http.Client, url string) (int, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	return resp.StatusCode, nil
+}
+--- test
+package main
+
+import (
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+)
+
+func TestConnectionReuse(t *testing.T) {
+	var newConns atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(strings.Repeat("x", 2048)))
+	}))
+	srv.Config.ConnState = func(c net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			newConns.Add(1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	client := &http.Client{Transport: &http.Transport{}}
+	defer client.CloseIdleConnections()
+	for i := 0; i < 20; i++ {
+		code, err := Status(client, srv.URL)
+		if err != nil || code != 200 {
+			t.Fatalf("Status = %d, %v", code, err)
+		}
+	}
+	if n := newConns.Load(); n != 1 {
+		t.Fatalf("20 次顺序请求建立了 %d 个连接，响应体没有关闭（或没读完）时连接无法复用", n)
+	}
+}
+
+=== perf-22-1
+title: 记录慢 SQL
+--- desc
+在数据访问层统一包一层，超过阈值的查询打印慢日志，是定位「接口慢是不是 SQL 慢」最直接的手段。
+
+实现 `WithSlowLog(threshold, now, log, next)`，返回包装后的查询函数：
+
+- 正常调用 `next`，原样返回它的错误；
+- 耗时 **≥** `threshold` 时调用 `log`，格式为 `slow query (120ms): SELECT * FROM t WHERE id = ?`；
+- SQL 里连续的空白（换行、多个空格）压缩成一个空格；超过 100 个字符时截断为前 100 个字符加 `...`；
+- **不要**把参数打进日志（可能包含手机号、身份证号等敏感信息）。
+--- solution
+package main
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+)
+
+type QueryFunc func(ctx context.Context, sql string, args ...any) error
+
+func WithSlowLog(threshold time.Duration, now func() time.Time, log func(string), next QueryFunc) QueryFunc {
+	return func(ctx context.Context, sql string, args ...any) error {
+		// @solution
+		start := now()
+		err := next(ctx, sql, args...)
+		if d := now().Sub(start); d >= threshold {
+			s := strings.Join(strings.Fields(sql), " ")
+			if len(s) > 100 {
+				s = s[:100] + "..."
+			}
+			log(fmt.Sprintf("slow query (%v): %s", d, s))
+		}
+		return err
+		// @starter
+		// return next(ctx, sql, args...) // TODO
+		// @end
+	}
+}
+--- test
+package main
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestSlowLog(t *testing.T) {
+	now := time.Unix(0, 0)
+	var logs []string
+	cost := 120 * time.Millisecond
+	boom := errors.New("deadlock")
+	q := WithSlowLog(100*time.Millisecond, func() time.Time { return now }, func(s string) { logs = append(logs, s) },
+		func(ctx context.Context, sql string, args ...any) error {
+			now = now.Add(cost)
+			if strings.Contains(sql, "UPDATE") {
+				return boom
+			}
+			return nil
+		})
+
+	q(context.Background(), "SELECT *\n  FROM orders\n  WHERE phone = ?", "13800138000")
+	if len(logs) != 1 || logs[0] != "slow query (120ms): SELECT * FROM orders WHERE phone = ?" {
+		t.Fatalf("logs = %q", logs)
+	}
+	if strings.Contains(logs[0], "13800138000") {
+		t.Fatal("参数不应出现在日志里")
+	}
+
+	cost = 10 * time.Millisecond
+	q(context.Background(), "SELECT 1")
+	if len(logs) != 1 {
+		t.Fatal("快查询不应记录")
+	}
+
+	cost = time.Second
+	long := "SELECT " + strings.Repeat("col, ", 40) + "id FROM t"
+	if err := q(context.Background(), "UPDATE "+long); !errors.Is(err, boom) {
+		t.Fatal("应原样返回 next 的错误")
+	}
+	if l := logs[1]; !strings.HasSuffix(l, "...") || len(l) != len("slow query (1s): ")+103 {
+		t.Fatalf("超长 SQL 应截断：%q", l)
+	}
+}
+
+=== perf-23-1
+title: 排查偶发 502：空闲超时要配对
+--- desc
+偶发 502 的经典原因：负载均衡器复用与后端的空闲连接，但后端 Go 服务的 `IdleTimeout` 比负载均衡器的更短——后端先关了连接，LB 恰好在这个连接上发请求，收到 RST，返回 502。
+
+- `CheckIdle(lbIdle, backendIdle)`：后端空闲超时必须**大于** LB 的空闲超时，否则返回错误；
+- `Classify(upstreamStatus, duration, proxyTimeout)`：根据网关日志判断错误类型：上游状态为 `-`（没收到响应）且耗时 ≥ 代理超时 → `"504-timeout"`；为 `-` 且耗时更短 → `"502-reset"`；上游返回了 5xx → `"upstream-5xx"`；其他 → `"ok"`。
+--- solution
+package main
+
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+func CheckIdle(lbIdle, backendIdle time.Duration) error {
+	// @solution
+	if backendIdle <= lbIdle {
+		return fmt.Errorf("backend idle timeout %v must be greater than load balancer idle timeout %v", backendIdle, lbIdle)
+	}
+	return nil
+	// @starter
+	// return nil // TODO
+	// @end
+}
+
+func Classify(upstreamStatus string, duration, proxyTimeout time.Duration) string {
+	// @solution
+	switch {
+	case upstreamStatus == "-" && duration >= proxyTimeout:
+		return "504-timeout"
+	case upstreamStatus == "-":
+		return "502-reset"
+	case strings.HasPrefix(upstreamStatus, "5"):
+		return "upstream-5xx"
+	}
+	return "ok"
+	// @starter
+	// return "ok" // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+func TestCheckIdle(t *testing.T) {
+	if err := CheckIdle(60*time.Second, 30*time.Second); err == nil {
+		t.Error("后端 30s < LB 60s，应报错")
+	}
+	if err := CheckIdle(60*time.Second, 60*time.Second); err == nil {
+		t.Error("相等也不安全")
+	}
+	if err := CheckIdle(60*time.Second, 90*time.Second); err != nil {
+		t.Errorf("90s > 60s 是正确的配置：%v", err)
+	}
+}
+
+func TestClassify(t *testing.T) {
+	cases := []struct {
+		status string
+		d      time.Duration
+		want   string
+	}{
+		{"-", 60 * time.Second, "504-timeout"},
+		{"-", 3 * time.Millisecond, "502-reset"},
+		{"503", 20 * time.Millisecond, "upstream-5xx"},
+		{"200", 20 * time.Millisecond, "ok"},
+		{"404", 20 * time.Millisecond, "ok"},
+	}
+	for _, c := range cases {
+		if got := Classify(c.status, c.d, 60*time.Second); got != c.want {
+			t.Errorf("Classify(%s, %v) = %s，期望 %s", c.status, c.d, got, c.want)
+		}
+	}
+}
+
+=== perf-24-1
+title: 批量处理减少唤醒和切换
+race: true
+--- desc
+每来一条消息就唤醒一次消费者、写一次下游，会产生大量的 goroutine 切换和系统调用。常见的优化是**攒批**。
+
+实现 `Batch(in, max, wait)`：返回一个输出 channel，按以下规则输出 `[]int`：
+
+- 攒够 `max` 条立即输出一批；
+- 距离这一批的**第一条**数据到达已经过了 `wait`，即使没攒够也输出；
+- `in` 关闭时把剩余的数据作为最后一批输出（如果有），然后关闭输出 channel。
+
+每一批都是新的切片，不能复用底层数组。
+--- solution
+package main
+
+import "time"
+
+func Batch(in <-chan int, max int, wait time.Duration) <-chan []int {
+	out := make(chan []int)
+	go func() {
+		defer close(out)
+		// @solution
+		var batch []int
+		var timer *time.Timer
+		var timeout <-chan time.Time
+		flush := func() {
+			if len(batch) > 0 {
+				out <- batch
+				batch = nil
+			}
+			if timer != nil {
+				timer.Stop()
+				timer, timeout = nil, nil
+			}
+		}
+		for {
+			select {
+			case v, ok := <-in:
+				if !ok {
+					flush()
+					return
+				}
+				if len(batch) == 0 {
+					timer = time.NewTimer(wait)
+					timeout = timer.C
+				}
+				batch = append(batch, v)
+				if len(batch) >= max {
+					flush()
+				}
+			case <-timeout:
+				flush()
+			}
+		}
+		// @starter
+		// for v := range in {
+		// 	out <- []int{v} // TODO: 每条一批
+		// }
+		// @end
+	}()
+	return out
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+	"time"
+)
+
+func TestBatchBySize(t *testing.T) {
+	in := make(chan int)
+	out := Batch(in, 10, time.Second)
+	go func() {
+		for i := 0; i < 25; i++ {
+			in <- i
+		}
+		close(in)
+	}()
+	var sizes []int
+	for b := range out {
+		sizes = append(sizes, len(b))
+	}
+	if !slices.Equal(sizes, []int{10, 10, 5}) {
+		t.Fatalf("批大小 = %v，期望 [10 10 5]", sizes)
+	}
+}
+
+func TestBatchByTime(t *testing.T) {
+	in := make(chan int)
+	out := Batch(in, 100, 30*time.Millisecond)
+	go func() {
+		in <- 1
+		in <- 2
+		time.Sleep(100 * time.Millisecond)
+		in <- 3
+		close(in)
+	}()
+	start := time.Now()
+	first := <-out
+	if !slices.Equal(first, []int{1, 2}) || time.Since(start) > 90*time.Millisecond {
+		t.Fatalf("应在约 30ms 后输出 [1 2]，实际 %v（%v）", first, time.Since(start))
+	}
+	if second := <-out; !slices.Equal(second, []int{3}) {
+		t.Fatalf("第二批 = %v", second)
+	}
+	if _, ok := <-out; ok {
+		t.Fatal("输入关闭后输出也应关闭")
+	}
+}
+
+=== perf-25-1
+title: 最近 N 秒的 p99
+--- desc
+监控面板上的 p99 是**滑动窗口**内的统计。实现一个按秒分桶的 `Window`：
+
+- `Add(at, d)`：记录一个请求在 `at` 时刻完成、耗时 `d`；
+- `P99(now)`：统计最近 `size` 秒（即 Unix 秒数在 `(now − size, now]` 之间）的所有样本，用最近秩法返回 p99：排序后取第 `ceil(0.99 × n)` 个；没有样本返回 0。
+
+用 `size` 个桶的环形数组，桶下标为 `秒数 % size`；写入时如果桶里存的是更早的秒，先清空。这样内存是固定的，不会无限增长。
+--- solution
+package main
+
+import (
+	"slices"
+	"time"
+)
+
+type bucket struct {
+	sec     int64
+	samples []time.Duration
+}
+
+type Window struct {
+	size    int
+	buckets []bucket
+}
+
+func NewWindow(size int) *Window { return &Window{size: size, buckets: make([]bucket, size)} }
+
+func (w *Window) Add(at time.Time, d time.Duration) {
+	// @solution
+	sec := at.Unix()
+	b := &w.buckets[sec%int64(w.size)]
+	if b.sec != sec {
+		b.sec, b.samples = sec, b.samples[:0]
+	}
+	b.samples = append(b.samples, d)
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (w *Window) P99(now time.Time) time.Duration {
+	// @solution
+	var all []time.Duration
+	cur := now.Unix()
+	for _, b := range w.buckets {
+		if b.sec > cur-int64(w.size) && b.sec <= cur {
+			all = append(all, b.samples...)
+		}
+	}
+	if len(all) == 0 {
+		return 0
+	}
+	slices.Sort(all)
+	rank := (len(all)*99 + 99) / 100
+	return all[rank-1]
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+func TestWindow(t *testing.T) {
+	base := time.Unix(1000, 0)
+	w := NewWindow(10)
+	for i := 0; i < 99; i++ {
+		w.Add(base, 10*time.Millisecond)
+	}
+	w.Add(base, 900*time.Millisecond)
+	if p := w.P99(base); p != 10*time.Millisecond {
+		t.Fatalf("100 个样本的 p99 = %v，期望 10ms（第 99 个）", p)
+	}
+	w.Add(base.Add(time.Second), 950*time.Millisecond)
+	if p := w.P99(base.Add(time.Second)); p != 900*time.Millisecond {
+		t.Fatalf("101 个样本的 p99 = %v，期望 900ms", p)
+	}
+	if p := w.P99(base.Add(10 * time.Second)); p != 950*time.Millisecond {
+		t.Fatalf("10 秒后 base 那一秒应移出窗口：p99 = %v", p)
+	}
+	w.Add(base.Add(20*time.Second), time.Millisecond) // 复用旧的桶
+	if p := w.P99(base.Add(20 * time.Second)); p != time.Millisecond {
+		t.Fatalf("旧数据应被清空：p99 = %v", p)
+	}
+	if NewWindow(5).P99(base) != 0 {
+		t.Fatal("没有样本返回 0")
+	}
+}
+
+=== perf-26-1
+title: 从 cpu.stat 发现 CPU 限流
+--- desc
+容器的 CPU 使用率看起来不高，延迟却周期性飙升？去看 cgroup v2 的 `cpu.stat`：
+
+```text
+usage_usec 92837465
+user_usec 81023344
+system_usec 11814121
+nr_periods 36000
+nr_throttled 9000
+throttled_usec 1260000000
+```
+
+- `ParseCPUStat(text)`：解析成「字段名 → 值」；
+- `Throttle(a, b)`：两次采样之间被限流的周期比例（`Δnr_throttled / Δnr_periods`）以及每次限流的平均时长（`Δthrottled_usec / Δnr_throttled`）。比例超过百分之几就会明显影响延迟，常见原因是 GOMAXPROCS 大于 CPU limit。
+--- solution
+package main
+
+import (
+	"errors"
+	"strconv"
+	"strings"
+	"time"
+)
+
+func ParseCPUStat(text string) (map[string]int64, error) {
+	m := map[string]int64{}
+	// @solution
+	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			return nil, errors.New("bad line: " + line)
+		}
+		v, err := strconv.ParseInt(f[1], 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		m[f[0]] = v
+	}
+	// @starter
+	// // TODO
+	// @end
+	return m, nil
+}
+
+func Throttle(a, b map[string]int64) (ratio float64, avg time.Duration) {
+	// @solution
+	periods := b["nr_periods"] - a["nr_periods"]
+	throttled := b["nr_throttled"] - a["nr_throttled"]
+	if periods <= 0 || throttled <= 0 {
+		return 0, 0
+	}
+	usec := b["throttled_usec"] - a["throttled_usec"]
+	return float64(throttled) / float64(periods), time.Duration(usec/throttled) * time.Microsecond
+	// @starter
+	// return 0, 0 // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+func TestThrottle(t *testing.T) {
+	a, err := ParseCPUStat("usage_usec 1000\nnr_periods 36000\nnr_throttled 9000\nthrottled_usec 1260000000\n")
+	if err != nil || a["nr_throttled"] != 9000 {
+		t.Fatalf("ParseCPUStat = %v, %v", a, err)
+	}
+	b, _ := ParseCPUStat("usage_usec 9000\nnr_periods 36600\nnr_throttled 9150\nthrottled_usec 1272000000")
+	ratio, avg := Throttle(a, b)
+	if ratio != 0.25 || avg != 80*time.Millisecond {
+		t.Fatalf("ratio=%v avg=%v，期望 25%% / 80ms", ratio, avg)
+	}
+	if r, _ := Throttle(a, a); r != 0 {
+		t.Fatal("没有新的周期时返回 0")
+	}
+	if _, err := ParseCPUStat("bad"); err == nil {
+		t.Fatal("格式错误应返回错误")
+	}
+}
+
+=== perf-27-1
+title: 解析 ping 统计判断丢包
+--- desc
+排查网络问题时，`ping` 的最后两行最有用：
+
+```text
+--- 10.0.0.2 ping statistics ---
+100 packets transmitted, 97 received, 3% packet loss, time 99130ms
+rtt min/avg/max/mdev = 0.210/0.452/12.301/1.203 ms
+```
+
+实现 `ParsePing(output)`，返回发送数、接收数、丢包率（自己根据发送和接收计算，单位 %），以及 min/avg/max/mdev（`time.Duration`）。全部丢包时没有 rtt 行，这时 rtt 都为 0。可以用 `fmt.Sscanf` 解析。
+
+`max` 远大于 `avg` 往往意味着偶发的排队或重传；mdev 大说明抖动严重。
+--- solution
+package main
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+)
+
+type Ping struct {
+	Sent, Received          int
+	LossPct                 float64
+	Min, Avg, Max, Mdev     time.Duration
+}
+
+func ParsePing(output string) (Ping, error) {
+	var p Ping
+	// @solution
+	found := false
+	ms := func(v float64) time.Duration { return time.Duration(v * float64(time.Millisecond)) }
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.Contains(line, "packets transmitted"):
+			if _, err := fmt.Sscanf(line, "%d packets transmitted, %d received", &p.Sent, &p.Received); err != nil {
+				return p, err
+			}
+			found = true
+		case strings.HasPrefix(line, "rtt ") || strings.HasPrefix(line, "round-trip "):
+			_, vals, _ := strings.Cut(line, "= ")
+			var a, b, c, d float64
+			if _, err := fmt.Sscanf(vals, "%f/%f/%f/%f ms", &a, &b, &c, &d); err != nil {
+				return p, err
+			}
+			p.Min, p.Avg, p.Max, p.Mdev = ms(a), ms(b), ms(c), ms(d)
+		}
+	}
+	if !found || p.Sent == 0 {
+		return p, errors.New("no statistics line")
+	}
+	p.LossPct = float64(p.Sent-p.Received) / float64(p.Sent) * 100
+	return p, nil
+	// @starter
+	// return p, errors.New("TODO")
+	// @end
+}
+--- test
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+func TestParsePing(t *testing.T) {
+	out := `PING 10.0.0.2 (10.0.0.2) 56(84) bytes of data.
+64 bytes from 10.0.0.2: icmp_seq=1 ttl=64 time=0.210 ms
+
+--- 10.0.0.2 ping statistics ---
+100 packets transmitted, 97 received, 3% packet loss, time 99130ms
+rtt min/avg/max/mdev = 0.210/0.452/12.301/1.203 ms
+`
+	p, err := ParsePing(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Sent != 100 || p.Received != 97 || p.LossPct != 3 {
+		t.Fatalf("统计 = %+v", p)
+	}
+	if p.Min != 210*time.Microsecond || p.Max != 12301*time.Microsecond || p.Mdev != 1203*time.Microsecond {
+		t.Fatalf("rtt = %+v", p)
+	}
+}
+
+func TestAllLost(t *testing.T) {
+	p, err := ParsePing("--- x ping statistics ---\n4 packets transmitted, 0 received, 100% packet loss, time 3060ms\n")
+	if err != nil || p.LossPct != 100 || p.Avg != 0 {
+		t.Fatalf("p=%+v err=%v", p, err)
+	}
+	if _, err := ParsePing("hello"); err == nil {
+		t.Fatal("没有统计行应返回错误")
+	}
+}
+
+=== perf-28-1
+title: 实现 bcc 风格的 log2 直方图
+--- desc
+`biolatency`、`runqlat` 这些 eBPF 工具在内核里把延迟按 2 的幂分桶计数，只把桶传回用户态，开销极低。实现同样的分桶和展示：
+
+- `Log2Hist(values)`：0 和 1 落在第 0 个桶 `[0, 1]`；其他值 v 落在第 k 个桶 `[2^k, 2^(k+1) − 1]`，其中 `k = bits.Len64(v) − 1`。返回从第 0 个桶到最高的非空桶的所有桶（中间的空桶也要有）；
+- `Render(buckets, width)`：每个桶一行，格式为 `fmt.Sprintf("%8d -> %-8d : %-6d |%s|", Lo, Hi, Count, 星号)`，星号的个数 = `Count × width / 最大Count`（整数除法），右侧用空格补齐到 width。
+--- solution
+package main
+
+import (
+	"fmt"
+	"math/bits"
+	"strings"
+)
+
+type Bucket struct {
+	Lo, Hi uint64
+	Count  int
+}
+
+func Log2Hist(values []uint64) []Bucket {
+	// @solution
+	var counts []int
+	for _, v := range values {
+		k := 0
+		if v > 1 {
+			k = bits.Len64(v) - 1
+		}
+		for len(counts) <= k {
+			counts = append(counts, 0)
+		}
+		counts[k]++
+	}
+	out := make([]Bucket, len(counts))
+	for k, c := range counts {
+		lo := uint64(1) << k
+		if k == 0 {
+			lo = 0
+		}
+		out[k] = Bucket{lo, uint64(1)<<(k+1) - 1, c}
+	}
+	return out
+	// @starter
+	// return nil // TODO
+	// @end
+}
+
+func Render(buckets []Bucket, width int) string {
+	// @solution
+	maxCount := 0
+	for _, b := range buckets {
+		maxCount = max(maxCount, b.Count)
+	}
+	var sb strings.Builder
+	for _, b := range buckets {
+		stars := 0
+		if maxCount > 0 {
+			stars = b.Count * width / maxCount
+		}
+		bar := strings.Repeat("*", stars) + strings.Repeat(" ", width-stars)
+		fmt.Fprintf(&sb, "%8d -> %-8d : %-6d |%s|\n", b.Lo, b.Hi, b.Count, bar)
+	}
+	return sb.String()
+	// @starter
+	// return "" // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"strings"
+	"testing"
+)
+
+func TestLog2Hist(t *testing.T) {
+	vals := []uint64{0, 1, 2, 3, 5, 7, 7, 300, 260}
+	got := Log2Hist(vals)
+	want := []Bucket{{0, 1, 2}, {2, 3, 2}, {4, 7, 3}, {8, 15, 0}, {16, 31, 0}, {32, 63, 0}, {64, 127, 0}, {128, 255, 0}, {256, 511, 2}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("Log2Hist = %v\n期望 %v", got, want)
+	}
+	if Log2Hist(nil) != nil && len(Log2Hist(nil)) != 0 {
+		t.Fatal("空输入")
+	}
+}
+
+func TestRender(t *testing.T) {
+	out := Render([]Bucket{{0, 1, 5}, {2, 3, 20}, {4, 7, 10}}, 20)
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("应有 3 行：%q", out)
+	}
+	if lines[1] != "       2 -> 3        : 20     |********************|" {
+		t.Fatalf("第二行 = %q", lines[1])
+	}
+	if strings.Count(lines[0], "*") != 5 || strings.Count(lines[2], "*") != 10 {
+		t.Fatalf("星号数量不对：\n%s", out)
+	}
+}

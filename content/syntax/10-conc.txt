@@ -1,0 +1,792 @@
+=== goroutine
+name: goroutine：go 关键字
+group: 并发
+--- body
+`go f(x)` 启动一个新的 goroutine 并发执行 `f`，当前函数**不会等待**它结束。goroutine 很轻量（初始栈约 2KB），可以轻松创建成千上万个。
+
+**写法**
+
+```go
+go worker(jobs)
+go func() {
+	defer wg.Done()
+	process()
+}()
+```
+
+**例子：并发请求并收集结果**
+
+```go
+func fetchAll(urls []string) []int {
+	sizes := make([]int, len(urls))
+	var wg sync.WaitGroup
+	for i, u := range urls {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sizes[i] = fetch(u) // 每个 goroutine 写不同的下标，不需要加锁
+		}()
+	}
+	wg.Wait()
+	return sizes
+}
+```
+
+**注意**
+
+- **main 函数返回时所有 goroutine 都会被直接终止**，需要用 WaitGroup、channel 等方式等待它们。
+- `go f(x)` 的参数在**启动时**就求值了。
+- 每个 goroutine 都要有明确的退出路径，否则就是 goroutine 泄漏（内存和资源一直被占用）。典型原因：往没人读的 channel 发送、从没人写也不关闭的 channel 接收。
+- 多个 goroutine 读写同一个变量必须同步，用 `go test -race` 检测数据竞争。
+- goroutine 里的 panic 会让整个程序崩溃。
+
+=== chan
+name: channel 基础
+group: 并发
+--- body
+channel 是 goroutine 之间传递数据的管道：`ch <- v` 发送，`v := <-ch` 接收。**无缓冲 channel** 的发送会阻塞到有人接收为止，因此它同时起到了**同步**的作用。
+
+**写法**
+
+```go
+ch := make(chan int)      // 无缓冲
+ch <- 1                   // 发送（阻塞直到被接收）
+v := <-ch                 // 接收（阻塞直到有数据）
+<-done                    // 只等待信号，丢弃值
+done := make(chan struct{}) // 只做信号用
+```
+
+**例子：等待后台任务完成**
+
+```go
+done := make(chan struct{})
+go func() {
+	work()
+	close(done) // 或者 done <- struct{}{}
+}()
+<-done        // 阻塞到 work 完成
+```
+
+**例子：ping-pong 交替打印**
+
+```go
+ping, pong := make(chan int), make(chan int)
+go func() {
+	for v := range ping {
+		fmt.Println("ping", v)
+		pong <- v + 1
+	}
+}()
+ping <- 0
+fmt.Println(<-pong) // 1
+```
+
+**注意**
+
+- **nil channel 的发送和接收永远阻塞**（在 select 里可以用来“关掉”一个分支）。
+- 所有 goroutine 都阻塞时运行时会报 `fatal error: all goroutines are asleep - deadlock!`；只有部分阻塞时不会报错，而是泄漏。
+- “不要通过共享内存来通信，而要通过通信来共享内存”：channel 适合传递所有权和编排流程，简单的计数器 / 缓存用锁或原子操作更直接。
+
+=== chan-buffered
+name: 带缓冲的 channel
+group: 并发
+--- body
+`make(chan T, n)` 创建容量为 n 的缓冲 channel：缓冲区没满时发送不阻塞，缓冲区不空时接收不阻塞。
+
+**写法**
+
+```go
+ch := make(chan int, 3)
+ch <- 1; ch <- 2; ch <- 3  // 都不阻塞
+// ch <- 4                 // 缓冲满了，阻塞
+len(ch)                    // 当前缓冲中的元素个数
+cap(ch)                    // 容量 3
+```
+
+**例子：用缓冲 channel 做信号量，限制并发数**
+
+```go
+sem := make(chan struct{}, 3) // 同时最多 3 个
+var wg sync.WaitGroup
+for _, task := range tasks {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sem <- struct{}{}        // 获取令牌，满了就等
+		defer func() { <-sem }() // 释放令牌
+		run(task)
+	}()
+}
+wg.Wait()
+```
+
+**注意**
+
+- 缓冲只是削峰，不能解决“生产比消费快”的根本问题，满了照样阻塞。
+- 缓冲为 1 的 channel 常用来“确保 goroutine 发送结果后能退出”：即使接收方因为超时已经走了，发送也不会永远阻塞（避免泄漏）。
+- 不要用 `len(ch)` 做判断逻辑，在并发下它的值随时会变。
+
+=== chan-close
+name: 关闭 channel
+group: 并发
+--- body
+`close(ch)` 表示“不会再发送了”。关闭后，接收方会先把缓冲里剩下的数据读完，然后每次接收都**立即返回零值**；`range ch` 会结束。
+
+**写法**
+
+```go
+close(ch)
+for v := range ch { } // 读完并在关闭后退出
+v, ok := <-ch          // ok == false 表示已关闭且读空
+```
+
+**例子：广播退出信号**
+
+```go
+quit := make(chan struct{})
+for i := 0; i < 3; i++ {
+	go func() {
+		for {
+			select {
+			case <-quit: // 关闭后所有 goroutine 都能立即收到
+				return
+			default:
+				doWork()
+			}
+		}
+	}()
+}
+close(quit) // 一次 close 通知所有等待者，发送一个值只能通知一个
+```
+
+**注意**
+
+- **向已关闭的 channel 发送会 panic**，**重复 close 也会 panic**，close nil channel 同样 panic。
+- 原则：**由发送方关闭**；有多个发送方时，等所有发送方结束（WaitGroup）后由一个协调者关闭。
+- channel 不需要像文件那样必须关闭，只在需要通知接收方“结束了”时才关闭，不再使用的 channel 会被 GC 回收。
+- 需要“只关闭一次”的场景用 `sync.Once` 包装 close。
+
+=== chan-commaok
+name: v, ok := <-ch
+group: 并发
+--- body
+接收时用两个变量 `v, ok := <-ch`：`ok` 为 false 表示 channel **已关闭且缓冲已读空**，此时 `v` 是零值。用来区分“收到了零值”和“channel 关了”。
+
+**写法**
+
+```go
+v, ok := <-ch
+if !ok {
+	// 已关闭
+}
+
+select {
+case v, ok := <-ch:
+	if !ok {
+		ch = nil // 关闭后设为 nil，这个 case 以后永远不会被选中
+		continue
+	}
+	use(v)
+}
+```
+
+**例子：合并两个 channel**
+
+```go
+func merge(a, b <-chan int) []int {
+	var out []int
+	for a != nil || b != nil {
+		select {
+		case v, ok := <-a:
+			if !ok {
+				a = nil
+				continue
+			}
+			out = append(out, v)
+		case v, ok := <-b:
+			if !ok {
+				b = nil
+				continue
+			}
+			out = append(out, v)
+		}
+	}
+	return out
+}
+```
+
+**注意**
+
+- 关闭的 channel 在 select 里**永远可读**，如果不检查 ok 并置 nil，会变成忙循环。
+- 关闭前缓冲区里的数据仍然会先被读到，`ok` 为 true。
+
+=== chan-dir
+name: 单向 channel
+group: 并发
+--- body
+在函数参数里把 channel 声明成只发送 `chan<- T` 或只接收 `<-chan T`，编译器会禁止反方向的操作，让“谁负责写、谁负责读和关闭”一目了然。
+
+**写法**
+
+```go
+func producer(out chan<- int) { out <- 1; close(out) } // 只能发送和关闭
+func consumer(in <-chan int)  { for v := range in { _ = v } } // 只能接收
+
+ch := make(chan int)
+go producer(ch) // 双向 channel 可以自动转换成单向的
+consumer(ch)
+```
+
+**例子：生成器模式**
+
+```go
+func gen(nums ...int) <-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)
+		for _, n := range nums {
+			out <- n
+		}
+	}()
+	return out // 调用方只能读，不能误写或误关闭
+}
+
+func square(in <-chan int) <-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)
+		for n := range in {
+			out <- n * n
+		}
+	}()
+	return out
+}
+
+for v := range square(gen(1, 2, 3)) {
+	fmt.Println(v) // 1 4 9
+}
+```
+
+**注意**
+
+- 箭头的位置：`<-chan` 箭头在 chan 左边（数据从 chan 流出 = 只读），`chan<-` 箭头在右边（数据流入 = 只写）。
+- 只接收的 channel 不能 close（编译报错），这正好保证了“由发送方关闭”。
+- `time.After`、`ctx.Done()` 返回的都是 `<-chan`。
+
+=== select
+name: select 多路复用
+group: 并发
+--- body
+`select` 同时等待多个 channel 操作，**哪个先就绪就执行哪个**；多个同时就绪时**随机**选一个。常用于超时、取消、合并多个来源。
+
+**写法**
+
+```go
+select {
+case v := <-ch1:
+	use(v)
+case ch2 <- x:
+	// 发送成功
+case <-time.After(time.Second):
+	// 超时
+case <-ctx.Done():
+	return ctx.Err()
+}
+```
+
+**例子：带超时的请求**
+
+```go
+func callWithTimeout(d time.Duration) (string, error) {
+	ch := make(chan string, 1) // 缓冲 1：超时后 goroutine 也能发送完退出
+	go func() { ch <- slowCall() }()
+	select {
+	case res := <-ch:
+		return res, nil
+	case <-time.After(d):
+		return "", errors.New("timeout")
+	}
+}
+```
+
+**注意**
+
+- 没有任何 case 的 `select {}` 会永久阻塞。
+- 如果用无缓冲 channel，超时后 goroutine 的发送永远没人接收，goroutine 泄漏。
+- 在循环里每次都 `time.After` 会不断创建定时器；长期循环里用一个 `time.Timer` 或 `time.Ticker` 复用。
+- case 里的 `break` 只跳出 select。
+- 随机选择意味着**没有优先级**；需要优先处理退出信号时，可以在循环开头先单独非阻塞检查一次 `ctx.Done()`。
+
+=== select-default
+name: select 的 default：非阻塞操作
+group: 并发
+--- body
+`select` 带 `default` 分支时，如果所有 case 都没就绪，就**立即执行 default**，不阻塞。用来实现“尝试发送 / 尝试接收”。
+
+**写法**
+
+```go
+select {
+case ch <- v:
+	// 发送成功
+default:
+	// channel 满了，丢弃或走降级逻辑
+}
+
+select {
+case v := <-ch:
+	use(v)
+default:
+	// 现在没有数据
+}
+```
+
+**例子：非阻塞地通知（合并多次通知）**
+
+```go
+notify := make(chan struct{}, 1)
+
+func trigger() {
+	select {
+	case notify <- struct{}{}: // 已有一个待处理通知就不再重复发
+	default:
+	}
+}
+```
+
+**注意**
+
+- 在 `for` 里使用带 default 的 select 而 default 什么都不做，会变成占满 CPU 的忙等待。
+- 判断“channel 是否已关闭”不能用这种方式可靠地实现，应该用 `v, ok := <-ch`。
+
+=== waitgroup
+name: sync.WaitGroup
+group: 并发
+--- body
+`WaitGroup` 用来**等待一组 goroutine 全部结束**：启动前 `Add(n)`，每个 goroutine 结束时 `Done()`，等待方调用 `Wait()` 阻塞到计数归零。
+
+**写法**
+
+```go
+var wg sync.WaitGroup
+for _, t := range tasks {
+	wg.Add(1)              // 在启动 goroutine 之前 Add
+	go func() {
+		defer wg.Done()    // defer 保证即使 panic 也会 Done
+		run(t)
+	}()
+}
+wg.Wait()
+
+// Go 1.25 新增了 wg.Go(func() { run(t) })，自动 Add 和 Done
+```
+
+**例子：并发计算后关闭结果 channel**
+
+```go
+results := make(chan int)
+var wg sync.WaitGroup
+for _, n := range nums {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		results <- n * n
+	}()
+}
+go func() {
+	wg.Wait()      // 所有发送方都结束了
+	close(results) // 再关闭，range 才能结束
+}()
+sum := 0
+for r := range results {
+	sum += r
+}
+```
+
+**注意**
+
+- **`Add` 必须在 `go` 语句之前**调用；放在 goroutine 里面可能导致 `Wait` 在 `Add` 之前就返回。
+- WaitGroup 不能复制，传给函数要用指针 `*sync.WaitGroup`（更好的做法是用闭包，不传它）。
+- 计数变成负数会 panic（`Done` 多调用了）。
+- 需要“任意一个出错就取消其他”时，用 `golang.org/x/sync/errgroup`。
+
+=== mutex
+name: sync.Mutex / RWMutex
+group: 并发
+--- body
+互斥锁保护共享数据：同一时刻只有一个 goroutine 能持有锁。`RWMutex` 允许**多个读者同时读**，写者独占，适合读多写少。
+
+**写法**
+
+```go
+var mu sync.Mutex
+mu.Lock()
+defer mu.Unlock()
+
+var rw sync.RWMutex
+rw.RLock()   // 读锁，可以多个 goroutine 同时持有
+rw.RUnlock()
+rw.Lock()    // 写锁，独占
+rw.Unlock()
+
+mu.TryLock() // 尝试加锁，不阻塞（很少需要）
+```
+
+**例子：并发安全的计数器**
+
+```go
+type Counter struct {
+	mu sync.Mutex
+	m  map[string]int
+}
+
+func (c *Counter) Inc(k string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = map[string]int{}
+	}
+	c.m[k]++
+}
+```
+
+**注意**
+
+- **锁不能复制**：包含锁的结构体要用指针接收者、传指针，`go vet` 会检查。
+- Go 的锁**不可重入**：持有锁时再次 `Lock` 同一把锁会死锁（比如一个加锁的方法调用另一个加锁的方法）。
+- 锁的粒度尽量小：不要在持锁时做 IO、调用外部回调或往 channel 发送。
+- 多把锁要按固定顺序获取，否则可能死锁。
+- 零值就是未加锁的可用锁，不需要初始化。
+
+=== once
+name: sync.Once
+group: 并发
+--- body
+`once.Do(f)` 保证 `f` 在多个 goroutine 并发调用时**只执行一次**，其他调用者会等到 f 执行完毕才返回。常用于延迟初始化、单例、只关闭一次。
+
+**写法**
+
+```go
+var (
+	once sync.Once
+	cfg  *Config
+)
+
+func GetConfig() *Config {
+	once.Do(func() {
+		cfg = loadConfig()
+	})
+	return cfg
+}
+
+// Go 1.21+ 更简洁的写法
+var getConfig = sync.OnceValue(loadConfig) // getConfig() 返回同一个结果
+```
+
+**例子：安全地多次关闭**
+
+```go
+type Worker struct {
+	quit      chan struct{}
+	closeOnce sync.Once
+}
+
+func (w *Worker) Stop() {
+	w.closeOnce.Do(func() { close(w.quit) }) // 重复调用 Stop 不会 panic
+}
+```
+
+**注意**
+
+- 即使 `f` panic 了，Once 也认为“已经执行过”，之后不会再执行。
+- 在 `f` 里再次调用同一个 `once.Do` 会死锁。
+- 初始化可能失败时，用 `sync.OnceValues(func() (T, error))` 把错误一起缓存，或者自己用锁实现“失败可重试”。
+
+=== cond
+name: sync.Cond 条件变量
+group: 并发
+--- body
+`sync.Cond` 让 goroutine **等待某个条件成立**：`Wait()` 会原子地释放锁并挂起，被 `Signal()`（唤醒一个）或 `Broadcast()`（唤醒全部）唤醒后重新拿到锁。
+
+**写法**
+
+```go
+var mu sync.Mutex
+cond := sync.NewCond(&mu)
+
+// 等待方
+mu.Lock()
+for !ready {      // 必须用 for 循环检查条件
+	cond.Wait()
+}
+mu.Unlock()
+
+// 通知方
+mu.Lock()
+ready = true
+mu.Unlock()
+cond.Broadcast()
+```
+
+**例子：阻塞队列**
+
+```go
+type Queue struct {
+	mu       sync.Mutex
+	notEmpty *sync.Cond
+	items    []int
+}
+
+func NewQueue() *Queue {
+	q := &Queue{}
+	q.notEmpty = sync.NewCond(&q.mu)
+	return q
+}
+
+func (q *Queue) Put(v int) {
+	q.mu.Lock()
+	q.items = append(q.items, v)
+	q.mu.Unlock()
+	q.notEmpty.Signal()
+}
+
+func (q *Queue) Get() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.items) == 0 {
+		q.notEmpty.Wait()
+	}
+	v := q.items[0]
+	q.items = q.items[1:]
+	return v
+}
+```
+
+**注意**
+
+- **Wait 一定要放在 for 循环里**：被唤醒时条件可能已经被别的 goroutine 改掉了（虚假唤醒 / 抢先消费）。
+- 调用 `Wait` 前必须持有锁。
+- Cond 不能和 `select`、超时、context 配合，所以大多数场景用 channel 更简单；Cond 适合“多个等待者 + 广播”的场景。
+
+=== atomic
+name: sync/atomic 原子操作
+group: 并发
+--- body
+`sync/atomic` 提供无锁的原子读写、加减、比较并交换（CAS），适合简单的计数器、标志位、配置指针替换，比锁更轻。
+
+**写法**
+
+```go
+var n atomic.Int64        // Go 1.19+ 的类型化写法，推荐
+n.Add(1)
+n.Load()
+n.Store(10)
+n.CompareAndSwap(10, 20)  // 值等于 10 才改成 20，返回是否成功
+
+var ready atomic.Bool
+ready.Store(true)
+
+var cfg atomic.Pointer[Config]
+cfg.Store(newCfg)          // 原子替换整个配置
+c := cfg.Load()
+
+atomic.AddInt64(&x, 1)     // 老写法：操作普通变量的地址
+```
+
+**例子：CAS 实现“只允许一个成功”**
+
+```go
+type Gate struct{ open atomic.Bool }
+
+func (g *Gate) TryOpen() bool {
+	return g.open.CompareAndSwap(false, true) // 只有第一个调用者返回 true
+}
+```
+
+**注意**
+
+- 一个变量只要有一处用了原子操作，**所有读写都必须用原子操作**，混用普通读写仍然是数据竞争。
+- 原子操作只保证单个变量；需要同时更新多个相关字段时还是要用锁。
+- 老式函数 `atomic.AddInt64(&x, 1)` 在 32 位平台上要求 x 8 字节对齐，类型化的 `atomic.Int64` 自动保证。
+
+=== sync-map
+name: sync.Map
+group: 并发
+--- body
+`sync.Map` 是并发安全的 map，针对**读多写少**、或者**各 goroutine 操作不相交的 key 集合**的场景做了优化。其他场景用 `map + sync.RWMutex` 通常更快、类型也更安全。
+
+**写法**
+
+```go
+var m sync.Map
+m.Store("a", 1)
+v, ok := m.Load("a")           // v 是 any，需要断言 v.(int)
+actual, loaded := m.LoadOrStore("a", 2) // 已存在就返回旧值
+m.LoadAndDelete("a")
+m.Delete("a")
+m.Range(func(k, v any) bool {  // 返回 false 停止遍历
+	fmt.Println(k, v)
+	return true
+})
+```
+
+**例子：只初始化一次的连接缓存**
+
+```go
+var conns sync.Map // map[string]*Conn
+
+func getConn(addr string) *Conn {
+	if c, ok := conns.Load(addr); ok {
+		return c.(*Conn)
+	}
+	c, _ := conns.LoadOrStore(addr, dial(addr)) // 并发时只有一个会被存进去
+	return c.(*Conn)
+}
+```
+
+**注意**
+
+- key 和 value 都是 `any`，失去了类型检查，取值要类型断言。
+- 没有 `Len()` 方法。
+- 上面例子里并发时 `dial` 可能被调用多次（只是只保留一个）；如果创建代价很大，要配合 `sync.Once` 或单飞（singleflight）。
+
+=== sync-pool
+name: sync.Pool 对象池
+group: 并发
+--- body
+`sync.Pool` 缓存**临时对象**以便复用，减少分配和 GC 压力。池里的对象随时可能被 GC 清掉，所以只能放“丢了也无所谓”的东西（如 buffer）。
+
+**写法**
+
+```go
+var bufPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
+buf := bufPool.Get().(*bytes.Buffer)
+buf.Reset()                 // 拿到的可能是用过的，先重置
+defer bufPool.Put(buf)
+```
+
+**例子**
+
+```go
+func render(name string) string {
+	buf := bufPool.Get().(*bytes.Buffer)
+	defer func() {
+		buf.Reset()
+		bufPool.Put(buf)
+	}()
+	buf.WriteString("hello, ")
+	buf.WriteString(name)
+	return buf.String() // String() 会复制，放回池子后不影响返回值
+}
+```
+
+**注意**
+
+- **不能用来做连接池**，因为对象会被无声地回收。
+- 放回去之前要清理敏感数据；放回非常大的 buffer 会让池子长期占用大量内存，可以设置上限，超过就不放回。
+- 不要在 Put 之后继续使用这个对象。
+- 只有在 profile 证明分配是瓶颈时才值得引入。
+
+=== context
+name: context：取消、超时与传值
+group: 并发
+--- body
+`context.Context` 在调用链上传递**取消信号、截止时间**和少量请求范围的值。约定作为函数的**第一个参数** `ctx context.Context`。
+
+**写法**
+
+```go
+ctx := context.Background()                      // 根 context
+ctx, cancel := context.WithCancel(parent)
+ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+ctx, cancel := context.WithDeadline(parent, t)
+defer cancel()                                   // 一定要调用，释放资源
+
+<-ctx.Done()      // 被取消或超时时关闭
+ctx.Err()         // context.Canceled 或 context.DeadlineExceeded
+ctx = context.WithValue(ctx, key, v)
+```
+
+**例子：可取消的 worker**
+
+```go
+func worker(ctx context.Context, jobs <-chan int) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case j, ok := <-jobs:
+			if !ok {
+				return nil
+			}
+			process(j)
+		}
+	}
+}
+
+ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+defer cancel()
+err := worker(ctx, jobs)
+```
+
+**注意**
+
+- **`cancel` 必须调用**（通常 `defer cancel()`），否则子 context 和定时器要等父 context 结束才释放，`go vet` 会提示。
+- 取消是**协作式**的：被调用的函数要自己检查 `ctx.Done()`，context 不会强行终止 goroutine。
+- 父 context 取消时所有子 context 都会被取消，反过来不会。
+- `WithValue` 只放请求范围的元数据（trace id、用户身份），**不要用来传可选参数**；key 用自定义的未导出类型避免冲突。
+- 不要把 context 存进结构体字段，也不要传 nil context（用 `context.TODO()`）。
+
+=== timer
+name: time.Timer / Ticker / After
+group: 并发
+--- body
+`time` 包的定时器通过 channel 通知时间到了：`time.After(d)` 返回一个 d 之后会收到值的 channel；`Timer` 可以停止和重置；`Ticker` 按固定间隔反复触发。
+
+**写法**
+
+```go
+<-time.After(100 * time.Millisecond)
+
+t := time.NewTimer(time.Second)
+defer t.Stop()
+select {
+case <-t.C:
+case <-done:
+}
+t.Reset(2 * time.Second)
+
+tk := time.NewTicker(time.Second)
+defer tk.Stop()
+for range tk.C { ... }
+
+time.AfterFunc(d, func() { ... }) // 时间到后在新 goroutine 里执行
+```
+
+**例子：定期刷新，直到被取消**
+
+```go
+func flushLoop(ctx context.Context, flush func()) {
+	tk := time.NewTicker(500 * time.Millisecond)
+	defer tk.Stop()
+	for {
+		select {
+		case <-tk.C:
+			flush()
+		case <-ctx.Done():
+			flush() // 退出前最后刷一次
+			return
+		}
+	}
+}
+```
+
+**注意**
+
+- **Ticker 用完要 Stop**（Go 1.23 起未引用的 Ticker 也能被回收，但显式 Stop 仍是好习惯）。
+- 循环里写 `case <-time.After(d)` 每次都会新建一个定时器；需要“空闲超时”时复用一个 Timer 并 `Reset`。
+- Go 1.23 起 `Reset` / `Stop` 后不会再收到旧的过期值，之前的版本需要先排空 `t.C`，旧代码里常看到这种写法。
+- Ticker 在处理慢于间隔时会丢弃多余的 tick，不会堆积。

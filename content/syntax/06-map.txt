@@ -1,0 +1,131 @@
+=== map
+name: map 字典
+group: map
+--- body
+`map[K]V` 是哈希表：按 key 查找、插入、删除平均 O(1)。key 必须是**可比较**的类型（数字、字符串、指针、数组、只含可比较字段的结构体等），切片、map、函数不能做 key。
+
+**写法**
+
+```go
+m := map[string]int{}             // 空 map
+m := make(map[string]int, 100)    // 预估容量
+m := map[string]int{"a": 1, "b": 2}
+m["c"] = 3                        // 插入 / 更新
+v := m["x"]                       // 不存在时返回零值 0
+delete(m, "a")                    // 删除，不存在也不报错
+n := len(m)
+clear(m)                          // Go 1.21+：清空
+```
+
+**例子：词频统计**
+
+```go
+func wordCount(s string) map[string]int {
+	cnt := map[string]int{}
+	for _, w := range strings.Fields(s) {
+		cnt[w]++ // 不存在时从零值 0 开始加，不需要先判断
+	}
+	return cnt
+}
+```
+
+**例子：值是切片的分组**
+
+```go
+groups := map[string][]string{}
+for _, s := range strs {
+	key := sortString(s)
+	groups[key] = append(groups[key], s) // nil 切片可以直接 append
+}
+```
+
+**注意**
+
+- **nil map 可以读，不能写**：`var m map[string]int; m["a"] = 1` 会 panic。
+- map 是引用语义：传给函数后修改会影响调用方。
+- map 的元素**不可取地址**：`m[k].Field = 1` 编译报错（值是结构体时），要么整个取出修改再写回，要么存指针 `map[string]*T`。
+- 遍历顺序随机；并发读写会 fatal，需要 `sync.Mutex` / `sync.RWMutex` 或 `sync.Map`。
+- 大量删除后 map 不会缩容，长期运行的服务里要注意。
+
+=== map-commaok
+name: comma-ok：判断 key 是否存在
+group: map
+--- body
+`v, ok := m[k]` 第二个返回值 `ok` 表示 key 是否存在。用它区分“key 不存在”和“key 存在但值恰好是零值”。
+
+**写法**
+
+```go
+v, ok := m[key]
+if !ok {
+	// 不存在
+}
+if _, ok := seen[x]; ok {
+	// 已经见过
+}
+```
+
+同样的 `x, ok` 形式还出现在：类型断言 `v, ok := x.(T)`、channel 接收 `v, ok := <-ch`。
+
+**例子：缓存**
+
+```go
+type Cache struct {
+	mu   sync.RWMutex
+	data map[string]string
+}
+
+func (c *Cache) Get(k string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	v, ok := c.data[k]
+	return v, ok
+}
+```
+
+**注意**
+
+- 只写 `v := m[k]` 时无法区分“不存在”和“值为零值”，像计数 `cnt[k]++` 这种零值就有意义的场景才可以省略 ok。
+- `ok` 只是惯用名，可以是任何名字，但大家都写 `ok`。
+
+=== set-struct
+name: 用 map 实现集合
+group: map
+--- body
+Go 没有内置 set，用 `map[T]struct{}` 或 `map[T]bool` 表示集合。`struct{}` 是空结构体，**不占内存**，表示“只关心 key 是否存在”。
+
+**写法**
+
+```go
+set := map[string]struct{}{}
+set["a"] = struct{}{}           // 加入
+_, ok := set["a"]               // 判断存在
+delete(set, "a")                // 删除
+
+seen := map[int]bool{}          // 另一种写法，读起来更直观
+seen[3] = true
+if seen[3] { }                  // 不存在时是 false，不需要 comma-ok
+```
+
+**例子：去重并保持顺序**
+
+```go
+func dedup(nums []int) []int {
+	seen := make(map[int]struct{}, len(nums))
+	out := nums[:0] // 复用原切片的空间
+	for _, n := range nums {
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+	}
+	return out
+}
+```
+
+**注意**
+
+- `map[T]bool` 写起来更简单，`map[T]struct{}` 更省内存且语义更明确（不会出现 `false` 值的歧义），两种都很常见。
+- `chan struct{}` 也是同样的思路：只传递“信号”，不携带数据。
+- 需要有序集合时，Go 标准库没有现成实现，可以排序后用切片，或者用第三方的平衡树 / 跳表。

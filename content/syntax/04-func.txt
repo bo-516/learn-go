@@ -1,0 +1,256 @@
+=== multi-return
+name: 多返回值
+group: 函数
+--- body
+Go 函数可以返回多个值，最常见的是 `(结果, error)` 和 `(值, bool)`。调用方必须接收全部返回值（不要的用 `_`）。
+
+**写法**
+
+```go
+func divmod(a, b int) (int, int) {
+	return a / b, a % b
+}
+
+q, r := divmod(7, 3)   // 2 1
+q, _ = divmod(9, 2)    // 不需要的值用 _ 丢弃
+```
+
+**例子**
+
+```go
+func minMax(nums []int) (lo, hi int, ok bool) {
+	if len(nums) == 0 {
+		return 0, 0, false
+	}
+	lo, hi = nums[0], nums[0]
+	for _, n := range nums[1:] {
+		lo, hi = min(lo, n), max(hi, n)
+	}
+	return lo, hi, true
+}
+```
+
+**注意**
+
+- `error` 惯例放在**最后一个**返回值。
+- 一个多返回值的调用可以直接作为另一个函数的全部参数：`f(g())`，前提是参数个数和类型完全对应。
+- 返回值超过 3 个通常说明该定义一个结构体了。
+
+=== named-return
+name: 命名返回值
+group: 函数
+--- body
+给返回值起名字后，它们在函数开头就被声明并初始化为零值，可以直接赋值，最后写一个空的 `return`（裸返回）。
+
+**写法**
+
+```go
+func split(sum int) (x, y int) {
+	x = sum * 4 / 9
+	y = sum - x
+	return // 返回当前的 x, y
+}
+```
+
+**例子：defer 里统一处理错误**
+
+```go
+func copyFile(dst, src string) (err error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// Close 失败（比如磁盘满了写不进去）也要报告出来
+		if cerr := out.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+	_, err = io.Copy(out, in)
+	return err
+}
+```
+
+**注意**
+
+- 命名返回值最有用的场景是**在 defer 里修改返回值**（错误包装、recover 后设置 err）。
+- 长函数里用裸 `return` 会让人不清楚到底返回了什么，建议显式写出返回值。
+- 小心在内层作用域用 `:=` 遮蔽了命名返回值，编译器会对裸 return 报错 `result parameter err not in scope at return`。
+
+=== func-value
+name: 函数是一等值
+group: 函数
+--- body
+函数可以赋值给变量、作为参数传递、作为返回值，也可以放进 map、结构体字段里。函数类型写作 `func(参数) 返回值`。
+
+**写法**
+
+```go
+var op func(int, int) int = add
+ops := map[string]func(int, int) int{
+	"+": func(a, b int) int { return a + b },
+	"-": func(a, b int) int { return a - b },
+}
+fmt.Println(ops["+"](1, 2)) // 3
+
+func apply(nums []int, f func(int) int) { }
+```
+
+**例子：中间件**
+
+```go
+type Handler func(string) string
+
+func Logging(next Handler) Handler {
+	return func(s string) string {
+		log.Println("in:", s)
+		return next(s)
+	}
+}
+```
+
+**注意**
+
+- 函数类型的零值是 `nil`，调用 nil 函数会 panic，可选回调要先判空。
+- 函数之间不能用 `==` 比较（只能和 nil 比），所以函数不能当 map 的 key。
+- 方法也能当值用：`f := obj.Method`（见「方法值」）。
+
+=== closure
+name: 匿名函数与闭包
+group: 函数
+--- body
+`func(...) { ... }` 可以在函数内部直接定义匿名函数。匿名函数能访问外层的变量，并且**捕获的是变量本身（引用），不是值的拷贝**，这就是闭包。
+
+**写法**
+
+```go
+add := func(a, b int) int { return a + b }
+func() { fmt.Println("立即执行") }()
+go func() { ... }()
+defer func() { ... }()
+```
+
+**例子：计数器**
+
+```go
+func counter() func() int {
+	n := 0
+	return func() int {
+		n++        // 修改的是外层的 n，n 会一直活着
+		return n
+	}
+}
+
+c := counter()
+c(); c()
+fmt.Println(c()) // 3
+```
+
+**例子：排序用的比较函数**
+
+```go
+slices.SortFunc(people, func(a, b Person) int {
+	return cmp.Compare(a.Age, b.Age)
+})
+```
+
+**注意**
+
+- 多个闭包共享同一个外层变量；在 goroutine 里修改捕获的变量需要加锁。
+- Go 1.22 之前，循环里启动 goroutine 捕获循环变量 `i` 会全部拿到最后一个值，需要 `i := i` 或传参；1.22 起每次迭代都是新变量。
+- 被闭包捕获的变量会逃逸到堆上，热点路径里大量创建闭包会增加 GC 压力。
+
+=== recursive-closure
+name: 递归的闭包
+group: 函数
+--- body
+匿名函数要递归调用自己，必须**先用 `var` 声明变量，再赋值**。因为 `f := func() { f() }` 里，右边的函数体还看不到正在声明的 `f`。
+
+**写法**
+
+```go
+var dfs func(node *TreeNode) int
+dfs = func(node *TreeNode) int {
+	if node == nil {
+		return 0
+	}
+	return 1 + max(dfs(node.Left), dfs(node.Right))
+}
+```
+
+**例子：DFS 时直接修改外层结果**
+
+```go
+func diameterOfBinaryTree(root *TreeNode) int {
+	best := 0
+	var depth func(*TreeNode) int
+	depth = func(n *TreeNode) int {
+		if n == nil {
+			return 0
+		}
+		l, r := depth(n.Left), depth(n.Right)
+		best = max(best, l+r) // 闭包可以直接更新外层的 best
+		return 1 + max(l, r)
+	}
+	depth(root)
+	return best
+}
+```
+
+**注意**
+
+- 这种写法在 LeetCode 树、回溯、DFS 题里非常常见，好处是不用把 `best`、`visited`、`path` 等状态一层层传参。
+- 也可以写成普通的具名函数 + 参数传状态，二者选一个最清晰的即可。
+- 递归太深（比如链表长度 10⁶）可能栈增长很多，Go 的栈会自动扩容，但仍然有上限（默认 1GB）。
+
+=== variadic
+name: 可变参数 ...
+group: 函数
+--- body
+参数类型前加 `...`，函数就能接收任意个该类型的参数，在函数内它是一个**切片**。调用时把已有切片展开要写 `s...`。
+
+**写法**
+
+```go
+func sum(nums ...int) int {
+	total := 0
+	for _, n := range nums {
+		total += n
+	}
+	return total
+}
+
+sum()            // 0
+sum(1, 2, 3)     // 6
+xs := []int{4, 5}
+sum(xs...)       // 展开切片
+s = append(s, other...) // append 也是可变参数
+```
+
+**例子：函数选项模式**
+
+```go
+type Option func(*Server)
+
+func WithPort(p int) Option { return func(s *Server) { s.port = p } }
+
+func NewServer(opts ...Option) *Server {
+	s := &Server{port: 80}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+```
+
+**注意**
+
+- 可变参数必须是**最后一个**参数。
+- `f(xs...)` 不会复制切片，函数内修改元素会影响调用方的切片。
+- `fmt.Println(args...)` 要求 `args` 是 `[]any`；`[]string` 不能直接展开传给 `...any`。

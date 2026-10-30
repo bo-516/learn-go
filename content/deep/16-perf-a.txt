@@ -1,0 +1,738 @@
+=== perf-01
+--- deep
+**原理展开**
+
+60 秒分析法背后的核心 methodology 是 **USE 方法**（Utilization 使用率、Saturation 饱和度、Errors 错误）：对每种硬件资源（CPU、内存、磁盘、网络）依次检查这三项指标，能在最短时间内定位系统级瓶颈，避免一上来就陷入单个进程的细节。
+
+- **使用率（Utilization）**：资源忙于工作的平均时间比例，例如 CPU 的 `100% - id%`、磁盘的 `%util`、网卡吞吐与带宽上限的比值。
+- **饱和度（Saturation）**：工作量超过资源处理能力而排队的程度，例如 `vmstat` 的 `r` 列（大于 CPU 核数说明运行队列排队）、`iostat` 的 `aqu-sz`（磁盘请求队列长度）、`sar -B` 的页回收频率。很多时候使用率还没到 100%，但饱和度已经飙升，延迟开始显著恶化。
+- **错误（Errors）**：最容易被忽略但往往一锤定音的信号，如 `dmesg` 里的 OOM、文件系统只读、磁盘 I/O Error、网卡丢包计数增长。
+
+**代码示例**
+
+```go
+// Go 服务内建可观测性自检端点：在登录机器的同时，直接拉取进程级关键健康指标
+func registerDiagHandler(mux *http.ServeMux) {
+	mux.HandleFunc("GET /debug/quick", func(w http.ResponseWriter, r *http.Request) {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		out := map[string]any{
+			"goroutines":   runtime.NumGoroutine(),
+			"gomaxprocs":   runtime.GOMAXPROCS(0),
+			"heap_inuse_m": m.HeapInuse >> 20,
+			"sys_m":        m.Sys >> 20,
+			"num_gc":       m.NumGC,
+			"last_gc_ago":  time.Since(time.Unix(0, int64(m.LastGC))).String(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+	})
+}
+```
+
+```bash
+# 容器环境下宿主机命令的注意点：进入目标容器的 namespace 查看网络与挂载
+nsenter -t <container-pid> -n ss -s
+cat /sys/fs/cgroup/cpu.stat        # 检查 nr_throttled 确认是否被 cgroup 限流
+```
+
+**常见追问**
+
+- 为什么 `vmstat 1` 的第一行输出不能看？→ 第一行是自系统启动以来的历史平均值，从第二行开始才是过去 1 秒的实时增量数据（`iostat`、`mpstat` 同理）。
+- 机器已经卡到 SSH 登不上去或者敲命令没反应怎么办？→ 先通过负载均衡摘流止损（保留一台现场实例供排查，其余重启或扩容恢复业务），再通过云厂商控制台的串行控制台（VNC）或提前部署的带外监控（Prometheus node_exporter、持续剖析器）回溯指标。
+- 容器里执行 `top` 和 `free` 看到的是容器还是宿主机的数据？→ 默认挂载 `/proc` 时看到的是**宿主机**的数据（除非部署了 lxcfs），在容器内排查必须看 `/sys/fs/cgroup/` 下的文件。
+
+**实战建议**
+
+- 把常用的 60 秒诊断命令封装成只读脚本预置在基础镜像或跳板机上，故障发生时一键采集快照并保存时间戳，防止止损重启后现场丢失。
+- 养成“先止损、保留单实例现场、再深挖原因”的线上应急习惯，切忌在全部流量都打在故障节点上时长时间跑高开销的采样工具。
+
+=== perf-02
+--- deep
+**原理展开**
+
+Linux 内核每 **5 秒**（由 `LOAD_FREQ = 5*HZ` 定义）采样一次当前的活跃任务数 $n$（所有处于 `TASK_RUNNING` 和 `TASK_UNINTERRUPTIBLE` 状态的线程数之和），并用**指数移动平均**（Exponentially Weighted Moving Average）更新 1、5、15 分钟三个值：
+
+$$L_t = L_{t-1} \cdot e^{-5/T} + n \cdot (1 - e^{-5/T})$$
+
+其中 $T$ 分别为 60、300、900 秒。因此所谓的“1 分钟负载”并不是过去 60 秒的算术平均值，而是历史值权重占 $e^{-5/60} \approx 92\%$、最新采样占 $8\%$ 的衰减曲线。
+
+为什么 Linux 要把 `D` 状态（不可中断睡眠）算进负载？因为早期 Unix 只统计 CPU 运行队列，后来 Linux 开发者认为 load average 应该反映**对系统全部关键资源（包括 CPU 和磁盘 IO）的需求总和**。线程进入 `D` 状态是因为正在等待内核态的关键操作（如块设备读写、页错误加载、`mutex_lock` 内核互斥锁），此时若响应信号提前中断，会导致内核数据结构与硬件状态不一致，所以内核不允许信号打断它。
+
+**代码示例**
+
+```bash
+# 采样 5 秒内的所有 D 状态线程及其内核调用栈，统计阻塞最多的内核函数
+for i in $(seq 1 10); do
+  for pid in $(ps -eL -o state,tid | awk '$1=="D"{print $2}'); do
+    cat /proc/$pid/wchan 2>/dev/null
+    echo
+  done
+  sleep 0.5
+done | sort | uniq -c | sort -nr
+```
+
+```go
+// Go 中文件同步写入在磁盘卡顿时会导致 M（系统线程）陷入 D 状态
+// 运行时 sysmon 发现 P 被系统调用阻塞超过 ~20us~10ms 后，会解绑 P 并唤醒/新建 M
+// 如果瞬间有数千个 goroutine 同时 fsync，会暴增大量处于 D 状态的系统线程，把 load 推高到数千
+func writeLogBad(f *os.File, msg []byte) error {
+	if _, err := f.Write(msg); err != nil {
+		return err
+	}
+	return f.Sync() // 每条都触发 fsync，高并发下极易打满磁盘 IO 并堆积 D 状态线程
+}
+```
+
+**常见追问**
+
+- load average 的三个数字 `12.5, 4.2, 1.8` 和 `1.8, 4.2, 12.5` 分别说明什么？→ 前者说明负载在最近 1 分钟内急剧飙升，故障正在发生；后者说明高峰已经过去，系统正在恢复。
+- 没有磁盘 IO、CPU 使用率也不高，load 却突然冲高，还可能是什么原因？→ 常见于**短时间内频繁创建销毁线程或进程**，或者大量 goroutine 在极短时间内同时被唤醒（惊群效应）恰好撞上内核每 5 秒一次的采样点。
+- D 状态的进程能用 `kill -9` 杀掉吗？→ 不能立即杀掉。`SIGKILL` 信号会被挂起，必须等进程从内核态的等待中返回（比如 NFS 超时或磁盘恢复）后才能处理信号并退出。
+
+**实战建议**
+
+- 对 Go 服务监控 `runtime.NumThread`（或 `/sched/threads/total:threads`）：如果系统线程数突然暴增，往往意味着大量 goroutine 阻塞在同步文件 IO 或 cgo 调用中，这通常是 load 飙升的直接推手。
+- Linux 4.20+ 引入了 **PSI**（Pressure Stall Information，位于 `/proc/pressure/cpu`、`memory`、`io`），直接分别统计 CPU、内存、IO 的等待时间占比，比混在一起的 load average 更清晰准确。
+
+=== perf-03
+--- deep
+**原理展开**
+
+内核在每个时钟节拍（tick）或高精度计时器事件中，根据当前 CPU 所处的执行上下文对时间进行归类账目统计，汇总在 `/proc/stat` 中（单位为 `USER_HZ`，通常是 10ms）：
+
+- **us vs sy 的边界**：线程执行普通指令时计入 `us`；一旦通过 `SYSCALL` 指令陷入内核（或发生缺页异常、页表分配），直到 `SYSRET` 返回用户态之前的 CPU 时间全部计入 `sy`。对于 Go 程序，高频的小包网络读写、无缓冲的文件写入、或者 `runtime.futex` 引起的频繁线程休眠/唤醒，都会让 `sy` 显著升高。
+- **wa（iowait）的本质**：`wa` 本质上是 **idle（空闲）时间的一种子状态**——当某个 CPU 核上没有任何可运行的线程，**且**该核上有至少一个发起过块设备 IO 尚未完成的任务时，这段空闲时间就被记为 `wa`。如果此时该核上有其他计算任务在跑，即使磁盘再忙，`wa` 也会是 0。
+- **si（软中断）机制**：网卡收到数据包时先触发极短的硬中断（`hi`），仅把数据描述符挂到队列并触发 `NET_RX_SOFTIRQ` 软中断，繁重的协议栈处理（IP/TCP 解析、netfilter/iptables 规则匹配）都在 `ksoftirqd/N` 软中断上下文中完成。
+
+**代码示例**
+
+```bash
+# 1. sy 偏高时：用 perf 统计系统调用次数和耗时占比，避免 strace 拖垮生产进程
+perf trace -s -p <pid> -- sleep 5
+
+# 2. si 偏高时：对比 1 秒前后 /proc/softirqs 的变化，定位是网络收包还是定时器
+watch -n 1 -d 'cat /proc/softirqs'
+# 查看网卡硬中断是否只绑定在了 CPU0 上（导致单核 si 100%）
+grep -E 'CPU|eth|ens' /proc/interrupts
+```
+
+```go
+// Go 中避免 sy 飙高的典型例子：用 bufio.Writer 合并系统调用
+func writeLines(w io.Writer, lines []string) error {
+	bw := bufio.NewWriterSize(w, 64<<10) // 64KB 缓冲，将成千上万次 write 系统调用合并为几次
+	for _, line := range lines {
+		if _, err := bw.WriteString(line); err != nil {
+			return err
+		}
+		if err := bw.WriteByte('\n'); err != nil {
+			return err
+		}
+	}
+	return bw.Flush()
+}
+```
+
+**常见追问**
+
+- 为什么不能在生产高并发 Go 进程上直接跑 `strace -p <pid>`？→ `strace` 基于 `ptrace` 机制，每次系统调用入口和出口都会把目标线程暂停并切换到 `strace` 进程，会让高 QPS 服务的吞吐量暴跌数倍甚至直接假死；应改用基于 eBPF/tracepoint 的 `perf trace` 或 ` bpftrace`。
+- 多核机器总 CPU 使用率只有 15%，但接口延迟极大，看 `top` 需要注意什么？→ 按数字 `1` 展开所有逻辑核，检查是否存在某个核的 `si` 或 `us` 达到了 100%（单核瓶颈被总平均掩盖）。
+- `wa` 很高就一定代表磁盘坏了或者慢吗？→ 不一定，如果 CPU 完全闲置，少量的正常磁盘读写也会表现为较高的 `wa`；反之 CPU 跑满时，即使磁盘已经严重卡顿，`wa` 也接近 0。
+
+**实战建议**
+
+- 当 Go 服务的 `sy` 超过 25% 时，优先抓取 CPU profile 看 `syscall.Syscall` 的调用栈来源：九成以上是未缓冲的文件写、频繁新建短连接、或锁冲突严重导致的 `runtime.futex`。
+- 高并发网关或长连接服务如果发现单核 `si` 飙高，开启网卡多队列（RSS）和 RPS（Receive Packet Steering）将软中断均衡分摊到多个核。
+
+=== perf-04
+--- deep
+**原理展开**
+
+为什么 Go 程序的操作系统线程（M）不能直接对应业务 goroutine？在 GMP 调度模型下，goroutine（G）是用户态轻量级协程，每次发生 channel 阻塞、网络 I/O 等待、系统调用返回或时间片抢占（10ms）时，被重新唤醒的 G 极可能被放到其他 P 的本地队列、或者被其他 M 通过 work-stealing 偷走执行。因此 `top -H` 看到的某个高 CPU 线程 `tid`，在 1 秒钟内可能先后执行了成百上千个不同的 goroutine。
+
+但 `top -H` 和 `pidstat -t` 在 Go 排查中依然有两个不可替代的用途：
+1. **排查 cgo 或系统调用卡死**：cgo 调用执行 C 代码期间会独占当前 M，此时在 `top -H` 抓出高 CPU 的 `tid`，用 `gdb` 或 `perf top -t <tid>` 可以直接看到 C 函数调用栈。
+2. **定位上下文切换风暴**：`pidstat -wt -p <pid> 1` 中的 `cswch/s`（自愿切换，线程因等待锁或 I/O 主动让出）和 `nvcswch/s`（非自愿切换，时间片耗尽被内核强行抢占）过高时，说明 M 之间存在剧烈的线程级争用。
+
+**代码示例**
+
+```bash
+# Go 编译的二进制默认自带帧指针（frame pointer，Go 1.7+ amd64 / 1.12+ arm64），
+# 可以直接用 Linux perf 按调用栈采样整个进程（包含 Go 函数、runtime 和内核态 C 函数）
+perf record -F 99 -p <pid> -g -- sleep 10
+perf report -n --stdio
+```
+
+```go
+// Go 1.18+ 支持 pprof 标签（pprof.Labels）：给 goroutine 打上业务维度标签，
+// 抓出的 CPU profile 里不仅能看到函数名，还能按租户、接口或任务类型分组统计 CPU 消耗
+func handleJob(ctx context.Context, jobType string, fn func(context.Context)) {
+	labels := pprof.Labels("job_type", jobType)
+	pprof.Do(ctx, labels, func(ctx context.Context) {
+		fn(ctx)
+	})
+}
+```
+
+**常见追问**
+
+- 在容器里没有安装 `go` 工具链，怎么分析 CPU 热点？→ 直接用 `curl -o cpu.pb.gz http://127.0.0.1:6060/debug/pprof/profile?seconds=20` 把几百 KB 的压缩 profile 文件拉回开发机，在本地执行 `go tool pprof -http=:8080 cpu.pb.gz` 即可，无需线上机器有任何工具。
+- Go 二进制被 `strip` 或 `-ldflags="-s -w"` 去掉符号表后，pprof 还能看到函数名吗？→ **能**。Go 二进制内部保留了专门的 `.gopclntab` 段用于运行时栈回溯和 panic 打印，即使 strip 掉标准 ELF 符号表，`net/http/pprof` 依然能解析出完整的函数名、文件名和行号。
+- `perf top` 和 `go tool pprof` 看到的 CPU 占比有时候不一样，为什么？→ `pprof` 依赖 `SIGPROF` 信号，主要统计用户态和部分系统调用入口；而 `perf` 基于硬件 PMU 计数器，能同时精确捕获内核态（如缺页中断、软中断、内核锁）和 cgo 动态库的开销。
+
+**实战建议**
+
+- 在后台多任务或多租户的 Go 服务中，善用 `runtime/pprof.Do` 给关键入口打上标签，排查“到底是哪个类型的任务把 CPU 打满了”时能省去大量顺藤摸瓜的时间。
+- 构建生产镜像时不要加奇怪的混淆参数破坏 `.gopclntab`，并归档每次发版对应的编译产物，便于需要反汇编（`disasm`）指令级热点时对照。
+
+=== perf-05
+--- deep
+**原理展开**
+
+理解 Linux 内存管理的关键是区分**匿名页（Anonymous Pages）**与**文件背景页（File-backed Pages / Page Cache）**：
+
+- 程序通过 `malloc` 或 Go runtime 的 `mmap(MAP_ANON)` 申请的堆内存属于**匿名页**。除非开启了 Swap，否则匿名页**无法被内核回收**（因为磁盘上没有对应的文件备份），一旦匿名页总和突破限制就会触发 OOM Killer。
+- 读写磁盘文件时内核自动缓存的数据属于**文件页（buff/cache）**。当内存吃紧时，干净的文件页（与磁盘一致）可以直接丢弃释放；脏页（已修改未落盘）回写磁盘后也能释放。
+- `available` 的计算逻辑（见 `/proc/meminfo` 的 `MemAvailable`）：以 `MemFree` 为基础，加上活跃/不活跃文件页中可回收的部分和可回收的内核 Slab（`SReclaimable`），同时扣减各内存区域必须保留的水位线（`low watermarks`），因为有一部分页可能正在被锁定或无法立即回收。
+
+在 Kubernetes 容器（cgroup v2）中，`memory.stat` 里的 `anon`（匿名内存）和 `file`（页缓存）共同计入 `memory.current`。如果 Go 程序在容器内频繁读写本地大文件，会把 `file` 缓存撑满直至顶到 `memory.max`，但此时内核会自动触发容器级别的页回收，**不会**因为纯文件缓存触发 OOM——真正危险的是 `anon` 持续逼近 `memory.max`。
+
+**代码示例**
+
+```bash
+# 在容器内精确查看内存构成（cgroup v2）
+cat /sys/fs/cgroup/memory.current
+cat /sys/fs/cgroup/memory.max
+grep -E '^(anon|file|slab|kernel|oom)' /sys/fs/cgroup/memory.stat /sys/fs/cgroup/memory.events
+```
+
+```go
+// 读取进程自身的 RSS（常驻物理内存）与 Go 运行时内存对照，判断是否存在堆外内存膨胀
+func memSummary() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	// HeapSys - HeapReleased 是 Go 运行时当前向 OS 持有且未归还的堆虚拟页
+	fmt.Printf("HeapInuse=%dMB HeapHold=%dMB StackInuse=%dMB TotalSys=%dMB\n",
+		m.HeapInuse>>20, (m.HeapSys-m.HeapReleased)>>20, m.StackInuse>>20, m.Sys>>20)
+}
+```
+
+**常见追问**
+
+- Go 进程把大对象释放并触发 GC 后，为什么 `top` 里的 `RES`（RSS）没有立刻下降？→ Go runtime 回收空闲的 span 后不会立即调用系统调用归还物理页，而是由后台 `bgscavenger` 协程分批通过 `madvise(MADV_DONTNEED)` 归还给内核，避免频繁向 OS 申请/释放内存的开销。
+- `madvise(MADV_FREE)` 和 `MADV_DONTNEED` 对 RSS 显示有什么影响？→ `MADV_FREE`（Go 1.12~1.15 默认）只标记页面可回收，只有宿主内存真正紧张时内核才回收，导致监控看到 RSS 居高不下；Go 1.16 起改回默认使用 `MADV_DONTNEED`，调用后 RSS 会立即下降。
+- 为什么线上服务器一般建议关闭 Swap（`swapoff -a`）？→ 当内存不足触发 Swap 抖动（thrashing）时，进程每次访问内存都变成毫秒级的磁盘 IO，服务完全卡死却又不触发 OOM 退出，导致负载均衡和健康检查难以及时摘除故障节点。
+
+**实战建议**
+
+- 容器化部署的 Go 服务务必设置 `GOMEMLIMIT` 为容器内存 limit 的 **80%～85%**（预留 15%～20% 给栈、全局变量、运行时元数据、cgo 和页缓存），让 Go GC 在接近容器上限前主动加强回收。
+- 监控容器内存时，同时看 `container_memory_working_set_bytes` 和 `container_memory_rss`，避免被文件读写产生的 Page Cache 误导。
+
+=== perf-06
+--- deep
+**原理展开**
+
+Linux 的块设备 I/O 路径分为三层：**VFS / Page Cache 层 → 块设备调度层（Block Layer） → 设备驱动与硬件层**。`iostat` 统计的是经过 Page Cache 之后真正下发到块设备层的请求：
+
+- **`%util` 在现代 NVMe SSD 上的失真**：`%util` 统计的是“在采样周期内，设备队列中至少有一个请求正在处理的时间占比”。机械硬盘只有一个磁头，串行处理请求，所以 `%util = 100%` 就意味着彻底满载；而现代 NVMe SSD 和云盘内部有数十个并行通道和多个硬件队列（blk-mq），哪怕一直有 1 个请求在处理（`%util = 100%`），它的 64 个并行通道其实闲了 63 个。判断 SSD 是否饱和，必须看 **`aqu-sz`（平均队列深度）是否远超平时**以及 **`r_await / w_await` 是否出现数量级上升**。
+- **I/O 合并（Merge）**：`rrqm/s` 和 `wrqm/s` 表示每秒被块层合并的相邻小请求数；`areq-sz`（平均请求大小）结合 `r/s`、`w/s` 可以看出应用是在做高 IOPS 的随机小读写，还是高吞吐的顺序大读写。
+
+**代码示例**
+
+```bash
+# 找出正在产生大量实际磁盘写入（绕过或刷出 Page Cache）的进程与线程
+pidstat -d 1
+# 查看进程累计的系统调用级读写（rchar/wchar 含缓存）与真实落盘读写（read_bytes/write_bytes）
+cat /proc/<pid>/io
+```
+
+```go
+// Go 日志组件常见的磁盘 IO 陷阱：每条日志直接写 os.Stdout/os.File 且不控制速率
+// 高并发出错时瞬间产生上万次小写入，打满云盘 IOPS 配额
+type asyncBatchWriter struct {
+	ch chan []byte
+}
+
+func (w *asyncBatchWriter) loop(f *os.File) {
+	bw := bufio.NewWriterSize(f, 256<<10) // 256KB 批量合并落盘，将随机小 IO 转化为顺序大块写
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case p, ok := <-w.ch:
+			if !ok {
+				_ = bw.Flush()
+				return
+			}
+			_, _ = bw.Write(p)
+		case <-ticker.C:
+			_ = bw.Flush()
+		}
+	}
+}
+```
+
+**常见追问**
+
+- 为什么 `iostat` 显示 `wkB/s` 很高，但 `pidstat -d` 里所有进程的 `kB_wr/s` 都是 0？→ 应用写入文件时只是把数据写进了内核的 Page Cache（脏页）就立即返回了；几秒后由内核的后台回写线程（`kworker/flush`）根据 `dirty_background_ratio` 或 `dirty_expire_centisecs` 统一刷盘，此时写盘账目算在内核线程头上。
+- 云服务器（如 AWS EBS、阿里云 ESSD）为什么有时候吞吐不大，`await` 却突然从 0.5ms 飙到 20ms？→ 触发了云盘的 **IOPS 或吞吐量突发配额（Burst Balance）耗尽**，或者是共享型宿主机网络存储链路拥塞，需要对照云监控的云盘限流指标确认。
+- Go 怎么避免读取大文件把系统的 Page Cache 冲掉？→ 在 Linux 上用 `unix.Open(..., unix.O_DIRECT, 0)`（配合内存对齐缓冲区）或读完后调用 `unix.Fadvise(fd, offset, length, unix.FADV_DONTNEED)` 提示内核立即释放对应文件缓存。
+
+**实战建议**
+
+- 容器生产环境中，尽量把业务日志直接写到标准输出（由节点上的采集 Agent 批量异步转发）或使用带内存环形缓冲区的异步日志写盘，绝对避免在请求主链路里做同步 `fsync`。
+- 当发现 `w_await` 周期性每隔 5～30 秒就跳高一次，通常是内核脏页达到阈值触发了集中刷盘，可以调小 `vm.dirty_background_bytes` 让回写更平滑。
+
+=== perf-07
+--- deep
+**原理展开**
+
+Linux 处理一个 TCP 连接涉及两个核心队列与内核状态跟踪表，线上 90% 的网络层偶发超时都与它们有关：
+
+1. **半连接队列（SYN Queue）与全连接队列（Accept Queue）**：
+   - 客户端发来 `SYN`，内核回复 `SYN+ACK` 并放入半连接队列（处于 `SYN_RECV`）；
+   - 收到第三次握手的 `ACK` 后，内核把连接移入全连接队列（处于 `ESTABLISHED`），等待应用调用 `accept()` 取走；
+   - 如果应用进程由于 GC 卡顿或负载太高来不及 `accept()`，全连接队列满了（上限为 `min(backlog, net.core.somaxconn)`），内核默认会丢弃后续握手的 `ACK`（或回 `RST`），表现为主机 CPU/带宽都正常，但上游建连频繁超时。
+2. **连接跟踪表（`nf_conntrack`）**：在使用 iptables NAT（如 Kubernetes 默认的 kube-proxy iptables 模式、Docker 桥接网络）的节点上，内核会记录每一条五元组连接的状态。高并发短连接场景下，一旦活跃连接加 `TIME_WAIT` 连接数突破 `nf_conntrack_max`，新到的 SYN 包会被直接丢弃，引发大面积建连失败。
+
+**代码示例**
+
+```bash
+# 查看监听端口的全连接队列情况：Recv-Q 是当前排队未 accept 的连接数，Send-Q 是队列最大容量
+ss -lnt
+
+# 检查历史累计的半连接/全连接队列溢出次数（如果不为 0 且在增长，说明发生过建连丢包）
+nstat -az | grep -E 'TcpExtListenOverflows|TcpExtListenDrops'
+
+# 检查 conntrack 表当前使用量与上限
+sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max
+```
+
+```go
+// Go 作为客户端时，如果忘记设置 MaxIdleConnsPerHost（默认仅 2），
+// 高并发调用同一个下游会频繁新建和关闭连接，打爆本机 ephemeral 端口和 conntrack 表
+func newTunedHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 3 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        1000,
+			MaxIdleConnsPerHost: 200, // 关键：调大单主机空闲连接池，避免高 QPS 下退化为短连接
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+}
+```
+
+**常见追问**
+
+- 大量 `TIME_WAIT` 和大量 `CLOSE_WAIT` 分别代表谁出了问题？→ `TIME_WAIT` 是**主动关闭连接方**正常进入的 2MSL 等待状态，过多通常是客户端没复用连接（如 `MaxIdleConnsPerHost` 太小）；`CLOSE_WAIT` 是**被动关闭方**收到对端 `FIN` 后自己没有调用 `close()`，几乎 100% 是代码 bug（如忘记 `resp.Body.Close()` 或连接泄漏）。
+- 可以在生产环境开启 `net.ipv4.tcp_tw_recycle` 来快速回收 `TIME_WAIT` 吗？→ **绝对不行**（Linux 4.12 已彻底移除该参数）。在 NAT 环境下，不同客户端经过网关后源 IP 相同但时间戳不同，开启 `tw_recycle` 会导致内核把正常的新连接 SYN 包当成过期包直接静默丢弃；应该开启的是客户端侧的 `tcp_tw_reuse = 1`。
+- Go 的 `net.Listen` 默认用多大的全连接队列 backlog？→ Go 默认读取 `/proc/sys/net/core/somaxconn` 的值（新版内核默认 4096，旧内核可能是 128）作为 `listen(fd, backlog)` 的参数。
+
+**实战建议**
+
+- 把 `TcpExtListenOverflows`、`TcpExtTCPSynRetrans`、`TcpExtTCPTimeouts` 纳入基础监控告警：网络层的静默丢包在应用日志里往往只表现为笼统的 `context deadline exceeded`。
+- 高并发 Kubernetes 节点建议将 kube-proxy 切换为 IPVS 或 eBPF（Cilium）模式，并适当调大 `nf_conntrack_max` 和调小 `nf_conntrack_tcp_timeout_time_wait`。
+
+=== perf-08
+--- deep
+**原理展开**
+
+Go 的各个内置剖析器在运行时的采样机制与开销截然不同，理解原理才能知道哪些可以常开、哪些只能按需开启：
+
+- **CPU Profile**：开启后运行时启动每秒 100 次（100Hz，每 10ms 一次）的操作系统定时器（`setitimer` 发送 `SIGPROF` 信号），收到信号的线程记下当前正在执行的 goroutine 调用栈。采集期间开销约 **1%～2%**，不采集时开销为 **0**。
+- **Heap / Allocs Profile**：**常驻开启**。并不是每次 `mallocgc` 都记录调用栈，而是按字节步长泊松采样：每分配约 `runtime.MemProfileRate`（默认 **512 KB**）的内存才采样一次调用栈，再按对象大小反推总体分配量。因此常态下几乎零开销，随时请求 `/debug/pprof/heap` 都能拿到当前快照。
+- **Mutex / Block Profile**：默认关闭（采样率为 0）。`SetMutexProfileFraction(rate)` 每次发生锁争用时以 `1/rate` 的概率调用 `nanotime()` 记录等待耗时；`SetBlockProfileRate(ns)` 则是每次发生 channel/select/锁阻塞时都计时。**注意**：如果把 `BlockProfileRate` 设为 `1`（记录所有阻塞），高并发服务会因为高频获取时间戳和栈回溯导致吞吐暴跌 **30% 以上**！
+
+**代码示例**
+
+```go
+// 生产安全的 pprof 挂载方式：使用独立 ServeMux + 本地回环绑定 + 可动态调节的 mutex 采样
+func startAdminServer(ctx context.Context, addr string) *http.Server {
+	runtime.SetMutexProfileFraction(100) // 1/100 采样率在生产环境开销极低，可常驻开启
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	srv := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		<-ctx.Done()
+		_ = srv.Close()
+	}()
+	return srv
+}
+```
+
+```bash
+# 对比优化前后（或高负载与平时）的两个 CPU profile，查看增量热点
+go tool pprof -http=:8080 -diff_base=baseline_cpu.pb.gz spike_cpu.pb.gz
+```
+
+**常见追问**
+
+- 为什么 `import _ "net/http/pprof"` 会有安全隐患？→ 它的 `init()` 函数会把 `/debug/pprof/*` 注册到全局的 `http.DefaultServeMux`。如果业务 HTTP Server 恰好也用了默认的 `nil` Handler（即 `DefaultServeMux`），pprof 接口就会直接暴露到公网，攻击者可以借此获取内部调用栈甚至连刷 `/debug/pprof/trace` 打垮服务。
+- 抓取 `heap` profile 会触发 STW 吗？→ 不会触发全量 GC STW；除非传了 `?gc=1` 参数强制先跑一次 `runtime.GC()`，默认直接汇总运行时已维护好的内存采样桶链表，耗时通常在几毫秒以内。
+- 为什么刚分配的 10KB 小对象在 `heap` profile 里找不到？→ 因为默认每分配满 512KB 才采样一次，单次小分配可能恰好没命中心跳点；本地复现调试时可以在启动时设置 `runtime.MemProfileRate = 1` 捕获每一次分配。
+
+**实战建议**
+
+- 生产环境推荐常驻设置 `runtime.SetMutexProfileFraction(100)`，平时开销不到 0.1%，一旦发生锁争用事故可以直接拉取 `/debug/pprof/mutex` 看到罪魁祸首，无需重启加参数。
+- 需要开启 `block` profile 排查线上问题时，提供动态管理接口临时设为 `1000000`（1ms），抓完数据后立刻重置为 `0` 关闭。
+
+=== perf-09
+--- deep
+**原理展开**
+
+阅读 CPU Profile 和火焰图时，最核心的是区分 **Flat（自身耗时）** 与 **Cum（累计耗时，含所有子函数调用）**：
+
+- **高 Cum、低 Flat**：比如 `http.(*conn).serve` → `OrderHandler.Create`，它本身不做重计算，只是处于热路径的上游。顺着它往下找，才能找到真正吃掉 CPU 的叶子函数。
+- **高 Flat、高 Cum**：比如 `encoding/json.Marshal`、`regexp.Compile`、`runtime.mapassign_faststr`，说明 CPU 实打实地消耗在这个函数体内部。
+- **火焰图的横轴与纵轴**：纵轴是调用栈深度（上面是子函数，下面是父函数）；横轴是**采样命中次数占比**（按字母顺序排列合并，**不代表时间先后顺序**）。找到“平顶山”（顶部很宽且上面没有再调用别的函数）就是当前的直接瓶颈。
+
+在 Go 中，如果火焰图被分成三大块：业务代码占 40%、`runtime.mallocgc` 占 30%、`runtime.gcBgMarkWorker` + `runtime.scanobject` 占 30%，这说明 **CPU 是被高频内存分配引发的 GC 拖垮的**——此时去优化业务里的算术逻辑毫无意义，应该立刻切到 `allocs` profile（`inuse` 看不出来短命对象，必须看 `alloc_objects` 和 `alloc_space`）消除堆分配。
+
+**代码示例**
+
+```go
+// 典型的高 CPU 隐蔽凶手：time.After 在循环内部的 select 中使用
+// 每次循环都会在堆上新建一个 timer 并注册到 P 的四叉堆中（Go 1.23 前甚至在触发前无法被 GC 回收）
+func consumeBad(ch <-chan int) {
+	for {
+		select {
+		case v := <-ch:
+			process(v)
+		case <-time.After(5 * time.Second): // 错误：若 ch 每秒有 5 万条消息，每秒会创建 5 万个底层定时器！
+			return
+		}
+	}
+}
+
+// 正确写法：复用同一个 time.Timer
+func consumeGood(ch <-chan int) {
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		timer.Reset(5 * time.Second)
+		select {
+		case v := <-ch:
+			process(v)
+		case <-timer.C:
+			return
+		}
+	}
+}
+```
+
+**常见追问**
+
+- 在 `pprof` 的交互式命令行里，怎么看某个函数内部具体哪一行最慢？→ 输入 `list 函数名正则`（如 `list OrderHandler`）查看逐行耗时；如果想看对应的汇编指令和内联情况，输入 `weblist 函数名` 或 `disasm 函数名`。
+- 为什么有时候 `runtime.Duffcopy` 或 `runtime.memmove` 在 CPU profile 里占比很高？→ 说明代码中存在大量的大结构体按值传参、大数组值拷贝（比如 `for _, item := range hugeStructSlice` 每次循环都拷贝整个结构体），改为传指针或用下标遍历 `for i := range slice` 即可消除。
+- 持续剖析（Continuous Profiling，如 Pyroscope / Datadog Profiler）为什么可以在生产常开？→ 它以较低频率（如 19Hz～49Hz）周期性采集 CPU 和常驻的 heap/goroutine/mutex 快照并流式上传，整体 CPU 开销控制在 1%～2% 以内，却能完美保留凌晨 3 点持续仅 15 秒的毛刺现场。
+
+**实战建议**
+
+- 优化 CPU 热点前，先用 `testing.B` 把热点函数抽出来写一个 Benchmark，记录优化前的 `ns/op` 和 `B/op`、`allocs/op`，修改后用 `benchstat` 验证确实有显著提升再上线。
+- 排查 CPU 飙高时，永远把 `cpu` profile 和 `allocs` profile 一起抓下来对照看，因为 Go 里过半数的 CPU 瓶颈本质上是内存分配瓶颈。
+
+=== perf-10
+--- deep
+**原理展开**
+
+排查 Go 内存问题时，首先要分清 `runtime.MemStats` 中几个容易混淆的指标，它们构成了从对象到操作系统物理页的完整账本：
+
+```text
++-------------------------------------------------------------------+
+| MemStats.Sys（Go 运行时向 OS 申请的虚拟内存总和）                   |
+|  +----------------------------------------------+ +-------------+ |
+|  | HeapSys（堆向 OS 申请的虚拟地址空间）          | | StackSys    | |
+|  |  +---------------+ +-----------------------+ | | MSpanSys    | |
+|  |  | HeapInuse     | | HeapIdle              | | | BuckHashSys | |
+|  |  | +-----------+ | | +-------------------+ | | | GCSys       | |
+|  |  | | HeapAlloc | | | | HeapReleased      | | | | OtherSys    | |
+|  |  | | (存活对象) | | | | (已归还 OS 的页)  | | | +-------------+ |
+|  |  | +-----------+ | | +-------------------+ | |                 |
+|  |  | | 内部碎片  | | | | 未归还的空闲 span | | |                 |
+|  |  +---------------+ +-----------------------+ |                 |
++-------------------------------------------------------------------+
+```
+
+- **`HeapAlloc` vs `HeapInuse`**：`HeapAlloc` 是实际存活对象占用的字节数；`HeapInuse` 是正在使用的 `mspan` 页总大小。如果 `HeapInuse` 远大于 `HeapAlloc`，说明存在严重的**内存碎片**（大量 8KB 的 span 里只存活了一两个小对象，导致整个 span 无法被标记为空闲回收）。
+- **`inuse_space` vs `inuse_objects`**：排查内存泄漏时，除了看字节数（`inuse_space`），还要切到对象个数（`inuse_objects`），因为一千万个 16 字节的小结构体泄漏同样会撑爆内存并严重拖慢 GC 扫描。
+
+**代码示例**
+
+```go
+// 隐蔽的内存滞留（Memory Pinning）：切片缩容与子切片引用底层大数组
+type PacketPool struct {
+	headers [][]byte
+}
+
+func (p *PacketPool) SaveHeaderBad(raw64KB []byte) {
+	// raw64KB 是从网络读出的 64KB 缓冲区，只截取前 32 字节保存，但整个 64KB 底层数组都无法被 GC 回收！
+	p.headers = append(p.headers, raw64KB[:32])
+}
+
+func (p *PacketPool) SaveHeaderGood(raw64KB []byte) {
+	// 用 bytes.Clone（Go 1.20+）拷贝出独立的 32 字节切片，让 64KB 原数组立刻可回收
+	p.headers = append(p.headers, bytes.Clone(raw64KB[:32]))
+}
+```
+
+```go
+// 指针切片缩容时必须用 clear 清零尾部元素（Go 1.21+），否则被裁掉的元素指针仍在底层数组中被 GC 视为存活
+func popTail[T any](s []*T, keep int) []*T {
+	clear(s[keep:]) // 将 s[keep:len(s)] 置为 nil，断开对已弹出对象的引用
+	return s[:keep]
+}
+```
+
+**常见追问**
+
+- Go 的 `map` 删除大量 key（`delete(m, k)`）后，占用的内存会释放吗？→ **不会减少桶（bucket）的数量**。`delete` 只是把对应槽位标记为空（且清空 key/value 引用），底层已经分配的哈希桶数组永远不会缩容。如果一个全局 `map` 曾经达到过 1000 万个 key，即使全部删空，桶本身的内存依然占着，必须重建一个新 `map` 替换旧引用才能释放。
+- 为什么 `go tool pprof` 里显示的 `inuse_space` 总和只有 200MB，但容器 RSS 却有 800MB？→ 原因可能有三：① `pprof` 只统计采样到的堆存活对象（`HeapAlloc`），不含未归还的 `HeapIdle - HeapReleased`、内部碎片、goroutine 栈（`StackInuse`）和 GC 元数据（`GCSys`）；② 使用了 cgo（如 SQLite、RocksDB、音视频库），C 的 `malloc` 不受 Go 追踪；③ 大量 mmap 文件或内核 Page Cache。
+- Go 1.23 对 `time.Ticker` 和 `time.Timer` 做了什么改动？→ Go 1.23 起，不再被引用的 `Timer` 和 `Ticker` 即使没有调用 `Stop()` 也能被 GC 立即回收，彻底消除了历史上著名的 `time.After` 内存滞留问题。
+
+**实战建议**
+
+- 凡是作为全局缓存或长生命周期会话池的 `map` / `slice`，必须设计容量上限（LRU/LFU）或周期性重建机制，绝不能依赖只增不减的普通 `map`。
+- 在读取大块 JSON 或网络缓冲区后如果只保留其中极少数字段，务必确认没有直接引用原始的 `[]byte` 切片。
+
+=== perf-11
+--- deep
+**原理展开**
+
+一个泄漏的 goroutine 危害远不止它初始占用的 **2KB 栈空间**：
+1. **根对象引用链滞留**：GC 进行并发三色标记时，**所有存活 goroutine 的栈都是扫描的根节点（GC Roots）**。只要一个 goroutine 卡死在某处未退出，它栈帧上的局部变量、闭包捕获的变量所指向的整棵对象图（比如请求上下文、几十 KB 的响应结构体、甚至数据库连接）都永远无法被 GC 回收。
+2. **GC 扫描与调度开销**：每次 GC 的栈扫描阶段都要遍历所有 goroutine；当泄漏累积到数十万个时，仅扫描这些死栈就会消耗大量 CPU 并拉长 GC 周期。
+
+在 `/debug/pprof/goroutine?debug=2` 的原始文本中，每个 goroutine 的第一行格式为 `goroutine 8421 [chan send, 42 minutes]:`——方括号里的第一个字段是阻塞原因（`chan receive`、`select`、`IO wait`、`semacquire`、`syscall`），第二个字段是**自上次阻塞以来的持续分钟数**（不足 1 分钟不显示），这是区分“正在正常处理请求的协程”和“已经卡死泄漏的协程”最直接的标志。
+
+**代码示例**
+
+```go
+// 经典泄漏场景：并发查询多个副本取最快返回的一个（Hedging / First-Win），使用无缓冲 channel
+func fastestBad(ctx context.Context, urls []string) (string, error) {
+	ch := make(chan string) // 错误：无缓冲 channel！后完成的两个 goroutine 会在 ch <- res 永久阻塞
+	for _, u := range urls {
+		go func() {
+			ch <- fetch(ctx, u)
+		}()
+	}
+	return <-ch, nil
+}
+
+// 正确写法：容量设为 len(urls)，或结合 select + ctx.Done() 保证发送方一定能退出
+func fastestGood(ctx context.Context, urls []string) (string, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel() // 拿到第一个结果后立即取消其余正在进行的请求
+	ch := make(chan string, len(urls)) // 缓冲大小等于发送者数量，即使没人再读也不会阻塞
+	for _, u := range urls {
+		go func() {
+			ch <- fetch(ctx, u)
+		}()
+	}
+	select {
+	case res := <-ch:
+		return res, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+```
+
+```go
+// 在单元测试中集成 goleak（或手写栈检查）自动拦截泄漏
+func TestNoLeak(t *testing.T) {
+	before := runtime.NumGoroutine()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, _ = fastestGood(ctx, []string{"a", "b", "c"})
+	time.Sleep(10 * time.Millisecond) // 给异步 goroutine 一点退出时间
+	if after := runtime.NumGoroutine(); after > before {
+		t.Fatalf("goroutine leaked: before=%d after=%d", before, after)
+	}
+}
+```
+
+**常见追问**
+
+- 为什么用了自定义的 `http.Client` 请求外部接口，会出现大量 `net/http.(*persistConn).writeLoop` 和 `readLoop` 泄漏？→ 两个常见原因：① 收到响应后没有完整读取并调用 `resp.Body.Close()`，或者只在 `err == nil && resp.StatusCode == 200` 时才 `Close`（实际上只要 `err == nil` 就必须 `Close`）；② 在每次请求的函数内部反复调用 `&http.Client{Transport: &http.Transport{}}` 创建新的 `Transport`，每个 `Transport` 都维护自己独立的长连接池且永不释放。
+- 阻塞在 `chan receive` 永远不退出的 goroutine，GC 知道这个 channel 已经没有任何外部引用了吗？→ **GC 不会回收阻塞中的 goroutine**。只要 goroutine 挂在 channel 的等待队列（`sudog`）里，运行时就认为它仍在等待唤醒，即使 channel 在外部已无任何发送者引用（除非主进程退出）。
+- `debug=1` 和 `debug=2` 在生产环境抓取时该选哪个？→ 先抓 `debug=1`（由运行时在内存里按相同调用栈聚合计数，体积只有几 KB）；需要看具体某个卡死协程的参数和阻塞时长时再抓 `debug=2`（注意：如果有 50 万个 goroutine，`debug=2` 会生成上百 MB 的文本并引发明显卡顿！）。
+
+**实战建议**
+
+- 代码审查铁律：**每写一个 `go func()`，必须能立刻回答“它在什么条件下会退出？如果下游卡死或调用方超时，它会不会卡在 channel 发送或接收上？”**
+- 全局只能复用少量 `http.Client` / `http.Transport` 实例，严禁在请求处理函数内部每次 new 一个新的 `http.Transport`。
+
+=== perf-12
+--- deep
+**原理展开**
+
+传统的 CPU Profile 只采集 **On-CPU** 时间（线程正在 CPU 核上执行指令的时刻）。一旦 goroutine 因为等待网络响应、等待 `sync.Mutex`、等待数据库连接池 `sql.DB` 的空闲连接、或者等待定时器而进入 `_Gwaiting` 状态，它就不再消耗任何 CPU 时间，因此在 CPU 火焰图上**完全隐身**。
+
+这类 **Off-CPU 延迟**可以通过 Little 定律 $L = \lambda \cdot W$ 来理解：假设服务每秒请求数 $\lambda = 1000\text{ QPS}$，平时平均响应时间 $W = 5\text{ms}$，那么系统中同时在途的请求 goroutine 数 $L = 1000 \times 0.005 = 5$ 个；当某个下游或锁让平均等待时间变成 $W = 2\text{s}$ 时，CPU 依然很闲，但同时阻塞在途的 goroutine 数会瞬间膨胀到 $L = 1000 \times 2 = 2000$ 个！这就是为什么**阻塞时抓一张 `goroutine` profile 往往能一眼看到罪魁祸首**：哪里等待时间最长，哪里堆积的 goroutine 就最多。
+
+**代码示例**
+
+```go
+// 暴露 database/sql 与 HTTP 连接池等待指标，第一时间发现连接池饥饿引起的低 CPU 高延迟
+func collectDBPoolMetrics(db *sql.DB) map[string]any {
+	st := db.Stats()
+	return map[string]any{
+		"max_open":        st.MaxOpenConnections,
+		"open":            st.OpenConnections,
+		"in_use":          st.InUse,
+		"idle":            st.Idle,
+		"wait_count":      st.WaitCount,                 // 累计因连接池满而排队的次数
+		"wait_duration_ms": st.WaitDuration.Milliseconds(), // 累计排队等待总耗时
+	}
+}
+```
+
+```go
+// 使用 httptrace.ClientTrace 拆解单次慢 HTTP 调用到底卡在 DNS、建连、TLS 还是服务端处理
+func traceHTTPRequest(req *http.Request) *http.Request {
+	var t0, dnsDone, connDone, gotFirstByte time.Time
+	trace := &httptrace.ClientTrace{
+		DNSStart:          func(httptrace.DNSStartInfo) { t0 = time.Now() },
+		DNSDone:           func(httptrace.DNSDoneInfo) { dnsDone = time.Now() },
+		ConnectDone:       func(net, addr string, err error) { connDone = time.Now() },
+		GotFirstResponseByte: func() {
+			gotFirstByte = time.Now()
+			slog.Info("http trace",
+				"dns", dnsDone.Sub(t0),
+				"connect", connDone.Sub(dnsDone),
+				"ttfb", gotFirstByte.Sub(connDone))
+		},
+	}
+	return req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+}
+```
+
+**常见追问**
+
+- 为什么 `net/http` 的默认 `Transport` 在高并发调用同一个微服务时会导致连接排队和大量 `TIME_WAIT`？→ `http.DefaultTransport` 的 `MaxIdleConnsPerHost` 默认只有 **2**，如果还设置了较小的 `MaxConnsPerHost`，超出部分的请求就会在客户端内存队列里干等（阻塞在 `Transport.getConn`），CPU 极低但延迟极高。
+- 容器 CPU 使用率只有 30%，为什么还会出现严重的 CFS CPU 限流（`nr_throttled` 暴增）？→ 假设容器 limit 是 2 核（每 100ms 配额 200ms），但 `GOMAXPROCS` 是宿主机核数 32。当一个突发请求到来唤醒 20 个线程并行处理时，只需 10ms（$20 \times 10\text{ms} = 200\text{ms}$）就把当前 100ms 周期的配额全部耗尽，剩下 90ms 整个进程被内核强行冻结；按秒平均下来 CPU 使用率看似不高，但每次请求都平白无故多了近 90ms 的停顿。
+- Mutex Profile 和 Block Profile 有什么区别？→ `mutex` 只记录 `sync.Mutex` 和 `sync.RWMutex` 的锁争用等待时间；`block` 的范围更广，还包含 channel 收发阻塞、`select` 阻塞、`sync.WaitGroup.Wait` 和 `sync.Cond.Wait` 的等待时间（但不包含网络 I/O 和 `time.Sleep`）。
+
+**实战建议**
+
+- 遇到“高延迟、低 CPU”时，三板斧顺序是：① 看链路追踪（OpenTelemetry）确认是本服务慢还是下游慢；② 抓 `/debug/pprof/goroutine?debug=1` 看几百个在途请求卡在哪个调用栈；③ 检查容器 `cpu.stat` 的 `nr_throttled` 和连接池的 `WaitCount`。
+- 关键的下游客户端（MySQL、Redis、gRPC、HTTP）务必将连接池状态指标接入监控大盘。
+
+=== perf-13
+--- deep
+**原理展开**
+
+`go tool trace` 与 `pprof` 的根本差异在于**采集粒度**：`pprof` 是把几千次采样拍扁成一张统计汇总图，丢失了时间先后顺序和因果关系；而 `trace` 在运行时钩入调度器、GC、网络轮询器（netpoller）和同步原语的每一个状态跃迁点，完整记录“某年某月某日某纳秒，G18 在 P2 上被 G12 唤醒，等待了 1.4ms 后开始在 P0 上执行，运行 300µs 后因进入 GC Mark Assist 被暂停”。
+
+在 Go 1.21 重构新的执行追踪器（execution tracer v2）之前，开启 trace 会有 10%～20% 的性能损耗且文件巨大；Go 1.21+ 将开销降到了 **1% 左右**，并在 Go 1.25 正式引入了 **`runtime/trace.FlightRecorder`**（类似飞机黑匣子）：它在内存环形缓冲区中持续滚动保留最近几秒（或几 MB）的 trace 事件，平时不落盘；一旦业务代码捕获到一次慢请求（例如某次接口耗时 > 500ms），立刻把黑匣子里的最近几秒数据快照写出到文件，彻底解决了“偶发毛刺抓不到现场”的难题。
+
+**代码示例**
+
+```go
+// 1. 使用 trace.NewTask 和 trace.WithRegion 给业务请求打上结构化标记，
+// 在 go tool trace 的 "User-defined tasks" 视图中可以直接按延迟分布筛选出最慢的那笔请求
+func HandleOrder(ctx context.Context, orderID string) error {
+	ctx, task := trace.NewTask(ctx, "HandleOrder")
+	defer task.End()
+
+	trace.Log(ctx, "order_id", orderID) // 在该请求的时间线上记录关键业务参数
+
+	trace.WithRegion(ctx, "CheckInventory", func() {
+		checkInventory(ctx, orderID)
+	})
+	trace.WithRegion(ctx, "ChargePayment", func() {
+		chargePayment(ctx, orderID)
+	})
+	return nil
+}
+```
+
+```go
+// 2. Go 1.25+ FlightRecorder 模式示意：只在发现慢请求时才把内存中的环形缓冲写出
+func slowRequestHook(elapsed time.Duration, dump func(io.Writer) error) {
+	if elapsed > 500*time.Millisecond {
+		f, err := os.Create(fmt.Sprintf("slow-trace-%d.out", time.Now().Unix()))
+		if err == nil {
+			defer f.Close()
+			_ = dump(f)
+		}
+	}
+}
+```
+
+**常见追问**
+
+- 打开 `go tool trace trace.out` 后里面有十几个链接，排查延迟毛刺重点看哪几个？→ ① **View trace by proc**：按 P 的时间轴查看全局情况（GC STW、Mark Assist、网络唤醒、协程切换）；② **Goroutine analysis**：查看某类协程在运行（Execution）、网络等待（Network wait）、同步阻塞（Sync block）、**调度等待（Scheduler wait）**上的时间占比；③ **User-defined tasks**：如果埋了 `trace.NewTask`，可以直接查看慢请求的端到端时间线。
+- 什么是 Scheduler wait（调度等待时间），它很高说明什么？→ 指 goroutine 已经满足运行条件（变为 `_Grunnable` 状态，比如锁已经释放或网络数据已到达），但因为所有 P 都在忙，只能在运行队列里排队等待被 M 调度上核的时间。它很高说明 CPU 过载、存在未让出的计算密集循环、或者 `GOMAXPROCS` 被容器限流。
+- 为什么有时候浏览器打不开 `go tool trace` 的页面或渲染极卡？→ 抓取时间太长（如超过 10 秒）且高并发下产生了几十 MB 的事件；一般抓取 **2～5 秒**即可，Go 1.22+ 的 `go tool trace` 已会自动将大文件按时间分片展示。
+
+**实战建议**
+
+- 在核心网关或 RPC 框架的拦截器（Middleware）中统一植入 `trace.NewTask(ctx, routeName)`，平时不开启 trace 时这个函数是空操作（零开销），一旦线上抓取 trace，就能在数十万个事件中一秒钟定位到具体的慢接口请求。
+- 分析偶发的 p999 毛刺时，不要抓 30 秒的 CPU profile（毛刺会被 99.9% 的正常请求彻底稀释），要用 `trace` 看毫秒级的时间线。
+
+=== perf-14
+--- deep
+**原理展开**
+
+很多人误以为 Go GC 引起延迟毛刺是因为 STW（Stop The World），实际上现代 Go（1.8+）的两次 STW（Mark Setup 和 Mark Termination）绝大多数都在 **0.1ms～0.5ms** 以内。真正让业务请求出现几十毫秒延迟毛刺的头号元凶是 **Mark Assist（辅助标记）**：
+
+在并发标记阶段，后台标记协程（默认占用 25% 的 P）正在努力扫描存活对象。如果某个业务 goroutine 分配内存的速度太快，超过了后台标记的速度，运行时为了防止在标记完成前把堆内存撑爆，会实施**“谁分配得多，谁就得先帮 GC 干活”**的惩罚机制——强行暂停这个正在处理用户请求的业务 goroutine，让它转身去执行 `gcAssistAlloc` 扫描一定字节数的堆对象，扫描够了债务额度才允许它继续往下走。
+
+读懂 `GODEBUG=gctrace=1` 的输出是诊断 GC 的基本功：
+```text
+gc 14 @6.120s 4%: 0.045+18+0.032 ms clock, 0.36+12/34/8.5+0.25 ms cpu, 120->145->78 MB, 130 MB goal, 8 P
+```
+- `0.045+18+0.032 ms clock`：分别是 **STW 清扫终止与标记准备耗时（0.045ms） + 并发标记总墙钟耗时（18ms） + STW 标记终止耗时（0.032ms）**；
+- `12/34/8.5`（并发标记阶段的 CPU 时间细分）：分别是 **Assist Time（业务协程被迫辅助标记耗费的 CPU 时间 12ms） / 后台专门标记协程耗时（34ms） / 空闲 P 标记耗时（8.5ms）**。如果第一个数字（Assist）很大，说明存在严重的 Mark Assist 停顿！
+- `120->145->78 MB`：GC 开始前堆大小 120MB → GC 结束时堆增长到了 145MB → 其中实际存活对象 78MB。
+
+**代码示例**
+
+```go
+// 使用 runtime/metrics（Go 1.16+，比 ReadMemStats 开销更低且不会触发 STW）监控 GC 与调度延迟分布
+func readGCMetrics() {
+	samples := []metrics.Sample{
+		{Name: "/gc/cycles/total:gc-cycles"},
+		{Name: "/gc/heap/live:bytes"},
+		{Name: "/cpu/classes/gc/mark/assist:cpu-seconds"},     // 关键：辅助标记消耗的 CPU 秒数
+		{Name: "/cpu/classes/gc/mark/dedicated:cpu-seconds"},  // 后台标记消耗的 CPU 秒数
+	}
+	metrics.Read(samples)
+	for _, s := range samples {
+		switch s.Value.Kind() {
+		case metrics.KindUint64:
+			fmt.Printf("%s = %d\n", s.Name, s.Value.Uint64())
+		case metrics.KindFloat64:
+			fmt.Printf("%s = %.3f\n", s.Name, s.Value.Float64())
+		}
+	}
+}
+```
+
+```go
+// 消除 GC 扫描压力：将包含指针的大 map 改为无指针结构，或把 []byte 拼成大块缓冲区 + 整数偏移量
+// GC 遇到不含指针（noscan）的对象时，只需标记对象头，完全不需要递归扫描内部内容
+type MetricPoint struct {
+	Timestamp int64
+	Value     float64
+	TagID     uint32 // 用整型字典 ID 代替 string（string 内部含有指针，会让整个切片变成需要 GC 扫描的区域）
+}
+```
+
+**常见追问**
+
+- 如果把 `GOGC=off` 关掉，只设 `GOMEMLIMIT=4GiB` 会发生什么？→ Go 会在堆内存逼近 4GiB 时才开始触发 GC，平时完全不跑 GC，能最大化吞吐并减少 GC 次数；但一旦存活对象本身就涨到了 3.9GiB，剩余可分配空间只剩 100MB，GC 会以极高频率连续触发（GC 抖动 / 死亡螺旋），此时 `GOMEMLIMIT` 也有大约 50% CPU 封顶的软限制保护，超出可能会 OOM。通常建议保持 `GOGC=100`（或 200）配合 `GOMEMLIMIT` 一起使用。
+- 为什么把 `map[int]*User` 改成 `map[int]User`（且 `User` 内部没有 string/slice/指针字段）能大幅降低 GC 耗时？→ Go 编译器会对值类型做指针分析：如果 key 和 value 都不含任何指针，整个 map 的哈希桶会被分配在 **noscan span** 中，GC 标记阶段会直接跳过这片内存，哪怕里面有上千万条记录，GC 扫描耗时也是 0。
+- `sync.Pool` 怎么帮助缓解 Mark Assist？→ 它把高分配速率的临时缓冲区（如 `*bytes.Buffer`、`[]byte`）在两次 GC 之间循环复用，直接压低了单位时间内的堆分配速率（allocation rate），从而避免触发辅助标记。
+
+**实战建议**
+
+- 在监控系统中重点采集 `/cpu/classes/gc/mark/assist:cpu-seconds` 的增长率：只要这个指标出现尖峰，就代表业务请求正在被 GC 强行抓去干苦力，必然伴随 p99 毛刺。
+- 对内存充裕但延迟敏感的服务，将 `GOGC` 调大到 `200`～`400` 并配合 `GOMEMLIMIT` 兜底，是最快见效的无代码侵入调优手段。

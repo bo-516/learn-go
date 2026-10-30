@@ -1,0 +1,496 @@
+=== arch-01
+--- deep
+**原理展开**
+
+微服务真正的收益来自**组织层面**：多个团队可以独立开发、测试、部署自己负责的服务，不需要协调发布时间，也不会因为别人的代码出问题而阻塞。技术层面的收益（独立扩容、故障隔离、技术栈自由）是次要的，而且都有代价。
+
+常见的反模式：
+
+- **分布式单体**：服务拆开了，但每次需求都要同时修改、同时发布好几个服务，既有微服务的复杂度，又没有独立性；
+- **共享数据库**：多个服务直接读写同一个数据库，表结构的任何变化都会影响多个服务，边界形同虚设；
+- **拆得太细**：一个请求要串行调用十几个服务，延迟和故障概率都大幅增加。
+
+**代码示例**
+
+```text
+模块化单体：在一个进程里，但按领域严格划分包，模块之间只通过接口通信
+
+internal/
+  order/        // 订单领域：自己的 service、repository、表
+    api.go      // 对其他模块公开的接口（相当于将来的 RPC 接口）
+  inventory/
+    api.go
+  payment/
+    api.go
+```
+
+```go
+// order 模块只依赖 inventory 公开的接口，不访问它的表
+type Inventory interface {
+	Reserve(ctx context.Context, sku string, qty int) (reservationID string, err error)
+}
+```
+
+将来需要拆分时，把 `Inventory` 的实现从进程内调用换成 gRPC 客户端即可。
+
+**常见追问**
+
+- 怎么判断服务边界是否合理？→ 看需求变更时需要改几个服务；看服务之间的调用是否频繁且同步；看数据是否需要跨服务的事务。
+- 微服务之间应该同步调用还是异步消息？→ 需要立即得到结果的用同步；事件通知（订单已创建）用异步，降低耦合。
+- 多少人的团队适合微服务？→ 没有固定数字；一个小团队维护几十个服务通常是负担。
+
+**实战建议**
+
+- 从模块化的单体开始，保持清晰的模块边界，等团队和业务规模增长、边界被验证之后再拆分。
+- 拆分时先拆数据（每个服务独立的库），再拆代码。
+
+=== arch-02
+--- deep
+**原理展开**
+
+CAP 中的“一致性”指的是**线性一致性**（linearizability）：所有操作看起来像是在某个时间点瞬间完成的，任何读都能看到最近一次完成的写。“可用性”指的是**每个请求都能得到非错误的响应**（不保证是最新的数据）。
+
+**PACELC**：如果有分区（P），在可用性（A）和一致性（C）之间选择；否则（E，正常情况），在延迟（L）和一致性（C）之间选择。比如同步复制到多个副本能保证一致，但每次写都要等最慢的副本，延迟更高。这比 CAP 更贴近日常的工程决策。
+
+一致性模型从强到弱：线性一致 → 顺序一致 → 因果一致 → 读己之写 / 单调读 → 最终一致。很多业务只需要“读己之写”（用户能看到自己刚做的修改），而不需要全局的线性一致。
+
+**代码示例**
+
+```go
+// etcd：线性一致读（默认）vs 可串行化读（可能读到旧数据，但更快、不需要经过 leader）
+resp, err := cli.Get(ctx, "/config/feature")                       // 线性一致
+resp, err = cli.Get(ctx, "/config/feature", clientv3.WithSerializable()) // 本地读
+
+// “读己之写”：写入后记住版本号，读取时要求至少达到这个版本
+rev := putResp.Header.Revision
+resp, err = cli.Get(ctx, "/config/feature", clientv3.WithMinModRev(rev))
+```
+
+**常见追问**
+
+- MySQL 主从是 CP 还是 AP？→ 异步复制下，从库可以在主库不可达时继续提供（可能过时的）读，更接近 AP；半同步复制增加了一致性但牺牲了一些可用性。CAP 的分类对真实系统往往过于简化。
+- Redis Cluster 呢？→ 异步复制，故障切换时可能丢失已确认的写入，偏向 AP。
+- 注册中心应该选 CP 还是 AP？→ 服务发现更看重可用性（宁可拿到稍旧的列表，也不要完全拿不到），所以很多注册中心选择 AP；配置管理、分布式锁需要 CP。
+
+**实战建议**
+
+- 按数据的一致性需求分类：资金、库存用强一致；推荐、计数、展示类数据用最终一致。
+- 最终一致的系统一定要有对账和补偿机制，“最终”要有明确的时间上限。
+
+=== arch-03
+--- deep
+**原理展开**
+
+**租约**（lease）是服务注册的核心：注册时绑定一个有过期时间的租约，实例定期续约证明自己还活着，崩溃后租约到期，注册信息被自动删除，不需要别人来清理。
+
+健康检查的两种方式：
+
+- **实例主动上报**（心跳 / 续约）：实例能续约只说明进程还在，不代表它能正常处理请求；
+- **注册中心主动探测**（HTTP / TCP 检查）：更准确，但注册中心的负担更大。
+
+Kubernetes 的方式：kubelet 执行就绪探针，结果决定 Pod 是否出现在 Service 的 Endpoints 中，kube-proxy 和 DNS 据此更新。
+
+**代码示例**
+
+```go
+// etcd 注册：租约 + KeepAlive
+func register(ctx context.Context, cli *clientv3.Client, key, addr string) error {
+	lease, err := cli.Grant(ctx, 10) // 10 秒租约
+	if err != nil {
+		return err
+	}
+	if _, err := cli.Put(ctx, key, addr, clientv3.WithLease(lease.ID)); err != nil {
+		return err
+	}
+	ch, err := cli.KeepAlive(ctx, lease.ID) // 后台自动续约
+	if err != nil {
+		return err
+	}
+	go func() {
+		for range ch { // 必须消费续约响应，否则 channel 满了会告警
+		}
+		slog.Warn("lease keepalive stopped") // ctx 取消或者连接断开
+	}()
+	return nil
+}
+
+// 发现：读取当前列表 + 从这个版本之后开始 Watch，避免遗漏
+resp, _ := cli.Get(ctx, "/services/user/", clientv3.WithPrefix())
+watchCh := cli.Watch(ctx, "/services/user/", clientv3.WithPrefix(), clientv3.WithRev(resp.Header.Revision+1))
+```
+
+**常见追问**
+
+- 注册中心挂了服务还能调用吗？→ 客户端应该缓存最后一次获取的实例列表，注册中心不可用时继续使用缓存。
+- 实例优雅下线的顺序？→ 先从注册中心注销（主动撤销租约），等待客户端更新（几秒），再停止服务。
+- 心跳间隔和 TTL 怎么设？→ TTL 是心跳间隔的 3 倍左右，容忍偶尔一两次心跳丢失。
+
+**实战建议**
+
+- 在 Kubernetes 中优先使用平台提供的服务发现，只有跨集群、混合部署等场景才引入独立的注册中心。
+- 客户端负载均衡要结合健康状态：连续失败的实例暂时摘除，即使注册中心还认为它是健康的。
+
+=== arch-04
+--- deep
+**原理展开**
+
+负载均衡算法的选择取决于**请求和后端的特点**：
+
+- 请求耗时均匀、后端性能一致：轮询就足够了；
+- 后端性能不同：加权轮询，或者根据实时负载调整；
+- 请求耗时差异大：最少连接、P2C 这类基于负载的算法，避免慢请求在某个实例上堆积；
+- 需要状态亲和（本地缓存、会话）：一致性哈希。
+
+P2C 为什么效果好：完全随机时，最忙的实例的负载会偏离平均值 O(log n / log log n)；每次比较两个随机实例选较闲的那个，偏离降到 O(log log n)，这是“两个选择的力量”这个结论的由来。而且它不需要全局的状态，不同的客户端独立决策也不会产生羊群效应。
+
+**代码示例**
+
+```go
+// 基于 EWMA 延迟和在途请求数计算负载分数（Kratos / go-zero 的思路）
+type node struct {
+	addr     string
+	inflight atomic.Int64
+	ewmaLat  atomic.Int64 // 纳秒，指数加权移动平均
+}
+
+func (n *node) load() float64 {
+	return float64(n.ewmaLat.Load()) * float64(n.inflight.Load()+1)
+}
+
+func (n *node) observe(lat time.Duration) {
+	const decay = 0.9
+	old := float64(n.ewmaLat.Load())
+	n.ewmaLat.Store(int64(old*decay + float64(lat)*(1-decay)))
+}
+
+func pick(nodes []*node) *node {
+	a, b := nodes[rand.IntN(len(nodes))], nodes[rand.IntN(len(nodes))]
+	if b.load() < a.load() {
+		return b
+	}
+	return a
+}
+```
+
+**常见追问**
+
+- 一致性哈希在节点变化时会怎样？→ 只有一部分 key 迁移；配合虚拟节点让分布均匀。
+- 慢启动是什么？→ 新加入的实例（缓存是冷的、JIT 没有预热）先分配较少的流量，逐步增加，避免一上来就被打垮。
+- L4 和 L7 负载均衡的区别？→ L4 按连接分配（看不到请求内容）；L7 按请求分配，可以根据路径、头部路由，也能做重试和熔断。
+
+**实战建议**
+
+- 服务间调用使用支持健康检查和故障剔除的客户端负载均衡（或者服务网格）。
+- 监控各实例的流量分布，发现明显不均衡时检查负载均衡策略和长连接问题。
+
+=== arch-05
+--- deep
+**原理展开**
+
+**Google SRE 自适应熔断**（客户端节流）：客户端统计最近一段时间的请求总数 `requests` 和被下游接受（成功）的数量 `accepts`，以概率 `max(0, (requests − K × accepts) / (requests + 1))` 在本地直接拒绝请求，K 通常是 2。
+
+- 下游正常时，accepts ≈ requests，拒绝概率为 0；
+- 下游开始失败，accepts 下降，拒绝概率平滑上升，发往下游的请求逐渐减少；
+- 下游恢复后，accepts 回升，拒绝概率逐渐降回 0。
+
+没有“打开 / 关闭”的突变，也不需要手工设置错误率阈值和冷却时间。
+
+**代码示例**
+
+```go
+// sony/gobreaker：经典的三状态熔断器
+cb := gobreaker.NewCircuitBreaker[[]byte](gobreaker.Settings{
+	Name:        "payment",
+	MaxRequests: 3,                // 半开状态允许的探测请求数
+	Interval:    10 * time.Second, // 关闭状态下统计窗口
+	Timeout:     30 * time.Second, // 打开状态持续多久后进入半开
+	ReadyToTrip: func(c gobreaker.Counts) bool {
+		return c.Requests >= 20 && float64(c.TotalFailures)/float64(c.Requests) >= 0.5
+	},
+	IsSuccessful: func(err error) bool {
+		return err == nil || errors.Is(err, ErrBusiness) // 业务错误不算下游故障
+	},
+})
+
+body, err := cb.Execute(func() ([]byte, error) { return callPayment(ctx) })
+if errors.Is(err, gobreaker.ErrOpenState) {
+	return fallbackPayment() // 降级
+}
+```
+
+**常见追问**
+
+- 哪些错误应该计入熔断？→ 下游故障（超时、连接失败、5xx）；参数错误、业务拒绝（余额不足）不应该计入。
+- 熔断的粒度？→ 按下游服务或者按接口，一个接口出问题不应该让整个服务都被熔断。
+- 降级的数据从哪里来？→ 缓存的旧数据、默认值、简化的计算结果、“服务繁忙”的友好提示。
+
+**实战建议**
+
+- 限流、熔断、降级、超时、重试作为一套组合策略统一设计，在故障演练中验证。
+- 降级逻辑要定期演练，长期不用的降级路径往往在需要时才发现已经失效。
+
+=== arch-06
+--- deep
+**原理展开**
+
+**TCC 的三个异常问题**：
+
+- **空回滚**：Try 请求因为网络问题没有到达参与者，事务管理器超时后发起 Cancel。参与者收到 Cancel 时发现没有对应的 Try 记录，应该直接返回成功（并记录这次空回滚）；
+- **悬挂**：Cancel 已经执行完了，迟到的 Try 才到达。如果执行这个 Try，冻结的资源永远不会被释放。所以执行 Try 前要检查是否已经有 Cancel 记录；
+- **幂等**：Confirm 和 Cancel 都可能被重试，必须幂等。
+
+这三个问题通常通过一张“事务控制表”（全局事务 ID + 分支 ID + 状态）统一处理，dtm 的“子事务屏障”就是这样实现的。
+
+**Outbox 模式的投递保证**：业务数据和消息记录在同一个事务里，所以“业务成功”和“消息会被发送”是原子的；投递进程至少投递一次，消费者幂等处理，整体达到最终一致。
+
+**代码示例**
+
+```go
+// Outbox：同一个事务里写业务数据和待发消息
+func createOrder(ctx context.Context, db *sql.DB, o Order) error {
+	return WithTx(ctx, db, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO orders (...) VALUES (...)", o.ID /* ... */); err != nil {
+			return err
+		}
+		payload, _ := json.Marshal(OrderCreated{ID: o.ID, Amount: o.Amount})
+		_, err := tx.ExecContext(ctx,
+			"INSERT INTO outbox (id, topic, payload, status) VALUES (?, 'order.created', ?, 'PENDING')",
+			newID(), payload)
+		return err
+	})
+}
+
+// 投递进程：取出待发送的消息，发送成功后标记
+func relay(ctx context.Context, db *sql.DB, pub Publisher) error {
+	rows, err := db.QueryContext(ctx,
+		"SELECT id, topic, payload FROM outbox WHERE status = 'PENDING' ORDER BY id LIMIT 100")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var topic string
+		var payload []byte
+		if err := rows.Scan(&id, &topic, &payload); err != nil {
+			return err
+		}
+		if err := pub.Publish(ctx, topic, payload); err != nil {
+			continue // 下次重试
+		}
+		db.ExecContext(ctx, "UPDATE outbox SET status = 'SENT' WHERE id = ?", id)
+	}
+	return rows.Err()
+}
+```
+
+**常见追问**
+
+- 多个投递进程会重复发送吗？→ 会，可以用 `SELECT ... FOR UPDATE SKIP LOCKED` 让多个进程分别领取不同的消息，或者只运行一个投递进程（主备）。
+- Saga 的补偿失败了怎么办？→ 持续重试；超过次数后记录、告警，人工处理。
+- 分布式事务的性能代价有多大？→ 2PC 在准备和提交之间锁定资源，并发高时吞吐量下降明显；最终一致的方案基本没有锁定开销。
+
+**实战建议**
+
+- 设计服务边界时尽量让一个业务操作只修改一个服务的数据。
+- 必须跨服务时，默认选择 Outbox + 幂等消费，并配套对账。
+
+=== arch-07
+--- deep
+**原理展开**
+
+雪花 ID 的几个工程问题：
+
+- **趋势递增 ≠ 严格递增**：不同机器同一毫秒生成的 ID 之间没有顺序，跨机器的 ID 只是“大致按时间”排列；
+- **ID 泄露信息**：从 ID 中可以解析出生成时间、机器编号，订单号能被用来估算业务量；
+- **前端精度问题**：64 位整数超过 JavaScript Number 的安全范围（2⁵³），传给前端时必须用字符串；
+- **时钟依赖**：完全依赖本机时钟，时钟回拨是最主要的风险。
+
+**号段模式**的双缓冲：当前号段用到一定比例（比如 10%）时，异步加载下一个号段，切换时没有停顿；数据库只需要每用完一个号段访问一次，压力很小。缺点是 ID 只是趋势递增（每个实例各自分配一段），而且服务重启时当前号段剩下的 ID 会被浪费。
+
+**代码示例**
+
+```go
+// 号段模式：数据库表 id_segments(biz_tag, max_id, step)
+func (g *Segment) fetch(ctx context.Context) (lo, hi int64, err error) {
+	err = WithTx(ctx, g.db, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE id_segments SET max_id = max_id + step WHERE biz_tag = ?", g.tag); err != nil {
+			return err
+		}
+		var max, step int64
+		if err := tx.QueryRowContext(ctx,
+			"SELECT max_id, step FROM id_segments WHERE biz_tag = ?", g.tag).Scan(&max, &step); err != nil {
+			return err
+		}
+		lo, hi = max-step+1, max
+		return nil
+	})
+	return
+}
+
+// UUIDv7：时间有序的 UUID（Go 生态：github.com/google/uuid）
+id, _ := uuid.NewV7()
+```
+
+**常见追问**
+
+- 41 位时间戳为什么能用 69 年？→ 2⁴¹ 毫秒 ≈ 69.7 年，从自定义的纪元开始计算。
+- 序列号用完了怎么办？→ 等待下一毫秒；高并发时也可以“借用”未来的时间戳（需要谨慎处理）。
+- 分库分表时 ID 有什么额外要求？→ 可以在 ID 中嵌入分片信息（基因法），按 ID 查询时直接定位分片。
+
+**实战建议**
+
+- 中小规模的系统使用数据库号段或 UUIDv7，减少对时钟和机器 ID 分配的依赖。
+- 对外展示的编号（订单号）可以和内部主键分开，避免泄露业务信息。
+
+=== arch-08
+--- deep
+**原理展开**
+
+高可用可以用两个指标来度量：
+
+- **MTBF**（平均故障间隔）：多久出一次故障，靠冗余、容错、变更管控来延长；
+- **MTTR**（平均恢复时间）：出故障后多久恢复，靠监控告警、快速定位、一键回滚、自动故障转移来缩短。
+
+可用性 ≈ MTBF / (MTBF + MTTR)。很多时候缩短 MTTR 比延长 MTBF 更容易：从“1 小时才发现、1 小时才恢复”提升到“5 分钟发现、5 分钟回滚”，可用性的提升非常显著。
+
+故障的主要来源统计上通常是：**变更**（发布、配置修改、数据库变更）> 依赖故障 > 容量问题 > 硬件故障。所以变更管控（灰度、回滚、变更窗口）是性价比最高的投入。
+
+**代码示例**
+
+```go
+// 舱壁隔离：不同下游使用独立的并发配额，一个下游变慢不会耗尽所有资源
+type Bulkhead struct{ sem chan struct{} }
+
+func NewBulkhead(n int) *Bulkhead { return &Bulkhead{sem: make(chan struct{}, n)} }
+
+func (b *Bulkhead) Do(ctx context.Context, fn func(context.Context) error) error {
+	select {
+	case b.sem <- struct{}{}:
+		defer func() { <-b.sem }()
+		return fn(ctx)
+	default:
+		return ErrBulkheadFull // 快速失败，而不是排队等待
+	}
+}
+
+var (
+	paymentBH = NewBulkhead(50)
+	searchBH  = NewBulkhead(200)
+)
+```
+
+**常见追问**
+
+- 怎么设定可用性目标？→ 根据业务的重要程度和成本；每多一个 9，成本往往成倍增加；用 SLO 和错误预算平衡稳定性和迭代速度。
+- 依赖的可用性比自己低怎么办？→ 对依赖做降级（不可用时返回兜底结果），或者异步化（不在关键路径上同步调用）。
+- 混沌工程从哪里开始？→ 先在测试环境注入单实例故障和网络延迟，逐步扩展到生产环境的小范围演练。
+
+**实战建议**
+
+- 每次故障做复盘（不追责），找到根本原因并跟进改进项。
+- 定期演练故障转移和回滚流程，确保在真正需要时可以使用。
+
+=== arch-09
+--- deep
+**原理展开**
+
+本地缓存的几个设计点：
+
+- **淘汰策略**：LRU 实现简单，但会被一次性的大量扫描污染；W-TinyLFU（ristretto、otter、Caffeine）用一个很小的计数草图估算访问频率，只让“比被淘汰者更热”的数据进入缓存，命中率通常更高；
+- **GC 友好**：缓存几十万个对象时，每个对象都是 GC 要追踪的指针。bigcache / freecache 把数据序列化后存放在少数几个大的 `[]byte` 里，索引是 `map[uint64]uint32`（不含指针），GC 几乎不需要扫描；代价是每次读写都要序列化；
+- **并发**：分片加锁，或者使用无锁的读路径。
+
+**代码示例**
+
+```go
+// otter：高性能的本地缓存（W-TinyLFU）
+cache, _ := otter.MustBuilder[string, *Product](100_000).
+	WithTTL(30 * time.Second).
+	Build()
+
+func getProduct(ctx context.Context, id string) (*Product, error) {
+	if p, ok := cache.Get(id); ok {
+		return p, nil
+	}
+	p, err := loadFromRedisOrDB(ctx, id)
+	if err == nil {
+		cache.Set(id, p)
+	}
+	return p, err
+}
+
+// 订阅失效消息
+sub := rdb.Subscribe(ctx, "invalidate:product")
+go func() {
+	for msg := range sub.Channel() {
+		cache.Delete(msg.Payload)
+	}
+}()
+```
+
+**常见追问**
+
+- 本地缓存命中率低怎么办？→ 检查容量是否够、过期时间是否太短、key 的分布是否太分散（长尾数据不适合本地缓存）。
+- 多个实例的本地缓存内容不一样会有问题吗？→ 用户在不同请求间可能看到不同的数据（被路由到不同实例），对一致性敏感的数据不要放本地缓存。
+- Redis 6 的客户端缓存（client-side caching）是什么？→ Redis 主动通知客户端哪些 key 失效了（tracking），比自己做广播更可靠。
+
+**实战建议**
+
+- 本地缓存的对象设计成不可变的，避免调用方修改共享对象。
+- 监控本地缓存的命中率、条目数和内存占用。
+
+=== arch-10
+--- deep
+**原理展开**
+
+**指标类型**的选择：
+
+- **Counter**：只增不减（请求总数、错误总数），用 `rate()` 计算速率；
+- **Gauge**：可增可减（当前连接数、队列长度）；
+- **Histogram**：按桶计数（请求耗时），可以在服务端聚合多个实例后计算分位数；
+- **Summary**：在客户端计算分位数，无法跨实例聚合，一般不推荐。
+
+**标签的基数**：每个标签组合都是一个独立的时间序列。把用户 ID、订单号、完整的 URL 作为标签，序列数会爆炸，拖垮 Prometheus。标签只能是有限的、可枚举的值（接口名、状态码、方法）。
+
+**基于 SLO 的告警**：比如 SLO 是“30 天内 99.9% 的请求成功”，错误预算就是 0.1%。如果最近 1 小时的错误率达到了“按这个速度 2 天就会耗尽整月预算”的程度（燃烧速率 14.4 倍），立即告警；燃烧得慢则只发工单。这比“错误率超过 1% 就告警”更能反映对用户的实际影响。
+
+**代码示例**
+
+```go
+var (
+	reqDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "http_request_duration_seconds",
+		Help:    "HTTP 请求耗时",
+		Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5},
+	}, []string{"route", "method", "code"})
+)
+
+func metrics(route string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, code: 200}
+		next.ServeHTTP(rec, r)
+		reqDuration.WithLabelValues(route, r.Method, strconv.Itoa(rec.code)).
+			Observe(time.Since(start).Seconds())
+	})
+}
+// route 用路由模式（"/users/{id}"），而不是实际的路径（"/users/42"），控制基数
+```
+
+```promql
+# p99 延迟（所有实例聚合）
+histogram_quantile(0.99, sum by (le, route) (rate(http_request_duration_seconds_bucket[5m])))
+```
+
+**常见追问**
+
+- USE 方法是什么？→ 面向资源的指标：使用率（Utilization）、饱和度（Saturation）、错误（Errors），用于 CPU、磁盘、连接池等；RED 面向请求。
+- 日志和指标怎么取舍？→ 需要聚合和告警的用指标（便宜）；需要查看单个事件的细节用日志（贵）；不要通过统计日志来生成核心指标。
+- 链路追踪的采样会丢掉重要的链路吗？→ 用尾部采样，保留所有错误和慢请求的链路。
+
+**实战建议**
+
+- 每个服务至少有：RED 指标、依赖调用指标、运行时指标，以及对应的仪表盘和 SLO 告警。
+- 定期检查告警的有效性：频繁误报的告警要么修正，要么删除。

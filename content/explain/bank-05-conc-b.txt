@@ -1,0 +1,296 @@
+=== conc-11-1
+--- explain
+**思路**
+
+`sync.Map` 适合“key 只写一次、之后大量读”的场景。词频统计里每个词的计数器只创建一次，之后只是原子加一，所以把 value 设计成 `*atomic.Int64`：map 本身几乎只读，计数在计数器上原子完成。
+
+**代码讲解**
+
+1. `chunk := (len(words) + workers - 1) / max(workers, 1)`：向上取整的除法，把切片均分成 workers 份；`max` 防止除以 0。
+2. `part := words[start:min(start+chunk, len(words))]`：每个 goroutine 处理一段。
+3. 先 `Load`，不存在再 `LoadOrStore(w, new(atomic.Int64))`：大部分词已经存在时，只走无锁的快速路径，也避免每次都分配一个新计数器。
+4. `LoadOrStore` 返回的是**最终存在 map 里的那个值**（可能是别的 goroutine 先存进去的），所以并发创建时也只会用同一个计数器。
+5. `v.(*atomic.Int64).Add(1)`：`sync.Map` 的值是 `any`，需要类型断言。
+6. `Range` 遍历转换成普通 map，回调返回 true 表示继续。
+
+**易错点**
+
+- 用 `Load` + `Store` 代替 `LoadOrStore`：两个 goroutine 可能同时发现不存在、各自 Store 一个新计数器，其中一个的计数会丢失。
+- 一般的读写混合场景用 `map + RWMutex` 或分片锁更快，`sync.Map` 不是通用的并发 map。
+
+=== conc-12-1
+--- explain
+**思路**
+
+`sync.Pool` 缓存临时对象以减少分配。两条规则：拿出来的对象可能是别人用过的，**必须重置**；不要把特别大的对象放回去，否则偶尔一次大请求会让池子长期占用大量内存。
+
+**代码讲解**
+
+1. `sync.Pool{New: func() any { return new(bytes.Buffer) }}`：池子空的时候调用 New 创建。
+2. `Get()`：`p.pool.Get().(*bytes.Buffer)` 类型断言，池里只放这一种类型。
+3. `Put(b)`：`b.Cap() > p.maxCap` 时直接丢弃，让 GC 回收；否则 `b.Reset()`（长度清零，保留容量）后放回。
+4. 在 Put 时 Reset，Get 拿到的一定是空 buffer。
+
+**易错点**
+
+- Put 之后继续使用这个 buffer：它可能已经被另一个 goroutine 拿走并写入数据。
+- Pool 里的对象会在 GC 时被清理（Go 1.13 起有一个“受害者缓存”，最多保留两轮 GC），不能用来做连接池这类需要长期保存的资源。
+- 返回 `b.Bytes()` 给调用方后又把 b 放回池子，调用方拿到的切片会被后续使用者覆盖。需要返回数据时先复制。
+
+=== conc-13-1
+--- explain
+**思路**
+
+计数器、标志位这类**单个变量**的并发更新，用原子操作比加锁更轻：没有锁竞争，也不会让 goroutine 挂起。代价是多个变量之间没有原子性。
+
+**代码讲解**
+
+1. `requests atomic.Int64`、`errors atomic.Int64`：类型化的原子变量，零值可用，不能被复制（`go vet` 会检查）。
+2. `Record`：`Add(1)` 原子加一。
+3. `Snapshot`：分别 `Load` 两个值，命名返回值 `(requests, errors int64)` 让签名自带说明。
+4. `ErrorRate`：先判断除数是否为 0，再转成 float64 相除。
+
+**易错点**
+
+- `Snapshot` 不是一致的快照：两次 Load 之间可能有新的 `Record`，读到的 errors 可能对应更多的请求。统计场景通常可以接受；需要严格一致时用 Mutex 保护两个字段。
+- 混用原子操作和普通读写（比如在某处直接读 `s.requests`）仍然是数据竞争，类型化的 `atomic.Int64` 从语法上杜绝了这种错误。
+
+=== conc-13-2
+--- explain
+**思路**
+
+**写时复制（copy-on-write）**：配置对象一旦发布就不再修改，更新时创建一个新对象，然后原子地替换指针。读取只需要一次原子 Load，完全无锁。多个写者并发更新时，“读旧值 → 生成新值 → 写回”之间可能被别人抢先，所以用 **CAS 循环**：只有当指针仍然是我读到的那个 old 时才替换，否则重新读取、重新计算。
+
+**代码讲解**
+
+1. `p atomic.Pointer[Config]`：泛型的原子指针（Go 1.19+）。
+2. `NewHolder` 先 `Store` 初始配置。
+3. `Load()` 直接返回当前指针，调用方只读不改。
+4. `Update`：`for { old := Load(); if CompareAndSwap(old, fn(old)) { return } }`。CAS 失败说明别人已经更新过，重试时 `fn` 会基于最新的配置计算。
+
+**易错点**
+
+- `fn` 修改旧对象（比如 `old.Limits["x"] = 1` 然后返回 old）：正在读旧配置的 goroutine 会看到半更新的数据，而且 map 并发读写会崩溃。必须深拷贝需要修改的部分。
+- 写入非常频繁时 CAS 会大量失败重试，这时用 Mutex 更合适；这个模式适合读远多于写的场景。
+
+=== conc-14-1
+--- explain
+**思路**
+
+errgroup = WaitGroup + “记录第一个错误” + “出错时取消 context”。所有任务共享同一个派生的 ctx，任何一个任务失败就 cancel，其他任务检查 `ctx.Done()` 后尽快退出，`Wait` 返回第一个错误。
+
+**代码讲解**
+
+1. `WithContext`：`context.WithCancel(ctx)` 派生子 context，把 cancel 存进 Group，把子 ctx 返回给调用方传给各个任务。
+2. `Go(f)`：`wg.Add(1)` 后启动 goroutine；`f()` 返回错误时用 `errOnce.Do` 保证只记录第一个错误并只 cancel 一次。
+3. `Wait()`：等所有任务结束，再 `cancel()` 一次（释放 context 资源），返回 `g.err`。
+4. `g.err` 只在 `errOnce.Do` 里写、在 `wg.Wait()` 之后读，WaitGroup 保证了可见性，不需要额外的锁。
+
+**易错点**
+
+- 任务必须使用 `WithContext` 返回的 ctx 而不是原来的 ctx，否则取消信号传不到。
+- 和 WaitGroup 的区别：WaitGroup 只负责等待，不传递错误也不取消。
+- 真实的 `golang.org/x/sync/errgroup` 还支持 `SetLimit(n)` 限制并发数、`TryGo`。
+
+=== conc-15-1
+--- explain
+**思路**
+
+缓存击穿：热点 key 过期的瞬间，大量请求同时发现缓存未命中，全部去查数据库。**singleflight** 把同一个 key 的并发请求合并成一次：第一个请求真正执行查询，其他请求等待并共享结果。
+
+**代码讲解**
+
+1. 先 `s.cached(id)` 查缓存，用读锁。
+2. 未命中：`s.sf.Do("user:"+id, func() ...)`，同一个 key 同时只有一个函数在执行。
+3. 回调里查询数据库；出错直接返回，**不写缓存**（否则错误会被缓存，或者写入空值）。
+4. 成功后加写锁写缓存。
+
+**已给出的 singleflight 实现**：用 map 记录正在进行的调用 `*call`。后来的请求发现 key 已存在，就 `c.wg.Wait()` 等第一个请求完成，然后读取 `c.val, c.err`。第一个请求执行完后从 map 删除 key，之后的新请求会重新执行。
+
+**易错点**
+
+- 合并请求也会合并错误：第一个请求失败，同一批等待的请求都会拿到这个错误。
+- singleflight 只能防住单个进程内的并发；多实例部署时还需要分布式锁或缓存预热、逻辑过期等策略。
+- 真实的 `x/sync/singleflight` 的 `Do` 还返回 `shared bool`，并提供 `DoChan`（可以配合超时）和 `Forget`。
+
+=== conc-16-1
+--- explain
+**思路**
+
+有界阻塞队列需要两个等待条件：“不空”（Get 等它）和“不满”（Put 等它），各用一个 `sync.Cond`，它们共享同一把锁。数据放在**环形缓冲区**里，用 `head` 和 `size` 表示有效区间，不需要移动元素。
+
+**代码讲解**
+
+1. `NewQueue`：`sync.NewCond(&q.mu)` 把条件变量绑定到队列的锁上。返回指针，因为结构体里有锁。
+2. `Put`：`for q.size == len(q.buf) && !q.closed { q.notFull.Wait() }`。`Wait` 会原子地释放锁并挂起，被唤醒后重新拿到锁、**再次检查条件**。
+3. 写入位置是 `(head + size) % len(buf)`，写完 `size++`，`notEmpty.Signal()` 唤醒一个等待的 Get。
+4. `Get`：等待“不空或已关闭”；关闭且读空时返回 `(0, false)`；读取后 `head` 前进一格（取模回绕），`notFull.Signal()`。
+5. `Close`：设置标记后 `Broadcast` 唤醒**所有**等待者，让它们重新检查条件后退出。
+
+**易错点**
+
+- `Wait` 放在 `if` 而不是 `for` 里：被唤醒时条件可能已经被其他 goroutine 改变（比如另一个 Get 抢先取走了数据）。
+- Close 只用 Signal 会漏唤醒一部分等待者，它们会永远阻塞。
+- 已关闭的队列里如果还有数据，Get 仍然先把数据读完，这和 channel 的语义一致。
+
+=== conc-17-1
+--- explain
+**思路**
+
+关闭 channel 的原则是“只由唯一的发送方关闭”。多个生产者时，任何一个生产者都不知道其他生产者是否还在发送，所以由一个**单独的协调 goroutine** 等所有生产者结束（WaitGroup）后再关闭。消费者用 `for range` 读到关闭为止。
+
+**代码讲解**
+
+1. `ch := make(chan int, 16)`：有一点缓冲，减少生产者和消费者之间的同步次数。
+2. 生产者用 `prod` 这个 WaitGroup 计数。
+3. `go func() { prod.Wait(); close(ch) }()`：协调者。必须放在单独的 goroutine 里，如果在主 goroutine 里先 `prod.Wait()`，此时消费者还没启动，生产者会阻塞在发送上，造成死锁。
+4. 消费者用另一个 WaitGroup `cons`，累加到 `atomic.Int64`（多个消费者并发写）。
+5. 主 goroutine `cons.Wait()` 后返回总和。
+
+**易错点**
+
+- 让某个生产者在发完后关闭 channel：其他生产者再发送时 panic `send on closed channel`。
+- 用 `sync.Once` 包装 close 也只能防止重复关闭，防不住“关闭之后别人还在发送”。
+
+=== conc-18-1
+--- explain
+**思路**
+
+两个 goroutine 同时访问同一个变量、至少一个是写、并且没有同步，就是**数据竞争**。`total++` 是“读 → 加 → 写”三步，并发时会丢失更新；map 的并发写更会直接崩溃。用一把 Mutex 保护这两个字段。
+
+**代码讲解**
+
+1. 结构体里加 `mu sync.Mutex`，放在它保护的字段前面。
+2. `Record`：加锁后同时更新 `total` 和 `byPath`，两个字段的更新是一起完成的。
+3. `Get` 也要加锁：**读也必须同步**，只给写加锁仍然是数据竞争。
+4. 构造函数返回指针，方法都是指针接收者。
+
+**易错点**
+
+- 竞态检测器只能发现**实际执行到**的竞争，所以测试要有足够的并发覆盖；它会让程序变慢 2～20 倍、内存增加 5～10 倍，一般在测试和预发环境开启，不在生产环境长期开启。
+- 只有计数时也可以用 `atomic.Int64`，但这里还有 map，用锁更简单。
+
+=== conc-19-1
+--- explain
+**思路**
+
+双重检查锁的外层 `if instance == nil` 是一次**不加锁的读**，而另一个 goroutine 正在加锁写 instance，这就是数据竞争。按 Go 内存模型，没有 happens-before 关系，读到的可能是一个非 nil 但字段还没写完的对象。用 `sync.Once` 系列可以正确地实现“只初始化一次”。
+
+**代码讲解**
+
+1. `var GetConfig = sync.OnceValue(loadConfig)`：Go 1.21 的 `sync.OnceValue` 接收一个 `func() T`，返回一个新函数：第一次调用时执行 loadConfig 并缓存结果，之后直接返回缓存，并发安全。
+2. `GetConfig` 是一个包级的**函数类型变量**，调用方式和普通函数一样：`cfg := GetConfig()`。
+3. `loads` 计数器用来在测试里验证 loadConfig 只执行了一次。
+
+**易错点**
+
+- 在 Java 里给变量加 `volatile` 可以修复双重检查锁，Go 里的对应做法是用 `atomic.Pointer` 做快速路径（标准库 sync.Once 就是这样实现的），但直接用 Once 最简单。
+- `sync.OnceValues` 用于可能返回错误的初始化：`var load = sync.OnceValues(func() (*Config, error) {...})`。
+
+=== conc-20-1
+--- explain
+**思路**
+
+防抖（debounce）：频繁触发时，只在“安静下来”一段时间后执行一次。每次触发都取消上一次的定时器，重新开始计时，所以只有最后一次触发后的定时器能活到时间到期。
+
+**代码讲解**
+
+1. 返回一个闭包，`mu` 和 `timer` 是闭包捕获的状态，每次调用 Debounce 都有自己独立的一套。
+2. `var ( mu sync.Mutex; timer *time.Timer )`：分组声明。
+3. 触发时加锁（触发函数可能被多个 goroutine 并发调用）。
+4. `timer.Stop()` 停掉旧定时器，`time.AfterFunc(d, f)` 创建新的：到期后在**新的 goroutine** 里执行 f。
+
+**易错点**
+
+- `Stop` 返回 false 表示定时器已经触发或已停止。如果 f 已经开始执行，Stop 拦不住它，所以 f 可能和新的触发并发执行，f 本身需要是并发安全的。
+- 也可以复用同一个定时器调用 `timer.Reset(d)`，效果一样。
+- 和**节流**（throttle）区分：节流是“固定时间内最多执行一次”，防抖是“停止触发后才执行”。
+
+=== conc-20-2
+--- explain
+**思路**
+
+空闲超时：每收到一条数据就重新开始计时。在循环里每轮调用 `time.After(idle)` 会每轮创建一个新定时器；更好的做法是循环外创建一个 Timer，收到数据后 `Reset`。
+
+**代码讲解**
+
+1. `timer := time.NewTimer(idle)`，`defer timer.Stop()`。
+2. `for { select { ... } }`：两个 case。
+3. 收到数据：append，然后 `timer.Reset(idle)` 重新计时。
+4. channel 关闭（`!ok`）或定时器触发：返回已收集的数据。
+
+**易错点**
+
+- Go 1.23 之前，`Reset` 一个已经触发但 channel 里的值还没被读走的定时器，之后的 select 会立刻读到那个旧值，导致提前超时。老代码里常见的修复是 `if !t.Stop() { <-t.C }` 先排空。Go 1.23 起 Timer 的 channel 改为同步（无缓冲），Stop / Reset 之后不会再收到旧值，这个坑消失了（需要 go.mod 中 go ≥ 1.23）。
+- 用 `time.After` 的写法在 Go 1.23 之前还会让每个未触发的定时器一直存活到到期。
+
+=== conc-21-1
+--- explain
+**思路**
+
+CPU 缓存以 **cache line**（通常 64 字节）为单位。两个不相关的变量如果在同一个 cache line 里，被不同的 CPU 核心频繁写入时，这个 cache line 会在核心之间来回失效、传递，性能大幅下降，这就是**伪共享**。让每个计数器独占一个 cache line 就能避免。
+
+**代码讲解**
+
+1. `n atomic.Int64` 占 8 字节，`_ [56]byte` 填充 56 字节，合计 64 字节。字段名 `_` 表示不会被使用。
+2. `slots []PaddedCounter`：切片里的元素是连续存放的，每个元素正好 64 字节，所以相邻槽位不会共享 cache line（假设起始地址对齐）。
+3. `Add`：`c.slots[slot].n.Add(delta)`，直接通过下标访问元素的字段，不会复制。
+4. `Sum`：`for i := range c.slots` 用下标访问，避免 `for _, s := range` 复制包含原子变量的结构体（`go vet` 会报 copylocks）。
+
+**易错点**
+
+- 填充会浪费内存，只用在真正高频并发写的热点上，比如分片计数器、每个 P 一个的本地缓存。
+- 有的 CPU 的 cache line 是 128 字节（如 Apple M 系列）；`golang.org/x/sys/cpu.CacheLinePad` 会按平台给出合适的大小。
+
+=== conc-21-2
+--- explain
+**思路**
+
+Treiber 栈：栈顶是一个原子指针。Push 时让新节点指向当前栈顶，然后 CAS 把栈顶换成新节点；Pop 时 CAS 把栈顶换成 `old.next`。CAS 失败说明别人修改过栈顶，重新读取再试。
+
+**代码讲解**
+
+1. `head atomic.Pointer[node]`：零值是 nil，空栈。
+2. `Push`：节点只分配一次，循环里每次重新设置 `n.next = old`，然后 `CompareAndSwap(old, n)`。
+3. `Pop`：`old == nil` 返回空；否则 `CompareAndSwap(old, old.next)` 成功就返回 `old.val`。
+
+**为什么 Go 里没有 ABA 问题**：ABA 指的是：线程 1 读到栈顶 A，准备 CAS；期间线程 2 弹出 A、B，又把 A 的内存释放后重新分配成一个新节点压回去，地址又是 A。线程 1 的 CAS 会成功，但 `old.next` 已经是一个无效的 B。Go 有 GC：只要线程 1 还持有 `old` 指针，A 就不会被回收，它的地址也不会被复用，所以这种情况不会发生。
+
+**易错点**
+
+- 高竞争下 CAS 会反复失败、空转，性能可能不如 Mutex。无锁数据结构的价值在于不会因为某个持锁的 goroutine 被挂起而让所有人等待。
+
+=== conc-22-1
+--- explain
+**思路**
+
+每个 goroutine 至少有 2KB 栈（会按需增长），百万连接每连接一个 goroutine 就是几个 GB 的内存，调度和 GC 扫描栈的开销也会显著增加。用**固定数量的 worker** 从队列里取连接处理，goroutine 数量就和连接数解耦了。
+
+**代码讲解**
+
+1. `queue := make(chan int, workers)`：小缓冲的任务队列。
+2. 启动 `workers` 个 goroutine，`for c := range queue` 消费。
+3. 主 goroutine 把所有连接放进队列，`close(queue)`，然后 `wg.Wait()`。
+
+**易错点**
+
+- 这个模型适合“处理一下就结束”的任务。真实的长连接服务里，连接大部分时间在等数据，如果 worker 阻塞在某个连接的读取上，就会饿死其他连接。百万长连接的方案通常是**基于 epoll 的事件驱动**（gnet、netpoll 等库）：只有可读的连接才交给 worker 处理。
+- 另外还要调整文件描述符上限（`ulimit -n`）、内核的 TCP 内存参数，并为每个连接分配尽可能小的缓冲区。
+
+=== conc-23-1
+--- explain
+**思路**
+
+死锁的必要条件之一是“循环等待”：A 拿着锁 1 等锁 2，B 拿着锁 2 等锁 1。如果所有 goroutine 都**按同一个全局顺序**加锁（比如按账户 ID 从小到大），就不可能形成环，死锁也就不会发生。
+
+**代码讲解**
+
+1. `from == to` 时直接返回：否则会对同一把锁加锁两次，Go 的锁不可重入，自己就把自己锁死了。
+2. `first, second := from, to`，ID 大的在前就交换：多重赋值完成交换。
+3. 先锁 first 再锁 second，各自 defer 解锁（解锁顺序是后进先出，正好相反，没有问题）。
+4. 加锁顺序和业务方向（from、to）无关，修改余额时仍然用 from、to。
+
+**易错点**
+
+- 按指针地址排序也可以，但 ID 更稳定、更容易理解。
+- 排查死锁：所有 goroutine 都阻塞时运行时会报 `all goroutines are asleep - deadlock!`；只有部分阻塞时，看 `/debug/pprof/goroutine?debug=2` 里卡在 `sync.(*Mutex).Lock` 的 goroutine，比较它们持有和等待的锁。

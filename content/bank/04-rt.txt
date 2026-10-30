@@ -1,0 +1,1921 @@
+运行时与内存（RT-01 ~ RT-18）的编程小任务。多数任务是对运行时机制的简化建模。
+
+=== rt-01-1
+title: 模拟调度器的 findRunnable
+--- desc
+用简化模型实现调度器为 P 挑选下一个 G 的过程。G 用正整数编号，0 表示「没有」。
+
+`FindRunnable(s, p)` 的规则：
+
+1. 先把 `p.SchedTick` 加一；如果加一后 `SchedTick % 61 == 0` 且全局队列非空，**先从全局队列**取队首（防止全局队列饥饿）；
+2. `p.RunNext` 非 0 时返回它并清零；
+3. 本地队列非空时取队首；
+4. 全局队列非空时取队首；
+5. 按 `s.Ps` 的顺序找第一个本地队列非空的其他 P，从它的**队首偷走一半**（向上取整）：第一个偷来的 G 直接返回，其余追加到 `p` 的本地队列；
+6. 都没有则返回 0。
+--- solution
+package main
+
+type P struct {
+	ID        int
+	RunNext   int
+	Local     []int
+	SchedTick int
+}
+
+type Sched struct {
+	Global []int
+	Ps     []*P
+}
+
+func FindRunnable(s *Sched, p *P) int {
+	// @solution
+	p.SchedTick++
+	if p.SchedTick%61 == 0 && len(s.Global) > 0 {
+		g := s.Global[0]
+		s.Global = s.Global[1:]
+		return g
+	}
+	if p.RunNext != 0 {
+		g := p.RunNext
+		p.RunNext = 0
+		return g
+	}
+	if len(p.Local) > 0 {
+		g := p.Local[0]
+		p.Local = p.Local[1:]
+		return g
+	}
+	if len(s.Global) > 0 {
+		g := s.Global[0]
+		s.Global = s.Global[1:]
+		return g
+	}
+	for _, victim := range s.Ps {
+		if victim == p || len(victim.Local) == 0 {
+			continue
+		}
+		n := len(victim.Local) - len(victim.Local)/2
+		stolen := victim.Local[:n:n]
+		victim.Local = victim.Local[n:]
+		p.Local = append(p.Local, stolen[1:]...)
+		return stolen[0]
+	}
+	return 0
+	// @starter
+	// p.SchedTick++
+	// return 0 // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestOrder(t *testing.T) {
+	p := &P{ID: 0, RunNext: 9, Local: []int{1, 2}}
+	s := &Sched{Global: []int{100}, Ps: []*P{p}}
+	var got []int
+	for i := 0; i < 5; i++ {
+		got = append(got, FindRunnable(s, p))
+	}
+	if !slices.Equal(got, []int{9, 1, 2, 100, 0}) {
+		t.Fatalf("调度顺序 = %v，期望 [9 1 2 100 0]（runnext → 本地 → 全局 → 无）", got)
+	}
+}
+
+func TestFairnessTick(t *testing.T) {
+	p := &P{SchedTick: 60, Local: []int{1}}
+	s := &Sched{Global: []int{100}, Ps: []*P{p}}
+	if g := FindRunnable(s, p); g != 100 {
+		t.Fatalf("第 61 次调度应先查全局队列，得到 %d", g)
+	}
+	if g := FindRunnable(s, p); g != 1 {
+		t.Fatalf("之后回到本地队列，得到 %d", g)
+	}
+}
+
+func TestWorkStealing(t *testing.T) {
+	idle := &P{ID: 0}
+	empty := &P{ID: 1}
+	busy := &P{ID: 2, Local: []int{1, 2, 3, 4, 5}}
+	s := &Sched{Ps: []*P{idle, empty, busy}}
+	if g := FindRunnable(s, idle); g != 1 {
+		t.Fatalf("应偷到 busy 的队首 1，实际 %d", g)
+	}
+	if !slices.Equal(idle.Local, []int{2, 3}) || !slices.Equal(busy.Local, []int{4, 5}) {
+		t.Fatalf("偷一半（向上取整 3 个）：idle=%v busy=%v", idle.Local, busy.Local)
+	}
+	busy.Local = append(busy.Local, 6)
+	if !slices.Equal(idle.Local, []int{2, 3}) {
+		t.Fatal("偷来的 G 不应和 victim 共享底层数组")
+	}
+}
+
+=== rt-02-1
+title: 模拟时间片抢占
+--- desc
+一个 P 上有多个任务，`Work` 表示需要的 CPU 时间（ms）。实现 `Schedule(tasks, quantum)` 模拟**抢占式**调度：
+
+- 按队列顺序轮流执行，每个任务每次最多运行 `quantum` ms（Go 的抢占阈值是 10ms）；
+- 没做完的任务放回队尾；
+- 返回每个任务的完成时刻，按完成顺序排列。
+
+把 `quantum` 设得非常大就退化成了协作式调度：一个长任务会一直霸占 P，短任务只能干等。
+--- solution
+package main
+
+type Task struct {
+	Name string
+	Work int
+}
+
+type Finish struct {
+	Name string
+	At   int
+}
+
+func Schedule(tasks []Task, quantum int) []Finish {
+	// @solution
+	queue := append([]Task(nil), tasks...)
+	var out []Finish
+	now := 0
+	for len(queue) > 0 {
+		t := queue[0]
+		queue = queue[1:]
+		run := min(t.Work, quantum)
+		now += run
+		t.Work -= run
+		if t.Work == 0 {
+			out = append(out, Finish{t.Name, now})
+		} else {
+			queue = append(queue, t)
+		}
+	}
+	return out
+	// @starter
+	// return nil // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestPreemptive(t *testing.T) {
+	tasks := []Task{{"A", 25}, {"B", 5}, {"C", 12}}
+	got := Schedule(tasks, 10)
+	want := []Finish{{"B", 15}, {"C", 37}, {"A", 42}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("Schedule = %v，期望 %v", got, want)
+	}
+	if tasks[0].Work != 25 {
+		t.Fatal("不应修改入参")
+	}
+}
+
+func TestCooperative(t *testing.T) {
+	got := Schedule([]Task{{"long", 1000}, {"short", 1}}, 1<<30)
+	want := []Finish{{"long", 1000}, {"short", 1001}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("Schedule = %v，期望 %v（短任务被长任务饿死）", got, want)
+	}
+}
+
+=== rt-03-1
+title: 根据 cgroup 限制计算 GOMAXPROCS
+--- desc
+容器里 Go 1.25 之前读取的是宿主机核数。实现 `DefaultProcs(cpuMax, numCPU, env)` 计算 GOMAXPROCS，规则参考 Go 1.25 的做法：
+
+1. 环境变量 `GOMAXPROCS`（`env`）是合法的正整数时，直接使用它；
+2. `cpuMax` 是 cgroup v2 `cpu.max` 文件的内容，格式为 `"<quota> <period>"`，`quota` 为 `max` 表示不限制，此时返回 `numCPU`；
+3. 有限制时，`limit = ceil(quota / period)`，再取 `max(limit, 2)`（GOMAXPROCS=1 的性能断崖太大），最后不超过 `numCPU`；
+4. 格式不合法返回错误。
+
+| cpuMax | numCPU | 结果 |
+| --- | --- | --- |
+| `max 100000` | 64 | 64 |
+| `200000 100000` | 64 | 2 |
+| `150000 100000` | 64 | 2 |
+| `450000 100000` | 64 | 5 |
+| `50000 100000` | 64 | 2 |
+| `400000 100000` | 2 | 2 |
+--- solution
+package main
+
+import (
+	"errors"
+	"strconv"
+	"strings"
+)
+
+func DefaultProcs(cpuMax string, numCPU int, env string) (int, error) {
+	// @solution
+	if n, err := strconv.Atoi(env); err == nil && n > 0 {
+		return n, nil
+	}
+	fields := strings.Fields(cpuMax)
+	if len(fields) != 2 {
+		return 0, errors.New("invalid cpu.max")
+	}
+	period, err := strconv.Atoi(fields[1])
+	if err != nil || period <= 0 {
+		return 0, errors.New("invalid period")
+	}
+	if fields[0] == "max" {
+		return numCPU, nil
+	}
+	quota, err := strconv.Atoi(fields[0])
+	if err != nil || quota <= 0 {
+		return 0, errors.New("invalid quota")
+	}
+	limit := (quota + period - 1) / period
+	return min(max(limit, 2), numCPU), nil
+	// @starter
+	// return numCPU, nil // TODO
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestDefaultProcs(t *testing.T) {
+	cases := []struct {
+		cpuMax string
+		numCPU int
+		env    string
+		want   int
+	}{
+		{"max 100000", 64, "", 64},
+		{"200000 100000", 64, "", 2},
+		{"150000 100000", 64, "", 2},
+		{"450000 100000", 64, "", 5},
+		{"50000 100000", 64, "", 2},
+		{"400000 100000", 2, "", 2},
+		{"50000 100000", 1, "", 1},
+		{"200000 100000", 64, "8", 8},
+		{"200000 100000", 64, "abc", 2},
+		{"200000 100000\n", 64, "0", 2},
+	}
+	for _, c := range cases {
+		got, err := DefaultProcs(c.cpuMax, c.numCPU, c.env)
+		if err != nil || got != c.want {
+			t.Errorf("DefaultProcs(%q, %d, %q) = %d, %v，期望 %d", c.cpuMax, c.numCPU, c.env, got, err, c.want)
+		}
+	}
+}
+
+func TestInvalid(t *testing.T) {
+	for _, s := range []string{"", "100000", "x 100000", "100000 0", "-5 100000"} {
+		if _, err := DefaultProcs(s, 8, ""); err == nil {
+			t.Errorf("DefaultProcs(%q) 应返回错误", s)
+		}
+	}
+}
+
+=== rt-04-1
+title: 模拟 netpoller：goroutine 挂在 fd 上等待
+race: true
+--- desc
+网络 IO 没有就绪时，goroutine 不会阻塞线程，而是挂在 netpoller 上，fd 就绪后再被放回运行队列。实现一个简化的 `Poller`：
+
+- `Wait(ctx, fd)`：把当前 goroutine 挂在 `fd` 上，直到 `Ready(fd)` 被调用（返回 nil），或者 `ctx` 被取消（返回 `ctx.Err()`，并把自己从等待列表中移除）；
+- `Ready(fd)`：唤醒所有等待 `fd` 的 goroutine，返回唤醒的数量；
+- `Waiting(fd)`：当前等待 `fd` 的 goroutine 数量。
+--- solution
+package main
+
+import (
+	"context"
+	"slices"
+	"sync"
+)
+
+type Poller struct {
+	mu      sync.Mutex
+	waiters map[int][]chan struct{}
+}
+
+func NewPoller() *Poller { return &Poller{waiters: map[int][]chan struct{}{}} }
+
+func (p *Poller) Wait(ctx context.Context, fd int) error {
+	// @solution
+	ch := make(chan struct{})
+	p.mu.Lock()
+	p.waiters[fd] = append(p.waiters[fd], ch)
+	p.mu.Unlock()
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		ws := p.waiters[fd]
+		if i := slices.Index(ws, ch); i >= 0 {
+			p.waiters[fd] = slices.Delete(ws, i, i+1)
+			return ctx.Err()
+		}
+		return nil // 取消的同时刚好被 Ready 唤醒
+	}
+	// @starter
+	// return nil // TODO
+	// @end
+}
+
+func (p *Poller) Ready(fd int) int {
+	// @solution
+	p.mu.Lock()
+	ws := p.waiters[fd]
+	delete(p.waiters, fd)
+	p.mu.Unlock()
+	for _, ch := range ws {
+		close(ch)
+	}
+	return len(ws)
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+
+func (p *Poller) Waiting(fd int) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.waiters[fd])
+}
+--- test
+package main
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("等待条件超时")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestReadyWakesAll(t *testing.T) {
+	p := NewPoller()
+	errs := make(chan error, 3)
+	for i := 0; i < 3; i++ {
+		go func() { errs <- p.Wait(context.Background(), 5) }()
+	}
+	waitFor(t, func() bool { return p.Waiting(5) == 3 })
+	if n := p.Ready(7); n != 0 {
+		t.Fatalf("没有人等 fd 7，Ready(7) = %d", n)
+	}
+	if n := p.Ready(5); n != 3 {
+		t.Fatalf("Ready(5) = %d，期望 3", n)
+	}
+	for i := 0; i < 3; i++ {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Ready 之后等待者应被唤醒")
+		}
+	}
+}
+
+func TestCancelRemovesWaiter(t *testing.T) {
+	p := NewPoller()
+	ctx, cancel := context.WithCancel(context.Background())
+	errs := make(chan error, 1)
+	go func() { errs <- p.Wait(ctx, 1) }()
+	waitFor(t, func() bool { return p.Waiting(1) == 1 })
+	cancel()
+	select {
+	case err := <-errs:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("应返回 context.Canceled，实际 %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("取消后 Wait 应返回")
+	}
+	if n := p.Waiting(1); n != 0 {
+		t.Fatalf("取消后应从等待列表移除，还剩 %d 个", n)
+	}
+}
+
+=== rt-05-1
+title: 深递归与显式栈
+--- desc
+goroutine 的栈从几 KB 开始，不够时整体拷贝到 2 倍大小的新栈上，最大可以到 1GB。
+
+- `SumTo(n)`：用**递归**计算 `1 + 2 + … + n`。测试会在一个新的 goroutine 里以 n = 1,000,000 调用它，栈会自动增长到几十 MB；
+- `MaxDepth(root)`：用**显式栈**（切片）计算多叉树的最大深度（只有根节点时深度为 1，nil 为 0），不用递归。
+--- solution
+package main
+
+type Node struct {
+	Children []*Node
+}
+
+func SumTo(n int) int {
+	// @solution
+	if n == 0 {
+		return 0
+	}
+	return n + SumTo(n-1)
+	// @starter
+	// return 0 // TODO: 用递归实现
+	// @end
+}
+
+func MaxDepth(root *Node) int {
+	// @solution
+	if root == nil {
+		return 0
+	}
+	type item struct {
+		n     *Node
+		depth int
+	}
+	best := 0
+	stack := []item{{root, 1}}
+	for len(stack) > 0 {
+		it := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		best = max(best, it.depth)
+		for _, c := range it.n.Children {
+			stack = append(stack, item{c, it.depth + 1})
+		}
+	}
+	return best
+	// @starter
+	// return 0 // TODO: 用切片模拟栈
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestSumToDeep(t *testing.T) {
+	done := make(chan int)
+	go func() { done <- SumTo(1_000_000) }()
+	if got := <-done; got != 500000500000 {
+		t.Fatalf("SumTo(1e6) = %d", got)
+	}
+}
+
+func TestMaxDepth(t *testing.T) {
+	if MaxDepth(nil) != 0 {
+		t.Fatal("nil 深度应为 0")
+	}
+	root := &Node{Children: []*Node{{}, {Children: []*Node{{Children: []*Node{{}}}}}}}
+	if d := MaxDepth(root); d != 4 {
+		t.Fatalf("MaxDepth = %d，期望 4", d)
+	}
+	chain := &Node{}
+	cur := chain
+	for i := 1; i < 200000; i++ {
+		next := &Node{}
+		cur.Children = []*Node{next}
+		cur = next
+	}
+	if d := MaxDepth(chain); d != 200000 {
+		t.Fatalf("长链 MaxDepth = %d，期望 200000", d)
+	}
+}
+
+=== rt-06-1
+title: 三色标记与清除
+--- desc
+用三色标记实现一次（非并发的）GC。`heap[x]` 是对象 `x` 引用的对象列表。
+
+- `Mark(heap, roots)`：根对象先标灰放进工作队列；不断取出一个灰色对象，把它引用的**白色**对象标灰入队，然后把它自己标黑。返回所有黑色对象的集合；
+- `Sweep(heap, marked)`：返回所有未被标记（白色）的对象编号，升序。
+
+注意循环引用：不可达的环也必须被回收，可达的环不能导致死循环。
+--- solution
+package main
+
+import "slices"
+
+func Mark(heap map[int][]int, roots []int) map[int]bool {
+	// @solution
+	black := map[int]bool{}
+	grey := map[int]bool{}
+	var queue []int
+	for _, r := range roots {
+		if !grey[r] {
+			grey[r] = true
+			queue = append(queue, r)
+		}
+	}
+	for len(queue) > 0 {
+		x := queue[0]
+		queue = queue[1:]
+		for _, y := range heap[x] {
+			if !grey[y] && !black[y] {
+				grey[y] = true
+				queue = append(queue, y)
+			}
+		}
+		delete(grey, x)
+		black[x] = true
+	}
+	return black
+	// @starter
+	// return nil // TODO
+	// @end
+}
+
+func Sweep(heap map[int][]int, marked map[int]bool) []int {
+	// @solution
+	var garbage []int
+	for x := range heap {
+		if !marked[x] {
+			garbage = append(garbage, x)
+		}
+	}
+	slices.Sort(garbage)
+	return garbage
+	// @starter
+	// return nil // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestMarkSweep(t *testing.T) {
+	heap := map[int][]int{
+		1: {2, 3},
+		2: {4},
+		3: {},
+		4: {2}, // 可达的环 2 <-> 4
+		5: {6},
+		6: {5}, // 不可达的环
+		7: {3},
+	}
+	marked := Mark(heap, []int{1})
+	for _, x := range []int{1, 2, 3, 4} {
+		if !marked[x] {
+			t.Errorf("对象 %d 可达，应被标记", x)
+		}
+	}
+	if got := Sweep(heap, marked); !slices.Equal(got, []int{5, 6, 7}) {
+		t.Fatalf("Sweep = %v，期望 [5 6 7]", got)
+	}
+}
+
+func TestMultipleRoots(t *testing.T) {
+	heap := map[int][]int{1: {}, 2: {3}, 3: {}, 4: {}}
+	marked := Mark(heap, []int{1, 2, 2})
+	if len(marked) != 3 || marked[4] {
+		t.Fatalf("marked = %v", marked)
+	}
+}
+
+=== rt-06-2
+title: 写屏障：防止并发标记漏标
+--- desc
+并发标记时用户代码还在修改指针。经典的漏标场景：
+
+1. 对象 1（已黑）→ 2（灰）→ 3（白）；
+2. 用户代码执行 `1.f = 3`（黑对象引用了白对象），然后删除 `2 → 3`；
+3. 继续标记：2 变黑，但 3 再也不会被扫描到，最终被误回收，而它明明还被 1 引用着。
+
+`Heap` 已经实现了增量标记 `Step`。请实现两个写屏障：
+
+- `WritePointer(src, dst)`：添加引用 `src → dst`；**插入屏障**：如果标记正在进行且 dst 是白色，把它标灰；
+- `DeletePointer(src, dst)`：删除引用 `src → dst`；**删除屏障**：如果标记正在进行且 dst 是白色，把它标灰。
+
+Go 1.8 起用的混合写屏障就是这两种屏障的结合。
+--- solution
+package main
+
+import "slices"
+
+type Color int
+
+const (
+	White Color = iota
+	Grey
+	Black
+)
+
+type Heap struct {
+	refs    map[int][]int
+	color   map[int]Color
+	grey    []int
+	marking bool
+}
+
+func NewHeap(refs map[int][]int, roots []int) *Heap {
+	h := &Heap{refs: refs, color: map[int]Color{}, marking: true}
+	for _, r := range roots {
+		h.shade(r)
+	}
+	return h
+}
+
+func (h *Heap) shade(x int) {
+	if h.color[x] == White {
+		h.color[x] = Grey
+		h.grey = append(h.grey, x)
+	}
+}
+
+// Step 最多处理 n 个灰色对象，返回标记是否已经完成。
+func (h *Heap) Step(n int) bool {
+	for ; n > 0 && len(h.grey) > 0; n-- {
+		x := h.grey[0]
+		h.grey = h.grey[1:]
+		for _, y := range h.refs[x] {
+			h.shade(y)
+		}
+		h.color[x] = Black
+	}
+	if len(h.grey) == 0 {
+		h.marking = false
+	}
+	return !h.marking
+}
+
+func (h *Heap) WritePointer(src, dst int) {
+	// @solution
+	if h.marking {
+		h.shade(dst)
+	}
+	// @starter
+	// // TODO: 插入写屏障
+	// @end
+	h.refs[src] = append(h.refs[src], dst)
+}
+
+func (h *Heap) DeletePointer(src, dst int) {
+	// @solution
+	if h.marking {
+		h.shade(dst)
+	}
+	// @starter
+	// // TODO: 删除写屏障
+	// @end
+	if i := slices.Index(h.refs[src], dst); i >= 0 {
+		h.refs[src] = slices.Delete(h.refs[src], i, i+1)
+	}
+}
+
+// Garbage 返回标记完成后仍为白色的对象。
+func (h *Heap) Garbage() []int {
+	var out []int
+	for x := range h.refs {
+		if h.color[x] == White {
+			out = append(out, x)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestBarrierPreventsLostObject(t *testing.T) {
+	h := NewHeap(map[int][]int{1: {2}, 2: {3}, 3: {}, 4: {}}, []int{1})
+	h.Step(1) // 1 变黑，2 变灰
+	h.WritePointer(1, 3)
+	h.DeletePointer(2, 3)
+	for !h.Step(1) {
+	}
+	got := h.Garbage()
+	if slices.Contains(got, 3) {
+		t.Fatalf("对象 3 仍被 1 引用，却被当成了垃圾：%v", got)
+	}
+	if !slices.Equal(got, []int{4}) {
+		t.Fatalf("Garbage = %v，期望 [4]", got)
+	}
+}
+
+func TestNoBarrierAfterMarking(t *testing.T) {
+	h := NewHeap(map[int][]int{1: {}, 2: {}}, []int{1})
+	for !h.Step(10) {
+	}
+	h.WritePointer(1, 2) // 标记已结束，不再需要屏障
+	if h.color[2] != White {
+		t.Fatal("标记结束后写屏障应关闭")
+	}
+}
+
+=== rt-07-1
+title: 计算 GC 目标堆大小
+--- desc
+实现两个函数：
+
+`ParseGOGC(s)`：解析环境变量 GOGC。空字符串返回默认值 100；`off` 返回 -1；其他必须是非负整数，否则返回错误。
+
+`HeapGoal(live, stacks, globals, gogc, memLimit)` 计算下一次 GC 的目标堆大小（字节）：
+
+- `goal = live + (live + stacks + globals) * gogc / 100`（Go 1.18 起栈和全局变量也计入）；
+- `gogc < 0`（off）时比例触发关闭：如果没有设置内存上限（`memLimit == 0`）返回 `math.MaxUint64`，否则返回 `memLimit`；
+- `memLimit > 0` 时目标不超过 `memLimit`（GOMEMLIMIT 是软上限，这里简化成截断）。
+--- solution
+package main
+
+import (
+	"errors"
+	"math"
+	"strconv"
+)
+
+func ParseGOGC(s string) (int, error) {
+	// @solution
+	switch s {
+	case "":
+		return 100, nil
+	case "off":
+		return -1, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 0, errors.New("invalid GOGC")
+	}
+	return n, nil
+	// @starter
+	// return 100, nil // TODO
+	// @end
+}
+
+func HeapGoal(live, stacks, globals uint64, gogc int, memLimit uint64) uint64 {
+	// @solution
+	if gogc < 0 {
+		if memLimit == 0 {
+			return math.MaxUint64
+		}
+		return memLimit
+	}
+	goal := live + (live+stacks+globals)*uint64(gogc)/100
+	if memLimit > 0 && goal > memLimit {
+		return memLimit
+	}
+	return goal
+	// @starter
+	// return live * 2 // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"math"
+	"testing"
+)
+
+const MB = 1 << 20
+
+func TestParseGOGC(t *testing.T) {
+	cases := map[string]int{"": 100, "off": -1, "200": 200, "0": 0}
+	for in, want := range cases {
+		if got, err := ParseGOGC(in); err != nil || got != want {
+			t.Errorf("ParseGOGC(%q) = %d, %v，期望 %d", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"-1", "abc", "1.5"} {
+		if _, err := ParseGOGC(bad); err == nil {
+			t.Errorf("ParseGOGC(%q) 应返回错误", bad)
+		}
+	}
+}
+
+func TestHeapGoal(t *testing.T) {
+	cases := []struct {
+		live, stacks, globals uint64
+		gogc                  int
+		limit, want           uint64
+	}{
+		{100 * MB, 0, 0, 100, 0, 200 * MB},
+		{100 * MB, 10 * MB, 10 * MB, 100, 0, 220 * MB},
+		{100 * MB, 0, 0, 50, 0, 150 * MB},
+		{100 * MB, 0, 0, 200, 250 * MB, 250 * MB},
+		{100 * MB, 0, 0, -1, 0, math.MaxUint64},
+		{100 * MB, 0, 0, -1, 900 * MB, 900 * MB},
+		{100 * MB, 0, 0, 0, 0, 100 * MB},
+	}
+	for _, c := range cases {
+		if got := HeapGoal(c.live, c.stacks, c.globals, c.gogc, c.limit); got != c.want {
+			t.Errorf("HeapGoal(live=%dMB gogc=%d limit=%dMB) = %d，期望 %d", c.live/MB, c.gogc, c.limit/MB, got, c.want)
+		}
+	}
+}
+
+=== rt-08-1
+title: 零分配地解析一行数字
+--- desc
+`SumCSV("12,7,30")` 解析逗号分隔的整数并求和，非法数字返回错误。
+
+起始代码用 `strings.Split`，每次都要为结果切片分配内存，在高频调用的解析路径上会带来 GC 压力。改成**零分配**：用 `strings.Cut` 循环切分，或者手动扫描。
+--- solution
+package main
+
+import (
+	"strconv"
+	"strings"
+)
+
+func SumCSV(line string) (int, error) {
+	sum := 0
+	for line != "" {
+		field, rest, _ := strings.Cut(line, ",")
+		n, err := strconv.Atoi(field)
+		if err != nil {
+			return 0, err
+		}
+		sum += n
+		line = rest
+	}
+	return sum, nil
+}
+--- starter
+package main
+
+import (
+	"strconv"
+	"strings"
+)
+
+func SumCSV(line string) (int, error) {
+	if line == "" {
+		return 0, nil
+	}
+	sum := 0
+	for _, field := range strings.Split(line, ",") { // Split 会分配 []string
+		n, err := strconv.Atoi(field)
+		if err != nil {
+			return 0, err
+		}
+		sum += n
+	}
+	return sum, nil
+}
+--- test
+package main
+
+import "testing"
+
+func TestSumCSV(t *testing.T) {
+	cases := map[string]int{"12,7,30": 49, "5": 5, "": 0, "-3,3": 0}
+	for in, want := range cases {
+		if got, err := SumCSV(in); err != nil || got != want {
+			t.Errorf("SumCSV(%q) = %d, %v，期望 %d", in, got, err, want)
+		}
+	}
+	if _, err := SumCSV("1,x,3"); err == nil {
+		t.Error("非法数字应返回错误")
+	}
+}
+
+var sink int
+
+func TestSumCSVAllocs(t *testing.T) {
+	line := "101,202,303,404,505,606,707,808,909"
+	if a := testing.AllocsPerRun(100, func() { sink, _ = SumCSV(line) }); a != 0 {
+		t.Fatalf("SumCSV 发生了 %.0f 次分配，期望 0 次", a)
+	}
+}
+
+=== rt-09-1
+title: size class 向上取整
+--- desc
+小对象（≤ 32KB）按 size class 向上取整分配。代码里给出了 Go 的 size class 表。实现：
+
+- `RoundUp(size)`：返回实际分配的字节数。≤ 32768 时取表中第一个不小于 size 的值（用二分查找）；更大的是大对象，按 8KB 页向上取整；
+- `Kind(size, hasPointers)`：小于 16 字节且不含指针为 `"tiny"`，≤ 32768 为 `"small"`，否则为 `"large"`。
+
+测试还会用真实的 `append` 验证：`append([]int64{}, 1, 2, 3, 4, 5)` 需要 40 字节，向上取整到 48，所以 cap 是 6。
+--- solution
+package main
+
+import "slices"
+
+var sizeClasses = []int{
+	8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256,
+	288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 896, 1024, 1152, 1280,
+	1408, 1536, 1792, 2048, 2304, 2688, 3072, 3200, 3456, 4096, 4864, 5376, 6144, 6528,
+	6784, 6912, 8192, 9472, 9728, 10240, 10880, 12288, 13568, 14336, 16384, 18432, 19072,
+	20480, 21760, 24576, 27264, 28672, 32768,
+}
+
+const pageSize = 8192
+
+func RoundUp(size int) int {
+	// @solution
+	if size > 32768 {
+		return (size + pageSize - 1) / pageSize * pageSize
+	}
+	i, _ := slices.BinarySearch(sizeClasses, size)
+	return sizeClasses[i]
+	// @starter
+	// return size // TODO
+	// @end
+}
+
+func Kind(size int, hasPointers bool) string {
+	// @solution
+	switch {
+	case size < 16 && !hasPointers:
+		return "tiny"
+	case size <= 32768:
+		return "small"
+	default:
+		return "large"
+	}
+	// @starter
+	// return "" // TODO
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestRoundUp(t *testing.T) {
+	cases := map[int]int{1: 8, 8: 8, 9: 16, 33: 48, 40: 48, 100: 112, 1025: 1152, 32768: 32768, 32769: 40960, 100000: 106496}
+	for in, want := range cases {
+		if got := RoundUp(in); got != want {
+			t.Errorf("RoundUp(%d) = %d，期望 %d", in, got, want)
+		}
+	}
+}
+
+func TestKind(t *testing.T) {
+	if Kind(8, false) != "tiny" || Kind(8, true) != "small" || Kind(16, false) != "small" || Kind(40000, false) != "large" {
+		t.Fatal("Kind 分类不对")
+	}
+}
+
+func TestRealAppend(t *testing.T) {
+	s := append([]int64{}, 1, 2, 3, 4, 5)
+	if want := RoundUp(5*8) / 8; cap(s) != want {
+		t.Fatalf("真实 cap = %d，RoundUp 推算 = %d", cap(s), want)
+	}
+	b := append([]byte{}, make([]byte, 33)...)
+	if cap(b) != RoundUp(33) {
+		t.Fatalf("真实 cap = %d，RoundUp 推算 = %d", cap(b), RoundUp(33))
+	}
+}
+
+=== rt-10-1
+title: 分析 RSS 为什么不下降
+--- desc
+根据 `runtime.MemStats` 的几个字段和进程 RSS 判断内存去向。实现 `Explain(rss, m)`，按下面的顺序检查，返回命中的结论列表：
+
+1. `HeapIdle - HeapReleased`（空闲但还没归还操作系统的内存）超过 RSS 的 25% → `"idle-not-released"`；
+2. `StackInuse` 超过 RSS 的 25% → `"goroutine-stacks"`；
+3. RSS 超过 `Sys`（Go 运行时向操作系统申请的总量）的 1.1 倍 → `"non-go-memory"`（cgo、mmap 等，heap profile 看不到）；
+4. 以上都没有命中，且 `HeapInuse` 超过 RSS 的 60% → `"heap-in-use"`。
+
+另外实现 `Snapshot()`，从 `runtime.ReadMemStats` 读取真实数据填充 `MemStats`。
+--- solution
+package main
+
+import "runtime"
+
+type MemStats struct {
+	HeapInuse    uint64
+	HeapIdle     uint64
+	HeapReleased uint64
+	StackInuse   uint64
+	Sys          uint64
+}
+
+func Snapshot() MemStats {
+	// @solution
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	return MemStats{
+		HeapInuse:    ms.HeapInuse,
+		HeapIdle:     ms.HeapIdle,
+		HeapReleased: ms.HeapReleased,
+		StackInuse:   ms.StackInuse,
+		Sys:          ms.Sys,
+	}
+	// @starter
+	// return MemStats{} // TODO
+	// @end
+}
+
+func Explain(rss uint64, m MemStats) []string {
+	var out []string
+	// @solution
+	if m.HeapIdle-m.HeapReleased > rss/4 {
+		out = append(out, "idle-not-released")
+	}
+	if m.StackInuse > rss/4 {
+		out = append(out, "goroutine-stacks")
+	}
+	if float64(rss) > float64(m.Sys)*1.1 {
+		out = append(out, "non-go-memory")
+	}
+	if len(out) == 0 && float64(m.HeapInuse) > float64(rss)*0.6 {
+		out = append(out, "heap-in-use")
+	}
+	// @starter
+	// // TODO
+	// @end
+	return out
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+const MB = 1 << 20
+
+func TestExplain(t *testing.T) {
+	cases := []struct {
+		rss  uint64
+		m    MemStats
+		want []string
+	}{
+		{1000 * MB, MemStats{HeapInuse: 300 * MB, HeapIdle: 600 * MB, HeapReleased: 100 * MB, StackInuse: 10 * MB, Sys: 1000 * MB}, []string{"idle-not-released"}},
+		{400 * MB, MemStats{HeapInuse: 100 * MB, StackInuse: 200 * MB, Sys: 400 * MB}, []string{"goroutine-stacks"}},
+		{2000 * MB, MemStats{HeapInuse: 300 * MB, StackInuse: 10 * MB, Sys: 500 * MB}, []string{"non-go-memory"}},
+		{500 * MB, MemStats{HeapInuse: 400 * MB, StackInuse: 10 * MB, Sys: 500 * MB}, []string{"heap-in-use"}},
+		{500 * MB, MemStats{HeapInuse: 100 * MB, StackInuse: 10 * MB, Sys: 500 * MB}, nil},
+	}
+	for i, c := range cases {
+		if got := Explain(c.rss, c.m); !slices.Equal(got, c.want) {
+			t.Errorf("case %d: Explain = %v，期望 %v", i, got, c.want)
+		}
+	}
+}
+
+func TestSnapshot(t *testing.T) {
+	m := Snapshot()
+	if m.Sys == 0 || m.HeapInuse == 0 || m.StackInuse == 0 {
+		t.Fatalf("Snapshot 应读取真实数据：%+v", m)
+	}
+	if m.HeapReleased > m.HeapIdle {
+		t.Fatal("HeapReleased 不应超过 HeapIdle")
+	}
+}
+
+=== rt-11-1
+title: 限制阻塞调用的并发数
+race: true
+--- desc
+GOMAXPROCS 不限制总线程数：每个阻塞在文件 IO 或 cgo 里的调用都占着一个线程，并发多了线程会暴涨（默认上限 10000，超过直接崩溃）。
+
+实现 `BlockingPool`：
+
+- `NewBlockingPool(n)`：同时最多 `n` 个调用在执行；
+- `Do(ctx, fn)`：拿到名额后执行 `fn` 并返回 nil；排队期间 `ctx` 被取消，则放弃等待、**不执行** `fn`，返回 `ctx.Err()`。
+--- solution
+package main
+
+import "context"
+
+type BlockingPool struct {
+	sem chan struct{}
+}
+
+func NewBlockingPool(n int) *BlockingPool {
+	return &BlockingPool{sem: make(chan struct{}, n)}
+}
+
+func (p *BlockingPool) Do(ctx context.Context, fn func()) error {
+	// @solution
+	select {
+	case p.sem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-p.sem }()
+	fn()
+	return nil
+	// @starter
+	// fn() // TODO: 没有任何限制
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestLimit(t *testing.T) {
+	p := NewBlockingPool(4)
+	var running, maxRunning atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p.Do(context.Background(), func() {
+				n := running.Add(1)
+				for {
+					m := maxRunning.Load()
+					if n <= m || maxRunning.CompareAndSwap(m, n) {
+						break
+					}
+				}
+				time.Sleep(15 * time.Millisecond)
+				running.Add(-1)
+			})
+		}()
+	}
+	wg.Wait()
+	if m := maxRunning.Load(); m != 4 {
+		t.Fatalf("最大并发 = %d，期望 4", m)
+	}
+}
+
+func TestCancelWhileWaiting(t *testing.T) {
+	p := NewBlockingPool(1)
+	release := make(chan struct{})
+	go p.Do(context.Background(), func() { <-release })
+	time.Sleep(10 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	ran := false
+	err := p.Do(ctx, func() { ran = true })
+	close(release)
+	if !errors.Is(err, context.DeadlineExceeded) || ran {
+		t.Fatalf("排队超时应返回 DeadlineExceeded 且不执行 fn：err=%v ran=%v", err, ran)
+	}
+}
+
+=== rt-12-1
+title: 解析 gctrace 输出
+--- desc
+解析一行 `GODEBUG=gctrace=1` 的输出：
+
+```text
+gc 52 @38.124s 3%: 0.041+4.2+0.065 ms clock, 0.33+1.1/8.0/12+0.52 ms cpu, 412->420->205 MB, 418 MB goal, 0 MB stacks, 0 MB globals, 8 P
+```
+
+`ParseGCTrace(line)` 返回结构化结果（可以用 `fmt.Sscanf`）；`Problems(t)` 按顺序返回问题：
+
+1. 两次 STW 的墙钟时间之和（clock 的第 1、3 项）超过 1ms → `"long-stw"`；
+2. GC 占用 CPU 比例 ≥ 10% → `"high-gc-cpu"`；
+3. 辅助标记 CPU 时间（cpu 第 2 项斜杠前）大于后台标记 CPU 时间（斜杠中间）→ `"heavy-assist"`。
+--- solution
+package main
+
+import "fmt"
+
+type GCTrace struct {
+	Num        int
+	AtSec      float64
+	CPUPercent int
+	STWStart   float64 // ms，清理终止 STW
+	Concurrent float64 // ms，并发标记
+	STWEnd     float64 // ms，标记终止 STW
+	AssistCPU  float64 // ms
+	BgMarkCPU  float64 // ms
+	HeapStart  int     // MB
+	HeapEnd    int     // MB
+	Live       int     // MB
+	Goal       int     // MB
+	Procs      int
+}
+
+func ParseGCTrace(line string) (GCTrace, error) {
+	var t GCTrace
+	// @solution
+	var cpuSTW1, idle, cpuSTW2 float64
+	var stacks, globals int
+	_, err := fmt.Sscanf(line,
+		"gc %d @%fs %d%%: %f+%f+%f ms clock, %f+%f/%f/%f+%f ms cpu, %d->%d->%d MB, %d MB goal, %d MB stacks, %d MB globals, %d P",
+		&t.Num, &t.AtSec, &t.CPUPercent,
+		&t.STWStart, &t.Concurrent, &t.STWEnd,
+		&cpuSTW1, &t.AssistCPU, &t.BgMarkCPU, &idle, &cpuSTW2,
+		&t.HeapStart, &t.HeapEnd, &t.Live, &t.Goal, &stacks, &globals, &t.Procs)
+	return t, err
+	// @starter
+	// return t, fmt.Errorf("TODO")
+	// @end
+}
+
+func Problems(t GCTrace) []string {
+	var out []string
+	// @solution
+	if t.STWStart+t.STWEnd > 1 {
+		out = append(out, "long-stw")
+	}
+	if t.CPUPercent >= 10 {
+		out = append(out, "high-gc-cpu")
+	}
+	if t.AssistCPU > t.BgMarkCPU {
+		out = append(out, "heavy-assist")
+	}
+	// @starter
+	// // TODO
+	// @end
+	return out
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestParseGCTrace(t *testing.T) {
+	line := "gc 52 @38.124s 3%: 0.041+4.2+0.065 ms clock, 0.33+1.1/8.0/12+0.52 ms cpu, 412->420->205 MB, 418 MB goal, 0 MB stacks, 0 MB globals, 8 P"
+	got, err := ParseGCTrace(line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := GCTrace{Num: 52, AtSec: 38.124, CPUPercent: 3, STWStart: 0.041, Concurrent: 4.2, STWEnd: 0.065,
+		AssistCPU: 1.1, BgMarkCPU: 8.0, HeapStart: 412, HeapEnd: 420, Live: 205, Goal: 418, Procs: 8}
+	if got != want {
+		t.Fatalf("got  %+v\nwant %+v", got, want)
+	}
+	if p := Problems(got); len(p) != 0 {
+		t.Fatalf("这一行是健康的，Problems = %v", p)
+	}
+}
+
+func TestProblems(t *testing.T) {
+	line := "gc 9 @1.5s 14%: 0.9+30+0.3 ms clock, 7.2+40/12/0+2.4 ms cpu, 900->950->400 MB, 800 MB goal, 1 MB stacks, 0 MB globals, 8 P"
+	g, err := ParseGCTrace(line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := Problems(g); !slices.Equal(p, []string{"long-stw", "high-gc-cpu", "heavy-assist"}) {
+		t.Fatalf("Problems = %v", p)
+	}
+	if _, err := ParseGCTrace("not a gc line"); err == nil {
+		t.Fatal("格式不对应返回错误")
+	}
+}
+
+=== rt-13-1
+title: 模拟 sysmon 的抢占检查与休眠间隔
+--- desc
+sysmon 是不需要 P 的监控线程。实现它的两项逻辑：
+
+`Preemptable(gs, now, limit)`：返回正在运行（`Running`）且连续运行时间**超过** `limit`（Go 里是 10ms）的 G 的 ID，升序。
+
+`NextDelay(prev, idle)`：计算下一次休眠时间。`idle` 是连续「什么也没做」的轮数：
+
+- `idle == 0` → 20µs；
+- `idle > 50` → 上次间隔翻倍；
+- 其他情况保持上次间隔；
+- 最长 10ms。
+--- solution
+package main
+
+import (
+	"slices"
+	"time"
+)
+
+type G struct {
+	ID           int
+	Running      bool
+	RunningSince time.Time
+}
+
+func Preemptable(gs []G, now time.Time, limit time.Duration) []int {
+	// @solution
+	var ids []int
+	for _, g := range gs {
+		if g.Running && now.Sub(g.RunningSince) > limit {
+			ids = append(ids, g.ID)
+		}
+	}
+	slices.Sort(ids)
+	return ids
+	// @starter
+	// return nil // TODO
+	// @end
+}
+
+func NextDelay(prev time.Duration, idle int) time.Duration {
+	// @solution
+	d := prev
+	if idle == 0 {
+		d = 20 * time.Microsecond
+	} else if idle > 50 {
+		d *= 2
+	}
+	return min(d, 10*time.Millisecond)
+	// @starter
+	// return prev // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+	"time"
+)
+
+func TestPreemptable(t *testing.T) {
+	now := time.Now()
+	gs := []G{
+		{ID: 3, Running: true, RunningSince: now.Add(-15 * time.Millisecond)},
+		{ID: 1, Running: true, RunningSince: now.Add(-11 * time.Millisecond)},
+		{ID: 2, Running: true, RunningSince: now.Add(-2 * time.Millisecond)},
+		{ID: 4, Running: false, RunningSince: now.Add(-time.Second)},
+		{ID: 5, Running: true, RunningSince: now.Add(-10 * time.Millisecond)},
+	}
+	if got := Preemptable(gs, now, 10*time.Millisecond); !slices.Equal(got, []int{1, 3}) {
+		t.Fatalf("Preemptable = %v，期望 [1 3]", got)
+	}
+}
+
+func TestNextDelay(t *testing.T) {
+	us := time.Microsecond
+	cases := []struct {
+		prev time.Duration
+		idle int
+		want time.Duration
+	}{
+		{5 * time.Millisecond, 0, 20 * us},
+		{20 * us, 10, 20 * us},
+		{20 * us, 51, 40 * us},
+		{8 * time.Millisecond, 60, 10 * time.Millisecond},
+		{10 * time.Millisecond, 100, 10 * time.Millisecond},
+	}
+	for _, c := range cases {
+		if got := NextDelay(c.prev, c.idle); got != c.want {
+			t.Errorf("NextDelay(%v, %d) = %v，期望 %v", c.prev, c.idle, got, c.want)
+		}
+	}
+	d, idle := 20*us, 0
+	for i := 0; i < 100; i++ {
+		idle++
+		d = NextDelay(d, idle)
+	}
+	if d != 10*time.Millisecond {
+		t.Fatalf("长时间空闲后间隔应增长到 10ms，实际 %v", d)
+	}
+}
+
+=== rt-14-1
+title: 用 container/heap 实现定时器队列
+--- desc
+Go 的每个 P 都用最小堆管理定时器。用 `container/heap` 实现一个支持停止和重置的定时器队列：
+
+- `Add(id, when)`：添加定时器；
+- `Stop(id) bool`：删除定时器（用 `heap.Remove`，需要记住每个元素在堆里的下标）；
+- `Reset(id, when) bool`：修改触发时间（用 `heap.Fix`）；
+- `PopExpired(now) []int`：按触发时间顺序弹出所有 `when <= now` 的定时器 ID；
+- `Len()`。
+
+关键：实现 `heap.Interface` 的 `Swap` 时同步更新元素的 `index` 字段。
+--- solution
+package main
+
+import (
+	"container/heap"
+	"time"
+)
+
+type timer struct {
+	id    int
+	when  time.Time
+	index int
+}
+
+type timerHeap []*timer
+
+func (h timerHeap) Len() int           { return len(h) }
+func (h timerHeap) Less(i, j int) bool { return h[i].when.Before(h[j].when) }
+
+func (h timerHeap) Swap(i, j int) {
+	// @solution
+	h[i], h[j] = h[j], h[i]
+	h[i].index = i
+	h[j].index = j
+	// @starter
+	// h[i], h[j] = h[j], h[i] // TODO: 同步更新 index
+	// @end
+}
+
+func (h *timerHeap) Push(x any) {
+	t := x.(*timer)
+	t.index = len(*h)
+	*h = append(*h, t)
+}
+
+func (h *timerHeap) Pop() any {
+	old := *h
+	t := old[len(old)-1]
+	old[len(old)-1] = nil
+	*h = old[:len(old)-1]
+	t.index = -1
+	return t
+}
+
+type TimerQueue struct {
+	h    timerHeap
+	byID map[int]*timer
+}
+
+func NewTimerQueue() *TimerQueue { return &TimerQueue{byID: map[int]*timer{}} }
+
+func (q *TimerQueue) Add(id int, when time.Time) {
+	t := &timer{id: id, when: when}
+	q.byID[id] = t
+	heap.Push(&q.h, t)
+}
+
+func (q *TimerQueue) Stop(id int) bool {
+	// @solution
+	t, ok := q.byID[id]
+	if !ok {
+		return false
+	}
+	heap.Remove(&q.h, t.index)
+	delete(q.byID, id)
+	return true
+	// @starter
+	// return false // TODO
+	// @end
+}
+
+func (q *TimerQueue) Reset(id int, when time.Time) bool {
+	// @solution
+	t, ok := q.byID[id]
+	if !ok {
+		return false
+	}
+	t.when = when
+	heap.Fix(&q.h, t.index)
+	return true
+	// @starter
+	// return false // TODO
+	// @end
+}
+
+func (q *TimerQueue) PopExpired(now time.Time) []int {
+	// @solution
+	var ids []int
+	for len(q.h) > 0 && !q.h[0].when.After(now) {
+		t := heap.Pop(&q.h).(*timer)
+		delete(q.byID, t.id)
+		ids = append(ids, t.id)
+	}
+	return ids
+	// @starter
+	// return nil // TODO
+	// @end
+}
+
+func (q *TimerQueue) Len() int { return len(q.h) }
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+	"time"
+)
+
+func TestTimerQueue(t *testing.T) {
+	base := time.Unix(0, 0)
+	at := func(ms int) time.Time { return base.Add(time.Duration(ms) * time.Millisecond) }
+	q := NewTimerQueue()
+	for i, ms := range []int{50, 10, 30, 20, 40} {
+		q.Add(i+1, at(ms))
+	}
+	if got := q.PopExpired(at(25)); !slices.Equal(got, []int{2, 4}) {
+		t.Fatalf("PopExpired(25ms) = %v，期望 [2 4]", got)
+	}
+	if !q.Stop(3) || q.Stop(3) {
+		t.Fatal("Stop(3) 第一次应返回 true，第二次 false")
+	}
+	if !q.Reset(1, at(5)) {
+		t.Fatal("Reset(1) 应返回 true")
+	}
+	if got := q.PopExpired(at(45)); !slices.Equal(got, []int{1, 5}) {
+		t.Fatalf("PopExpired(45ms) = %v，期望 [1 5]", got)
+	}
+	if q.Len() != 0 {
+		t.Fatalf("Len = %d，期望 0", q.Len())
+	}
+}
+
+func TestManyTimers(t *testing.T) {
+	base := time.Unix(0, 0)
+	q := NewTimerQueue()
+	for i := 0; i < 1000; i++ {
+		q.Add(i, base.Add(time.Duration((i*7919)%1000)*time.Millisecond))
+	}
+	for i := 0; i < 1000; i += 2 {
+		q.Stop(i)
+	}
+	got := q.PopExpired(base.Add(time.Hour))
+	if len(got) != 500 {
+		t.Fatalf("应弹出 500 个，实际 %d", len(got))
+	}
+	for i := 1; i < len(got); i++ {
+		a, b := (got[i-1]*7919)%1000, (got[i]*7919)%1000
+		if a > b {
+			t.Fatal("弹出顺序没有按触发时间排序")
+		}
+	}
+}
+
+=== rt-15-1
+title: 模拟辅助标记的记账
+--- desc
+GC 标记期间，分配内存的 goroutine 要「还债」：每分配 1 字节需要完成 `ratio` 单位的扫描工作。用一个简化模型实现 `Assist(n, ratio, credit, bg, overAssist)`：
+
+1. 本次债务 `debt = ceil(n * ratio)`；
+2. 先用自己的 `credit` 抵扣；
+3. 还不够，再从后台标记积累的全局信用 `bg` 中「偷」；
+4. 仍然不够，就必须亲自做扫描工作，而且一次至少做 `overAssist` 单位（多做的部分存为自己的 credit，下次分配就不用再停下来）。
+
+返回 `(work, credit, bg)`：本次亲自做的扫描量，以及更新后的个人信用和全局信用。
+--- solution
+package main
+
+import "math"
+
+func Assist(n int64, ratio float64, credit, bg, overAssist int64) (work, newCredit, newBg int64) {
+	// @solution
+	debt := int64(math.Ceil(float64(n) * ratio))
+	use := min(debt, credit)
+	debt -= use
+	credit -= use
+	steal := min(debt, bg)
+	debt -= steal
+	bg -= steal
+	if debt > 0 {
+		work = max(debt, overAssist)
+		credit += work - debt
+	}
+	return work, credit, bg
+	// @starter
+	// return 0, credit, bg // TODO
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestAssist(t *testing.T) {
+	cases := []struct {
+		name                         string
+		n                            int64
+		ratio                        float64
+		credit, bg, over             int64
+		wantWork, wantCredit, wantBg int64
+	}{
+		{"自己的信用够用", 100, 0.5, 80, 0, 64, 0, 30, 0},
+		{"借用后台信用", 100, 1, 30, 100, 64, 0, 0, 30},
+		{"必须亲自扫描，多做的存起来", 100, 1, 10, 20, 64, 70, 0, 0},
+		{"欠得多就做得多", 1000, 1, 0, 0, 64, 1000, 0, 0},
+		{"向上取整", 3, 0.5, 0, 0, 0, 2, 0, 0},
+	}
+	for _, c := range cases {
+		w, cr, bg := Assist(c.n, c.ratio, c.credit, c.bg, c.over)
+		if w != c.wantWork || cr != c.wantCredit || bg != c.wantBg {
+			t.Errorf("%s: Assist = (%d, %d, %d)，期望 (%d, %d, %d)", c.name, w, cr, bg, c.wantWork, c.wantCredit, c.wantBg)
+		}
+	}
+}
+
+=== rt-16-1
+title: 按 span 分组扫描（Green Tea 的思路）
+--- desc
+传统标记按发现对象的顺序扫描，内存访问在不同的页之间跳来跳去；Green Tea 以 span 为单位批量扫描。
+
+- `SpanOrder(objs)`：把待扫描对象按 span 分组：span 按**第一次出现**的顺序排列，同一 span 内保持原来的顺序；
+- `SpanSwitches(order)`：统计扫描顺序中相邻两个对象 span 不同的次数（近似「换页」的次数）。
+
+分组后，换页次数等于不同 span 数减一。
+--- solution
+package main
+
+type Obj struct {
+	ID   int
+	Span int
+}
+
+func SpanOrder(objs []Obj) []Obj {
+	// @solution
+	var spans []int
+	groups := map[int][]Obj{}
+	for _, o := range objs {
+		if _, ok := groups[o.Span]; !ok {
+			spans = append(spans, o.Span)
+		}
+		groups[o.Span] = append(groups[o.Span], o)
+	}
+	out := make([]Obj, 0, len(objs))
+	for _, s := range spans {
+		out = append(out, groups[s]...)
+	}
+	return out
+	// @starter
+	// return objs // TODO
+	// @end
+}
+
+func SpanSwitches(order []Obj) int {
+	// @solution
+	n := 0
+	for i := 1; i < len(order); i++ {
+		if order[i].Span != order[i-1].Span {
+			n++
+		}
+	}
+	return n
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestSpanOrder(t *testing.T) {
+	objs := []Obj{{1, 7}, {2, 3}, {3, 7}, {4, 9}, {5, 3}, {6, 7}}
+	got := SpanOrder(objs)
+	want := []Obj{{1, 7}, {3, 7}, {6, 7}, {2, 3}, {5, 3}, {4, 9}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("SpanOrder = %v\n期望 %v", got, want)
+	}
+	if SpanSwitches(objs) != 5 || SpanSwitches(got) != 2 {
+		t.Fatalf("换页次数：原顺序 %d（期望 5），分组后 %d（期望 2）", SpanSwitches(objs), SpanSwitches(got))
+	}
+	if SpanSwitches(nil) != 0 {
+		t.Fatal("空输入换页次数为 0")
+	}
+}
+
+=== rt-17-1
+title: 显式 Close + AddCleanup 兜底
+--- desc
+文件、连接这类资源必须显式关闭，`runtime.AddCleanup`（Go 1.24+）只能用来兜底和发现泄漏。实现：
+
+- `Open(fd)`：创建资源，并用 `runtime.AddCleanup` 注册清理函数：资源被 GC 回收时如果还没关闭，就把全局计数 `leaked` 加一；
+- `Close()`：第一次调用关闭资源并返回 nil，同时调用 `cleanup.Stop()` 取消兜底；重复调用返回 `ErrClosed`。
+
+注意：清理函数**不能引用资源对象本身**（否则对象永远不可达），所以要把 fd 作为单独的参数传给它。
+--- solution
+package main
+
+import (
+	"errors"
+	"runtime"
+	"sync/atomic"
+)
+
+var ErrClosed = errors.New("already closed")
+
+var leaked atomic.Int32
+
+type Resource struct {
+	fd      int
+	closed  bool
+	cleanup runtime.Cleanup
+	name    *string
+}
+
+func Open(fd int) *Resource {
+	name := "res"
+	r := &Resource{fd: fd, name: &name}
+	// @solution
+	r.cleanup = runtime.AddCleanup(r, func(fd int) { leaked.Add(1) }, fd)
+	// @starter
+	// // TODO: 注册兜底清理函数
+	// @end
+	return r
+}
+
+func (r *Resource) Close() error {
+	// @solution
+	if r.closed {
+		return ErrClosed
+	}
+	r.closed = true
+	r.cleanup.Stop()
+	return nil
+	// @starter
+	// r.closed = true // TODO: 重复关闭要报错，并取消兜底清理
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"errors"
+	"runtime"
+	"testing"
+	"time"
+)
+
+func TestCloseTwice(t *testing.T) {
+	r := Open(3)
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("重复 Close 应返回 ErrClosed，实际 %v", err)
+	}
+}
+
+func gcUntil(cond func() bool) bool {
+	for i := 0; i < 50; i++ {
+		runtime.GC()
+		if cond() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return cond()
+}
+
+func TestLeakDetection(t *testing.T) {
+	leaked.Store(0)
+	for i := 0; i < 10; i++ {
+		Open(i).Close()
+	}
+	gcUntil(func() bool { return false })
+	if n := leaked.Load(); n != 0 {
+		t.Fatalf("正确关闭的资源不应被算作泄漏，leaked = %d", n)
+	}
+
+	func() { Open(99) }() // 忘记 Close
+	if !gcUntil(func() bool { return leaked.Load() == 1 }) {
+		t.Fatalf("未关闭的资源被回收时应被发现，leaked = %d", leaked.Load())
+	}
+}
+
+=== rt-18-1
+title: 解析 schedtrace
+--- desc
+解析 `GODEBUG=schedtrace=1000` 的一行输出：
+
+```text
+SCHED 2003ms: gomaxprocs=8 idleprocs=0 threads=25 spinningthreads=0 needspinning=0 idlethreads=10 runqueue=127 [34 51 12 40 66 9 28 80]
+```
+
+- `ParseSchedTrace(line)`：解析出时间（ms）、各个 `key=value` 字段和方括号里每个 P 的本地队列长度。不同 Go 版本的字段可能不同（比如 `needspinning` 是新加的），用通用的 `key=value` 解析，不要依赖字段顺序；
+- `Runnable()`：全局队列 + 所有本地队列的长度之和；
+- `Diagnose()`：按顺序返回问题：`idleprocs == 0` 且 `Runnable() > 2 * gomaxprocs` → `"cpu-saturated"`；`threads > 4 * gomaxprocs` → `"too-many-threads"`。
+--- solution
+package main
+
+import (
+	"errors"
+	"strconv"
+	"strings"
+)
+
+type SchedTrace struct {
+	AtMS   int
+	Fields map[string]int
+	Local  []int
+}
+
+func ParseSchedTrace(line string) (SchedTrace, error) {
+	st := SchedTrace{Fields: map[string]int{}}
+	// @solution
+	head, rest, ok := strings.Cut(line, ": ")
+	if !ok || !strings.HasPrefix(head, "SCHED ") {
+		return st, errors.New("not a schedtrace line")
+	}
+	ms, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(head, "SCHED "), "ms"))
+	if err != nil {
+		return st, err
+	}
+	st.AtMS = ms
+	kv, local, _ := strings.Cut(rest, "[")
+	for _, f := range strings.Fields(kv) {
+		k, v, ok := strings.Cut(f, "=")
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return st, err
+		}
+		st.Fields[k] = n
+	}
+	for _, f := range strings.Fields(strings.TrimSuffix(strings.TrimSpace(local), "]")) {
+		n, err := strconv.Atoi(f)
+		if err != nil {
+			return st, err
+		}
+		st.Local = append(st.Local, n)
+	}
+	return st, nil
+	// @starter
+	// return st, errors.New("TODO")
+	// @end
+}
+
+func (s SchedTrace) Runnable() int {
+	// @solution
+	n := s.Fields["runqueue"]
+	for _, l := range s.Local {
+		n += l
+	}
+	return n
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+
+func (s SchedTrace) Diagnose() []string {
+	var out []string
+	// @solution
+	procs := s.Fields["gomaxprocs"]
+	if s.Fields["idleprocs"] == 0 && s.Runnable() > 2*procs {
+		out = append(out, "cpu-saturated")
+	}
+	if s.Fields["threads"] > 4*procs {
+		out = append(out, "too-many-threads")
+	}
+	// @starter
+	// // TODO
+	// @end
+	return out
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestParseSchedTrace(t *testing.T) {
+	line := "SCHED 2003ms: gomaxprocs=8 idleprocs=0 threads=25 spinningthreads=0 needspinning=0 idlethreads=10 runqueue=127 [34 51 12 40 66 9 28 80]"
+	st, err := ParseSchedTrace(line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.AtMS != 2003 || st.Fields["gomaxprocs"] != 8 || st.Fields["threads"] != 25 || st.Fields["runqueue"] != 127 {
+		t.Fatalf("解析结果不对：%+v", st)
+	}
+	if !slices.Equal(st.Local, []int{34, 51, 12, 40, 66, 9, 28, 80}) {
+		t.Fatalf("Local = %v", st.Local)
+	}
+	if st.Runnable() != 447 {
+		t.Fatalf("Runnable = %d，期望 447", st.Runnable())
+	}
+	if d := st.Diagnose(); !slices.Equal(d, []string{"cpu-saturated"}) {
+		t.Fatalf("Diagnose = %v", d)
+	}
+}
+
+func TestOlderFormat(t *testing.T) {
+	st, err := ParseSchedTrace("SCHED 0ms: gomaxprocs=2 idleprocs=1 threads=40 spinningthreads=0 idlethreads=30 runqueue=0 [0 0]")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := st.Diagnose(); !slices.Equal(d, []string{"too-many-threads"}) {
+		t.Fatalf("Diagnose = %v", d)
+	}
+	if _, err := ParseSchedTrace("hello"); err == nil {
+		t.Fatal("非法输入应返回错误")
+	}
+}

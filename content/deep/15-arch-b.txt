@@ -1,0 +1,521 @@
+=== arch-11
+--- deep
+**原理展开**
+
+Raft 的几个关键机制：
+
+- **任期**（term）是一个逻辑时钟：每次选举任期加一，节点收到更大任期的消息时立即更新自己的任期并转为 Follower，这样旧的 Leader 一旦发现自己落后就会让位；
+- **日志匹配**：AppendEntries 带上新日志之前那一条的下标和任期，Follower 检查自己在这个位置的日志是否匹配，不匹配就拒绝，Leader 向前回退，直到找到一致的位置，再用自己的日志覆盖 Follower 后面的部分；
+- **提交规则**：Leader 只通过计数提交**当前任期**的日志，之前任期的日志随之间接提交（见 Raft 论文 Figure 8）；
+- **随机选举超时**（如 150～300ms）：避免多个节点同时发起选举、平分选票。
+
+**线性一致读**：直接读 Leader 的状态机不一定安全（它可能已经被新的 Leader 取代，但自己还不知道）。etcd 用 **ReadIndex**：Leader 记录当前的提交下标，发一轮心跳确认自己仍是多数派认可的 Leader，等状态机应用到这个下标后再读取。
+
+**代码示例**
+
+```go
+// 基于 etcd 的 Leader 选举：多个实例中只有一个执行定时任务
+sess, err := concurrency.NewSession(cli, concurrency.WithTTL(10))
+if err != nil {
+	return err
+}
+defer sess.Close()
+e := concurrency.NewElection(sess, "/election/cron")
+if err := e.Campaign(ctx, nodeID); err != nil { // 阻塞直到成为 Leader
+	return err
+}
+slog.Info("became leader")
+runCron(ctx) // 会话失效（网络分区、进程卡顿）时要停止工作
+select {
+case <-sess.Done():
+	slog.Warn("lost leadership")
+case <-ctx.Done():
+	e.Resign(context.Background())
+}
+```
+
+**常见追问**
+
+- 网络分区时会发生什么？→ 多数派一侧可以选出新 Leader 继续工作；少数派一侧的旧 Leader 无法提交任何写入（得不到多数确认），分区恢复后发现更大的任期，自动降级并同步日志。
+- 日志无限增长怎么办？→ 定期生成状态机的**快照**，删除快照之前的日志；新节点或落后太多的节点直接从快照恢复。
+- 为什么写入性能受限？→ 每次写入都要经过 Leader 并等待多数节点持久化，延迟至少是一次网络往返加一次磁盘 fsync。
+
+**实战建议**
+
+- etcd 这类 Raft 系统适合存储少量关键的元数据（配置、服务注册、锁、选主），不适合大量业务数据。
+- 部署在低延迟的网络中，并使用 SSD（fsync 延迟直接影响写入延迟）。
+
+=== arch-12
+--- deep
+**原理展开**
+
+一致性哈希的数学性质：增加第 N+1 个节点时，只有约 1/(N+1) 的 key 需要迁移，并且全部是从其他节点迁移到新节点。
+
+几种替代方案：
+
+- **Jump Consistent Hash**（Google）：不需要存储环，几行代码、O(log n) 计算，分布非常均匀；但只能在**末尾**增删节点（适合分片编号连续的存储系统）；
+- **Rendezvous Hash**（最高随机权重）：对每个节点计算 `hash(key, node)`，选分数最高的；不需要虚拟节点，分布均匀，任意增删节点；代价是每次查找要遍历所有节点 O(n)；
+- **固定槽位**（Redis Cluster）：key 先映射到固定数量的槽，槽再分配给节点；迁移以槽为单位，可以精确控制和逐步迁移。
+
+**代码示例**
+
+```go
+// Jump Consistent Hash
+func JumpHash(key uint64, buckets int32) int32 {
+	var b, j int64 = -1, 0
+	for j < int64(buckets) {
+		b = j
+		key = key*2862933555777941757 + 1
+		j = int64(float64(b+1) * (float64(int64(1)<<31) / float64((key>>33)+1)))
+	}
+	return int32(b)
+}
+
+// Rendezvous Hash
+func Rendezvous(key string, nodes []string) string {
+	var best string
+	var bestScore uint64
+	for _, n := range nodes {
+		h := fnv.New64a()
+		h.Write([]byte(n))
+		h.Write([]byte(key))
+		if s := h.Sum64(); best == "" || s > bestScore {
+			best, bestScore = n, s
+		}
+	}
+	return best
+}
+```
+
+**常见追问**
+
+- 一致性哈希能解决热点 key 吗？→ 不能，同一个 key 总是落在同一个节点；热点要用复制多份、本地缓存来解决。
+- 节点权重不同怎么办？→ 给权重高的节点分配更多的虚拟节点。
+- 有界负载的一致性哈希是什么？→ 给每个节点设置负载上限（平均负载的 1.25 倍），超过时顺时针找下一个节点，在保持一致性的同时避免过载（Google 和 HAProxy 使用）。
+
+**实战建议**
+
+- 缓存客户端分片、有状态的路由用一致性哈希；存储系统的分片更常用固定槽位，迁移更可控。
+- 虚拟节点数量和哈希函数的选择要通过测试验证分布的均匀程度。
+
+=== arch-13
+--- deep
+**原理展开**
+
+秒杀的本质是**极少的库存面对极大的并发**，最终只有库存数量的请求能成功，其余全部失败。所以系统设计的核心是**尽早、尽量便宜地拒绝**注定失败的请求：
+
+- 前端拦截：活动没开始、重复点击；
+- 网关拦截：机器人、超出频率；
+- 本地内存拦截：本机已知已售罄；
+- Redis 拦截：原子地扣减库存，扣完后所有请求直接失败；
+- 只有扣减成功的少量请求，才进入后续的下单流程。
+
+**库存一致性**：Redis 预扣成功但下单失败（MQ 消费异常、用户不支付）时，要把库存加回去；定期把 Redis 的库存和数据库对账，修正差异。
+
+**代码示例**
+
+```go
+// Lua：原子地检查一人一单 + 扣减库存
+var seckill = redis.NewScript(`
+if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then return -2 end
+local stock = tonumber(redis.call('GET', KEYS[1]) or '0')
+if stock <= 0 then return -1 end
+redis.call('DECR', KEYS[1])
+redis.call('SADD', KEYS[2], ARGV[1])
+return stock - 1
+`)
+
+var soldOut atomic.Bool // 本地标记：已售罄后不再访问 Redis
+
+func buy(ctx context.Context, activity, uid string) error {
+	if soldOut.Load() {
+		return ErrSoldOut
+	}
+	n, err := seckill.Run(ctx, rdb, []string{"sk:stock:" + activity, "sk:users:" + activity}, uid).Int()
+	switch {
+	case err != nil:
+		return err
+	case n == -1:
+		soldOut.Store(true)
+		return ErrSoldOut
+	case n == -2:
+		return ErrDuplicate
+	}
+	return mq.Publish(ctx, "seckill.order", encode(activity, uid)) // 异步下单
+}
+```
+
+**常见追问**
+
+- 本地售罄标记在补货后怎么恢复？→ 通过配置中心或者广播消息重置。
+- 库存是热点 key 怎么办？→ 把库存拆成 N 个分段（`stock:1`…`stock:N`），请求随机选择一个分段扣减，某个分段扣完再尝试其他分段。
+- 用户下单后不支付怎么办？→ 延迟队列在超时后取消订单并归还库存（Redis 和数据库都要归还）。
+
+**实战建议**
+
+- 秒杀系统和主站隔离部署，避免秒杀流量影响正常业务。
+- 提前全链路压测，并准备好限流阈值、降级开关和应急预案。
+
+=== arch-14
+--- deep
+**原理展开**
+
+**容量估算**：每天 1 亿条新短链接，每条记录约 500 字节（长链接 + 元数据），一年约 18TB；读写比 100:1，读 QPS 平均约 11 万，峰值数十万。读请求必须几乎全部由缓存承担。
+
+**ID 混淆**：自增 ID 编码后是连续的（`a1b2c3`、`a1b2c4`），可以被遍历。用一个可逆的置换打乱 ID：比如 Feistel 网络，或者乘以一个与模数互质的大数再取模（`id * P mod 62^7`，P 有模逆元，可以还原），得到看起来随机但一一对应的值。
+
+**跳转的性能**：查询路径是“本地缓存 → Redis → 数据库”，热门短链接集中度很高，本地缓存命中率可以很高；跳转本身只需要返回一个 302 和 Location 头，非常轻量。
+
+**代码示例**
+
+```go
+// 可逆的 ID 混淆：在 [0, 62^7) 范围内做乘法置换
+const space = 3521614606208 // 62^7
+
+var (
+	mul = big.NewInt(1580030173)                                         // 与 space 互质
+	inv = new(big.Int).ModInverse(mul, big.NewInt(space))                 // 模逆元
+	mod = big.NewInt(space)
+)
+
+func obfuscate(id int64) int64 {
+	return new(big.Int).Mod(new(big.Int).Mul(big.NewInt(id), mul), mod).Int64()
+}
+
+func deobfuscate(x int64) int64 {
+	return new(big.Int).Mod(new(big.Int).Mul(big.NewInt(x), inv), mod).Int64()
+}
+// 短码 = Base62(obfuscate(id))，固定 7 位（不足补 0）
+```
+
+**常见追问**
+
+- 自定义短码（用户指定）怎么支持？→ 单独检查是否已被占用，和自动生成的短码使用不同的命名空间或字符集，避免冲突。
+- 过期的短链接怎么处理？→ 存储过期时间，跳转时检查；后台定期清理。
+- 怎么统计点击量又不影响跳转速度？→ 跳转时异步发送点击事件（MQ），由统计服务批量聚合。
+
+**实战建议**
+
+- 短码的生成和存储设计要预留足够的容量（短码长度、分片数），后期修改代价很大。
+- 对创建接口做严格的限流和恶意链接检测，防止服务被用于传播钓鱼链接。
+
+=== arch-15
+--- deep
+**原理展开**
+
+推模式和拉模式的取舍，本质上是**写放大**和**读放大**之间的平衡：
+
+- 推模式：一次发布写 N 次（N = 粉丝数），读 1 次；
+- 拉模式：一次发布写 1 次，读 M 次（M = 关注数），还要合并排序。
+
+社交网络的粉丝数分布极不均匀（少数大 V 有千万粉丝，大部分人只有几百），关注数则相对均匀（一般几百）。所以对普通用户推、对大 V 拉，可以同时控制写放大和读放大。
+
+**收件箱的存储**：每个用户的收件箱只保留最近的几百条（ZSet 按时间排序，超出的截断），翻到更早的内容时再回源。删除和隐私设置变化（拉黑、取消关注）不逐个修改收件箱，而是在读取时过滤。
+
+**代码示例**
+
+```go
+// 推送给粉丝：分批异步写入，大 V 跳过
+func fanout(ctx context.Context, author string, post Post) error {
+	if isBigV(author) {
+		return nil // 读取时拉取
+	}
+	return forEachFollowerBatch(ctx, author, 1000, func(batch []string) error {
+		pipe := rdb.Pipeline()
+		for _, uid := range batch {
+			key := "inbox:" + uid
+			pipe.ZAdd(ctx, key, redis.Z{Score: float64(post.Time), Member: post.ID})
+			pipe.ZRemRangeByRank(ctx, key, 0, -501) // 只保留最新 500 条
+		}
+		_, err := pipe.Exec(ctx)
+		return err
+	})
+}
+
+// 游标分页读取：score（时间）小于游标的前 20 条
+func timeline(ctx context.Context, uid string, before int64) ([]string, error) {
+	return rdb.ZRevRangeByScore(ctx, "inbox:"+uid, &redis.ZRangeBy{
+		Max: "(" + strconv.FormatInt(before, 10), Min: "-inf", Count: 20,
+	}).Result()
+}
+```
+
+**常见追问**
+
+- 推送的写入量太大怎么办？→ 异步化（MQ）、只推送给最近活跃的粉丝、批量写入。
+- 时间线需要按“热度”排序怎么办？→ 收件箱只负责召回候选内容，排序交给推荐 / 排序服务。
+- 新关注一个用户后，时间线要补上他之前的内容吗？→ 一般在读取时临时拉取一次，或者异步补写最近的若干条。
+
+**实战建议**
+
+- 先估算粉丝数分布和读写比，再决定推拉策略和大 V 的阈值。
+- 时间线分页一律使用游标，不要使用 offset。
+
+=== arch-16
+--- deep
+**原理展开**
+
+几种方案的取舍：
+
+- **数据库扫描**：最简单可靠（数据本来就在数据库里），延迟取决于扫描间隔，适合分钟级精度、数据量不大的场景，也是其他方案的兜底；
+- **Redis ZSet**：秒级精度，性能好；需要处理多实例的并发领取（Lua 原子地取出并删除）、任务处理失败的重试（取出后先放进“处理中”集合，处理成功后删除，超时未完成的重新放回）；
+- **消息队列**：有原生延迟消息的 MQ 最省事，消息的可靠性由 MQ 保证；延迟时间通常有上限或者只支持固定的级别；
+- **时间轮**：内存中性能最高，适合大量短时、可以丢失的任务（连接超时），需要持久化时要额外处理。
+
+**代码示例**
+
+```go
+// Redis ZSet 延迟队列：原子领取到期任务
+var claim = redis.NewScript(`
+local items = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+for _, id in ipairs(items) do
+  redis.call('ZREM', KEYS[1], id)
+  redis.call('ZADD', KEYS[2], ARGV[3], id)  -- 放入处理中集合，score 为处理超时时间
+end
+return items
+`)
+
+func poll(ctx context.Context) {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			now := time.Now()
+			ids, _ := claim.Run(ctx, rdb, []string{"delay:orders", "delay:processing"},
+				now.Unix(), 100, now.Add(time.Minute).Unix()).StringSlice()
+			for _, id := range ids {
+				if err := cancelIfUnpaid(ctx, id); err == nil {
+					rdb.ZRem(ctx, "delay:processing", id)
+				}
+			}
+			// 另一个协程把 processing 中超时的任务放回 delay:orders
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+```
+
+**常见追问**
+
+- 任务的执行时间可以修改吗？→ ZSet 直接 `ZADD` 新的 score 覆盖；MQ 的延迟消息一般不能修改，只能在执行时检查条件后跳过。
+- 大量任务在同一时刻到期怎么办？→ 分批领取、限制并发处理，必要时给执行时间加随机偏移。
+- asynq 是怎么实现的？→ 基于 Redis：延迟任务放在 ZSet，到期后移动到待处理的 List，worker 从 List 中领取，支持重试、超时、唯一任务。
+
+**实战建议**
+
+- 无论用哪种方案，都保留数据库扫描作为兜底，防止任务丢失。
+- 任务处理逻辑必须幂等，并基于业务状态做条件更新。
+
+=== arch-17
+--- deep
+**原理展开**
+
+订单和支付系统的正确性来自几个层面的保障：
+
+- **状态机**：所有状态变更经过统一的转移规则校验，并使用条件更新防止并发冲突；
+- **幂等**：同一笔支付回调、同一个退款请求，无论收到多少次结果都一样；
+- **对账**：再严谨的代码也可能有 bug，外部系统也可能出错，每天和支付平台逐笔核对是最后的保障；
+- **流水**：每一次资金变动都记录一条不可修改的流水（复式记账：一笔借、一笔贷，总额平衡），余额只是流水的汇总，可以随时重算校验。
+
+**代码示例**
+
+```go
+// 支付回调的完整处理
+func onPaid(ctx context.Context, db *sql.DB, cb Callback) error {
+	if !verifySign(cb) {
+		return ErrBadSign
+	}
+	return WithTx(ctx, db, func(tx *sql.Tx) error {
+		var amount int64
+		var status string
+		err := tx.QueryRowContext(ctx,
+			"SELECT amount, status FROM orders WHERE order_no = ? FOR UPDATE", cb.OrderNo).
+			Scan(&amount, &status)
+		if err != nil {
+			return err
+		}
+		if amount != cb.Amount {
+			return ErrAmountMismatch // 告警，人工处理
+		}
+		if status == "PAID" {
+			return nil // 幂等：已经处理过
+		}
+		if status != "UNPAID" {
+			return refundLater(ctx, tx, cb) // 订单已取消：登记退款
+		}
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE orders SET status = 'PAID', paid_txn = ?, paid_at = NOW() WHERE order_no = ? AND status = 'UNPAID'",
+			cb.TxnID, cb.OrderNo); err != nil {
+			return err
+		}
+		return insertOutbox(ctx, tx, "order.paid", cb.OrderNo) // 通知下游
+	})
+}
+```
+
+**常见追问**
+
+- 重复支付怎么处理？→ 同一个订单收到两笔不同交易号的成功支付，第二笔自动发起退款。
+- 退款要注意什么？→ 退款金额不能超过已支付金额（部分退款要累计）；退款请求带唯一的退款单号，保证幂等；退款结果也要回调 + 主动查询。
+- 订单号怎么设计？→ 唯一、不可预测（防遍历）、可以包含日期等信息方便排查，长度固定。
+
+**实战建议**
+
+- 金额全程使用整数（分），包括数据库、内存、接口；显示时才格式化。
+- 对账发现的差异要有自动处理和人工处理两条路径，并有清晰的记录。
+
+=== arch-18
+--- deep
+**原理展开**
+
+**利特尔定律**：系统中的平均请求数 = 到达速率 × 平均响应时间。可以用来做很多估算：比如 QPS 1000、平均响应 50ms，同时在处理的请求约 50 个；如果每个请求占用一个数据库连接 20ms，平均需要 20 个连接。
+
+压测中典型的曲线：随着压力增加，吞吐量先线性增长，到某个点后不再增长（达到瓶颈），继续加压只会让延迟急剧上升（排队），甚至吞吐量下降（资源争用、超时重试）。这个**拐点**才是系统的真实容量，不是“能扛住的最大 QPS”。
+
+**常见的压测失真**：数据量太小（全部在缓存里）、请求参数单一（缓存命中率 100%）、压测机本身成为瓶颈、下游被 mock 掉了、只压测了单个接口（真实流量是混合的）。
+
+**代码示例**
+
+```bash
+# vegeta：恒定速率压测，逐步提高速率
+for rate in 500 1000 2000 4000; do
+  echo "GET http://svc:8080/api/products/123" | \
+    vegeta attack -rate=$rate -duration=60s | vegeta report -type=text
+done
+
+# 同时采集 profile
+curl -o cpu-$rate.pprof 'http://svc:6060/debug/pprof/profile?seconds=30'
+```
+
+```go
+// 用 Go 写一个简单的恒定速率压测器
+func load(ctx context.Context, rate int, do func(context.Context) error) {
+	t := time.NewTicker(time.Second / time.Duration(rate))
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			go func() { // 开环：不等待上一个请求完成，避免“协同遗漏”
+				start := time.Now()
+				err := do(ctx)
+				record(time.Since(start), err)
+			}()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+```
+
+**常见追问**
+
+- 什么是“协同遗漏”（coordinated omission）？→ 闭环压测（每个并发等上一个请求完成才发下一个）在系统变慢时自动降低了发送速率，测出的延迟比真实情况乐观得多；应该用固定速率的开环压测。
+- 压测会影响生产吗？→ 全链路压测要有流量标记、影子存储、限流保护和随时停止的能力。
+- 怎么确定扩容的提前量？→ 自动扩容从触发到新实例可用通常需要数分钟，大促要提前手动扩容。
+
+**实战建议**
+
+- 建立定期的容量评估：每个核心服务记录“单实例容量”和“当前峰值”，保持足够的余量。
+- 压测报告至少包括：不同压力下的 QPS、延迟分位数、错误率、资源使用率和瓶颈分析。
+
+=== arch-19
+--- deep
+**原理展开**
+
+应对突发流量的核心思路：**让系统在过载时依然能以最大能力服务一部分请求，而不是全部失败**。过载时最糟糕的情况是：所有请求都进来，都排队，都超时，用户重试又带来更多流量，系统彻底崩溃。
+
+几道防线：
+
+1. **入口限流**：只放进系统能处理的量，超出的立即返回（429 或者排队页面）；
+2. **优先级**：核心链路（下单、支付）优先，非核心（推荐、评论）先被降级或限流；
+3. **自适应保护**：根据 CPU、延迟、排队时间动态调整放行量，不依赖准确的预估；
+4. **削峰**：能异步的都异步（消息队列），把瞬时峰值拉平；
+5. **缓存和静态化**：读请求尽量不触达后端服务。
+
+**代码示例**
+
+```go
+// 基于排队时间的自适应负载保护（CoDel 思想）：
+// 请求在队列中等待太久说明已经过载，直接丢弃，而不是让它继续占用资源
+func shed(maxWait time.Duration, next http.Handler) http.Handler {
+	sem := make(chan struct{}, 200)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), maxWait)
+		defer cancel()
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+			next.ServeHTTP(w, r)
+		case <-ctx.Done():
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "server busy", http.StatusServiceUnavailable)
+		}
+	})
+}
+```
+
+**常见追问**
+
+- 自动扩容为什么来不及？→ 扩容需要时间（申请资源、启动、预热），流量突增可能在几秒内发生；而且下游（数据库）往往无法快速扩容。
+- 降级的优先级怎么确定？→ 事先梳理业务链路，把功能分级（P0 核心交易、P1 重要、P2 可降级），预案里明确每一级的降级动作。
+- 客户端重试会加剧过载吗？→ 会，服务端返回 `Retry-After`，客户端遵守退避，并限制重试次数。
+
+**实战建议**
+
+- 降级开关和限流阈值做成可以动态调整的配置，并在演练中验证。
+- 大促前做全链路压测，压测流量要超过预估峰值一定比例（比如 1.5 倍）。
+
+=== arch-20
+--- deep
+**原理展开**
+
+异地多活的几个核心问题：
+
+- **数据分区**：按用户（或者商户、地域）划分单元，保证一个用户的数据只在一个单元写入，从根本上避免跨地域的写冲突；
+- **全局数据**：无法按用户划分的数据（商品、库存、全局配置）放在中心单元，各单元只读副本；需要写入时路由到中心单元，延迟更高；
+- **路由一致**：从入口（DNS、网关）到每一层服务，都要按同样的规则把请求路由到用户所属的单元，任何一层路由错误都会产生跨单元写入；
+- **故障切换**：切换时，故障单元最后一部分数据可能还没有同步到其他单元（RPO > 0）；切换前通常要短暂禁写，等待同步追平，或者接受少量数据的冲突后再修复。
+
+**代码示例**
+
+```go
+// 网关层：根据用户 ID 计算所属单元，转发到对应的单元入口
+type UnitRouter struct {
+	units   []Unit           // 槽位区间 → 单元
+	failover map[string]string // 故障单元 → 接管单元（配置中心下发）
+}
+
+func (r *UnitRouter) Target(uid int64) string {
+	slot := int(uid % 100)
+	for _, u := range r.units {
+		if slot >= u.From && slot < u.To {
+			if to, ok := r.failover[u.Name]; ok {
+				return to
+			}
+			return u.Name
+		}
+	}
+	return "central"
+}
+
+// 防御：服务端校验请求是否属于本单元，路由错误时拒绝写入（防止数据错乱）
+func (s *Service) checkUnit(uid int64) error {
+	if router.Target(uid) != s.localUnit {
+		return ErrWrongUnit
+	}
+	return nil
+}
+```
+
+**常见追问**
+
+- 同城双活和异地多活有什么区别？→ 同城机房之间延迟很低，可以使用同步复制和共享的数据库集群，复杂度低得多；异地多活要面对几十毫秒的延迟和异步复制。
+- 数据同步用什么？→ 基于 binlog 的同步工具（如阿里的 DRC、开源的 Canal + 自研），需要防止数据在单元之间循环同步。
+- 怎么验证多活是否真的可用？→ 定期切流演练，真实地把某个单元的流量切走。
+
+**实战建议**
+
+- 多活是一项长期的架构投资，先确认业务真的需要（RTO / RPO 的要求），再逐步推进：同城双活 → 异地容灾 → 异地多活。
+- 设计新业务时就考虑数据能否按单元划分，避免后期改造。

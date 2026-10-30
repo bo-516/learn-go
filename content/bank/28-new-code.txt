@@ -1,0 +1,903 @@
+=== code-19-1
+title: 修复并发批量拉取函数中的切片数据竞争与错误通道协程泄漏 Bug
+race: true
+--- desc
+起始代码中的 `FetchAll` 并发拉取 `ids` 对应的结果，但存在两个致命并发 Bug：
+1. 多个协程并发执行 `results = append(results, val)`，导致严重的数据竞争（Data Race）、丢数据且结果顺序错乱；
+2. 多个协程报错时向无缓冲 `errCh` 发送错误，或者没有等待所有协程退出，导致 Goroutine 泄漏。
+
+请修复 `FetchAll(parentCtx context.Context, ids []int, fn func(context.Context, int) (string, error)) ([]string, error)`：
+- **预分配定长切片** `results := make([]string, len(ids))`，每个协程按自己的下标 `results[i] = val` 无锁写入，保证结果顺序与 `ids` 严格一致；
+- 使用 `context.WithCancel(parentCtx)` 派生子 `ctx` 传给 `fn`；
+- 任一协程返回错误时，使用 `sync.Once` 记录首个错误并立即调用 `cancel()` 取消其余慢协程；
+- 必须通过 `wg.Wait()` 等待所有已启动的协程安全退出后再返回（若发生错误则返回 `(nil, firstErr)`，全部成功则返回 `(results, nil)`）。
+--- solution
+package main
+
+import (
+	"context"
+	"sync"
+)
+
+func FetchAll(parentCtx context.Context, ids []int, fn func(context.Context, int) (string, error)) ([]string, error) {
+	// @solution
+	ctx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+
+	results := make([]string, len(ids))
+	var (
+		wg       sync.WaitGroup
+		once     sync.Once
+		firstErr error
+	)
+
+	for i, id := range ids {
+		wg.Add(1)
+		go func(idx, itemID int) {
+			defer wg.Done()
+			val, err := fn(ctx, itemID)
+			if err != nil {
+				once.Do(func() {
+					firstErr = err
+					cancel()
+				})
+				return
+			}
+			results[idx] = val
+		}(i, id)
+	}
+
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return results, nil
+	// @starter
+	// var results []string
+	// for _, id := range ids {
+	// 	val, err := fn(parentCtx, id)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// 	results = append(results, val) // TODO: 改为并发执行、预分配按索引写入，并在出错时 cancel 其他协程且无协程泄漏
+	// }
+	// return results, nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"runtime"
+	"testing"
+	"time"
+)
+
+func TestFetchAllConcurrentAndCancel(t *testing.T) {
+	// 1. 验证并发执行且结果顺序严格保序（无 Data Race）
+	ids := []int{10, 20, 30, 40, 50}
+	start := time.Now()
+	got, err := FetchAll(context.Background(), ids, func(ctx context.Context, id int) (string, error) {
+		time.Sleep(25 * time.Millisecond)
+		return fmt.Sprintf("u-%d", id), nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if time.Since(start) >= 100*time.Millisecond {
+		t.Fatalf("expected concurrent execution (<100ms), took %v", time.Since(start))
+	}
+	want := []string{"u-10", "u-20", "u-30", "u-40", "u-50"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+
+	// 2. 验证多个协程同时报错时快速 cancel 慢协程，且无协程泄漏
+	baseG := runtime.NumGoroutine()
+	_, err = FetchAll(context.Background(), ids, func(ctx context.Context, id int) (string, error) {
+		if id == 10 || id == 20 {
+			return "", errors.New("rpc failed")
+		}
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	if err == nil {
+		t.Fatal("expected error when subtasks fail")
+	}
+	time.Sleep(10 * time.Millisecond)
+	if leaked := runtime.NumGoroutine() - baseG; leaked > 2 {
+		t.Fatalf("goroutine leak detected: +%d goroutines", leaked)
+	}
+}
+--- explain
+**思路**
+
+这是并发编程（其实就是 `errgroup.Group` 的底层实现）最核心的三板斧：
+1. **预分配定长切片 + 按独立下标赋值（`results[idx] = val`）**：不同协程写入完全隔离的数组槽位，无需加锁即可避免 Data Race，且保序。
+2. **`sync.Once` + `context.WithCancel`**：无论是 1 个协程报错还是 100 个协程同时报错，`once.Do` 保证只记录第一个错误并调用 `cancel()`，绝不会像无缓冲 channel 那样卡死后续报错协程。
+3. **`wg.Wait()` 兜底**：无论成功还是失败，都必须等所有子协程退出后函数才能返回，确保零 Goroutine 泄漏且不会在返回后还有野协程写 `results`。
+
+**代码讲解**
+
+- `results := make([]string, len(ids))` 在启动协程前一次性分配好底层数组。
+- `wg.Wait()` 之后再检查 `if firstErr != nil`，建立严格的 Happens-Before 内存同步屏障。
+
+**易错点**
+
+- 切勿在 `once.Do` 发现错误后不调 `wg.Wait()` 就直接提前 return，否则尚未退出的子协程会泄漏到函数生命周期之外。
+
+=== code-20-1
+title: 实现无锁局部聚合与归并的并发 MapReduce 词频统计器
+race: true
+--- desc
+实现并发词频统计函数 `ConcurrentWordCount(docs []string, workers int) map[string]int`：
+
+1. 将输入的 `docs` 交由最多 `workers` 个并发 Worker 协程处理（若 `workers <= 0` 则按 `1` 处理；若 `len(docs) == 0` 返回非 nil 的空 map）；
+2. **Map 阶段（无锁局部统计）**：每个 Worker 拥有自己私有的 `local := make(map[string]int)`，对分配给自己的文档使用 `strings.Fields(strings.ToLower(doc))` 切分单词并累加到 `local` 中（期间严禁争抢全局锁）；
+3. **Reduce 阶段（汇总归并）**：等待所有 Worker 完成后，将所有 Worker 的 `local` 词频合并到最终结果 map 中返回。
+--- solution
+package main
+
+import (
+	"strings"
+	"sync"
+)
+
+func ConcurrentWordCount(docs []string, workers int) map[string]int {
+	// @solution
+	total := make(map[string]int)
+	if len(docs) == 0 {
+		return total
+	}
+	if workers <= 0 {
+		workers = 1
+	}
+	if workers > len(docs) {
+		workers = len(docs)
+	}
+
+	locals := make([]map[string]int, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+
+	for w := range workers {
+		go func(workerID int) {
+			defer wg.Done()
+			local := make(map[string]int)
+			for i := workerID; i < len(docs); i += workers {
+				for _, word := range strings.Fields(strings.ToLower(docs[i])) {
+					local[word]++
+				}
+			}
+			locals[workerID] = local
+		}(w)
+	}
+
+	wg.Wait()
+	for _, local := range locals {
+		for word, count := range local {
+			total[word] += count
+		}
+	}
+	return total
+	// @starter
+	// return nil // TODO: 分片无锁统计 local map，再归并到 total map
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestConcurrentWordCount(t *testing.T) {
+	docs := []string{
+		"Go is expressive concise clean and efficient",
+		"Go concurrency mechanisms make it easy to write programs",
+		"clean code and expressive concurrency in go",
+		"go go GO",
+	}
+
+	got := ConcurrentWordCount(docs, 3)
+	if got["go"] != 6 {
+		t.Fatalf("count(go) = %d, want 6", got["go"])
+	}
+	if got["concurrency"] != 2 || got["expressive"] != 2 || got["clean"] != 2 {
+		t.Fatalf("unexpected counts: %+v", got)
+	}
+
+	empty := ConcurrentWordCount(nil, 4)
+	if empty == nil || len(empty) != 0 {
+		t.Fatalf("expected non-nil empty map for empty input, got %v", empty)
+	}
+}
+--- explain
+**思路**
+
+多核并行统计时，消除锁竞争的黄金法则是 **Share Nothing during Map, Merge once in Reduce**：
+1. 按步长交错分片 `for i := workerID; i < len(docs); i += workers`，每个 Worker 只操作自己的 `local` map，并把结果写入 `locals[workerID]`；
+2. `wg.Wait()` 后由主协程单线程遍历 `locals` 合并到 `total`，全程不需要任何 `sync.Mutex`！
+
+**代码讲解**
+
+- `for i := workerID; i < len(docs); i += workers`：经典的交错条带分片（Striping），即使部分文档特别长、部分特别短，也能比按连续块切分获得更均衡的负载。
+
+**易错点**
+
+- 注意 `strings.ToLower` 应在 `strings.Fields` 之前或之后统一调用，使 `"Go"`、`"go"`、`"GO"` 归并为同一个单词 `"go"`。
+
+=== code-21-1
+title: 实现基于最小堆（container/heap）与版本号惰性删除的 TTL Map
+race: true
+--- desc
+实现一个并发安全的带过期时间键值存储 `TTLMap`，结合哈希表与最小堆（`container/heap`）实现高效过期清理：
+
+1. `Set(key, val string, expireAt int64)`：
+   - 设置或更新 `key` 的值和绝对过期时间戳 `expireAt`（注意：若 `key` 已存在且被赋予了新的 `expireAt`，必须正确更新，不能被旧的堆节点在 `Cleanup` 时误删！）；
+2. `Get(key string, now int64) (string, bool)`：
+   - 若 `key` 存在且未过期（`now < entry.expireAt`），返回 `(val, true)`；
+   - 若不存在或已过期（`now >= entry.expireAt`），返回 `("", false)`；
+3. `Cleanup(now int64) int`：
+   - 利用最小堆循环弹出所有 `expireAt <= now` 的堆顶节点；
+   - 返回本次真正从哈希表中移除的过期有效 key 的数量（被覆盖过的旧版本影子堆节点不计入移除数量）。
+--- solution
+package main
+
+import (
+	"container/heap"
+	"sync"
+)
+
+type ttlItem struct {
+	val      string
+	expireAt int64
+	ver      uint64
+}
+
+type heapNode struct {
+	key      string
+	expireAt int64
+	ver      uint64
+}
+
+type minExpHeap []heapNode
+
+func (h minExpHeap) Len() int           { return len(h) }
+func (h minExpHeap) Less(i, j int) bool { return h[i].expireAt < h[j].expireAt }
+func (h minExpHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *minExpHeap) Push(x any)        { *h = append(*h, x.(heapNode)) }
+func (h *minExpHeap) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
+}
+
+type TTLMap struct {
+	mu    sync.Mutex
+	seq   uint64
+	items map[string]ttlItem
+	h     minExpHeap
+}
+
+func NewTTLMap() *TTLMap {
+	return &TTLMap{items: make(map[string]ttlItem)}
+}
+
+func (m *TTLMap) Set(key, val string, expireAt int64) {
+	// @solution
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.seq++
+	ver := m.seq
+	m.items[key] = ttlItem{val: val, expireAt: expireAt, ver: ver}
+	heap.Push(&m.h, heapNode{key: key, expireAt: expireAt, ver: ver})
+	// @starter
+	// // TODO: 更新 map 并推入最小堆（带上单调递增版本号 ver）
+	// @end
+}
+
+func (m *TTLMap) Get(key string, now int64) (string, bool) {
+	// @solution
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	it, ok := m.items[key]
+	if !ok || now >= it.expireAt {
+		return "", false
+	}
+	return it.val, true
+	// @starter
+	// return "", false // TODO: 校验存在且 now < expireAt
+	// @end
+}
+
+func (m *TTLMap) Cleanup(now int64) int {
+	// @solution
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	removed := 0
+	for m.h.Len() > 0 && m.h[0].expireAt <= now {
+		top := heap.Pop(&m.h).(heapNode)
+		if cur, ok := m.items[top.key]; ok && cur.ver == top.ver {
+			delete(m.items, top.key)
+			removed++
+		}
+	}
+	return removed
+	// @starter
+	// return 0 // TODO: 从堆顶弹出所有 expireAt <= now 的节点，比对 ver 一致时从 map 删除并计数
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestTTLMapHeapAndOverwrite(t *testing.T) {
+	m := NewTTLMap()
+	m.Set("k1", "v1", 10)
+	m.Set("k2", "v2", 20)
+	// 覆盖更新 k1 的过期时间到 50！
+	m.Set("k1", "v1-updated", 50)
+
+	// 在 t=15 时清理：虽然堆里有个 (k1, exp=10) 的旧节点，但 k1 已被续期到 50，绝不能误删 k1！
+	if removed := m.Cleanup(15); removed != 0 {
+		t.Fatalf("Cleanup(15) removed = %d, want 0 (k1 was extended to 50)", removed)
+	}
+	if val, ok := m.Get("k1", 15); !ok || val != "v1-updated" {
+		t.Fatalf("Get(k1, 15) = (%q, %v), want (v1-updated, true)", val, ok)
+	}
+
+	// 在 t=25 时清理：k2(exp=20) 应被精准清理，k1(exp=50) 仍在
+	if removed := m.Cleanup(25); removed != 1 {
+		t.Fatalf("Cleanup(25) removed = %d, want 1 (k2)", removed)
+	}
+	if _, ok := m.Get("k2", 25); ok {
+		t.Fatal("k2 should be expired")
+	}
+	if val, ok := m.Get("k1", 25); !ok || val != "v1-updated" {
+		t.Fatal("k1 should still be alive at t=25")
+	}
+}
+--- explain
+**思路**
+
+用 `map` + `container/heap` 实现 TTL 缓存时，最巧妙的设计就是**引入单调递增的更新序号 `ver`**：
+- 每次 `Set` 无需去堆里搜索修改旧节点（$O(N)$），而是直接递增 `m.seq` 压入一个带新 `ver` 的堆节点（$O(\log N)$）。
+- `Cleanup(now)` 循环查看堆顶 `m.h[0].expireAt <= now`：弹出堆顶后检查 `cur, ok := m.items[top.key]; ok && cur.ver == top.ver`。只有版本号对得上，才说明该 key 在那之后没有被重新续期覆盖过，此时安全执行 `delete(m.items, top.key)`。
+
+**代码讲解**
+
+1. 查看堆顶直接访问切片首元素 `m.h[0]`（$O(1)$），只有确认过期时才调用 `heap.Pop(&m.h)`（$O(\log N)$）。
+2. `Get` 采用惰性检查：若 `now >= it.expireAt` 直接视为未命中返回 `("", false)`。
+
+**易错点**
+
+- 注意 `container/heap` 需要通过 `heap.Push(&m.h, ...)` 和 `heap.Pop(&m.h)` 调用，千万不要直接调用切片方法 `m.h.Push(...)` 或 `m.h.Pop()`，否则不会触发堆的上浮（up）和下沉（down）调整！
+
+=== code-22-1
+title: 实现支持静态段、路径参数（:param）与通配符（*wildcard）的 HTTP Trie 路由器
+race: true
+--- desc
+实现 Web 框架的核心路由前缀树 `TrieRouter`：
+
+1. `AddRoute(pattern, handler string)`：
+   - 按 `/` 切分路径段（去除首尾多余的 `/`；根路径 `"/"` 切分为空切片 `[]string{}`）；
+   - 支持三类路径段：
+     - **静态段**（如 `"users"`）
+     - **单段参数**（以 `:` 开头，如 `":id"`，参数名为 `"id"`）
+     - **尾部通配符**（以 `*` 开头，如 `"*filepath"`，参数名为 `"filepath"`，仅出现在路由最末尾，匹配当前位置起的剩余所有非空路径段，并用 `"/"` 拼接）；
+2. `Match(path string) (handler string, params map[string]string, ok bool)`：
+   - 匹配优先级严格遵循：**静态段 > `:param` 参数段 > `*wildcard` 通配符**；
+   - 若高优先级的分支走到底发现无法匹配完整路径，需能够**回溯（Backtrack）**尝试同级的 `:param` 或 `*wildcard` 分支；
+   - 匹配成功返回 `(handler, params, true)`，失败返回 `("", nil, false)`。
+--- solution
+package main
+
+import "strings"
+
+type trieNode struct {
+	handler    string
+	static     map[string]*trieNode
+	paramChild *trieNode
+	paramName  string
+	wildChild  *trieNode
+	wildName   string
+}
+
+func newTrieNode() *trieNode {
+	return &trieNode{static: make(map[string]*trieNode)}
+}
+
+type TrieRouter struct {
+	root *trieNode
+}
+
+func NewTrieRouter() *TrieRouter {
+	return &TrieRouter{root: newTrieNode()}
+}
+
+func splitPath(p string) []string {
+	trimmed := strings.Trim(p, "/")
+	if trimmed == "" {
+		return nil
+	}
+	return strings.Split(trimmed, "/")
+}
+
+func (r *TrieRouter) AddRoute(pattern, handler string) {
+	// @solution
+	segs := splitPath(pattern)
+	cur := r.root
+	for _, seg := range segs {
+		if strings.HasPrefix(seg, ":") {
+			if cur.paramChild == nil {
+				cur.paramChild = newTrieNode()
+			}
+			cur.paramChild.paramName = seg[1:]
+			cur = cur.paramChild
+		} else if strings.HasPrefix(seg, "*") {
+			if cur.wildChild == nil {
+				cur.wildChild = newTrieNode()
+			}
+			cur.wildChild.wildName = seg[1:]
+			cur = cur.wildChild
+			break
+		} else {
+			next, ok := cur.static[seg]
+			if !ok {
+				next = newTrieNode()
+				cur.static[seg] = next
+			}
+			cur = next
+		}
+	}
+	cur.handler = handler
+	// @starter
+	// // TODO: 将 pattern 插入前缀树，区分静态段、:param 和 *wildcard
+	// @end
+}
+
+func (r *TrieRouter) Match(path string) (string, map[string]string, bool) {
+	// @solution
+	segs := splitPath(path)
+	params := make(map[string]string)
+	if h := matchNode(r.root, segs, 0, params); h != "" {
+		return h, params, true
+	}
+	return "", nil, false
+	// @starter
+	// return "", nil, false // TODO: 按 静态 > :param > *wildcard 优先级递归回溯匹配
+	// @end
+}
+
+func matchNode(n *trieNode, segs []string, idx int, params map[string]string) string {
+	if idx == len(segs) {
+		return n.handler
+	}
+	seg := segs[idx]
+
+	// 1. 优先匹配静态子节点
+	if child, ok := n.static[seg]; ok {
+		if h := matchNode(child, segs, idx+1, params); h != "" {
+			return h
+		}
+	}
+
+	// 2. 其次匹配 :param 参数子节点（支持回溯恢复 params）
+	if n.paramChild != nil {
+		if h := matchNode(n.paramChild, segs, idx+1, params); h != "" {
+			params[n.paramChild.paramName] = seg
+			return h
+		}
+	}
+
+	// 3. 最后匹配 *wildcard 尾部通配符子节点
+	if n.wildChild != nil && n.wildChild.handler != "" {
+		params[n.wildChild.wildName] = strings.Join(segs[idx:], "/")
+		return n.wildChild.handler
+	}
+
+	return ""
+}
+--- test
+package main
+
+import "testing"
+
+func TestTrieRouterPriorityAndBacktrack(t *testing.T) {
+	router := NewTrieRouter()
+	router.AddRoute("/users/new", "UserNewHandler")
+	router.AddRoute("/users/:id", "UserDetailHandler")
+	router.AddRoute("/users/:id/settings", "UserSettingsHandler")
+	router.AddRoute("/static/*filepath", "StaticFileHandler")
+
+	// 1. 静态路由优先于 :id 参数路由
+	h, params, ok := router.Match("/users/new")
+	if !ok || h != "UserNewHandler" || len(params) != 0 {
+		t.Fatalf("Match(/users/new) = (%q, %v, %v), want UserNewHandler", h, params, ok)
+	}
+
+	// 2. 参数路由匹配
+	h, params, ok = router.Match("/users/42")
+	if !ok || h != "UserDetailHandler" || params["id"] != "42" {
+		t.Fatalf("Match(/users/42) = (%q, %v, %v)", h, params, ok)
+	}
+
+	// 3. 回溯匹配：/users/new/settings 先走静态 "new" 发现没有 settings，应回溯到 :id="new" 命中 UserSettingsHandler！
+	h, params, ok = router.Match("/users/new/settings")
+	if !ok || h != "UserSettingsHandler" || params["id"] != "new" {
+		t.Fatalf("backtrack Match(/users/new/settings) = (%q, %v, %v), want UserSettingsHandler with id=new", h, params, ok)
+	}
+
+	// 4. 通配符捕获多段后缀路径
+	h, params, ok = router.Match("/static/css/theme/dark.css")
+	if !ok || h != "StaticFileHandler" || params["filepath"] != "css/theme/dark.css" {
+		t.Fatalf("wildcard Match = (%q, %v, %v)", h, params, ok)
+	}
+}
+--- explain
+**思路**
+
+将 URL 按 `/` 切分为 `segs` 数组后，Trie 路由器的每次匹配就是一个深度最多为 `len(segs)` 的递归搜索：
+1. 第一顺位查 `n.static[seg]`；
+2. 如果静态分支走不通（返回 `""`），自动往下走第二顺位 `n.paramChild`；而且只要**在递归确认子树匹配成功（`h != ""`）之后再写入 `params[n.paramChild.paramName] = seg`**，一旦分支匹配失败连清理脏参数都省了！
+3. 第三顺位查 `n.wildChild`，直接将 `strings.Join(segs[idx:], "/")` 收入囊中并返回。
+
+**代码讲解**
+
+- `strings.Trim(p, "/")` 自动兼容了 `"/users/42"` 和 `"/users/42/"` 的首尾斜杠规范化。
+
+**易错点**
+
+- 回溯时如果在进入 `matchNode(n.paramChild, ...)` **之前**就污染了 `params` map，而后续子路径匹配失败回退时又忘了 `delete`，就会残留错误的路径参数；在递归返回 `h != ""` **之后**再赋值 `params` 是最干净的写法。
+
+=== code-23-1
+title: 实现基于堆与 sync.Cond 的优先级并发任务调度器（同优先级 FIFO）
+race: true
+--- desc
+实现一个支持任务优先级的并发调度器 `PriorityScheduler`：
+
+1. `NewPriorityScheduler(workers int) *PriorityScheduler`：启动 `workers` 个后台 Worker 协程；
+2. `Submit(priority int, fn func()) bool`：
+   - 若调度器已关闭，返回 `false`；
+   - 否则将任务压入优先级等待队列并唤醒一个等待中的 Worker，返回 `true`；
+   - **调度优先级规则**：当队列中有多个待执行任务时，**`priority` 数值更大的高优任务必须优先被取出执行**；若 `priority` 相同，则按**先提交先执行（FIFO）**的顺序执行；
+3. `Shutdown()`：标记调度器关闭，等待队列中**所有已提交的任务全部执行完毕**且所有 Worker 协程退出后返回（幂等安全）。
+--- solution
+package main
+
+import (
+	"container/heap"
+	"sync"
+)
+
+type prioTask struct {
+	priority int
+	seq      int64
+	fn       func()
+}
+
+type taskHeap []prioTask
+
+func (h taskHeap) Len() int { return len(h) }
+func (h taskHeap) Less(i, j int) bool {
+	if h[i].priority != h[j].priority {
+		return h[i].priority > h[j].priority
+	}
+	return h[i].seq < h[j].seq
+}
+func (h taskHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *taskHeap) Push(x any)   { *h = append(*h, x.(prioTask)) }
+func (h *taskHeap) Pop() any {
+	old := *h
+	n := len(old)
+	it := old[n-1]
+	*h = old[:n-1]
+	return it
+}
+
+type PriorityScheduler struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	pq     taskHeap
+	seq    int64
+	closed bool
+	wg     sync.WaitGroup
+}
+
+func NewPriorityScheduler(workers int) *PriorityScheduler {
+	s := &PriorityScheduler{}
+	s.cond = sync.NewCond(&s.mu)
+	for range workers {
+		s.wg.Add(1)
+		go s.worker()
+	}
+	return s
+}
+
+func (s *PriorityScheduler) worker() {
+	defer s.wg.Done()
+	for {
+		s.mu.Lock()
+		for s.pq.Len() == 0 && !s.closed {
+			s.cond.Wait()
+		}
+		if s.pq.Len() == 0 && s.closed {
+			s.mu.Unlock()
+			return
+		}
+		task := heap.Pop(&s.pq).(prioTask)
+		s.mu.Unlock()
+
+		task.fn()
+	}
+}
+
+func (s *PriorityScheduler) Submit(priority int, fn func()) bool {
+	// @solution
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return false
+	}
+	s.seq++
+	heap.Push(&s.pq, prioTask{priority: priority, seq: s.seq, fn: fn})
+	s.mu.Unlock()
+	s.cond.Signal()
+	return true
+	// @starter
+	// return false // TODO: 压入最大堆（同优先级按 seq 升序）并 Signal 唤醒 Worker
+	// @end
+}
+
+func (s *PriorityScheduler) Shutdown() {
+	// @solution
+	s.mu.Lock()
+	if !s.closed {
+		s.closed = true
+		s.cond.Broadcast()
+	}
+	s.mu.Unlock()
+	s.wg.Wait()
+	// @starter
+	// // TODO: 设置 closed 标志、Broadcast 唤醒所有 Worker，并等待队列排空退出
+	// @end
+}
+--- test
+package main
+
+import (
+	"reflect"
+	"sync"
+	"testing"
+)
+
+func TestPrioritySchedulerOrderAndFIFO(t *testing.T) {
+	// 使用 1 个 Worker 验证队列积压时的优先级插队与同优先级 FIFO
+	sched := NewPriorityScheduler(1)
+
+	blockFirst := make(chan struct{})
+	firstStarted := make(chan struct{})
+
+	// 第 0 个任务先占住唯一的 Worker
+	sched.Submit(1, func() {
+		close(firstStarted)
+		<-blockFirst
+	})
+	<-firstStarted
+
+	var mu sync.Mutex
+	var order []string
+	record := func(name string) func() {
+		return func() {
+			mu.Lock()
+			order = append(order, name)
+			mu.Unlock()
+		}
+	}
+
+	// 在 Worker 繁忙期间依次提交 4 个积压任务
+	sched.Submit(1, record("low-1"))
+	sched.Submit(10, record("high-1"))
+	sched.Submit(5, record("mid-1"))
+	sched.Submit(10, record("high-2")) // 与 high-1 同优先级，应排在 high-1 之后
+
+	// 放行首个任务，并优雅关闭等待所有积压任务按优先级跑完
+	close(blockFirst)
+	sched.Shutdown()
+
+	want := []string{"high-1", "high-2", "mid-1", "low-1"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("execution order = %v, want %v", order, want)
+	}
+
+	if sched.Submit(100, func() {}) {
+		t.Fatal("Submit after Shutdown should return false")
+	}
+}
+--- explain
+**思路**
+
+1. **为什么堆元素要加 `seq int64`？** 二叉堆（Heap）本身是**不稳定**的数据结构，如果不加自增序号 `seq` 作为二级比较条件（`h[i].seq < h[j].seq`），两个相同优先级的任务弹出顺序会变得随机。
+2. **`sync.Cond` 等待范式**：Worker 在 `for s.pq.Len() == 0 && !s.closed { s.cond.Wait() }` 中挂起；注意退出循环的条件是 **`s.pq.Len() == 0 && s.closed`**（必须等队列里的存量任务全部被 Pop 执行完后 Worker 才能退出！）。
+
+**代码讲解**
+
+- `Submit` 使用 `s.cond.Signal()` 唤醒 1 个空闲 Worker；
+- `Shutdown` 使用 `s.cond.Broadcast()` 唤醒所有阻塞的 Worker 检查关闭状态。
+
+**易错点**
+
+- 如果 Worker 写成 `if s.closed { return }` 而不是 `if s.pq.Len() == 0 && s.closed { return }`，那么调用 `Shutdown()` 时积压在堆里的待处理任务会被直接丢弃！
+
+=== code-24-1
+title: 实现支持轮询负载均衡、被动连续失败剔除与冷却期自动恢复的后端池
+race: true
+--- desc
+仿照 Nginx `max_fails` 与 `fail_timeout` 机制，实现网关后端节点池 `BackendPool`：
+
+1. `NewBackendPool(addrs []string, maxFails int, failTimeout time.Duration) *BackendPool`
+2. `Next(now time.Time) (string, bool)`：
+   - 按 Round-Robin 顺序从上一次选中位置的下一个节点开始，最多扫描一圈（`len(backends)` 个节点）；
+   - 若某节点未被剔除，或者冷却期已满（`!now.Before(b.deadUntil)`，即 `now >= b.deadUntil`），则选中该节点并返回 `(b.addr, true)`；
+   - 若所有节点均处于熔断冷却期内（`now.Before(b.deadUntil)`），返回 `("", false)`；
+3. `ReportFailure(addr string, now time.Time)`：
+   - 将对应节点的连续失败计数 `fails++`；
+   - 若 `fails >= maxFails`，将该节点熔断至 `deadUntil = now.Add(failTimeout)`（并将 `fails` 重置为 `0`，以便冷却期过后重新计数或单次探测）；
+4. `ReportSuccess(addr string)`：
+   - 将对应节点的 `fails` 清零，并将 `deadUntil` 重置为零值 `time.Time{}`。
+--- solution
+package main
+
+import (
+	"sync"
+	"time"
+)
+
+type backendNode struct {
+	addr      string
+	fails     int
+	deadUntil time.Time
+}
+
+type BackendPool struct {
+	mu          sync.Mutex
+	nodes       []*backendNode
+	nextIdx     int
+	maxFails    int
+	failTimeout time.Duration
+}
+
+func NewBackendPool(addrs []string, maxFails int, failTimeout time.Duration) *BackendPool {
+	nodes := make([]*backendNode, len(addrs))
+	for i, a := range addrs {
+		nodes[i] = &backendNode{addr: a}
+	}
+	return &BackendPool{
+		nodes:       nodes,
+		maxFails:    maxFails,
+		failTimeout: failTimeout,
+	}
+}
+
+func (p *BackendPool) Next(now time.Time) (string, bool) {
+	// @solution
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := len(p.nodes)
+	for range n {
+		idx := p.nextIdx % n
+		p.nextIdx++
+		node := p.nodes[idx]
+		if !now.Before(node.deadUntil) {
+			return node.addr, true
+		}
+	}
+	return "", false
+	// @starter
+	// return "", false // TODO: 轮询挑选未处于冷却期 (now >= deadUntil) 的健康节点
+	// @end
+}
+
+func (p *BackendPool) ReportFailure(addr string, now time.Time) {
+	// @solution
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, node := range p.nodes {
+		if node.addr == addr {
+			node.fails++
+			if node.fails >= p.maxFails {
+				node.deadUntil = now.Add(p.failTimeout)
+				node.fails = 0
+			}
+			return
+		}
+	}
+	// @starter
+	// // TODO: 累加连续失败次数，达到 maxFails 时设置 deadUntil = now.Add(failTimeout)
+	// @end
+}
+
+func (p *BackendPool) ReportSuccess(addr string) {
+	// @solution
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, node := range p.nodes {
+		if node.addr == addr {
+			node.fails = 0
+			node.deadUntil = time.Time{}
+			return
+		}
+	}
+	// @starter
+	// // TODO: 清零失败计数并恢复健康状态
+	// @end
+}
+--- test
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+func TestBackendPoolOutlierEjectionAndRecovery(t *testing.T) {
+	t0 := time.Unix(1700000000, 0)
+	pool := NewBackendPool([]string{"n1", "n2", "n3"}, 2, 10*time.Second)
+
+	// 1. 初始正常轮询 n1 -> n2 -> n3
+	for _, want := range []string{"n1", "n2", "n3"} {
+		got, ok := pool.Next(t0)
+		if !ok || got != want {
+			t.Fatalf("Next = (%q, %v), want (%q, true)", got, ok, want)
+		}
+	}
+
+	// 2. n2 报错 1 次后又成功 1 次 -> 连续失败计数清零，不应被剔除
+	pool.ReportFailure("n2", t0)
+	pool.ReportSuccess("n2")
+	pool.ReportFailure("n2", t0) // 这只是重新计数的第 1 次失败
+
+	// 3. n1 连续失败 2 次达到 maxFails(2) -> 被熔断剔除 10s
+	pool.ReportFailure("n1", t0)
+	pool.ReportFailure("n1", t0)
+
+	// 在 t0 + 5s（冷却期内）连续选 4 次，应全部跳过 n1，只在 n2 和 n3 之间轮询！
+	for range 4 {
+		got, ok := pool.Next(t0.Add(5 * time.Second))
+		if !ok || got == "n1" {
+			t.Fatalf("ejected node n1 should be skipped during cooldown, got %q", got)
+		}
+	}
+
+	// 4. 到了 t0 + 10s（冷却期届满），n1 自动回归可被选中！
+	recovered := false
+	for range 3 {
+		if got, ok := pool.Next(t0.Add(10 * time.Second)); ok && got == "n1" {
+			recovered = true
+		}
+	}
+	if !recovered {
+		t.Fatal("n1 should automatically recover after failTimeout(10s)")
+	}
+}
+--- explain
+**思路**
+
+被动健康检查（Passive Outlier Detection）的核心状态转换：
+1. 每次节点正常响应调用 `ReportSuccess`，将连续错误计数 `fails` 归零，防止偶发抖动累积误杀；
+2. 当某节点连续报错达到 `maxFails` 时，设置 `node.deadUntil = now.Add(p.failTimeout)`，在接下来的 `failTimeout` 时间内，`Next(now)` 看到 `now.Before(node.deadUntil)` 就会自动跳过它；
+3. 当时间跨过 `deadUntil`（`!now.Before(node.deadUntil)`）时，无需后台协程干预，`Next(now)` 自然重新选中它进行探测。
+
+**代码讲解**
+
+- `for range n` 最多扫一圈所有节点；每次 `idx := p.nextIdx % n; p.nextIdx++` 保证轮询游标均匀前进。
+
+**易错点**
+
+- 判断冷却期是否届满使用 `!now.Before(node.deadUntil)`（等价于 `now >= node.deadUntil`）；对于从未熔断过的节点，`node.deadUntil` 是零值 `time.Time{}`，`!now.Before(time.Time{})` 恒为 `true`。

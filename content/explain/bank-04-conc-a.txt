@@ -1,0 +1,303 @@
+=== conc-01-1
+--- explain
+**思路**
+
+每个元素启动一个 goroutine 调用 `slow`，用 `sync.WaitGroup` 等待全部完成。10 个 50ms 的任务并发执行，总耗时约 50ms 而不是 500ms。结果按下标写回预先分配好的切片，每个 goroutine 写不同的位置，**不存在数据竞争**，不需要加锁。
+
+**代码讲解**
+
+1. `res := make([]int, len(nums))`：先分配好结果，goroutine 只写不扩容。
+2. `wg.Add(1)` 写在 `go` 语句**之前**。
+3. `go func() { defer wg.Done(); res[i] = slow(v) }()`：Go 1.22 起 `i`、`v` 每次迭代都是新变量，闭包直接捕获即可。
+4. `wg.Wait()` 阻塞到计数归零后返回结果。
+
+**易错点**
+
+- 多个 goroutine `append` 到同一个切片是数据竞争；写不同下标是安全的（不同元素是不同的内存位置）。
+- 元素非常多时（比如 100 万个），无限制地启动 goroutine 会耗尽内存或压垮下游，要用信号量或 worker 池限制并发数（见「如何控制并发的 goroutine 数量」）。
+- 需要“任意一个出错就取消其他”时用 `errgroup.Group`。
+
+=== conc-02-1
+--- explain
+**思路**
+
+流水线（pipeline）：每个阶段是一个函数，接收上游的只读 channel，启动一个 goroutine 处理，返回自己的输出 channel。**谁创建 channel 谁负责关闭**，上游关闭后下游的 `for range` 才能结束，关闭信号一级一级传下去。
+
+**代码讲解**
+
+1. 返回类型 `<-chan int`：调用方只能读，不能写或关闭。
+2. `defer close(out)`：goroutine 无论怎么退出都会关闭输出。
+3. `Generate(nums ...int)`：可变参数，内部是 `[]int`。
+4. `Square`：`for v := range in` 直到上游关闭，然后 defer 关闭自己的输出。
+5. `Sum` 在当前 goroutine 里读完所有值。
+
+**易错点**
+
+- 任何一个阶段忘了 close，下游就永远阻塞，最终 `all goroutines are asleep - deadlock!` 或测试超时。
+- 如果下游中途不读了（比如只取前几个），上游会阻塞在发送上导致泄漏；完整的流水线还需要一个 `done` channel 或 context 来通知上游提前退出（见「能被 context 取消的生产者」）。
+
+=== conc-02-2
+--- explain
+**思路**
+
+`select` 带 `default` 时，如果其他 case 都不能立即进行，就执行 default，**不会阻塞**。接收时用 `v, ok := <-ch` 区分“读到了值”和“channel 已关闭”。
+
+**代码讲解**
+
+1. `TrySend(ch chan<- int, v int)`：参数是只写 channel。`case ch <- v` 能立即发送（有接收者在等，或者缓冲没满）就返回 true。
+2. `TryRecv(ch <-chan int)`：`case v, ok := <-ch` 能立即接收时进入；`ok == false` 表示已关闭且缓冲读空。
+3. 两个函数的 `default` 分别表示“现在发不了”和“现在没数据”。
+
+**各种 channel 状态下的行为**
+
+| 操作 | nil channel | 已关闭的 channel |
+| --- | --- | --- |
+| 发送 | 永远阻塞 | panic |
+| 接收 | 永远阻塞 | 立即返回零值，ok 为 false |
+| 关闭 | panic | panic |
+
+所以对 nil channel，`TrySend` / `TryRecv` 都会走 default。
+
+**易错点**
+
+- 在 for 循环里反复调用 `TryRecv` 而 default 什么都不做，会变成占满 CPU 的忙等待。
+- 已关闭的 channel 里如果还有缓冲数据，接收会先读到这些数据（ok 为 true）。
+
+=== conc-03-1
+--- explain
+**思路**
+
+`wg.Wait()` 只看调用那一刻的计数。如果 `Add` 放在 goroutine 里，主 goroutine 可能在任何 goroutine 被调度之前就执行了 `Wait`，此时计数是 0，`Wait` 立即返回。所以 **`Add` 必须在 `go` 语句之前、在启动方的 goroutine 里调用**。
+
+**代码讲解**
+
+1. `wg.Add(1)` 移到 `go func()` 前面。
+2. goroutine 里 `defer wg.Done()`，保证即使 `f` panic 也会减少计数（虽然 panic 本身会让程序崩溃）。
+3. `wg.Wait()` 之后，所有 `res[i]` 都已经写好；WaitGroup 同时保证了内存可见性（Done 之前的写入对 Wait 之后的读取可见）。
+
+**易错点**
+
+- 知道任务总数时也可以在循环前一次性 `wg.Add(len(items))`。
+- WaitGroup 不能复制，作为参数要传指针；最好不传，直接用闭包捕获。
+- Go 1.25 新增了 `wg.Go(func() { ... })`，自动完成 Add 和 Done，从根本上避免这个错误。
+
+=== conc-04-1
+--- explain
+**思路**
+
+读多写少的配置用 `sync.RWMutex`：读锁可以被多个 goroutine 同时持有，写锁独占。`Snapshot` 不能直接返回内部的 map——返回后调用方读写它时没有锁保护，会和之后的 `Set` 产生数据竞争，所以要**在读锁内复制一份**再返回。
+
+**代码讲解**
+
+1. `Get`：`RLock` + `defer RUnlock`，comma-ok 返回是否存在。
+2. `Set`：`Lock` + `defer Unlock`。
+3. `Snapshot`：在读锁内 `maps.Clone(c.data)`（Go 1.21+），返回一个全新的 map。
+4. 所有方法都是指针接收者，避免复制锁。
+
+**易错点**
+
+- 返回内部 map 的引用是并发代码里很常见的数据竞争来源，切片也一样。
+- 写操作很频繁时，RWMutex 的读锁计数本身会成为争用点，性能可能不如普通 Mutex。
+- 配置几乎不变时，更高效的做法是 `atomic.Pointer[map[string]string]`：每次更新都创建新 map 并整体替换，读完全无锁（写时复制）。
+
+=== conc-05-1
+--- explain
+**思路**
+
+`select` 同时等待多个 channel，哪个先就绪就执行哪个。把一个定时器的 channel 也放进 select，就实现了超时。
+
+**代码讲解**
+
+1. `timer := time.NewTimer(timeout)`，`defer timer.Stop()`：函数返回时停止定时器，释放资源。
+2. 三个 case：a 先到、b 先到、定时器先到。
+3. 超时返回包级哨兵错误 `ErrTimeout`，调用方可以用 `errors.Is` 判断。
+
+**易错点**
+
+- `time.After(d)` 每次调用都会创建一个新的定时器，在高频循环里使用会产生大量定时器（Go 1.23 之前在到期前无法被回收）。函数里只用一次的话 `time.After` 也没问题，但养成用 `NewTimer` + `Stop` 的习惯更稳妥。
+- 如果 a、b 的发送方用的是无缓冲 channel，超时返回后它们的发送会永远阻塞，造成 goroutine 泄漏，这需要发送方配合（缓冲 channel 或 context）。
+
+=== conc-05-2
+--- explain
+**思路**
+
+已关闭的 channel 永远可读（立即返回零值），如果一直留在 select 里，就会被反复选中，变成忙循环。**nil channel 永远不会就绪**，把已关闭的 channel 变量设为 nil，对应的 case 就相当于被禁用了。两个都为 nil 时退出循环。
+
+**代码讲解**
+
+1. 命名返回值 `(sum, count int)`，最后 `return sum, count`。
+2. `for a != nil || b != nil`：还有没关闭的就继续。
+3. `case v, ok := <-a`：`!ok` 时 `a = nil` 并 `continue`，不计入结果。
+4. 正常值累加。
+
+**易错点**
+
+- 不设置 nil 而是用 `break`：在 select 里 break 只会跳出 select，不会退出 for 循环。
+- 参数 `a, b` 是函数的局部变量，设为 nil 不影响调用方的 channel。
+
+=== conc-06-1
+--- explain
+**思路**
+
+带缓冲的 channel 天然就是一个**计数信号量**：容量为 limit，发送一个值表示“占用一个名额”，缓冲满了再发送就会阻塞；接收一个值表示“释放名额”。
+
+**代码讲解**
+
+1. `sem := make(chan struct{}, limit)`：`struct{}` 不占空间，只当令牌。
+2. `sem <- struct{}{}` 写在**启动 goroutine 之前**：名额满时主循环会阻塞，不会一下子创建所有 goroutine。
+3. goroutine 里用一个 defer 同时释放名额和 `wg.Done()`。
+4. `wg.Wait()` 等所有任务完成。
+
+**易错点**
+
+- 把获取名额放在 goroutine 里面也能限制“同时运行”的数量，但所有 goroutine 会一次性被创建出来（大部分阻塞着），任务很多时浪费内存。
+- `limit <= 0` 时 `make(chan struct{}, 0)` 是无缓冲 channel，第一次发送就会永远阻塞，调用前应该校验参数。
+- 标准扩展库有现成的 `golang.org/x/sync/semaphore`（支持带权重和 context），以及 `errgroup.Group.SetLimit`。
+
+=== conc-06-2
+--- explain
+**思路**
+
+worker 池：固定启动 `workers` 个 goroutine，从同一个任务 channel 里取任务。主 goroutine 发完所有任务后**关闭** channel，worker 的 `for range` 读完剩余任务后自然退出，最后用 WaitGroup 等所有 worker 结束。
+
+**代码讲解**
+
+1. `type job struct { idx, val int }`：把下标和值一起发送，结果才能写回正确的位置，保证顺序。
+2. `jobs := make(chan job)`：无缓冲也可以，发送会等到某个 worker 空闲。
+3. 先启动 worker，再发送任务；否则无缓冲 channel 的第一次发送就会死锁。
+4. `jobs <- job{i, v}`：按位置初始化结构体字面量（字段少时可以这样写）。
+5. `close(jobs)` 之后 `wg.Wait()`。
+
+**易错点**
+
+- 忘记 `close(jobs)`，worker 永远不会退出，`wg.Wait()` 死锁。
+- 和「信号量」写法相比，worker 池的 goroutine 数量是固定的，适合任务数量非常多或者 worker 需要持有资源（连接、缓冲区）的场景。
+
+=== conc-07-1
+--- explain
+**思路**
+
+`sync.Once.Do(f)` 保证 f 只执行一次，并且**所有调用者都会等到 f 执行完**才返回，所以 `Do` 之后读取 `l.val` 一定能看到初始化的结果，不会有数据竞争。
+
+**代码讲解**
+
+1. `Lazy[T any]` 是泛型结构体，保存 once、初始化函数和缓存的值。
+2. `NewLazy` 返回指针：结构体里有 `sync.Once`，不能被复制。
+3. `Get()`：`l.once.Do(func() { l.val = l.init() })` 然后返回 `l.val`。
+
+**易错点**
+
+- 自己用“检查 nil 再初始化”的方式实现（不加锁）会有数据竞争，多个 goroutine 可能同时初始化。
+- 初始化函数 panic 后，Once 也认为已经执行过了，之后的 `Get` 会返回零值。
+- 标准库已经提供了同样的功能：`sync.OnceValue(f)` 返回一个只会执行一次 f 的函数（Go 1.21+）；`sync.OnceValues` 还能缓存 error。
+
+=== conc-07-2
+--- explain
+**思路**
+
+双重检查：
+
+1. **快速路径**：原子读 `done`，已经初始化过就直接返回，不加锁，开销极小。
+2. **慢速路径**：加锁后再检查一次（因为在等锁的时候可能已经被别人初始化了），仍然是 0 才执行 f。
+
+关键在于 `done` 要在 f **执行完之后**才设置为 1。
+
+**代码讲解**
+
+1. `done atomic.Uint32`：类型化的原子变量。
+2. `if o.done.Load() == 1 { return }`。
+3. `o.m.Lock(); defer o.m.Unlock()`：其他并发调用者会阻塞在这里，直到 f 执行完毕。
+4. 第二次检查 `o.done.Load() == 0`。
+5. `defer o.done.Store(1)` 然后 `f()`：用 defer 保证 f panic 时也会标记为已执行；而且两个 defer 的执行顺序是先 Store 再 Unlock。
+
+**易错点**
+
+- 用 CAS 实现 `if o.done.CompareAndSwap(0, 1) { f() }` 是**错误的**：第二个调用者看到 done 为 1 直接返回时，f 可能还没执行完，它拿到的是未初始化的数据。标准库的源码注释专门讨论了这一点。
+- 快速路径的原子读同时保证了内存可见性：看到 done == 1 时，f 里的写入一定也可见。
+
+=== conc-08-1
+--- explain
+**思路**
+
+无缓冲 channel 的发送要等到有人接收才能完成。只接收了第一个结果后，其余的 goroutine 永远卡在 `ch <- f()` 上，这就是**goroutine 泄漏**：它们占用的栈和引用的对象永远不会被释放。最简单的修复是把 channel 的**缓冲设为 fetcher 的数量**，所有发送都能立即完成，goroutine 随之退出。
+
+**代码讲解**
+
+1. `ch := make(chan string, len(fetchers))`：缓冲足够容纳所有结果。
+2. 每个 fetcher 一个 goroutine：`go func() { ch <- f() }()`。
+3. `return <-ch`：取最先到达的那个；其余结果留在缓冲里，channel 不再被引用后会被 GC 回收。
+
+**易错点**
+
+- 缓冲只解决了“发送阻塞”，fetcher 本身仍然会运行到结束。如果 fetcher 很慢或有副作用，应该再传一个 context，拿到第一个结果后 `cancel()` 让其他 fetcher 尽快退出。
+- 排查泄漏：`runtime.NumGoroutine()` 持续增长是信号；`/debug/pprof/goroutine?debug=1` 能看到所有 goroutine 卡在哪一行；测试里可以用 `go.uber.org/goleak`。
+
+=== conc-08-2
+--- explain
+**思路**
+
+生产者在两个地方可能阻塞：等待下游接收时、以及（如果有）等待上游数据时。只在循环开头检查 `ctx.Done()` 是不够的——下游不再读取后，生产者会永远卡在发送上。所以要把**发送本身放进 select**，同时监听 `ctx.Done()`。
+
+**代码讲解**
+
+1. `out := make(chan int)`，goroutine 里 `defer close(out)`：退出时关闭，下游的 range 能结束。
+2. `for i := 0; ; i++`：条件留空的无限循环。
+3. `select { case out <- i: case <-ctx.Done(): return }`：哪个先就绪执行哪个。
+
+**易错点**
+
+- 写成 `if ctx.Err() != nil { return }; out <- i`：取消发生在发送阻塞期间时无法感知，goroutine 泄漏。
+- 下游在取消之后如果还在 range 读取，可能还会读到一两个值（select 在两个都就绪时随机选择），这是正常的；需要严格不读时，下游也应该检查 ctx。
+
+=== conc-09-1
+--- explain
+**思路**
+
+`context.WithTimeout(parent, d)` 派生一个子 context，`d` 到期或父 context 结束时它都会结束（取较早的那个时间）。返回的 `cancel` **必须调用**：它会释放内部的定时器，并把子 context 从父 context 的子节点列表中移除。
+
+**代码讲解**
+
+1. `ctx, cancel := context.WithTimeout(ctx, d)`：用同名变量遮蔽参数 ctx，后面的代码只能看到新的子 context，不会误用父 context。
+2. `defer cancel()`：函数返回时取消，测试会检查 work 拿到的 ctx 在返回后已经结束。
+3. `return work(ctx)`：直接返回 work 的两个返回值。
+
+**易错点**
+
+- 不调用 cancel，定时器和子 context 要等到超时或父 context 结束才释放，`go vet` 会报 `the cancel function is not used on all paths (possible context leak)`。
+- 超时后的错误是 `context.DeadlineExceeded`，可以用 `errors.Is(err, context.DeadlineExceeded)` 判断。
+- context 的取消是**协作式**的，work 必须自己检查 `ctx.Done()`，否则超时也停不下来。
+
+=== conc-09-2
+--- explain
+**思路**
+
+`time.Sleep` 不能被中断。用定时器的 channel 和 `ctx.Done()` 一起 select：哪个先到就按哪个返回。
+
+**代码讲解**
+
+1. `timer := time.NewTimer(d)` 和 `defer timer.Stop()`：提前返回时停止定时器，及时释放资源。
+2. `case <-timer.C: return nil`：正常睡完。
+3. `case <-ctx.Done(): return ctx.Err()`：被取消时返回 `context.Canceled` 或 `context.DeadlineExceeded`。
+
+**易错点**
+
+- 用 `time.After(d)` 代替 NewTimer 也能工作，但 ctx 先结束时那个定时器在 Go 1.23 之前要等到 d 到期才会被回收。
+- 这个函数常用在重试逻辑里：`for attempt := ...; { if err := Sleep(ctx, backoff); err != nil { return err } }`，服务关闭时能立即退出等待。
+
+=== conc-10-1
+--- explain
+**思路**
+
+CAS（Compare-And-Swap）是一条原子指令：“如果当前值是 old，就改成 new，返回是否成功”。加锁就是不断尝试把状态从 0（未锁）CAS 成 1（已锁），成功的那个 goroutine 拿到锁。
+
+**代码讲解**
+
+1. `state atomic.Int32`：零值是 0，未加锁，零值可用。
+2. `Lock`：`for !l.state.CompareAndSwap(0, 1) { runtime.Gosched() }`，失败就让出 CPU，让持有锁的 goroutine 有机会运行并解锁。
+3. `Unlock`：`l.state.Store(0)`，原子写，同时保证临界区内的写入对下一个加锁者可见。
+4. `TryLock`：只尝试一次，返回是否成功。
+
+**易错点**
+
+- 不调用 `Gosched` 的纯自旋，在 GOMAXPROCS=1 或者 goroutine 很多时会白白浪费 CPU，甚至长时间拿不到锁。
+- 自旋锁只适合**临界区极短**的场景；业务代码直接用 `sync.Mutex`，它会先自旋几次，失败后把 goroutine 挂起排队，还有饥饿模式防止某个 goroutine 一直抢不到锁。

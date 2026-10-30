@@ -1,0 +1,554 @@
+Go 运行时新增题目（RT-19 ~ RT-24）的编程任务。
+
+=== rt-19-1
+title: 使用 Go 1.24 weak.Pointer 与 unique.Make 实现弱引用缓存与标签驻留
+--- desc
+使用 Go 1.24 标准库 `weak` 和 `unique` 实现两个功能：
+
+1. `InternTags(tags []string) []unique.Handle[string]`：将输入字符串切片转换为驻留句柄切片（相同的字符串共享同一个 `unique.Handle[string]`，可直接用 `==` 比较）；
+2. 为 `WeakBlobCache` 实现 `GetOrLoad(key string, loader func(string) *[]byte) *[]byte`：
+   - 内部用 `map[string]weak.Pointer[[]byte]` 保存弱指针；
+   - 如果 `key` 存在且 `wp.Value() != nil`，直接返回缓存的指针；
+   - 否则调用 `loader(key)` 拿到新指针，用 `weak.Make` 存入 map 并返回。
+--- solution
+package main
+
+import (
+	"sync"
+	"unique"
+	"weak"
+)
+
+func InternTags(tags []string) []unique.Handle[string] {
+	out := make([]unique.Handle[string], len(tags))
+	// @solution
+	for i, t := range tags {
+		out[i] = unique.Make(t)
+	}
+	// @starter
+	// // TODO: 使用 unique.Make 将每个 tag 转为 Handle
+	// @end
+	return out
+}
+
+type WeakBlobCache struct {
+	mu sync.Mutex
+	m  map[string]weak.Pointer[[]byte]
+}
+
+func NewWeakBlobCache() *WeakBlobCache {
+	return &WeakBlobCache{m: make(map[string]weak.Pointer[[]byte])}
+}
+
+func (c *WeakBlobCache) GetOrLoad(key string, loader func(string) *[]byte) *[]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// @solution
+	if wp, ok := c.m[key]; ok {
+		if ptr := wp.Value(); ptr != nil {
+			return ptr
+		}
+	}
+	ptr := loader(key)
+	c.m[key] = weak.Make(ptr)
+	return ptr
+	// @starter
+	// return nil // TODO: 先检查弱指针 Value() 是否非 nil，否则调用 loader 并用 weak.Make 存入
+	// @end
+}
+--- test
+package main
+
+import (
+	"runtime"
+	"testing"
+)
+
+func TestInternTags(t *testing.T) {
+	// 构造两个不同底层数组但内容相等的字符串
+	s1 := string([]byte{'p', 'r', 'o', 'd'})
+	s2 := string([]byte{'p', 'r', 'o', 'd'})
+	handles := InternTags([]string{s1, s2, "staging"})
+	if len(handles) != 3 {
+		t.Fatalf("len = %d, want 3", len(handles))
+	}
+	if handles[0] != handles[1] || handles[0].Value() != "prod" {
+		t.Fatalf("expected identical handles for equal strings")
+	}
+	if handles[0] == handles[2] {
+		t.Fatalf("expected different handles for prod and staging")
+	}
+}
+
+func TestWeakBlobCache(t *testing.T) {
+	cache := NewWeakBlobCache()
+	loads := 0
+	loader := func(k string) *[]byte {
+		loads++
+		b := make([]byte, 1024)
+		b[0] = byte(loads)
+		return &b
+	}
+
+	// 保持强引用 p1 期间，第二次 GetOrLoad 应该直接命中缓存
+	p1 := cache.GetOrLoad("k1", loader)
+	p2 := cache.GetOrLoad("k1", loader)
+	if p1 != p2 || loads != 1 {
+		t.Fatalf("expected cache hit while strong ref alive, loads=%d", loads)
+	}
+	runtime.KeepAlive(p1)
+	runtime.KeepAlive(p2)
+}
+--- explain
+**思路**
+
+1. `unique.Make(t)` 将值放入全局驻留表中，返回 `unique.Handle[string]`，内容相等的 `string` 必定返回相等的 `Handle`。
+2. `weak.Make(ptr)` 创建指向 `*[]byte` 的弱指针 `weak.Pointer[[]byte]`，读取时调用 `wp.Value()`：只要外部仍有强引用（或尚未被 GC 回收），它就返回非 `nil` 的原指针；一旦被 GC 回收则返回 `nil`，触发重新加载。
+
+**代码讲解**
+
+1. `out[i] = unique.Make(t)`：每个字符串转为规范化句柄。
+2. `if ptr := wp.Value(); ptr != nil { return ptr }`：把 `wp.Value()` 赋给局部变量 `ptr`，一旦拿到了非 `nil` 的 `*[]byte`，这个局部变量 `ptr` 本身就构成了新的强引用，保证返回给调用方期间绝不会被 GC 回收！
+
+**易错点**
+
+- 千万不要写成 `if wp.Value() != nil { return wp.Value() }`（調用两次 `wp.Value()`）：如果第一次判断非 `nil` 后刚好发生 GC 把对象回收了，第二次调用 `wp.Value()` 就会返回 `nil`！必须只调用一次赋给局部变量 `ptr` 再判断。
+
+=== rt-20-1
+title: 用 runtime/metrics 读取运行时指标与计算直方图分位数
+--- desc
+实现两个函数：
+
+1. `ReadGoroutineAndHeapMetrics() (goroutines uint64, heapAllocBytes uint64)`：使用 `runtime/metrics.Read` 读取当前存活 goroutine 数（`"/sched/goroutines:goroutines"`）和累计堆分配字节数（`"/gc/heap/allocs:bytes"`）；
+2. `HistogramQuantile(h *metrics.Float64Histogram, q float64) float64`：根据 `runtime/metrics` 的直方图结构（`h.Counts` 为各桶计数，`h.Buckets` 长度为 `len(Counts)+1`，第 `i` 个桶的上界为 `h.Buckets[i+1]`），找出累计计数首次达到 `ceil(total * q)`（当 `q <= 0` 时取第 1 个非空桶上界）所在桶的上界 `h.Buckets[i+1]`；若总计数为 0 则返回 `0`。
+--- solution
+package main
+
+import (
+	"math"
+	"runtime/metrics"
+)
+
+func ReadGoroutineAndHeapMetrics() (goroutines uint64, heapAllocBytes uint64) {
+	// @solution
+	samples := []metrics.Sample{
+		{Name: "/sched/goroutines:goroutines"},
+		{Name: "/gc/heap/allocs:bytes"},
+	}
+	metrics.Read(samples)
+	return samples[0].Value.Uint64(), samples[1].Value.Uint64()
+	// @starter
+	// return 0, 0 // TODO: 使用 metrics.Read 读取两个指标
+	// @end
+}
+
+func HistogramQuantile(h *metrics.Float64Histogram, q float64) float64 {
+	// @solution
+	var total uint64
+	for _, c := range h.Counts {
+		total += c
+	}
+	if total == 0 {
+		return 0
+	}
+	target := uint64(math.Ceil(float64(total) * q))
+	if target == 0 {
+		target = 1
+	}
+	var cum uint64
+	for i, c := range h.Counts {
+		cum += c
+		if cum >= target {
+			return h.Buckets[i+1]
+		}
+	}
+	return h.Buckets[len(h.Buckets)-1]
+	// @starter
+	// return 0 // TODO: 累加 h.Counts 找到达到 target 的桶并返回对应上界 h.Buckets[i+1]
+	// @end
+}
+--- test
+package main
+
+import (
+	"runtime/metrics"
+	"testing"
+)
+
+func TestReadGoroutineAndHeapMetrics(t *testing.T) {
+	g, heap := ReadGoroutineAndHeapMetrics()
+	if g == 0 {
+		t.Fatal("goroutines metric should be > 0")
+	}
+	if heap == 0 {
+		t.Fatal("heap live bytes should be > 0")
+	}
+}
+
+func TestHistogramQuantile(t *testing.T) {
+	h := &metrics.Float64Histogram{
+		Buckets: []float64{0, 0.001, 0.005, 0.010, 0.100},
+		Counts:  []uint64{50, 40, 9, 1}, // 总共 100 个样本
+	}
+	if got := HistogramQuantile(h, 0.50); got != 0.001 {
+		t.Fatalf("p50 = %v, want 0.001", got)
+	}
+	if got := HistogramQuantile(h, 0.90); got != 0.005 {
+		t.Fatalf("p90 = %v, want 0.005", got)
+	}
+	if got := HistogramQuantile(h, 0.99); got != 0.010 {
+		t.Fatalf("p99 = %v, want 0.010", got)
+	}
+	if got := HistogramQuantile(h, 1.00); got != 0.100 {
+		t.Fatalf("p100 = %v, want 0.100", got)
+	}
+	empty := &metrics.Float64Histogram{
+		Buckets: []float64{0, 1},
+		Counts:  []uint64{0},
+	}
+	if got := HistogramQuantile(empty, 0.99); got != 0 {
+		t.Fatalf("empty histogram quantile = %v, want 0", got)
+	}
+}
+--- explain
+**思路**
+
+`metrics.Read` 接收一个预先填充好 `Name` 字段的 `[]metrics.Sample` 切片，无 STW 地将当前值填入每个元素的 `Value` 中；直方图 `Float64Histogram` 的第 `i` 个桶 `Counts[i]` 对应区间 `[Buckets[i], Buckets[i+1])`，累加 `Counts` 直到达到目标排名 `ceil(total * q)`，返回该桶的上界 `Buckets[i+1]`。
+
+**代码讲解**
+
+1. `samples[0].Value.Uint64()`：这两个指标的类型都是 `KindUint64`，直接用 `.Uint64()` 取出。
+2. `target := uint64(math.Ceil(float64(total) * q))`：例如 100 个样本求 p99，第 99 个样本落在下标为 2 的桶（累计 $50+40+9 = 99$），上界为 `Buckets[3] = 0.010`。
+
+**易错点**
+
+- 访问 `sample.Value.Uint64()` 前ต้อง确认指标名称拼写完全正确；如果指标名拼错，`Value.Kind()` 会是 `KindBad`，此时调 `Uint64()` 会触发 panic。
+
+=== rt-21-1
+title: 模拟 PGO 接口去虚拟化（Devirtualization）与热路径分发
+--- desc
+在 PGO（Profile-Guided Optimization）中，当编译器从生产 CPU Profile 发现某个接口调用 `Adder.Add(a, b)` 绝大多数时候都是具体类型 `FastAdder` 时，会自动生成具体类型判断分支以实现内联。
+
+请实现 `SumPairs(adder Adder, pairs [][2]int) int`：
+
+- 先通过类型断言判断 `adder` 是否为值类型 `FastAdder`（或指针 `*FastAdder`）；
+- 如果是，直接在循环外转换并调用其具体方法累加所有 `pairs[i][0] + pairs[i][1]`（使编译器能够内联整个循环体）；
+- 否则回退到通过 `Adder` 接口方法调用。
+--- solution
+package main
+
+type Adder interface {
+	Add(a, b int) int
+}
+
+type FastAdder struct {
+	 Bias int
+}
+
+func (f FastAdder) Add(a, b int) int {
+	return a + b + f.Bias
+}
+
+func SumPairs(adder Adder, pairs [][2]int) int {
+	total := 0
+	// @solution
+	switch concrete := adder.(type) {
+	case FastAdder:
+		for _, p := range pairs {
+			total += concrete.Add(p[0], p[1])
+		}
+	case *FastAdder:
+		for _, p := range pairs {
+			total += concrete.Add(p[0], p[1])
+		}
+	default:
+		for _, p := range pairs {
+			total += adder.Add(p[0], p[1])
+		}
+	}
+	// @starter
+	// // TODO: 对 FastAdder / *FastAdder 做去虚拟化分支处理并求和
+	// @end
+	return total
+}
+--- test
+package main
+
+import "testing"
+
+type customAdder struct{}
+
+func (customAdder) Add(a, b int) int { return (a + b) * 2 }
+
+func TestSumPairsDevirtualized(t *testing.T) {
+	pairs := [][2]int{{1, 2}, {3, 4}, {5, 6}}
+	if got := SumPairs(FastAdder{Bias: 1}, pairs); got != 24 {
+		t.Fatalf("FastAdder value: got %d, want 24", got)
+	}
+	if got := SumPairs(&FastAdder{Bias: 10}, pairs); got != 51 {
+		t.Fatalf("*FastAdder ptr: got %d, want 51", got)
+	}
+	if got := SumPairs(customAdder{}, pairs); got != 42 {
+		t.Fatalf("customAdder fallback: got %d, want 42", got)
+	}
+}
+--- explain
+**思路**
+
+在循环外部使用 `switch concrete := adder.(type)` 将接口去虚拟化（Devirtualize）为具体类型 `FastAdder` 或 `*FastAdder`。在具体类型的分支循环中，`concrete.Add` 是静态方法调用，Go 编译器可以直接将其内联为 `a + b + concrete.Bias` 寄存器加法，完全消除了每次循环的 `itab` 查表开销。
+
+**代码讲解**
+
+1. `switch concrete := adder.(type)`：在进入高频循环前只做一次类型派发。
+2. `case FastAdder` / `case *FastAdder`：循环内部直接调用静态类型的方法。
+3. `default`：保留接口兜底分支，保证对任意其他实现类（如测试中的 `customAdder`）100% 行为正确。
+
+**易错点**
+
+- 把类型断言放在循环外部比放在每次循环内部更高效，还能帮助编译器对整个循环做向量化或寄存器分配优化。
+
+=== rt-22-1
+title: 解析 GODEBUG 环境变量键值配置
+--- desc
+Go 运行时通过 `GODEBUG` 环境变量接收逗号分隔的 `key=value` 配置串（例如 `"gctrace=1,schedtrace=1000,asyncpreemptoff=1"`）。
+
+请实现 `ParseGODEBUG(env string) map[string]string`：
+
+- 按逗号 `,` 切分配置项；
+- 忽略空白项或不含 `=`（或 `key` 为空）的非法项；
+- 如果同一个 `key` 在字符串中出现了多次（例如 `"gctrace=1,schedtrace=500,gctrace=0"`），**后面的值覆盖前面的值**（与 Go 运行时的解析规则一致）。
+--- solution
+package main
+
+import "strings"
+
+func ParseGODEBUG(env string) map[string]string {
+	out := make(map[string]string)
+	// @solution
+	for _, part := range strings.Split(env, ",") {
+		part = strings.TrimSpace(part)
+		k, v, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		if k != "" {
+			out[k] = v
+		}
+	}
+	// @starter
+	// // TODO: 用 strings.Split 和 strings.Cut 解析 key=value 对
+	// @end
+	return out
+}
+--- test
+package main
+
+import (
+	"maps"
+	"testing"
+)
+
+func TestParseGODEBUG(t *testing.T) {
+	got := ParseGODEBUG("gctrace=1, schedtrace=1000, invalid, =bad, gctrace=0")
+	want := map[string]string{
+		"gctrace":    "0",
+		"schedtrace": "1000",
+	}
+	if !maps.Equal(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	if empty := ParseGODEBUG(""); len(empty) != 0 {
+		t.Fatalf("expected empty map, got %v", empty)
+	}
+}
+--- explain
+**思路**
+
+按逗号拆分后，对每一段使用 Go 1.18 引入的 `strings.Cut(part, "=")` 拆出 `key` 和 `value`。顺序写入 `map` 天然满足“同名 key 后出现的值覆盖先出现的值”。
+
+**代码讲解**
+
+1. `strings.Split(env, ",")`：按逗号分隔各项。
+2. `k, v, ok := strings.Cut(part, "=")`：找到第一个 `=` 号切分；若不含 `=` 则 `ok == false` 直接跳过。
+3. `if k != ""`：过滤掉类似 `"=bad"` 的空键名。
+
+**易错点**
+
+- 如果某个值本身包含 `=`，使用 `strings.Cut` 只在第一个 `=` 处切分，比 `strings.Split(part, "=")` 更稳健。
+
+=== rt-23-1
+title: 计算内存分配器 Size Class 内部碎片率与对齐优化
+--- desc
+Go 内存分配器将小对象向上取整到固定的 Size Class 规格中：
+
+给定简化的规格表 `sizeClasses = []int{8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256}`：
+
+1. 实现 `RoundUpSizeClass(reqSize int) int`：对于 `1 <= reqSize <= 256`，返回第一个 `>= reqSize` 的规格大小；若 `reqSize <= 0` 返回 `0`，若 `reqSize > 256` 原样返回 `reqSize`；
+2. 实现 `WastedBytes(reqSize, count int) int`：计算分配 `count` 个大小为 `reqSize` 的对象时，因 Size Class 向上取整而多消耗的内部碎片总字节数 `(actualSize - reqSize) * count`。
+--- solution
+package main
+
+var sizeClasses = []int{8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256}
+
+func RoundUpSizeClass(reqSize int) int {
+	if reqSize <= 0 {
+		return 0
+	}
+	// @solution
+	for _, sc := range sizeClasses {
+		if sc >= reqSize {
+			return sc
+		}
+	}
+	return reqSize
+	// @starter
+	// return 0 // TODO: 查找第一个 >= reqSize 的 size class
+	// @end
+}
+
+func WastedBytes(reqSize, count int) int {
+	if reqSize <= 0 || count <= 0 {
+		return 0
+	}
+	// @solution
+	actual := RoundUpSizeClass(reqSize)
+	return (actual - reqSize) * count
+	// @starter
+	// return 0 // TODO: 计算 (RoundUpSizeClass(reqSize) - reqSize) * count
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestSizeClassFragmentation(t *testing.T) {
+	if got := RoundUpSizeClass(32); got != 32 {
+		t.Fatalf("RoundUpSizeClass(32) = %d, want 32", got)
+	}
+	// 33 字节刚好跨过 32 字节边界，跳到 48 字节规格
+	if got := RoundUpSizeClass(33); got != 48 {
+		t.Fatalf("RoundUpSizeClass(33) = %d, want 48", got)
+	}
+	// 100 万个 33 字节对象会浪费 15MB 内部碎片，而 32 字节对象浪费为 0！
+	if wasted := WastedBytes(33, 1_000_000); wasted != 15_000_000 {
+		t.Fatalf("WastedBytes(33, 1e6) = %d, want 15000000", wasted)
+	}
+	if wasted := WastedBytes(32, 1_000_000); wasted != 0 {
+		t.Fatalf("WastedBytes(32, 1e6) = %d, want 0", wasted)
+	}
+}
+--- explain
+**思路**
+
+按升序遍历 `sizeClasses` 找到第一个 `>= reqSize` 的槽位规格 `actual`，单个对象的内部碎片为 `actual - reqSize`，乘以对象数量 `count` 即为总内部碎片字节数。
+
+**代码讲解**
+
+1. `for _, sc := range sizeClasses`：由于规格表已按升序排列，第一个满足 `sc >= reqSize` 的就是最小可用规格（也可以用 `slices.BinarySearch` 二分查找）。
+2. `(actual - reqSize) * count`：直观体现为什么结构体从 33B 优化到 32B 能省下 31% 的内存。
+
+**易错点**
+
+- 注意处理 `reqSize <= 0` 和 `reqSize > 256` 的边界返回。
+
+=== rt-24-1
+title: 解析 runtime.Stack 调用栈文本统计各阻塞状态的 goroutine 数量
+--- desc
+当线上拉取 `/debug/pprof/goroutine?debug=2` 或调用 `runtime.Stack(buf, true)` 时，每个 goroutine 的第一行格式如下：
+
+```text
+goroutine 1 [running]:
+main.main()
+	/app/main.go:10 +0x25
+
+goroutine 18 [chan receive, 5 minutes]:
+main.worker()
+	/app/main.go:20 +0x40
+
+goroutine 19 [IO wait]:
+internal/poll.runtime_pollWait()
+```
+
+请实现 `CountGoroutineStates(stackDump string) map[string]int`：解析文本中所有以 `"goroutine "` 开头且包含 `[...]` 的标题行，提取方括号中逗号 `,` 之前的**基础状态名**（如 `"running"`、`"chan receive"`、`"IO wait"`），统计每种状态的 goroutine 数量。
+--- solution
+package main
+
+import "strings"
+
+func CountGoroutineStates(stackDump string) map[string]int {
+	counts := make(map[string]int)
+	// @solution
+	for _, line := range strings.Split(stackDump, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "goroutine ") {
+			continue
+		}
+		openIdx := strings.IndexByte(line, '[')
+		closeIdx := strings.IndexByte(line, ']')
+		if openIdx < 0 || closeIdx <= openIdx {
+			continue
+		}
+		inside := line[openIdx+1 : closeIdx]
+		state, _, _ := strings.Cut(inside, ",")
+		state = strings.TrimSpace(state)
+		if state != "" {
+			counts[state]++
+		}
+	}
+	// @starter
+	// // TODO: 解析 "goroutine <id> [<state>, ...]:" 行并按基础 state 聚合计数
+	// @end
+	return counts
+}
+--- test
+package main
+
+import (
+	"maps"
+	"testing"
+)
+
+func TestCountGoroutineStates(t *testing.T) {
+	dump := `
+goroutine 1 [running]:
+main.main()
+	/app/main.go:12 +0x25
+
+goroutine 34 [chan receive, 12 minutes]:
+main.consumer()
+	/app/main.go:40 +0x60
+
+goroutine 35 [chan receive]:
+main.consumer()
+	/app/main.go:40 +0x60
+
+goroutine 50 [IO wait, 2 minutes]:
+net.(*netFD).Read()
+`
+	got := CountGoroutineStates(dump)
+	want := map[string]int{
+		"running":      1,
+		"chan receive": 2,
+		"IO wait":      1,
+	}
+	if !maps.Equal(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+--- explain
+**思路**
+
+逐行扫描调用栈文本，识别以 `"goroutine "` 开头的协程头行，截取 `[` 与 `]` 之间的内容，再用 `strings.Cut(inside, ",")` 去掉后面的阻塞时长（如 `", 12 minutes"`），保留前面的核心等待原因字符串做哈希计数。
+
+**代码讲解**
+
+1. `strings.HasPrefix(line, "goroutine ")`：只处理每个协程块的第一行标题。
+2. `line[openIdx+1 : closeIdx]`：提取方括号内的状态描述。
+3. `state, _, _ := strings.Cut(inside, ",")`：无论有没有 `, N minutes` 后缀，`strings.Cut` 的第一个返回值 `state` 都是逗号前的内容（没有逗号时返回整个 `inside`），非常简洁。
+
+**易错点**
+
+- 不要直接把带分钟数的完整字符串作为 key，否则 `"chan receive"` 和 `"chan receive, 12 minutes"` 会被分到两个不同的统计桶里。

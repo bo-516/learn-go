@@ -1,0 +1,824 @@
+数据库与缓存新增题目（DB-32 ~ DB-39）的编程任务。
+
+=== db-32-1
+title: 模拟索引下推（ICP）与 MRR 顺序回表优化
+--- desc
+模拟 InnoDB 的二级索引查询加上 **ICP（索引下推）** 与 **MRR（Multi-Range Read）**：
+
+二级索引条目 `IndexEntry` 包含 `(Category, Price, Status, PrimaryKey)`，并且输入的 `entries` 已经按 `(Category, Price)` 排序。
+实现 `QueryByICPAndMRR(entries []IndexEntry, category string, minPrice, maxPrice int, targetStatus int) (rows []string, tableLookups int)`：
+
+1. 只挑选满足 `Category == category` 且 `minPrice <= Price <= maxPrice` 的二级索引项；
+2. **索引下推（ICP）**：在回表前，直接利用二级索引中的 `Status == targetStatus` 过滤掉不匹配的条目；
+3. **多范围读（MRR）**：对需要回表的 `PrimaryKey` 先**去重并按升序排序**，然后依次从聚簇索引表 `clusteredTable map[int64]string`（这里通过传入的 `fetchRow func(pk int64) string` 模拟）读取行数据，统计实际回表次数 `tableLookups`。
+--- solution
+package main
+
+import "slices"
+
+type IndexEntry struct {
+	Category   string
+	Price      int
+	Status     int
+	PrimaryKey int64
+}
+
+func QueryByICPAndMRR(
+	entries []IndexEntry,
+	category string,
+	minPrice, maxPrice int,
+	targetStatus int,
+	fetchRow func(pk int64) string,
+) (rows []string, tableLookups int) {
+	// @solution
+	var pks []int64
+	for _, e := range entries {
+		if e.Category != category || e.Price < minPrice || e.Price > maxPrice {
+			continue
+		}
+		// ICP：在二级索引层直接过滤 Status，避免无效回表
+		if e.Status != targetStatus {
+			continue
+		}
+		pks = append(pks, e.PrimaryKey)
+	}
+	// MRR：按主键升序排序并去重后再顺序回表
+	slices.Sort(pks)
+	pks = slices.Compact(pks)
+	rows = make([]string, 0, len(pks))
+	for _, pk := range pks {
+		tableLookups++
+		rows = append(rows, fetchRow(pk))
+	}
+	return rows, tableLookups
+	// @starter
+	// // TODO: 先用 ICP 过滤出满足条件的 PrimaryKey，再用 slices.Sort 升序排序后调用 fetchRow
+	// return nil, 0
+	// @end
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"slices"
+	"testing"
+)
+
+func TestQueryByICPAndMRR(t *testing.T) {
+	entries := []IndexEntry{
+		{Category: "book", Price: 30, Status: 1, PrimaryKey: 90},
+		{Category: "book", Price: 40, Status: 0, PrimaryKey: 20}, // Status 不匹配，应被 ICP 过滤不回表
+		{Category: "book", Price: 50, Status: 1, PrimaryKey: 10},
+		{Category: "book", Price: 60, Status: 0, PrimaryKey: 5},  // Status 不匹配
+		{Category: "book", Price: 70, Status: 1, PrimaryKey: 50},
+		{Category: "game", Price: 40, Status: 1, PrimaryKey: 1},
+	}
+	var visitedPKs []int64
+	rows, lookups := QueryByICPAndMRR(entries, "book", 25, 75, 1, func(pk int64) string {
+		visitedPKs = append(visitedPKs, pk)
+		return fmt.Sprintf("row-%d", pk)
+	})
+	if lookups != 3 {
+		t.Fatalf("tableLookups = %d, want 3 (ICP should skip status!=1)", lookups)
+	}
+	// 验证 MRR：回表顺序必须按主键升序 10 -> 50 -> 90，而不是原二级索引里的乱序 90 -> 10 -> 50
+	if !slices.Equal(visitedPKs, []int64{10, 50, 90}) {
+		t.Fatalf("visitedPKs = %v, want [10 50 90]", visitedPKs)
+	}
+	if !slices.Equal(rows, []string{"row-10", "row-50", "row-90"}) {
+		t.Fatalf("rows = %v", rows)
+	}
+}
+--- explain
+**思路**
+
+没有 ICP 时，范围条件 `25 <= Price <= 75` 命中的 5 条 `"book"` 记录都要先调用 `fetchRow(pk)` 回表，再过滤 `Status == 1`；有了 ICP 后，直接在扫描 `IndexEntry` 时检查 `e.Status == targetStatus`，将回表次数从 5 次降为 3 次。接着通过 `slices.Sort(pks)`（MRR）把原本乱序的主键 `[90, 10, 50]` 排成升序 `[10, 50, 90]`，实现聚簇索引的顺序页读取。
+
+**代码讲解**
+
+1. `if e.Status != targetStatus { continue }`：在二级索引扫描阶段直接完成过滤（ICP）。
+2. `slices.Sort(pks)` 和 `slices.Compact(pks)`：排序并去重主键值（MRR）。
+3. 按排好序的 `pks` 依次调用 `fetchRow(pk)` 并统计回表次数。
+
+**易错点**
+
+- 如果边扫二级索引边立刻调用 `fetchRow(e.PrimaryKey)`，回表顺序就是 `[90, 10, 50]`，失去了 MRR 顺序访问聚簇索引的效果。
+
+=== db-33-1
+title: 生成时间有序的 UUIDv7（RFC 9562）并提取毫秒时间戳
+--- desc
+InnoDB 使用随机 UUIDv4 作为主键会导致严重的 B+ 树页分裂，而 **UUIDv7（RFC 9562）** 将 48 位毫秒级 Unix 时间戳放在最前面的高 6 字节，使其天然按时间单调递增。
+
+请实现两个函数：
+
+1. `MakeUUIDv7(ms int64, randBytes [10]byte) [16]byte`：
+   - 前 6 个字节（`b[0..5]`）按**大端序（Big-Endian）**写入 `ms` 的低 48 位（毫秒时间戳）；
+   - 后 10 个字节（`b[6..15]`）先填入 `randBytes`；
+   - 将 `b[6]` 的高 4 位设为版本号 `7`（即 `0111xxxx`，`b[6] = (b[6] & 0x0f) | 0x70`）；
+   - 将 `b[8]` 的高 2 位设为 RFC 4122 变体 `10xxxxxx`（即 `b[8] = (b[8] & 0x3f) | 0x80`）。
+2. `ExtractUUIDv7Millis(u [16]byte) int64`：从 UUIDv7 的前 6 个字节还原出 48 位毫秒时间戳。
+--- solution
+package main
+
+func MakeUUIDv7(ms int64, randBytes [10]byte) [16]byte {
+	var b [16]byte
+	// @solution
+	ts := uint64(ms)
+	b[0] = byte(ts >> 40)
+	b[1] = byte(ts >> 32)
+	b[2] = byte(ts >> 24)
+	b[3] = byte(ts >> 16)
+	b[4] = byte(ts >> 8)
+	b[5] = byte(ts)
+	copy(b[6:], randBytes[:])
+	b[6] = (b[6] & 0x0f) | 0x70
+	b[8] = (b[8] & 0x3f) | 0x80
+	// @starter
+	// // TODO: 按大端序写入 48 位时间戳并设置 version(7) 和 variant 位
+	// @end
+	return b
+}
+
+func ExtractUUIDv7Millis(u [16]byte) int64 {
+	// @solution
+	ts := uint64(u[0])<<40 |
+		uint64(u[1])<<32 |
+		uint64(u[2])<<24 |
+		uint64(u[3])<<16 |
+		uint64(u[4])<<8 |
+		uint64(u[5])
+	return int64(ts)
+	// @starter
+	// return 0 // TODO: 从 u[0:6] 还原大端序毫秒时间戳
+	// @end
+}
+--- test
+package main
+
+import (
+	"bytes"
+	"testing"
+)
+
+func TestUUIDv7OrderAndTimestamp(t *testing.T) {
+	r := [10]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	u1 := MakeUUIDv7(1730000000000, r)
+	u2 := MakeUUIDv7(1730000000001, r)
+
+	// 验证版本号与变体位
+	if u1[6]>>4 != 7 {
+		t.Fatalf("version nibble = %d, want 7", u1[6]>>4)
+	}
+	if u1[8]>>6 != 0b10 {
+		t.Fatalf("variant bits = %02b, want 10", u1[8]>>6)
+	}
+	// 验证时间戳提取
+	if got := ExtractUUIDv7Millis(u1); got != 1730000000000 {
+		t.Fatalf("ExtractUUIDv7Millis = %d, want 1730000000000", got)
+	}
+	// 验证字节序单调递增（可直接用于 InnoDB BINARY(16) 主键顺序比较）
+	if bytes.Compare(u1[:], u2[:]) >= 0 {
+		t.Fatalf("expected u1 < u2 in lexicographical byte order")
+	}
+}
+--- explain
+**思路**
+
+为了让生成的 16 字节二进制主键在按字节序（`bytes.Compare` 或 MySQL `BINARY(16)`）比较时与时间先后顺序完全一致，前 6 个字节必须采用**大端序（Big-Endian，高位字节在前）**存储 48 位毫秒时间戳；随后按位掩码清除并写入 4 位版本号 `0x70` 和 2 位变体号 `0x80`。
+
+**代码讲解**
+
+1. `b[0] = byte(ts >> 40)` ～ `b[5] = byte(ts)`：将 48 位整数从最高字节到最低字节依次放入 `b[0..5]`。
+2. `b[6] = (b[6] & 0x0f) | 0x70`：`& 0x0f` 清零高 4 位，`| 0x70` 将高 4 位设为 `0111`（即十进制 7）。
+3. `b[8] = (b[8] & 0x3f) | 0x80`：`& 0x3f` 清零高 2 位，`| 0x80` 将高 2 位设为 `10`。
+
+**易错点**
+
+- 提取时间戳移位拼接时，必须先将 `u[i]` 转为 `uint64(u[i])` 再左移 `<< 40`，否则 `byte` 类型直接左移会溢出归零（编译报错）。
+
+=== db-34-1
+title: 根据 ROW 格式 Binlog 事件生成逆向闪回（Flashback）数据
+--- desc
+当 `binlog_format = ROW` 且 `binlog_row_image = FULL` 时，误操作可以通过反转 Binlog 事件来恢复（Flashback）：
+
+- `INSERT` 事件变为 `DELETE`（保留 `After` 作为 `Before`）；
+- `DELETE` 事件变为 `INSERT`（将原 `Before` 作为新 `After`）；
+- `UPDATE` 事件仍为 `UPDATE`，但将修改前镜像 `Before` 和修改后镜像 `After` **互换**；
+- 最终生成的回滚事件列表必须按原事件顺序**倒序排列**（后发生的修改先回滚）！
+
+请实现 `BuildFlashbackEvents(events []BinlogEvent) []BinlogEvent`。
+--- solution
+package main
+
+type OpType string
+
+const (
+	OpInsert OpType = "INSERT"
+	OpUpdate OpType = "UPDATE"
+	OpDelete OpType = "DELETE"
+)
+
+type BinlogEvent struct {
+	Op     OpType
+	Before map[string] string
+	After  map[string]string
+}
+
+func BuildFlashbackEvents(events []BinlogEvent) []BinlogEvent {
+	out := make([]BinlogEvent, 0, len(events))
+	// @solution
+	for i := len(events) - 1; i >= 0; i-- {
+		ev := events[i]
+		switch ev.Op {
+		case OpInsert:
+			out = append(out, BinlogEvent{Op: OpDelete, Before: ev.After})
+		case OpDelete:
+			out = append(out, BinlogEvent{Op: OpInsert, After: ev.Before})
+		case OpUpdate:
+			out = append(out, BinlogEvent{Op: OpUpdate, Before: ev.After, After: ev.Before})
+		}
+	}
+	// @starter
+	// // TODO: 从后往前遍历 events，反转操作类型与 Before/After 镜像
+	// @end
+	return out
+}
+--- test
+package main
+
+import (
+	"reflect"
+	"testing"
+)
+
+func TestBuildFlashbackEvents(t *testing.T) {
+	events := []BinlogEvent{
+		{Op: OpInsert, After: map[string]string{"id": "1", "val": "a"}},
+		{Op: OpUpdate, Before: map[string]string{"id": "1", "val": "a"}, After: map[string]string{"id": "1", "val": "b"}},
+		{Op: OpDelete, Before: map[string]string{"id": "1", "val": "b"}},
+	}
+	got := BuildFlashbackEvents(events)
+	want := []BinlogEvent{
+		{Op: OpInsert, After: map[string]string{"id": "1", "val": "b"}},
+		{Op: OpUpdate, Before: map[string]string{"id": "1", "val": "b"}, After: map[string]string{"id": "1", "val": "a"}},
+		{Op: OpDelete, Before: map[string]string{"id": "1", "val": "a"}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+--- explain
+**思路**
+
+如果同一行数据先后经历了 `INSERT (a) -> UPDATE (a->b) -> DELETE (b)`，回滚时必须**从后往前倒序执行**：先恢复最后被删掉的 `INSERT (b)`，再把 `b` 改回 `a`（`UPDATE b->a`），最后删掉最初插入的 `DELETE (a)`。
+
+**代码讲解**
+
+1. `for i := len(events) - 1; i >= 0; i--`：倒序遍历所有误操作事件。
+2. `OpInsert` 变 `OpDelete`（删除刚插入的 `ev.After`），`OpDelete` 变 `OpInsert`（重新插入被删掉的 `ev.Before`），`OpUpdate` 交换 `Before` 和 `After`。
+
+**易错点**
+
+- 如果不倒序而是正序回放逆向事件，当同一主键在同一个事务里被连续修改多次时，回滚结果会停留在错误的中间状态。
+
+=== db-35-1
+title: 使用泛型 sql.Null[T] 处理数据库可空列与动态 IN 查询占位符构造
+--- desc
+实现两个日常编写 Go SQL 访问层最常用的辅助函数：
+
+1. `NullOrValue[T any](n sql.Null[T], fallback T) T`：如果 Go 1.22+ 的 `sql.Null[T]` 有效（`n.Valid == true`），返回 `n.V`；否则（数据库列为 `NULL`）返回默认值 `fallback`；
+2. `BuildInQuery[T any](baseSQL string, items []T) (query string, args []any, err error)`：将包含单个 `"(?)"` 占位符的 `baseSQL`（例如 `"SELECT id FROM users WHERE id IN (?)"`）按 `len(items)` 展开为 `"SELECT id FROM users WHERE id IN (?, ?, ?)"`，并返回转换后的 `[]any` 参数切片；若 `len(items) == 0`，返回错误（防止生成非法的 `IN ()` 语法）。
+--- solution
+package main
+
+import (
+	"database/sql"
+	"errors"
+	"strings"
+)
+
+func NullOrValue[T any](n sql.Null[T], fallback T) T {
+	// @solution
+	if n.Valid {
+		return n.V
+	}
+	return fallback
+	// @starter
+	// return fallback // TODO: 检查 n.Valid
+	// @end
+}
+
+func BuildInQuery[T any](baseSQL string, items []T) (string, []any, error) {
+	// @solution
+	if len(items) == 0 {
+		return "", nil, errors.New("empty slice for IN clause")
+	}
+	placeholders := strings.Repeat("?, ", len(items)-1) + "?"
+	query := strings.Replace(baseSQL, "(?)", "("+placeholders+")", 1)
+	args := make([]any, len(items))
+	for i, v := range items {
+		args[i] = v
+	}
+	return query, args, nil
+	// @starter
+	// return "", nil, nil // TODO: 校验空切片、替换 (?) 并构造 []any 参数
+	// @end
+}
+--- test
+package main
+
+import (
+	"database/sql"
+	"slices"
+	"testing"
+)
+
+func TestNullOrValueAndBuildInQuery(t *testing.T) {
+	v1 := sql.Null[string]{V: "alice", Valid: true}
+	v2 := sql.Null[string]{Valid: false}
+	if got := NullOrValue(v1, "anon"); got != "alice" {
+		t.Fatalf("got %q, want alice", got)
+	}
+	if got := NullOrValue(v2, "anon"); got != "anon" {
+		t.Fatalf("got %q, want anon", got)
+	}
+
+	q, args, err := BuildInQuery("SELECT * FROM orders WHERE id IN (?)", []int{10, 20, 30})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	wantQ := "SELECT * FROM orders WHERE id IN (?, ?, ?)"
+	if q != wantQ {
+		t.Fatalf("query = %q, want %q", q, wantQ)
+	}
+	if len(args) != 3 || !slices.Equal([]int{args[0].(int), args[1].(int), args[2].(int)}, []int{10, 20, 30}) {
+		t.Fatalf("args = %v", args)
+	}
+
+	if _, _, err := BuildInQuery("SELECT * FROM orders WHERE id IN (?)", []int{}); err == nil {
+		t.Fatal("expected error for empty items slice")
+	}
+}
+--- explain
+**思路**
+
+1. Go 1.22 引入了泛型 `sql.Null[T]`，统一了以往繁琐的 `sql.NullString`、`sql.NullInt64` 等类型，通过 `n.Valid` 判断是否为非 `NULL`。
+2. `database/sql` 不支持直接把 `[]int` 传给单个 `?` 展开成 `IN (1, 2, 3)`，必须根据切片长度动态生成对应数量的 `?, ?, ?` 占位符并将元素转为 `[]any`（参数化查询，绝对不能直接把用户字符串拼进 SQL 以防注入！）。
+
+**代码讲解**
+
+1. `if len(items) == 0`：SQL 中 `WHERE id IN ()` 是语法错误，必须在构造阶段拦截报错。
+2. `strings.Repeat("?, ", len(items)-1) + "?"`：生成精确数量的问号占位符。
+3. 将 `[]T` 逐个放入 `[]any` 供 `db.QueryContext(ctx, query, args...)` 安全绑定参数。
+
+**易错点**
+
+- 传入空切片 `[]int{}` 时如果不提前拦截，拼出来的 `WHERE id IN ()` 发到 MySQL 会直接报 1064 语法错误。
+
+=== db-36-1
+title: 实现带“读己之写”粘性窗口的数据库读写分离路由器
+race: true
+--- desc
+实现读写分离路由器 `RWRouter`：
+
+- 包含一个主库节点名 `primary`（如 `"master"`）和一组只读从库节点名 `replicas`（如 `["slave-1", "slave-2"]`）；
+- `RouteWrite(userID string, now time.Time) string`：写操作永远路由到 `primary`，并记录该 `userID` 的最后写入时间为 `now`；
+- `RouteRead(ctx context.Context, userID string, now time.Time) string`：
+  1. 如果 `ctx` 被 `WithForcePrimary(ctx)` 标记过，或者 `replicas` 为空，返回 `primary`；
+  2. 如果该 `userID` 曾经写入过，且距离最后写入时间**严格小于** `stickyWindow`（主从延迟保护窗口，例如 2 秒），为了保证用户能“读己之写”，自动返回 `primary`；
+  3. 否则按轮询（Round-Robin）顺序依次返回 `replicas` 中的从库节点。
+--- solution
+package main
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type forcePrimaryKey struct{}
+
+func WithForcePrimary(ctx context.Context) context.Context {
+	return context.WithValue(ctx, forcePrimaryKey{}, true)
+}
+
+type RWRouter struct {
+	primary      string
+	replicas     []string
+	stickyWindow time.Duration
+	rr           atomic.Uint64
+	mu           sync.RWMutex
+	lastWrite    map[string]time.Time
+}
+
+func NewRWRouter(primary string, replicas []string, stickyWindow time.Duration) *RWRouter {
+	return &RWRouter{
+		primary:      primary,
+		replicas:     replicas,
+		stickyWindow: stickyWindow,
+		lastWrite:    make(map[string]time.Time),
+	}
+}
+
+func (r *RWRouter) RouteWrite(userID string, now time.Time) string {
+	// @solution
+	if userID != "" {
+		r.mu.Lock()
+		r.lastWrite[userID] = now
+		r.mu.Unlock()
+	}
+	return r.primary
+	// @starter
+	// return r.primary // TODO: 记录 userID 的写入时间并返回主库
+	// @end
+}
+
+func (r *RWRouter) RouteRead(ctx context.Context, userID string, now time.Time) string {
+	// @solution
+	if len(r.replicas) == 0 {
+		return r.primary
+	}
+	if force, _ := ctx.Value(forcePrimaryKey{}).(bool); force {
+		return r.primary
+	}
+	if userID != "" {
+		r.mu.RLock()
+		last, ok := r.lastWrite[userID]
+		r.mu.RUnlock()
+		if ok && now.Sub(last) < r.stickyWindow {
+			return r.primary
+		}
+	}
+	idx := (r.rr.Add(1) - 1) % uint64(len(r.replicas))
+	return r.replicas[idx]
+	// @starter
+	// return "" // TODO: 检查强制主库标记、粘性时间窗，否则轮询从库
+	// @end
+}
+--- test
+package main
+
+import (
+	"context"
+	"testing"
+	"time"
+)
+
+func TestRWRouterStickyAndRoundRobin(t *testing.T) {
+	r := NewRWRouter("master", []string{"s1", "s2"}, 2*time.Second)
+	t0 := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+
+	// 1. 未发生写入的用户正常轮询从库 s1 -> s2 -> s1
+	if got := r.RouteRead(context.Background(), "u1", t0); got != "s1" {
+		t.Fatalf("read 1 = %q, want s1", got)
+	}
+	if got := r.RouteRead(context.Background(), "u1", t0); got != "s2" {
+		t.Fatalf("read 2 = %q, want s2", got)
+	}
+
+	// 2. 用户 u1 发生写操作，在接下来 2s 内读请求自动粘性路由到 master
+	if got := r.RouteWrite("u1", t0); got != "master" {
+		t.Fatalf("write = %q, want master", got)
+	}
+	if got := r.RouteRead(context.Background(), "u1", t0.Add(500*time.Millisecond)); got != "master" {
+		t.Fatalf("sticky read within window = %q, want master", got)
+	}
+	// 同时其他未写入的用户 u2 仍然正常走从库
+	if got := r.RouteRead(context.Background(), "u2", t0.Add(500*time.Millisecond)); got != "s1" {
+		t.Fatalf("u2 read = %q, want s1", got)
+	}
+
+	// 3. 超过 2s 粘性窗口后，u1 恢复走从库
+	if got := r.RouteRead(context.Background(), "u1", t0.Add(2*time.Second)); got != "s2" {
+		t.Fatalf("u1 read after sticky window = %q, want s2", got)
+	}
+
+	// 4. 强制主库 Context
+	ctx := WithForcePrimary(context.Background())
+	if got := r.RouteRead(ctx, "u2", t0); got != "master" {
+		t.Fatalf("force primary read = %q, want master", got)
+	}
+}
+--- explain
+**思路**
+
+结合三种路由策略：写请求统一走 `primary` 并在 `lastWrite` 中记下该用户的写入时刻；读请求依次判断 `WithForcePrimary` 上下文标志、`now.Sub(last) < stickyWindow` 写后粘性保护窗口，都不命中时用原子计数器 `(r.rr.Add(1) - 1) % uint64(len(r.replicas))` 无锁轮询从库。
+
+**代码讲解**
+
+1. `ctx.Value(forcePrimaryKey{}).(bool)`：使用包私有的空结构体类型 `forcePrimaryKey{}` 作为 Context Key，避免与其他包冲突。
+2. `now.Sub(last) < r.stickyWindow`：在主从复制可能尚未同步完成的窗口期内，只把刚写过数据的那个用户路由到主库，既保证了“读己之写”一致性，又不会把其他 99% 只读用户的流量压到主库上。
+
+**易错点**
+
+- 原子自增 `r.rr.Add(1)` 返回的是加 1 后的值（从 1 开始），减 1 后再取模才能让第一个请求从下标 `0`（`"s1"`）开始。
+
+=== db-37-1
+title: 模拟 Redis Stream 消费者组的 PEL 跟踪、XACK 与超时认领（XAUTOCLAIM）
+--- desc
+模拟 Redis Stream 消费者组的核心状态机 `ConsumerGroup`：
+
+- `Deliver(id string, consumer string, now time.Time)`：将消息 `id` 派发给 `consumer`，放入 PEL（Pending Entries List），记录所属消费者、派发时间 `DeliveredAt = now` 和投递次数 `Count = 1`；
+- `Ack(id string) bool`：确认消息 `id`，将其从 PEL 中移除并返回 `true`（若不在 PEL 中返回 `false`）；
+- `AutoClaim(newConsumer string, minIdle time.Duration, now time.Time) []string`：扫描 PEL 中所有空闲时间 `now.Sub(entry.DeliveredAt) >= minIdle` 的未确认消息，将其所属消费者改为 `newConsumer`、更新时间 `DeliveredAt = now`、投递次数 `Count++`，并返回被成功认领的消息 ID 列表（按消息 ID 字典序升序排列）。
+--- solution
+package main
+
+import (
+	"slices"
+	"time"
+)
+
+type PelEntry struct {
+	ID          string
+	Consumer    string
+	DeliveredAt time.Time
+	Count       int
+}
+
+type ConsumerGroup struct {
+	pel map[string]*PelEntry
+}
+
+func NewConsumerGroup() *ConsumerGroup {
+	return &ConsumerGroup{pel: make(map[string]*PelEntry)}
+}
+
+func (g *ConsumerGroup) Deliver(id, consumer string, now time.Time) {
+	// @solution
+	g.pel[id] = &PelEntry{
+		ID:          id,
+		Consumer:    consumer,
+		DeliveredAt: now,
+		Count:       1,
+	}
+	// @starter
+	// // TODO: 将消息记入 g.pel
+	// @end
+}
+
+func (g *ConsumerGroup) Ack(id string) bool {
+	// @solution
+	if _, ok := g.pel[id]; ok {
+		delete(g.pel, id)
+		return true
+	}
+	return false
+	// @starter
+	// return false // TODO: 从 g.pel 中移除已确认的消息
+	// @end
+}
+
+func (g *ConsumerGroup) AutoClaim(newConsumer string, minIdle time.Duration, now time.Time) []string {
+	var claimed []string
+	// @solution
+	for id, e := range g.pel {
+		if now.Sub(e.DeliveredAt) >= minIdle {
+			e.Consumer = newConsumer
+			e.DeliveredAt = now
+			e.Count++
+			claimed = append(claimed, id)
+		}
+	}
+	slices.Sort(claimed)
+	// @starter
+	// // TODO: 找出空闲时间 >= minIdle 的 PEL 条目，过户给 newConsumer 并更新 DeliveredAt 和 Count
+	// @end
+	return claimed
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+	"time"
+)
+
+func TestConsumerGroupPELAndAutoClaim(t *testing.T) {
+	cg := NewConsumerGroup()
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	cg.Deliver("100-1", "c1", t0)
+	cg.Deliver("100-2", "c1", t0)
+	cg.Deliver("100-3", "c2", t0.Add(20*time.Second))
+
+	// c1 成功处理并 XACK 了 100-1，但处理 100-2 时崩溃了
+	if !cg.Ack("100-1") {
+		t.Fatal("Ack(100-1) should return true")
+	}
+
+	// 在 t0 + 30s 时，c2 执行 XAUTOCLAIM 认领空闲超过 25s 的消息（只有 100-2 满足）
+	claimed := cg.AutoClaim("c2", 25*time.Second, t0.Add(30*time.Second))
+	if !slices.Equal(claimed, []string{"100-2"}) {
+		t.Fatalf("claimed = %v, want [100-2]", claimed)
+	}
+	if entry := cg.pel["100-2"]; entry.Consumer != "c2" || entry.Count != 2 {
+		t.Fatalf("100-2 after claim: %+v", entry)
+	}
+}
+--- explain
+**思路**
+
+Redis Stream 通过每个消费者组内部的 PEL（Pending Entries List）实现 At-Least-Once 投递保证：派发时写入 PEL，`XACK` 时从 PEL 删除；当某个消费者宕机导致消息在 PEL 中停留超过 `minIdle` 时，`XAUTOCLAIM` 将其转交给存活消费者并重置计时、累加投递次数 `Count`。
+
+**代码讲解**
+
+1. `Deliver`：向 `g.pel` 写入初始 `PelEntry`，`Count` 置为 1。
+2. `Ack`：检查存在后 `delete(g.pel, id)`。
+3. `AutoClaim`：遍历 `g.pel`，对满足 `now.Sub(e.DeliveredAt) >= minIdle` 的消息修改 `Consumer`、`DeliveredAt` 和 `Count++`，最后排序返回认领的 ID 列表。
+
+**易错点**
+
+- `AutoClaim` 认领消息后必须将 `e.DeliveredAt` 更新为当前的 `now`，否则下一秒又会被重复认领！
+
+=== db-38-1
+title: 实现 Redis 小 Hash 分桶键映射器（Listpack 内存优化）
+--- desc
+为了将一千万个独立的 `String` 键值（如 `user:status:100001 -> "1"`）合并成紧凑的 `listpack` 编码小 Hash，我们按固定桶大小 `bucketSize`（例如 256）对 `id` 进行分桶：
+
+- 外层 Hash Key 为 `fmt.Sprintf("%s:%d", prefix, id / bucketSize)`；
+- 内层 Hash Field 为 `strconv.FormatInt(id % bucketSize, 10)`。
+
+请实现 `ShardedHashStore` 的 `Set(id int64, val string)`、`Get(id int64) (string, bool)` 和 `OuterKeyCount() int`（返回外层 Hash Key 的总数）。
+--- solution
+package main
+
+import (
+	"fmt"
+	"strconv"
+)
+
+type ShardedHashStore struct {
+	prefix     string
+	bucketSize int64
+	hashes     map[string]map[string]string
+}
+
+func NewShardedHashStore(prefix string, bucketSize int64) *ShardedHashStore {
+	return &ShardedHashStore{
+		prefix:     prefix,
+		bucketSize: bucketSize,
+		hashes:     make(map[string]map[string]string),
+	}
+}
+
+func (s *ShardedHashStore) keyAndField(id int64) (string, string) {
+	// @solution
+	key := fmt.Sprintf("%s:%d", s.prefix, id/s.bucketSize)
+	field := strconv.FormatInt(id%s.bucketSize, 10)
+	return key, field
+	// @starter
+	// return "", "" // TODO: 计算外层桶 key 和桶内偏移 field
+	// @end
+}
+
+func (s *ShardedHashStore) Set(id int64, val string) {
+	key, field := s.keyAndField(id)
+	if s.hashes[key] == nil {
+		s.hashes[key] = make(map[string]string)
+	}
+	s.hashes[key][field] = val
+}
+
+func (s *ShardedHashStore) Get(id int64) (string, bool) {
+	key, field := s.keyAndField(id)
+	h, ok := s.hashes[key]
+	if !ok {
+		return "", false
+	}
+	v, ok := h[field]
+	return v, ok
+}
+
+func (s *ShardedHashStore) OuterKeyCount() int {
+	return len(s.hashes)
+}
+--- test
+package main
+
+import "testing"
+
+func TestShardedHashStore(t *testing.T) {
+	store := NewShardedHashStore("u:st", 256)
+	for id := int64(0); id < 1000; id++ {
+		store.Set(id, "active")
+	}
+	// 1000 个连续 ID 按 256 分桶，只会产生 4 个外层 Key (0, 1, 2, 3)！
+	if got := store.OuterKeyCount(); got != 4 {
+		t.Fatalf("OuterKeyCount = %d, want 4", got)
+	}
+	if v, ok := store.Get(513); !ok || v != "active" {
+		t.Fatalf("Get(513) = %q, %v", v, ok)
+	}
+	if _, ok := store.Get(2000); ok {
+		t.Fatal("Get(2000) should be false")
+	}
+}
+--- explain
+**思路**
+
+通过整数除法 `id / bucketSize` 将相邻的 `bucketSize` 个 ID 聚合到同一个外层 Hash Key 下，并用取模 `id % bucketSize` 作为 Hash 内部的短字段名，使每个 Hash 的元素个数严格不超过 `bucketSize`（$\le 512$），从而让 Redis 始终保持零指针开销的 `listpack` 紧凑内存编码。
+
+**代码讲解**
+
+1. `id / s.bucketSize`：计算桶编号。
+2. `id % s.bucketSize`：计算桶内偏移量，转为短字符串如 `"0"`～`"255"`。
+
+**易错点**
+
+- `bucketSize` 必须小于或等于 Redis 配置的 `hash-max-listpack-entries`（默认 512），通常取 100 或 256 最稳妥。
+
+=== db-39-1
+title: 实现 Redis Cluster 哈希槽（Hash Slot）与 Hash Tag 计算
+--- desc
+Redis Cluster 将所有 Key 映射到 `0 ～ 16383` 共 16384 个槽中，规则如下：
+
+1. **提取 Hash Tag**：如果 `key` 中包含 `'{'` 且在其后面存在 `'}'`，并且**第一个 `'{'` 与其后第一个 `'}'` 之间的子串非空**（长度 `>= 1`），则只对该大括号内的子串计算 CRC16；
+2. 如果不满足上述条件（比如没有大括号，`}` 在 `{` 前面，或者大括号内为空 `"{}abc"`），则对整个 `key` 字符串计算 CRC16；
+3. 最终槽位号为 `crc16(effectiveKey) & 16383`（测试中已提供标准 `crc16` 函数）。
+
+请实现 `ExtractHashTag(key string) string` 和 `CalcSlot(key string) uint16`。
+--- solution
+package main
+
+import "strings"
+
+func ExtractHashTag(key string) string {
+	// @solution
+	start := strings.IndexByte(key, '{')
+	if start >= 0 {
+		end := strings.IndexByte(key[start+1:], '}')
+		if end > 0 { // end > 0 保证了 '{' 和 '}' 之间至少有 1 个字符
+			return key[start+1 : start+1+end]
+		}
+	}
+	return key
+	// @starter
+	// return key // TODO: 提取第一个有效非空的 {...} 子串，否则返回原 key
+	// @end
+}
+
+func CalcSlot(key string) uint16 {
+	tag := ExtractHashTag(key)
+	return crc16([]byte(tag)) & 16383
+}
+
+func crc16(data []byte) uint16 {
+	var crc uint16
+	for _, b := range data {
+		crc ^= uint16(b) << 8
+		for range 8 {
+			if crc&0x8000 != 0 {
+				crc = (crc << 1) ^ 0x1021
+			} else {
+				crc <<= 1
+			}
+		}
+	}
+	return crc
+}
+--- test
+package main
+
+import "testing"
+
+func TestRedisClusterHashSlot(t *testing.T) {
+	// 相同 Hash Tag 的两个不同 Key 必须落入完全相同的哈希槽
+	s1 := CalcSlot("order:{u1001}:items")
+	s2 := CalcSlot("payment:{u1001}:status")
+	if s1 != s2 {
+		t.Fatalf("expected same slot for same hash tag {u1001}, got %d vs %d", s1, s2)
+	}
+	if tag := ExtractHashTag("order:{u1001}:items"); tag != "u1001" {
+		t.Fatalf("tag = %q, want u1001", tag)
+	}
+	// 空大括号 "{}" 按 Redis 规范不生效，应使用完整 key
+	if tag := ExtractHashTag("{}foo"); tag != "{}foo" {
+		t.Fatalf("empty braces should fallback to full key, got %q", tag)
+	}
+	// 多个大括号时，以第一个 '{' 及其后的第一个 '}' 为准
+	if tag := ExtractHashTag("{a}{b}"); tag != "a" {
+		t.Fatalf("got %q, want a", tag)
+	}
+	// Redis 官方文档标准测试向量：CalcSlot("123456789") == 12739
+	if got := CalcSlot("123456789"); got != 12739 {
+		t.Fatalf("CalcSlot(\"123456789\") = %d, want 12739", got)
+	}
+}
+--- explain
+**思路**
+
+严格按照 Redis Cluster 源码（`cluster.c` 中的 `keyHashSlot`）规则：查找第一个 `'{'` 的位置 `start`，再从 `key[start+1:]` 中查找第一个 `'}'` 的偏移量 `end`。只有当 `end > 0`（即大括号内部至少有 1 个字节）时，才截取 `key[start+1 : start+1+end]` 作为有效键参与 `CRC16 & 16383` 计算。
+
+**代码讲解**
+
+1. `start := strings.IndexByte(key, '{')`：找左大括号。
+2. `end := strings.IndexByte(key[start+1:], '}')`：在左大括号之后找右大括号。
+3. `if end > 0`：若 `end == 0` 说明是紧挨着的空括号 `"{}"`，按规范需回退对整个 `key` 哈希。
+
+**易错点**
+
+- 忽略空括号 `"{}foo"` 的特判（误返回空字符串 `""`），会导致所有带空括号的 key 全部算出相同的 CRC16（0），落到 0 号槽。

@@ -1,0 +1,791 @@
+LeetCode · 数学与位运算、链表。题面为意译，函数签名与力扣的 Go 版本一致。
+
+=== lc-9
+no: 9
+title: 回文数
+slug: palindrome-number
+difficulty: 简单
+category: 数学与位运算
+topics: 数学
+go: 整数运算
+--- desc
+判断整数 `x` 是否是回文数：正着读和倒着读都一样。负数不是回文数。不要把整数转成字符串。
+
+**示例**：`121` → `true`；`-121` → `false`（倒着读是 `121-`）；`10` → `false`。
+--- solution
+package main
+
+func isPalindrome(x int) bool {
+	// @solution
+	if x < 0 || (x%10 == 0 && x != 0) {
+		return false
+	}
+	rev := 0
+	for x > rev {
+		rev = rev*10 + x%10
+		x /= 10
+	}
+	return x == rev || x == rev/10
+	// @starter
+	// return false
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestIsPalindrome(t *testing.T) {
+	cases := map[int]bool{121: true, -121: false, 10: false, 0: true, 7: true, 1221: true, 12321: true, 123: false, 1000021: false}
+	for in, want := range cases {
+		if got := isPalindrome(in); got != want {
+			t.Errorf("isPalindrome(%d) = %v，期望 %v", in, got, want)
+		}
+	}
+}
+--- explain
+只反转**后一半**数字：当反转出来的数不小于剩下的数时，说明已经处理了一半。偶数位时两者相等，奇数位时中间那位在 `rev` 的个位上，用 `rev/10` 去掉。
+
+只反转一半还避免了反转整个数可能导致的溢出。末尾是 0 的正数（如 10）不可能是回文，需要提前排除。
+
+=== lc-191
+no: 191
+title: 位1的个数
+slug: number-of-1-bits
+difficulty: 简单
+category: 数学与位运算
+topics: 位运算
+go: 位运算
+--- desc
+给定一个正整数 `n`，返回它的二进制表示中 `1` 的个数（也叫汉明重量）。
+
+**示例**：`11`（二进制 `1011`）→ `3`；`128`（`10000000`）→ `1`。
+--- solution
+package main
+
+func hammingWeight(n int) int {
+	// @solution
+	count := 0
+	for n != 0 {
+		n &= n - 1 // 去掉最低位的 1
+		count++
+	}
+	return count
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import (
+	"math/bits"
+	"testing"
+)
+
+func TestHammingWeight(t *testing.T) {
+	cases := map[int]int{11: 3, 128: 1, 2147483645: 30, 1: 1, 0: 0}
+	for in, want := range cases {
+		if got := hammingWeight(in); got != want {
+			t.Errorf("hammingWeight(%d) = %d，期望 %d", in, got, want)
+		}
+	}
+	for n := 0; n < 5000; n += 7 {
+		if hammingWeight(n) != bits.OnesCount(uint(n)) {
+			t.Fatalf("hammingWeight(%d) 结果不对", n)
+		}
+	}
+}
+--- explain
+`n & (n-1)` 会把 n 最低位的 1 变成 0，循环次数就是 1 的个数，比逐位检查 `n & 1` 更快。
+
+实际项目里直接用标准库 `math/bits.OnesCount`，它会被编译成 CPU 的 `POPCNT` 指令。`math/bits` 还有 `LeadingZeros`、`TrailingZeros`、`Len`、`Reverse` 等常用的位操作。
+
+=== lc-231
+no: 231
+title: 2 的幂
+slug: power-of-two
+difficulty: 简单
+category: 数学与位运算
+topics: 位运算, 数学
+go: 位运算
+--- desc
+判断整数 `n` 是否是 2 的幂次方（`n == 2^x`，x 为非负整数）。
+
+**示例**：`1` → `true`（2⁰）；`16` → `true`；`3` → `false`；`0` → `false`。
+--- solution
+package main
+
+func isPowerOfTwo(n int) bool {
+	// @solution
+	return n > 0 && n&(n-1) == 0
+	// @starter
+	// return false
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestIsPowerOfTwo(t *testing.T) {
+	for x := 0; x < 62; x++ {
+		if !isPowerOfTwo(1 << x) {
+			t.Errorf("isPowerOfTwo(%d) 应为 true", 1<<x)
+		}
+	}
+	for _, n := range []int{0, -2, -16, 3, 6, 12, 1<<40 + 1} {
+		if isPowerOfTwo(n) {
+			t.Errorf("isPowerOfTwo(%d) 应为 false", n)
+		}
+	}
+}
+--- explain
+2 的幂在二进制里**只有一个 1**，去掉最低位的 1（`n & (n-1)`）之后就变成 0。注意 0 和负数要单独排除。
+
+运算符优先级：Go 里 `&` 的优先级高于 `==`（和 C 不同），所以 `n&(n-1) == 0` 不用额外加括号也能正确解析为 `(n&(n-1)) == 0`。
+
+=== lc-70
+no: 70
+title: 爬楼梯
+slug: climbing-stairs
+difficulty: 简单
+category: 数学与位运算
+topics: 动态规划, 数学
+go: 多重赋值
+--- desc
+爬 `n` 阶楼梯，每次可以爬 1 阶或 2 阶，有多少种不同的方法可以爬到楼顶？
+
+**示例**：`n = 2` → `2`（1+1、2）；`n = 3` → `3`（1+1+1、1+2、2+1）。
+--- solution
+package main
+
+func climbStairs(n int) int {
+	// @solution
+	a, b := 1, 1 // f(0), f(1)
+	for i := 2; i <= n; i++ {
+		a, b = b, a+b
+	}
+	return b
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestClimbStairs(t *testing.T) {
+	cases := map[int]int{1: 1, 2: 2, 3: 3, 4: 5, 5: 8, 10: 89, 45: 1836311903}
+	for in, want := range cases {
+		if got := climbStairs(in); got != want {
+			t.Errorf("climbStairs(%d) = %d，期望 %d", in, got, want)
+		}
+	}
+}
+--- explain
+到第 n 阶的最后一步要么从 n-1 阶爬 1 阶，要么从 n-2 阶爬 2 阶，所以 `f(n) = f(n-1) + f(n-2)`，就是斐波那契数列。
+
+只需要保留前两个状态，`a, b = b, a+b` 一行完成「滚动」：右边的 `b` 和 `a+b` 先用旧值算好，再同时赋给 a 和 b。时间 O(n)，空间 O(1)。
+
+=== lc-509
+no: 509
+title: 斐波那契数
+slug: fibonacci-number
+difficulty: 简单
+category: 数学与位运算
+topics: 递归, 记忆化搜索, 动态规划
+go: 闭包, 递归, map
+--- desc
+斐波那契数列：`F(0) = 0`，`F(1) = 1`，`F(n) = F(n-1) + F(n-2)`。给定 n，计算 `F(n)`。
+
+请用**递归 + 记忆化**实现（直接递归是 O(2ⁿ)，n = 40 时要算几亿次）。
+
+**示例**：`F(4) = 3`，`F(10) = 55`。
+--- solution
+package main
+
+func fib(n int) int {
+	// @solution
+	memo := map[int]int{}
+	var f func(int) int
+	f = func(n int) int {
+		if n < 2 {
+			return n
+		}
+		if v, ok := memo[n]; ok {
+			return v
+		}
+		memo[n] = f(n-1) + f(n-2)
+		return memo[n]
+	}
+	return f(n)
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+func TestFib(t *testing.T) {
+	cases := map[int]int{0: 0, 1: 1, 2: 1, 4: 3, 10: 55, 30: 832040}
+	for in, want := range cases {
+		if got := fib(in); got != want {
+			t.Errorf("fib(%d) = %d，期望 %d", in, got, want)
+		}
+	}
+	start := time.Now()
+	if fib(90) != 2880067194370816120 {
+		t.Fatal("fib(90) 不对")
+	}
+	if time.Since(start) > 100*time.Millisecond {
+		t.Fatal("太慢了：需要记忆化")
+	}
+}
+--- explain
+在函数内部定义递归闭包，要**先声明变量再赋值**：`var f func(int) int; f = func(n int) int { … f(n-1) … }`。如果写成 `f := func…`，闭包体内引用 `f` 时它还没定义，编译报错。
+
+闭包捕获了外层的 `memo`，每次调用 `fib` 都有一份独立的缓存。当然最简单高效的写法还是上一题那种迭代。
+
+=== lc-202
+no: 202
+title: 快乐数
+slug: happy-number
+difficulty: 简单
+category: 数学与位运算
+topics: 哈希表, 数学, 双指针
+go: map, struct{} 集合
+--- desc
+「快乐数」：从正整数开始，每次把它替换为**各位数字的平方和**，重复这个过程，如果最终变成 1 就是快乐数；如果陷入不包含 1 的无限循环就不是。
+
+**示例**：`19` → `true`（1²+9²=82 → 68 → 100 → 1）；`2` → `false`。
+--- solution
+package main
+
+func next(n int) int {
+	sum := 0
+	for n > 0 {
+		d := n % 10
+		sum += d * d
+		n /= 10
+	}
+	return sum
+}
+
+func isHappy(n int) bool {
+	// @solution
+	seen := map[int]struct{}{}
+	for n != 1 {
+		if _, ok := seen[n]; ok {
+			return false
+		}
+		seen[n] = struct{}{}
+		n = next(n)
+	}
+	return true
+	// @starter
+	// return false
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestIsHappy(t *testing.T) {
+	cases := map[int]bool{19: true, 2: false, 1: true, 7: true, 4: false, 100: true, 1111111: true, 116: false}
+	for in, want := range cases {
+		if got := isHappy(in); got != want {
+			t.Errorf("isHappy(%d) = %v，期望 %v", in, got, want)
+		}
+	}
+}
+--- explain
+用集合记录出现过的数，重复出现说明进入了循环。
+
+不用额外空间的做法是**快慢指针**（和判断链表有环一样）：`slow = next(slow)`，`fast = next(next(fast))`，两者相遇时看是不是 1。把「求下一个数」拆成独立的 `next` 函数，让两种写法都很清晰。
+
+=== lc-206
+no: 206
+title: 反转链表
+slug: reverse-linked-list
+difficulty: 简单
+category: 链表
+topics: 链表, 递归
+go: 结构体与指针, 多重赋值
+--- desc
+给定单链表的头节点 `head`，反转链表，返回反转后的头节点。
+
+**示例**：`1 → 2 → 3 → 4 → 5` → `5 → 4 → 3 → 2 → 1`；空链表返回空。
+--- solution
+package main
+
+type ListNode struct {
+	Val  int
+	Next *ListNode
+}
+
+func reverseList(head *ListNode) *ListNode {
+	// @solution
+	var prev *ListNode
+	cur := head
+	for cur != nil {
+		next := cur.Next
+		cur.Next = prev
+		prev = cur
+		cur = next
+	}
+	return prev
+	// @starter
+	// return head
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func build(vals ...int) *ListNode {
+	dummy := &ListNode{}
+	cur := dummy
+	for _, v := range vals {
+		cur.Next = &ListNode{Val: v}
+		cur = cur.Next
+	}
+	return dummy.Next
+}
+
+func values(l *ListNode) []int {
+	var out []int
+	for ; l != nil; l = l.Next {
+		out = append(out, l.Val)
+	}
+	return out
+}
+
+func TestReverseList(t *testing.T) {
+	cases := []struct{ in, want []int }{
+		{[]int{1, 2, 3, 4, 5}, []int{5, 4, 3, 2, 1}},
+		{[]int{1, 2}, []int{2, 1}},
+		{[]int{7}, []int{7}},
+		{nil, nil},
+	}
+	for _, c := range cases {
+		if got := values(reverseList(build(c.in...))); !slices.Equal(got, c.want) {
+			t.Errorf("reverseList(%v) = %v，期望 %v", c.in, got, c.want)
+		}
+	}
+}
+--- explain
+迭代时维护三个指针：`prev`（已反转部分的头）、`cur`（当前节点）、`next`（暂存下一个节点，否则改了 `cur.Next` 就找不回去了）。
+
+也可以用多重赋值写成一行：`cur.Next, prev, cur = prev, cur, cur.Next`。它能正确工作，是因为 Go 先计算等号右边所有的值和左边的地址，再统一赋值。但可读性较差，面试时建议写成四行。
+
+=== lc-21
+no: 21
+title: 合并两个有序链表
+slug: merge-two-sorted-lists
+difficulty: 简单
+category: 链表
+topics: 链表, 递归
+go: 结构体与指针
+--- desc
+把两个**升序**链表合并成一个新的升序链表并返回。新链表由两个链表的节点拼接而成（不需要创建新节点）。
+
+**示例**：`1→2→4` 和 `1→3→4` → `1→1→2→3→4→4`。
+--- solution
+package main
+
+type ListNode struct {
+	Val  int
+	Next *ListNode
+}
+
+func mergeTwoLists(list1 *ListNode, list2 *ListNode) *ListNode {
+	// @solution
+	dummy := &ListNode{}
+	tail := dummy
+	for list1 != nil && list2 != nil {
+		if list1.Val <= list2.Val {
+			tail.Next, list1 = list1, list1.Next
+		} else {
+			tail.Next, list2 = list2, list2.Next
+		}
+		tail = tail.Next
+	}
+	if list1 != nil {
+		tail.Next = list1
+	} else {
+		tail.Next = list2
+	}
+	return dummy.Next
+	// @starter
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func build(vals ...int) *ListNode {
+	dummy := &ListNode{}
+	cur := dummy
+	for _, v := range vals {
+		cur.Next = &ListNode{Val: v}
+		cur = cur.Next
+	}
+	return dummy.Next
+}
+
+func values(l *ListNode) []int {
+	var out []int
+	for ; l != nil; l = l.Next {
+		out = append(out, l.Val)
+	}
+	return out
+}
+
+func TestMergeTwoLists(t *testing.T) {
+	cases := []struct{ a, b, want []int }{
+		{[]int{1, 2, 4}, []int{1, 3, 4}, []int{1, 1, 2, 3, 4, 4}},
+		{nil, nil, nil},
+		{nil, []int{0}, []int{0}},
+		{[]int{5}, []int{1, 2, 3}, []int{1, 2, 3, 5}},
+		{[]int{-3, 10}, []int{-2, -1, 11}, []int{-3, -2, -1, 10, 11}},
+	}
+	for _, c := range cases {
+		if got := values(mergeTwoLists(build(c.a...), build(c.b...))); !slices.Equal(got, c.want) {
+			t.Errorf("mergeTwoLists(%v, %v) = %v，期望 %v", c.a, c.b, got, c.want)
+		}
+	}
+}
+--- explain
+**哨兵节点**（dummy）是链表题的常用技巧：先创建一个假的头节点，所有节点都接在它后面，最后返回 `dummy.Next`。这样「结果链表还是空的」这种特殊情况就不需要单独处理。
+
+Go 里 `&ListNode{}` 直接创建结构体并取地址，不用担心它是在栈上还是堆上——逃逸分析会决定，GC 负责回收。
+
+=== lc-141
+no: 141
+title: 环形链表
+slug: linked-list-cycle
+difficulty: 简单
+category: 链表
+topics: 链表, 双指针
+go: 结构体与指针
+--- desc
+判断链表中是否有环：如果沿着 `Next` 一直走能再次到达某个节点，就存在环。要求 O(1) 的额外空间。
+
+**示例**：`3 → 2 → 0 → -4`，且 `-4` 的 Next 指回 `2` → `true`。
+--- solution
+package main
+
+type ListNode struct {
+	Val  int
+	Next *ListNode
+}
+
+func hasCycle(head *ListNode) bool {
+	// @solution
+	slow, fast := head, head
+	for fast != nil && fast.Next != nil {
+		slow = slow.Next
+		fast = fast.Next.Next
+		if slow == fast {
+			return true
+		}
+	}
+	return false
+	// @starter
+	// return false
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func withCycle(vals []int, pos int) *ListNode {
+	var nodes []*ListNode
+	for _, v := range vals {
+		nodes = append(nodes, &ListNode{Val: v})
+	}
+	for i := 0; i+1 < len(nodes); i++ {
+		nodes[i].Next = nodes[i+1]
+	}
+	if len(nodes) == 0 {
+		return nil
+	}
+	if pos >= 0 {
+		nodes[len(nodes)-1].Next = nodes[pos]
+	}
+	return nodes[0]
+}
+
+func TestHasCycle(t *testing.T) {
+	cases := []struct {
+		vals []int
+		pos  int
+		want bool
+	}{
+		{[]int{3, 2, 0, -4}, 1, true},
+		{[]int{1, 2}, 0, true},
+		{[]int{1}, -1, false},
+		{[]int{1}, 0, true},
+		{[]int{1, 2, 3, 4, 5}, -1, false},
+		{nil, -1, false},
+	}
+	for _, c := range cases {
+		if got := hasCycle(withCycle(c.vals, c.pos)); got != c.want {
+			t.Errorf("hasCycle(%v, pos=%d) = %v，期望 %v", c.vals, c.pos, got, c.want)
+		}
+	}
+}
+--- explain
+**快慢指针**（Floyd 判圈）：慢指针每次走一步，快指针每次走两步。有环时快指针一定会在环里追上慢指针；无环时快指针先走到 nil。
+
+`slow == fast` 比较的是**指针**（是不是同一个节点），而不是节点的值。用 `map[*ListNode]bool` 记录访问过的节点也能做，指针可以作为 map 的 key，但需要 O(n) 空间。
+
+=== lc-876
+no: 876
+title: 链表的中间结点
+slug: middle-of-the-linked-list
+difficulty: 简单
+category: 链表
+topics: 链表, 双指针
+go: 结构体与指针
+--- desc
+返回单链表的中间节点。如果有两个中间节点，返回**第二个**。
+
+**示例**：`1→2→3→4→5` → 节点 `3`；`1→2→3→4→5→6` → 节点 `4`。
+--- solution
+package main
+
+type ListNode struct {
+	Val  int
+	Next *ListNode
+}
+
+func middleNode(head *ListNode) *ListNode {
+	// @solution
+	slow, fast := head, head
+	for fast != nil && fast.Next != nil {
+		slow = slow.Next
+		fast = fast.Next.Next
+	}
+	return slow
+	// @starter
+	// return head
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func build(vals ...int) *ListNode {
+	dummy := &ListNode{}
+	cur := dummy
+	for _, v := range vals {
+		cur.Next = &ListNode{Val: v}
+		cur = cur.Next
+	}
+	return dummy.Next
+}
+
+func TestMiddleNode(t *testing.T) {
+	cases := []struct {
+		vals []int
+		want int
+	}{
+		{[]int{1, 2, 3, 4, 5}, 3},
+		{[]int{1, 2, 3, 4, 5, 6}, 4},
+		{[]int{1}, 1},
+		{[]int{1, 2}, 2},
+	}
+	for _, c := range cases {
+		head := build(c.vals...)
+		got := middleNode(head)
+		if got == nil || got.Val != c.want {
+			t.Errorf("middleNode(%v) 应返回值为 %d 的节点", c.vals, c.want)
+		}
+		n := head
+		for i := 1; i < c.want; i++ {
+			n = n.Next
+		}
+		if got != n {
+			t.Error("应返回链表中原有的那个节点，而不是新建的节点")
+		}
+	}
+}
+--- explain
+快指针走到末尾时，慢指针正好在中间。循环条件 `fast != nil && fast.Next != nil` 决定了偶数长度时返回第二个中间节点；如果要返回第一个，把条件改成 `fast.Next != nil && fast.Next.Next != nil`。
+
+=== lc-203
+no: 203
+title: 移除链表元素
+slug: remove-linked-list-elements
+difficulty: 简单
+category: 链表
+topics: 链表, 递归
+go: 结构体与指针
+--- desc
+删除链表中所有值等于 `val` 的节点，返回新的头节点。
+
+**示例**：`1→2→6→3→4→5→6, val = 6` → `1→2→3→4→5`；`7→7→7, val = 7` → 空链表。
+--- solution
+package main
+
+type ListNode struct {
+	Val  int
+	Next *ListNode
+}
+
+func removeElements(head *ListNode, val int) *ListNode {
+	// @solution
+	for p := &head; *p != nil; {
+		if (*p).Val == val {
+			*p = (*p).Next
+		} else {
+			p = &(*p).Next
+		}
+	}
+	return head
+	// @starter
+	// return head
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func build(vals ...int) *ListNode {
+	dummy := &ListNode{}
+	cur := dummy
+	for _, v := range vals {
+		cur.Next = &ListNode{Val: v}
+		cur = cur.Next
+	}
+	return dummy.Next
+}
+
+func values(l *ListNode) []int {
+	var out []int
+	for ; l != nil; l = l.Next {
+		out = append(out, l.Val)
+	}
+	return out
+}
+
+func TestRemoveElements(t *testing.T) {
+	cases := []struct {
+		vals []int
+		val  int
+		want []int
+	}{
+		{[]int{1, 2, 6, 3, 4, 5, 6}, 6, []int{1, 2, 3, 4, 5}},
+		{nil, 1, nil},
+		{[]int{7, 7, 7, 7}, 7, nil},
+		{[]int{1, 7, 7, 2}, 7, []int{1, 2}},
+		{[]int{7, 1}, 7, []int{1}},
+	}
+	for _, c := range cases {
+		if got := values(removeElements(build(c.vals...), c.val)); !slices.Equal(got, c.want) {
+			t.Errorf("removeElements(%v, %d) = %v，期望 %v", c.vals, c.val, got, c.want)
+		}
+	}
+}
+--- explain
+**指向指针的指针**：`p` 的类型是 `**ListNode`，它指向「某个指向节点的指针」——一开始是 `head` 变量本身，之后是前一个节点的 `Next` 字段。删除时直接 `*p = (*p).Next`，头节点和中间节点用同一套逻辑处理，连哨兵节点都不需要。
+
+这是 Linus Torvalds 称赞过的「有品位」的链表删除写法，在 Go 里同样适用。
+
+=== lc-234
+no: 234
+title: 回文链表
+slug: palindrome-linked-list
+difficulty: 简单
+category: 链表
+topics: 链表, 双指针
+go: 结构体与指针, 切片
+--- desc
+判断单链表是否是回文链表（正着读和反着读一样）。
+
+**示例**：`1→2→2→1` → `true`；`1→2` → `false`。
+--- solution
+package main
+
+type ListNode struct {
+	Val  int
+	Next *ListNode
+}
+
+func isPalindrome(head *ListNode) bool {
+	// @solution
+	var vals []int
+	for n := head; n != nil; n = n.Next {
+		vals = append(vals, n.Val)
+	}
+	for i, j := 0, len(vals)-1; i < j; i, j = i+1, j-1 {
+		if vals[i] != vals[j] {
+			return false
+		}
+	}
+	return true
+	// @starter
+	// return false
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func build(vals ...int) *ListNode {
+	dummy := &ListNode{}
+	cur := dummy
+	for _, v := range vals {
+		cur.Next = &ListNode{Val: v}
+		cur = cur.Next
+	}
+	return dummy.Next
+}
+
+func TestIsPalindrome(t *testing.T) {
+	cases := []struct {
+		vals []int
+		want bool
+	}{
+		{[]int{1, 2, 2, 1}, true},
+		{[]int{1, 2}, false},
+		{[]int{1}, true},
+		{[]int{1, 2, 3, 2, 1}, true},
+		{[]int{1, 2, 3, 1}, false},
+		{nil, true},
+	}
+	for _, c := range cases {
+		if got := isPalindrome(build(c.vals...)); got != c.want {
+			t.Errorf("isPalindrome(%v) = %v，期望 %v", c.vals, got, c.want)
+		}
+	}
+}
+--- explain
+最直接的做法：把值拷贝到切片里，再用双指针比较。时间 O(n)，空间 O(n)。
+
+进阶的 O(1) 空间做法组合了前面几题：用快慢指针找到中点（876），反转后半部分（206），然后同时从两端向中间比较，最后（如果需要）再把后半部分反转回来恢复链表。

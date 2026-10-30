@@ -1,0 +1,432 @@
+=== db-01
+--- deep
+**原理展开**
+
+两者最根本的区别在于**数据的组织方式**：
+
+- InnoDB 的表本身就是一棵按主键排序的 B+ 树（聚簇索引），二级索引的叶子存主键值；数据页通过 **buffer pool** 缓存在内存中，修改先写 redo log 再异步刷盘，崩溃后可以恢复。
+- MyISAM 的数据文件（.MYD）是按插入顺序存放的堆文件，索引文件（.MYI）的叶子存的是数据在文件中的偏移量；它只缓存索引，数据依赖操作系统的页缓存；没有日志，崩溃时正在写入的表可能损坏。
+
+`count(*)` 的差异：MyISAM 只有表锁，同一时刻只有一个写者，可以精确维护行数；InnoDB 有 MVCC，不同事务看到的行数可能不同，所以无法维护一个全局的计数，只能扫描（会选择最小的二级索引来扫）。
+
+**代码示例**
+
+```sql
+-- 查看表的引擎和行数估算
+SELECT table_name, engine, table_rows, data_length, index_length
+FROM information_schema.tables WHERE table_schema = 'shop';
+
+-- 迁移遗留的 MyISAM 表（会重建表，大表要用在线改表工具）
+ALTER TABLE legacy_log ENGINE = InnoDB;
+```
+
+**常见追问**
+
+- `table_rows` 准确吗？→ InnoDB 的是采样估算的，误差可能很大，不能代替 `count(*)`。
+- buffer pool 应该设多大？→ 专用数据库服务器通常设为物理内存的 60%～75%。
+- 还有哪些常见的引擎？→ Memory（内存表，重启丢失）、Archive（只能插入和查询，压缩率高）、RocksDB（MyRocks，写入放大小，适合写多的场景）。
+
+**实战建议**
+
+- 新表一律 InnoDB，并显式指定主键。
+- 关注 buffer pool 命中率（`Innodb_buffer_pool_read_requests` 和 `Innodb_buffer_pool_reads`），命中率低说明内存不够或者有大量的全表扫描。
+
+=== db-02
+--- deep
+**原理展开**
+
+磁盘（包括 SSD）读取的最小单位是页，随机读一页和读连续的多页，成本差别很大。所以数据库索引的设计目标是**最小化读取的页数**，这就要求树尽可能矮、每个节点尽可能装满一个页。
+
+B+ 树的写入：插入时找到目标叶子页，页满了就**分裂**成两个页，并在父节点中插入新的分隔键（可能递归向上分裂）。主键递增时，新数据总是写在最右边的叶子页，页可以被填满（约 15/16）；主键随机（UUID）时，插入位置随机，频繁在中间分裂，每个页平均只有一半多的利用率，还会导致大量随机 IO。
+
+**代码示例**
+
+```sql
+-- 查看索引的高度（MySQL 8.0）：通过 information_schema 和页号估算
+SELECT index_name, stat_name, stat_value
+FROM mysql.innodb_index_stats
+WHERE database_name = 'shop' AND table_name = 'orders' AND stat_name IN ('n_leaf_pages', 'size');
+```
+
+```go
+// 主键用趋势递增的 ID（雪花 ID），而不是随机的 UUIDv4
+// 必须用 UUID 时，用时间有序的 UUIDv7（前 48 位是毫秒时间戳）
+func newOrderID() int64 { return snowflake.Next() }
+```
+
+**常见追问**
+
+- 为什么 MongoDB 用 B 树（WiredTiger 实际是 B+ 树变体）、Redis 的有序集合用跳表？→ 不同的存储介质和访问模式：跳表适合内存，实现简单，范围查询方便；磁盘上 B+ 树的扇出优势更明显。
+- LSM 树和 B+ 树有什么区别？→ LSM（RocksDB、LevelDB）把写入先放在内存，批量顺序写到磁盘，写入性能高，但读取可能要查多个层级，需要后台合并（compaction）。
+- 索引是不是越多越好？→ 不是，每个索引都要在写入时维护，占用空间，还会让优化器选择变复杂。
+
+**实战建议**
+
+- 主键用短的、递增的整数；不要用业务字段（手机号、身份证）做主键。
+- 单表行数到千万级时关注查询的 IO 次数和 buffer pool 命中率，考虑归档或拆分。
+
+=== db-03
+--- deep
+**原理展开**
+
+回表的代价在于**随机 IO**：二级索引的扫描是顺序的，但扫描出来的主键在聚簇索引上可能分散在各处，每个都可能读一个不同的页。所以当需要回表的行数很多时，优化器可能认为全表扫描（顺序读）更快，直接放弃二级索引。
+
+MySQL 的两个相关优化：
+
+- **索引下推**（ICP，5.6+）：联合索引里有、但不能用于定位的条件，在存储引擎层用索引上的数据先过滤，减少回表次数（Extra 显示 `Using index condition`）；
+- **MRR**（Multi-Range Read）：先收集需要回表的主键，排序后再按顺序读取聚簇索引，把随机 IO 变成接近顺序的 IO。
+
+**代码示例**
+
+```sql
+-- 索引 idx_user_status_ctime(user_id, status, created_at)
+-- 覆盖索引：需要的列都在索引里（二级索引叶子自带主键 id）
+EXPLAIN SELECT id, status, created_at FROM orders WHERE user_id = 42;
+-- Extra: Using index
+
+-- 索引下推：status 用于定位，created_at 的条件在索引上过滤
+EXPLAIN SELECT * FROM orders WHERE user_id = 42 AND created_at > '2026-01-01';
+-- Extra: Using index condition
+```
+
+**常见追问**
+
+- 为什么二级索引的叶子存主键而不是行的物理地址？→ 行的位置会因为页分裂而移动，存主键就不需要在数据移动时更新所有二级索引。代价是回表要再查一次 B+ 树。
+- 主键很长有什么影响？→ 每个二级索引的每一项都包含主键，主键长度会放大到所有二级索引上。
+- 覆盖索引能用在 `SELECT *` 上吗？→ 不能，除非所有列都在索引里，这就是要避免 `SELECT *` 的原因之一。
+
+**实战建议**
+
+- 设计联合索引时考虑高频查询需要的列，尽量让它成为覆盖索引。
+- 列表页查询先用覆盖索引取出主键（分页、排序都在索引上完成），再按主键批量取详情。
+
+=== db-04
+--- deep
+**原理展开**
+
+联合索引 `(a, b, c)` 在 B+ 树里是按 `(a, b, c)` 的字典序排列的。查询能用多少列来**定位**，取决于条件能不能在这个顺序里确定一个连续的区间：
+
+- `a = 1`：确定了一个区间；
+- `a = 1 AND b = 2`：在 a = 1 的区间里，b 有序，继续缩小；
+- `a = 1 AND b > 2`：确定了区间，但这个区间里 c 是无序的（b 不同时 c 各自排序），c 无法再用来缩小区间，只能逐条过滤（ICP 在索引层过滤）。
+
+MySQL 8.0.13 起还有**跳跃扫描**（Skip Scan）：条件里没有第一列、但第一列的不同值很少时，优化器可以对第一列的每个值分别做范围扫描。
+
+**代码示例**
+
+```sql
+-- 函数导致失效 → 改写成范围
+SELECT * FROM orders WHERE DATE(created_at) = '2026-10-01';            -- 失效
+SELECT * FROM orders WHERE created_at >= '2026-10-01'
+                       AND created_at <  '2026-10-02';                  -- 走索引
+
+-- 隐式转换：phone 是 varchar
+SELECT * FROM users WHERE phone = 13800000000;   -- 字符串转数字，全表扫描
+SELECT * FROM users WHERE phone = '13800000000'; -- 走索引
+```
+
+```go
+// Go 里参数的类型决定了驱动发送的类型
+db.QueryContext(ctx, "SELECT * FROM users WHERE phone = ?", phoneInt)          // 隐患
+db.QueryContext(ctx, "SELECT * FROM users WHERE phone = ?", strconv.Itoa(phone)) // 正确
+```
+
+**常见追问**
+
+- `IN` 能用索引吗？→ 能，相当于多个等值条件，后面的列还能继续使用；但 IN 的值太多时优化器可能改为全表扫描。
+- `ORDER BY` 能用索引吗？→ 排序的列和方向与索引一致、并且前面的列都是等值条件时可以，避免 filesort。
+- 联合索引的列顺序怎么定？→ 等值条件的列放前面，范围条件的列放后面；区分度高的列优先（但更重要的是覆盖查询模式）。
+
+**实战建议**
+
+- 每个慢查询都用 EXPLAIN 确认实际使用的索引和 key_len。
+- 用 `pt-index-usage` 或者 `sys.schema_unused_indexes` 找出从未被使用的索引并删除。
+
+=== db-05
+--- deep
+**原理展开**
+
+各个隔离级别下可能出现的异常：
+
+- **脏读**：读到其他事务还没提交的数据（对方回滚后，读到的数据从未真正存在过）；
+- **不可重复读**：同一事务里两次读同一行，结果不同（中间被别的事务修改并提交）；
+- **幻读**：同一事务里两次范围查询，第二次多出了新插入的行。
+
+还有一个标准没有列出但很常见的问题：**丢失更新**。两个事务都读到余额 100，各自加 10 后写回 110，其中一次更新丢失了。可重复读也防不住这种“读-改-写”的竞态，必须用当前读加锁（`SELECT ... FOR UPDATE`）、原子更新（`UPDATE ... SET balance = balance + 10`）或者乐观锁（版本号）。
+
+**代码示例**
+
+```go
+// 乐观锁：带版本号的条件更新
+res, err := tx.ExecContext(ctx,
+	`UPDATE accounts SET balance = ?, version = version + 1 WHERE id = ? AND version = ?`,
+	newBalance, id, oldVersion)
+if err != nil {
+	return err
+}
+if n, _ := res.RowsAffected(); n == 0 {
+	return ErrConflict // 被别人改过了，重试或者报错
+}
+
+// 在 Go 中指定事务的隔离级别
+tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+```
+
+**常见追问**
+
+- RR 下为什么还能读到别人提交的数据？→ 当前读（`FOR UPDATE`、UPDATE）总是读最新版本。
+- 为什么改成 RC 时 binlog 要用 ROW 格式？→ RC 没有间隙锁，STATEMENT 格式的 binlog 在从库重放时，并发事务的执行顺序可能导致主从数据不一致。
+- 串行化是怎么实现的？→ InnoDB 把普通 SELECT 隐式转换为 `SELECT ... LOCK IN SHARE MODE`，读也加锁。
+
+**实战建议**
+
+- 涉及金额、库存的修改，用原子更新或者显式加锁，不要依赖隔离级别。
+- 事务尽量短：不在事务里做 RPC、不等待用户输入。
+
+=== db-06
+--- deep
+**原理展开**
+
+EXPLAIN 显示的是优化器基于**统计信息**做出的**估算**。统计信息（每个索引的基数、数据分布）是通过采样得到的，可能过时或不准确，这会导致优化器选错索引。几个常见的现象：
+
+- `rows` 和实际扫描行数相差很大；
+- 同一个 SQL 在不同参数下走不同的索引（数据倾斜）；
+- 统计信息更新后执行计划突然变化。
+
+`EXPLAIN ANALYZE` 会真正执行查询，并给出每一步的实际行数、循环次数和耗时，能直接看到估算和实际的差距。
+
+**代码示例**
+
+```sql
+EXPLAIN ANALYZE
+SELECT o.id, u.name FROM orders o JOIN users u ON u.id = o.user_id
+WHERE o.status = 1 ORDER BY o.created_at DESC LIMIT 20;
+-- -> Limit: 20 row(s)  (actual time=0.512..0.534 rows=20 loops=1)
+--     -> Nested loop inner join  (cost=... rows=20) (actual time=... rows=20 loops=1)
+--         -> Index scan on o using idx_status_ctime (reverse) ...
+
+-- 统计信息过时时手动更新
+ANALYZE TABLE orders;
+
+-- 优化器选错索引时的临时手段
+SELECT * FROM orders FORCE INDEX (idx_user_ctime) WHERE user_id = 42 ORDER BY created_at DESC;
+```
+
+**常见追问**
+
+- `key_len` 怎么算？→ 每个使用到的列的字节数之和：INT 4、BIGINT 8、VARCHAR(n) 在 utf8mb4 下是 4n + 2，允许 NULL 再加 1。用来判断联合索引用到了几列。
+- `type=index` 和 `type=ALL` 哪个更好？→ index 扫描整棵索引树，索引比表小时会快一些，但仍然是全量扫描。
+- `Using filesort` 一定慢吗？→ 结果集小时在内存中排序很快；结果集大时会用磁盘临时文件，就很慢了。
+
+**实战建议**
+
+- 上线前对核心 SQL 跑 EXPLAIN，写进代码评审的检查项。
+- 用 `FORCE INDEX` 是临时手段，更好的办法是调整索引设计或改写 SQL，让优化器自然地做出正确选择。
+
+=== db-07
+--- deep
+**原理展开**
+
+版本链存放在 **undo log** 中：每次修改一行时，把修改前的版本写入 undo log，并让行的 `DB_ROLL_PTR` 指向它。读一个旧版本需要沿着链表一步步回溯，所以**长事务**会带来两个问题：
+
+1. 它的 ReadView 很旧，读取时要回溯很长的版本链，越来越慢；
+2. purge 线程不能清理“还可能被某个活跃 ReadView 读到”的 undo 版本，undo log 会不断膨胀（`History list length` 持续增长）。
+
+删除操作也不是立即删除：只是给记录打上删除标记，由 purge 线程在确认没有 ReadView 需要它之后真正删除。
+
+**代码示例**
+
+```sql
+-- 找出长事务
+SELECT trx_id, trx_started, TIMESTAMPDIFF(SECOND, trx_started, NOW()) AS seconds,
+       trx_mysql_thread_id, trx_query
+FROM information_schema.innodb_trx
+ORDER BY trx_started LIMIT 10;
+
+-- undo 历史长度
+SHOW ENGINE INNODB STATUS\G   -- 看 TRANSACTIONS 部分的 History list length
+```
+
+```go
+// 长事务的常见来源：开启事务后做了耗时的外部调用
+tx, _ := db.BeginTx(ctx, nil)
+order, _ := loadOrder(ctx, tx, id)
+resp, _ := paymentClient.Charge(ctx, order) // ✗ 在事务中调用外部服务，可能耗时数秒
+tx.ExecContext(ctx, "UPDATE ...")
+tx.Commit()
+```
+
+**常见追问**
+
+- 只读事务会分配事务 ID 吗？→ 不会（5.6+），只读事务不需要 trx_id，开销很小。
+- 快照读能读到自己刚写入的数据吗？→ 能，版本的 trx_id 等于自己的事务 ID 时可见。
+- MVCC 能完全避免锁吗？→ 只是让普通读不加锁，写和当前读仍然需要锁。
+
+**实战建议**
+
+- 监控长事务和 History list length，设置告警。
+- 应用里给事务设置超时（ctx），避免事务因为 bug 一直不提交。
+
+=== db-08
+--- deep
+**原理展开**
+
+为什么需要间隙锁：RR 级别要防止**当前读**的幻读。`SELECT ... WHERE age > 20 FOR UPDATE` 锁住了所有符合条件的行，但如果别的事务能插入一条 age = 25 的新行，再次执行同样的当前读就会多出一行。间隙锁锁住记录之间的“空隙”，让这些位置无法插入。
+
+间隙锁之间**不冲突**（两个事务可以同时持有同一个间隙的间隙锁），它只阻止插入。这正是一类经典死锁的来源：两个事务先后执行“不存在则插入”，各自对同一个间隙加了间隙锁，然后都尝试插入，各自被对方的间隙锁阻塞。
+
+**代码示例**
+
+```sql
+-- 经典死锁：并发的“查询不存在，然后插入”
+-- 事务 A                                    -- 事务 B
+SELECT * FROM t WHERE k = 15 FOR UPDATE;     SELECT * FROM t WHERE k = 15 FOR UPDATE;
+-- 都没找到，都持有 (10, 20) 的间隙锁
+INSERT INTO t (k) VALUES (15);               INSERT INTO t (k) VALUES (15);
+-- A 等 B 的间隙锁，B 等 A 的间隙锁 → 死锁，其中一个被回滚
+
+-- 改进：依靠唯一索引直接插入，冲突时处理
+INSERT INTO t (k) VALUES (15) ON DUPLICATE KEY UPDATE updated_at = NOW();
+```
+
+```sql
+-- 查看当前的锁（MySQL 8.0）
+SELECT engine_transaction_id, index_name, lock_type, lock_mode, lock_data
+FROM performance_schema.data_locks;
+```
+
+**常见追问**
+
+- RC 隔离级别下有间隙锁吗？→ 基本没有（只在外键检查和唯一键检查时使用），这也是很多公司改用 RC 的原因。
+- 为什么 UPDATE 没走索引会锁全表？→ 扫描时会对每一条扫描到的记录加临键锁，全表扫描就锁住了所有记录和间隙。
+- 意向锁有什么用？→ 想加表锁时，只需要检查表上的意向锁，不需要逐行检查是否有行锁。
+
+**实战建议**
+
+- 所有 UPDATE / DELETE 的 WHERE 条件都要能走索引，上线前 EXPLAIN 确认。
+- “存在则更新、不存在则插入”用 `INSERT ... ON DUPLICATE KEY UPDATE` 配合唯一索引，而不是先查后插。
+
+=== db-09
+--- deep
+**原理展开**
+
+**redo log 的循环写**：固定大小的几个文件组成一个环，有两个位置：`write pos`（当前写入的位置）和 `checkpoint`（之前的修改都已经刷到数据页了）。write pos 追上 checkpoint 时，必须先把脏页刷盘、推进 checkpoint，才能继续写入，这时写入会出现明显的卡顿。所以 redo log 不能太小（MySQL 8.0.30 起用 `innodb_redo_log_capacity` 配置）。
+
+**组提交**（group commit）：“双 1”配置下每次提交都要 fsync，fsync 很慢。MySQL 会把同一时刻的多个事务的 redo log 和 binlog 合并成一次 fsync，大幅降低开销。
+
+**崩溃恢复的流程**：从 checkpoint 开始重放 redo log，把数据页恢复到崩溃前的状态；然后对处于 prepare 状态的事务，到 binlog 里查找它的 XID，存在就提交，不存在就用 undo log 回滚。
+
+**代码示例**
+
+```sql
+SHOW VARIABLES LIKE 'innodb_flush_log_at_trx_commit'; -- 1：每次提交都写入并刷盘
+SHOW VARIABLES LIKE 'sync_binlog';                    -- 1：每次提交都刷 binlog
+SHOW VARIABLES LIKE 'binlog_format';                  -- ROW
+SHOW VARIABLES LIKE 'innodb_redo_log_capacity';
+
+-- 查看 binlog 内容（行格式需要解码）
+-- mysqlbinlog --base64-output=DECODE-ROWS -v mysql-bin.000123
+```
+
+**常见追问**
+
+- `innodb_flush_log_at_trx_commit` 设成 2 有什么风险？→ 每次提交只写到操作系统缓存，每秒刷一次盘；MySQL 崩溃不丢数据，但操作系统崩溃或断电最多丢 1 秒。
+- binlog 的三种格式有什么区别？→ STATEMENT 记录 SQL（体积小，但不确定的函数会导致主从不一致）；ROW 记录每一行的变化（准确，体积大）；MIXED 混合。现在通常用 ROW。
+- 有了 redo log 为什么还要 binlog？→ redo 是 InnoDB 私有的、循环覆盖的物理日志，不能用于复制和长期的时间点恢复。
+
+**实战建议**
+
+- 核心业务库使用“双 1”配置；对可以容忍少量丢失的日志类库，可以放宽来换取写入性能。
+- 保留足够长时间的 binlog，配合全量备份可以恢复到任意时间点。
+
+=== db-10
+--- deep
+**原理展开**
+
+一条 SQL 的耗时由几部分组成：等待连接（应用端连接池）→ 网络 → 等待锁 → 执行（扫描、排序、回表）→ 返回数据。“慢”可能出在任何一环，所以第一步是**确定慢在哪里**：
+
+- 慢查询日志的 `Query_time` 包含了锁等待时间，`Lock_time` 单独列出了表锁等待（行锁等待要看 `performance_schema`）；
+- `Rows_examined` 远大于 `Rows_sent` 说明扫描了大量无用的行，通常是索引问题；
+- 应用端的耗时远大于数据库记录的耗时，说明问题在连接池或网络。
+
+**代码示例**
+
+```go
+// 应用端：区分“等连接”和“执行”的耗时
+stats := db.Stats()
+slog.Info("db pool",
+	"open", stats.OpenConnections, "in_use", stats.InUse, "idle", stats.Idle,
+	"wait_count", stats.WaitCount, "wait_duration", stats.WaitDuration)
+```
+
+```sql
+-- 数据库端：最近执行最慢的语句（performance_schema）
+SELECT digest_text, count_star, avg_timer_wait/1e12 AS avg_s, sum_rows_examined/count_star AS avg_rows
+FROM performance_schema.events_statements_summary_by_digest
+ORDER BY sum_timer_wait DESC LIMIT 10;
+
+-- 当前的锁等待
+SELECT * FROM sys.innodb_lock_waits\G
+```
+
+**常见追问**
+
+- `long_query_time` 设多少合适？→ 线上一般 0.1～1 秒，配合 `log_queries_not_using_indexes` 能发现潜在的问题。
+- pt-query-digest 做了什么？→ 把参数不同的同类 SQL 归一化成一个“指纹”，按总耗时、次数、平均耗时排序，找出最值得优化的那几个。
+- 加了索引后查询反而变慢了？→ 可能优化器选了这个新索引但它并不合适；或者写入变慢影响了整体。
+
+**实战建议**
+
+- 建立“慢查询 → 告警 → 分析 → 优化 → 验证”的常规流程，而不是等出了事故才处理。
+- 新功能上线前，用接近生产规模的数据测试核心查询的执行计划。
+
+=== db-11
+--- deep
+**原理展开**
+
+`LIMIT offset, n` 的执行过程：存储引擎按顺序返回行，server 层计数，丢弃前 offset 行。即使用了索引，这 offset 行也要被**逐行读取**（如果需要回表，每一行都要回表）。所以耗时与 offset 成正比。
+
+游标分页把“跳过多少行”变成了“从哪个值开始”：`WHERE id < ?` 在 B+ 树上直接定位到起点，耗时与页码无关。
+
+排序字段不唯一时（比如按 `created_at` 排序），游标必须包含能唯一确定位置的组合：
+
+```sql
+WHERE (created_at, id) < (?, ?) ORDER BY created_at DESC, id DESC LIMIT 20
+```
+
+需要 `(created_at, id)` 的联合索引。
+
+**代码示例**
+
+```go
+type Cursor struct {
+	CreatedAt time.Time
+	ID        int64
+}
+
+func listOrders(ctx context.Context, db *sql.DB, uid int64, after *Cursor, limit int) ([]Order, *Cursor, error) {
+	q := `SELECT id, created_at, amount FROM orders WHERE user_id = ?`
+	args := []any{uid}
+	if after != nil {
+		q += ` AND (created_at, id) < (?, ?)`
+		args = append(args, after.CreatedAt, after.ID)
+	}
+	q += ` ORDER BY created_at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := db.QueryContext(ctx, q, args...)
+	// ... 扫描结果，最后一条作为下一页的游标
+	_ = rows
+	return nil, nil, err
+}
+```
+
+**常见追问**
+
+- 行值比较 `(a, b) < (?, ?)` 能用索引吗？→ MySQL 8.0 可以用于范围扫描；更早的版本可以展开成 `a < ? OR (a = ? AND b < ?)`。
+- 数据在翻页过程中被插入或删除怎么办？→ 游标分页不会出现重复或遗漏（OFFSET 分页会），这也是它的一个优点。
+- 要显示总页数怎么办？→ `count(*)` 本身在大表上也很慢，可以显示估算值，或者只显示“下一页”。
+
+**实战建议**
+
+- 新接口默认用游标分页；必须跳页的后台管理页面限制最大页数。
+- 游标编码成不透明的字符串返回给前端（见「编码分页游标」任务）。

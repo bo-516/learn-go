@@ -1,0 +1,859 @@
+=== lc-200
+no: 200
+title: 岛屿数量
+slug: number-of-islands
+difficulty: 中等
+category: 图与搜索
+topics: 深度优先搜索, 广度优先搜索, 矩阵
+go: 递归的闭包, 二维切片, byte 与 rune
+--- desc
+给定由 `'1'`（陆地）和 `'0'`（水）组成的二维网格 `grid`，计算岛屿的数量。岛屿由**水平或竖直方向**相邻的陆地连接而成，网格四周都被水包围。
+
+**示例**：
+
+```text
+11000
+11000
+00100
+00011
+```
+
+→ `3`。
+--- solution
+package main
+
+func numIslands(grid [][]byte) int {
+	// @solution
+	m, n := len(grid), len(grid[0])
+	// sink 把 (i, j) 所在的整座岛“淹掉”（改成 '0'），相当于标记为已访问
+	var sink func(i, j int)
+	sink = func(i, j int) {
+		if i < 0 || i >= m || j < 0 || j >= n || grid[i][j] != '1' {
+			return
+		}
+		grid[i][j] = '0'
+		sink(i+1, j)
+		sink(i-1, j)
+		sink(i, j+1)
+		sink(i, j-1)
+	}
+	count := 0
+	for i := range grid {
+		for j := range grid[i] {
+			if grid[i][j] == '1' {
+				count++ // 发现一座新岛
+				sink(i, j)
+			}
+		}
+	}
+	return count
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func grid(rows ...string) [][]byte {
+	g := make([][]byte, len(rows))
+	for i, r := range rows {
+		g[i] = []byte(r)
+	}
+	return g
+}
+
+func TestNumIslands(t *testing.T) {
+	cases := []struct {
+		rows []string
+		want int
+	}{
+		{[]string{"11110", "11010", "11000", "00000"}, 1},
+		{[]string{"11000", "11000", "00100", "00011"}, 3},
+		{[]string{"1"}, 1},
+		{[]string{"0"}, 0},
+		{[]string{"10101"}, 3},
+		{[]string{"111", "010", "111"}, 1},
+		{[]string{"101", "010", "101"}, 5},
+	}
+	for _, c := range cases {
+		if got := numIslands(grid(c.rows...)); got != c.want {
+			t.Errorf("numIslands(%q) = %d，期望 %d", c.rows, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+遍历网格，每遇到一块还没访问过的陆地，岛屿数 +1，然后用 DFS 把和它相连的整座岛都标记掉，这样同一座岛不会被重复计数。标记的办法很简单：直接把 `'1'` 改成 `'0'`（“淹掉”）。
+
+**代码讲解**
+
+1. `m, n := len(grid), len(grid[0])`：行数和列数。
+2. `var sink func(i, j int)` 再赋值：递归闭包的写法，闭包里直接使用外层的 `grid`、`m`、`n`。
+3. 第一行把所有“不用处理”的情况一次判断完：越界、是水、已经访问过。`||` 短路保证越界时不会访问 `grid[i][j]`。
+4. 先 `grid[i][j] = '0'` 再递归四个方向，避免来回无限递归。
+5. 主循环 `for i := range grid` / `for j := range grid[i]`：只要下标的 range。
+
+**易错点**
+
+- `grid[i][j]` 的类型是 `byte`，要和字符 `'1'` 比较，不是整数 1。
+- 先递归再标记会在相邻两格之间无限来回，栈溢出。
+- 题目允许修改输入；不允许时要另开一个 `visited [][]bool`。
+
+**复杂度**
+
+时间 O(m·n)，每个格子最多访问一次；空间 O(m·n)（最坏情况下的递归深度）。
+
+**延伸**
+
+BFS 和并查集也能解这道题。网格很大时，DFS 递归可能很深，用 BFS（切片当队列）更稳妥。
+
+=== lc-994
+no: 994
+title: 腐烂的橘子
+slug: rotting-oranges
+difficulty: 中等
+category: 图与搜索
+topics: 广度优先搜索, 矩阵
+go: 切片当队列, 数组值类型, switch
+--- desc
+网格中每个格子是 0（空）、1（新鲜橘子）或 2（腐烂的橘子）。每分钟，腐烂橘子**上下左右**相邻的新鲜橘子都会腐烂。返回直到没有新鲜橘子为止所需的最少分钟数；如果不可能，返回 -1。
+
+**示例**：`[[2,1,1],[1,1,0],[0,1,1]]` → `4`；`[[2,1,1],[0,1,1],[1,0,1]]` → `-1`（左下角的橘子永远不会腐烂）；`[[0,2]]` → `0`。
+--- solution
+package main
+
+func orangesRotting(grid [][]int) int {
+	// @solution
+	m, n := len(grid), len(grid[0])
+	var queue [][2]int // 当前这一分钟刚腐烂的橘子
+	fresh := 0
+	for i := range m {
+		for j := range n {
+			switch grid[i][j] {
+			case 1:
+				fresh++
+			case 2:
+				queue = append(queue, [2]int{i, j})
+			}
+		}
+	}
+	dirs := [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}
+	minutes := 0
+	for len(queue) > 0 && fresh > 0 {
+		minutes++
+		var next [][2]int
+		for _, p := range queue {
+			for _, d := range dirs {
+				x, y := p[0]+d[0], p[1]+d[1]
+				if x >= 0 && x < m && y >= 0 && y < n && grid[x][y] == 1 {
+					grid[x][y] = 2
+					fresh--
+					next = append(next, [2]int{x, y})
+				}
+			}
+		}
+		queue = next
+	}
+	if fresh > 0 {
+		return -1
+	}
+	return minutes
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestOrangesRotting(t *testing.T) {
+	cases := []struct {
+		grid [][]int
+		want int
+	}{
+		{[][]int{{2, 1, 1}, {1, 1, 0}, {0, 1, 1}}, 4},
+		{[][]int{{2, 1, 1}, {0, 1, 1}, {1, 0, 1}}, -1},
+		{[][]int{{0, 2}}, 0},
+		{[][]int{{0}}, 0},
+		{[][]int{{1}}, -1},
+		{[][]int{{2, 2}, {1, 1}, {0, 0}, {2, 0}}, 1},
+		{[][]int{{2, 1, 1, 1, 1}}, 4},
+	}
+	for _, c := range cases {
+		if got := orangesRotting(c.grid); got != c.want {
+			t.Errorf("orangesRotting(%v) = %d，期望 %d", c.grid, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+**多源 BFS**：所有初始就腐烂的橘子同时作为起点放进队列，一层一层往外扩散，每扩散一层就是一分钟。用 `fresh` 记录剩余的新鲜橘子数，最后还有剩余就返回 -1。
+
+**代码讲解**
+
+1. `var queue [][2]int`：用**数组** `[2]int` 表示坐标，比 `[]int` 更轻（不需要单独分配），也能直接当 map 的 key。
+2. `for i := range m`：Go 1.22 的 range 整数写法。
+3. `switch grid[i][j]` 统计新鲜橘子、收集腐烂橘子。
+4. `dirs := [4][2]int{...}`：方向数组，网格题的常用技巧，避免写四段重复代码。
+5. 外层循环条件 `len(queue) > 0 && fresh > 0`：没有新鲜橘子时就不用再多算一分钟。
+6. 每一轮用新切片 `next` 收集下一分钟腐烂的橘子，处理完整层后 `queue = next`，这样“一轮 = 一分钟”很清楚。
+7. 新鲜橘子一旦被感染就立刻改成 2，避免被重复加入队列。
+
+**易错点**
+
+- 从每个腐烂橘子分别 BFS 再取最小值，会重复计算且结果不对；多个源头要**同时**出发。
+- 循环条件里不加 `fresh > 0`，最后一层腐烂后还会多计 1 分钟。
+- 一开始就没有新鲜橘子时答案是 0。
+
+**复杂度**
+
+时间 O(m·n)，空间 O(m·n)。
+
+=== lc-207
+no: 207
+title: 课程表
+slug: course-schedule
+difficulty: 中等
+category: 图与搜索
+topics: 图, 拓扑排序, 广度优先搜索
+go: 二维切片, 切片当队列, 多重赋值
+--- desc
+一共有 `numCourses` 门课，编号 0 到 numCourses−1。`prerequisites[i] = [a, b]` 表示学习课程 a 之前必须先学完课程 b。判断是否可能学完所有课程。
+
+**示例**：`numCourses = 2, prerequisites = [[1,0]]` → `true`；`[[1,0],[0,1]]` → `false`（互相依赖，形成了环）。
+--- solution
+package main
+
+func canFinish(numCourses int, prerequisites [][]int) bool {
+	// @solution
+	indeg := make([]int, numCourses)    // 每门课还有几门先修课没学
+	next := make([][]int, numCourses)   // 先修课 → 依赖它的课（邻接表）
+	for _, p := range prerequisites {
+		course, pre := p[0], p[1]
+		next[pre] = append(next[pre], course)
+		indeg[course]++
+	}
+	var queue []int
+	for c, d := range indeg {
+		if d == 0 {
+			queue = append(queue, c) // 没有先修课，可以直接学
+		}
+	}
+	done := 0
+	for len(queue) > 0 {
+		c := queue[0]
+		queue = queue[1:]
+		done++
+		for _, nx := range next[c] {
+			indeg[nx]--
+			if indeg[nx] == 0 {
+				queue = append(queue, nx)
+			}
+		}
+	}
+	return done == numCourses // 有环时环上的课入度永远不会变成 0
+	// @starter
+	// return false
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestCanFinish(t *testing.T) {
+	cases := []struct {
+		n    int
+		pre  [][]int
+		want bool
+	}{
+		{2, [][]int{{1, 0}}, true},
+		{2, [][]int{{1, 0}, {0, 1}}, false},
+		{3, nil, true},
+		{4, [][]int{{1, 0}, {2, 1}, {3, 2}, {1, 3}}, false},
+		{5, [][]int{{1, 4}, {2, 4}, {3, 1}, {3, 2}}, true},
+		{3, [][]int{{0, 1}, {0, 2}, {1, 2}}, true},
+	}
+	for _, c := range cases {
+		if got := canFinish(c.n, c.pre); got != c.want {
+			t.Errorf("canFinish(%d, %v) = %v，期望 %v", c.n, c.pre, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+课程和先修关系构成一张**有向图**，能学完所有课程 ⇔ 图里**没有环**。用拓扑排序（Kahn 算法）判断：
+
+1. 统计每门课的入度（还有几门先修课）；
+2. 入度为 0 的课可以直接学，放进队列；
+3. 每学完一门课，把依赖它的课的入度减 1，减到 0 就入队；
+4. 最后学完的课程数等于总数，说明没有环。
+
+**代码讲解**
+
+1. `next := make([][]int, numCourses)`：**邻接表**，二维切片，每一行先是 nil，用 append 添加边。
+2. `course, pre := p[0], p[1]`：多重赋值给两个元素起名字，比到处写 `p[0]`、`p[1]` 清楚得多。
+3. `for c, d := range indeg`：同时拿到课程编号和入度。
+4. 切片当队列：`queue[0]` 取队头，`queue = queue[1:]` 出队。
+5. `return done == numCourses`。
+
+**易错点**
+
+- 边的方向：`[a, b]` 表示 b → a（先学 b），入度加在 a 上。
+- 环上的节点入度永远不会降为 0，所以不会进入队列，`done` 会少于总数。
+
+**复杂度**
+
+时间 O(V + E)，空间 O(V + E)，V 是课程数，E 是先修关系数。
+
+**延伸**
+
+DFS 三色标记法也能判环：0 未访问、1 访问中、2 已完成；DFS 时遇到“访问中”的节点说明有环。如果要输出一种学习顺序（210 题），把出队顺序记录下来就是拓扑序。
+
+=== lc-733
+no: 733
+title: 图像渲染
+slug: flood-fill
+difficulty: 简单
+category: 图与搜索
+topics: 深度优先搜索, 矩阵
+go: 递归的闭包, 二维切片
+--- desc
+二维数组 `image` 表示一幅图像，每个值是像素颜色。从像素 `image[sr][sc]` 开始进行“上色”（油漆桶）：把和起点**颜色相同**并且**上下左右相连**的所有像素都改成 `color`，返回修改后的图像。
+
+**示例**：`image = [[1,1,1],[1,1,0],[1,0,1]], sr = 1, sc = 1, color = 2` → `[[2,2,2],[2,2,0],[2,0,1]]`（右下角的 1 没有和起点相连）。
+--- solution
+package main
+
+func floodFill(image [][]int, sr int, sc int, color int) [][]int {
+	// @solution
+	old := image[sr][sc]
+	if old == color {
+		return image // 颜色本来就一样，不处理（否则 DFS 会无限递归）
+	}
+	var fill func(i, j int)
+	fill = func(i, j int) {
+		if i < 0 || i >= len(image) || j < 0 || j >= len(image[0]) || image[i][j] != old {
+			return
+		}
+		image[i][j] = color
+		fill(i+1, j)
+		fill(i-1, j)
+		fill(i, j+1)
+		fill(i, j-1)
+	}
+	fill(sr, sc)
+	return image
+	// @starter
+	// return image
+	// @end
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"testing"
+)
+
+func TestFloodFill(t *testing.T) {
+	cases := []struct {
+		image         [][]int
+		sr, sc, color int
+		want          string
+	}{
+		{[][]int{{1, 1, 1}, {1, 1, 0}, {1, 0, 1}}, 1, 1, 2, "[[2 2 2] [2 2 0] [2 0 1]]"},
+		{[][]int{{0, 0, 0}, {0, 0, 0}}, 0, 0, 0, "[[0 0 0] [0 0 0]]"},
+		{[][]int{{0, 0, 0}, {0, 1, 1}}, 1, 1, 1, "[[0 0 0] [0 1 1]]"},
+		{[][]int{{1}}, 0, 0, 5, "[[5]]"},
+		{[][]int{{0, 1}, {1, 0}}, 0, 0, 3, "[[3 1] [1 0]]"},
+		{[][]int{{0, 0, 0}, {0, 1, 0}}, 0, 0, 2, "[[2 2 2] [2 1 2]]"},
+	}
+	for _, c := range cases {
+		in := fmt.Sprint(c.image)
+		if got := fmt.Sprint(floodFill(c.image, c.sr, c.sc, c.color)); got != c.want {
+			t.Errorf("floodFill(%s, %d, %d, %d) = %s，期望 %s", in, c.sr, c.sc, c.color, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+从起点开始 DFS，把颜色等于原颜色 `old` 的相邻像素改成新颜色，改过的像素颜色变了，自然不会被重复访问。和「岛屿数量」是同一个模板。
+
+**代码讲解**
+
+1. `old := image[sr][sc]`：先记下原颜色。
+2. **特判 `old == color`**：如果新旧颜色相同，改完的像素仍然等于 `old`，DFS 会在相邻像素之间来回无限递归，最终栈溢出。
+3. `fill` 闭包：越界或颜色不是 `old` 就返回；否则上色并递归四个方向。
+4. 直接修改并返回传入的 `image`（二维切片共享底层数据）。
+
+**易错点**
+
+- 漏掉第 2 步的特判，`[[0,0,0],[0,0,0]], color = 0` 会栈溢出。
+- 对角线方向不算相连。
+
+**复杂度**
+
+时间 O(m·n)，空间 O(m·n)（递归深度）。
+
+=== lc-46
+no: 46
+title: 全排列
+slug: permutations
+difficulty: 中等
+category: 回溯
+topics: 数组, 回溯
+go: 递归的闭包, slices 包, 切片
+--- desc
+给定一个**不含重复数字**的数组 `nums`，返回它所有可能的全排列，顺序不限。
+
+**示例**：`[1,2,3]` → `[[1,2,3],[1,3,2],[2,1,3],[2,3,1],[3,1,2],[3,2,1]]`；`[0,1]` → `[[0,1],[1,0]]`。
+--- solution
+package main
+
+import "slices"
+
+func permute(nums []int) [][]int {
+	// @solution
+	var res [][]int
+	path := make([]int, 0, len(nums))
+	used := make([]bool, len(nums))
+	var dfs func()
+	dfs = func() {
+		if len(path) == len(nums) {
+			res = append(res, slices.Clone(path)) // 必须复制，path 之后还会被修改
+			return
+		}
+		for i, v := range nums {
+			if used[i] {
+				continue
+			}
+			used[i] = true
+			path = append(path, v)
+			dfs()
+			path = path[:len(path)-1] // 撤销选择
+			used[i] = false
+		}
+	}
+	dfs()
+	return res
+	// @starter
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"slices"
+	"testing"
+)
+
+func sorted(x [][]int) string {
+	c := slices.Clone(x)
+	slices.SortFunc(c, slices.Compare[[]int])
+	return fmt.Sprint(c)
+}
+
+func TestPermute(t *testing.T) {
+	cases := []struct {
+		nums []int
+		want [][]int
+	}{
+		{[]int{1, 2, 3}, [][]int{{1, 2, 3}, {1, 3, 2}, {2, 1, 3}, {2, 3, 1}, {3, 1, 2}, {3, 2, 1}}},
+		{[]int{0, 1}, [][]int{{0, 1}, {1, 0}}},
+		{[]int{1}, [][]int{{1}}},
+	}
+	for _, c := range cases {
+		if got := permute(c.nums); sorted(got) != sorted(c.want) {
+			t.Errorf("permute(%v) = %v，期望 %v", c.nums, sorted(got), sorted(c.want))
+		}
+	}
+
+	got := permute([]int{1, 2, 3, 4})
+	seen := map[string]bool{}
+	for _, p := range got {
+		s := slices.Clone(p)
+		slices.Sort(s)
+		if !slices.Equal(s, []int{1, 2, 3, 4}) {
+			t.Fatalf("permute([1 2 3 4]) 里有不是排列的结果 %v", p)
+		}
+		seen[fmt.Sprint(p)] = true
+	}
+	if len(got) != 24 || len(seen) != 24 {
+		t.Errorf("permute([1 2 3 4]) 应该有 24 个不同的排列，得到 %d 个（不同的 %d 个）", len(got), len(seen))
+	}
+}
+--- explain
+**思路**
+
+**回溯**：一个位置一个位置地填数。每一层从还没用过的数里选一个放进 `path`，递归填下一个位置；递归回来后**撤销选择**（弹出、标记为未使用），再试下一个数。`path` 填满就得到一个排列。
+
+**代码讲解**
+
+1. `path := make([]int, 0, len(nums))`：预分配容量，回溯过程中 append 不会扩容。
+2. `used := make([]bool, len(nums))`：标记哪些下标已经在 path 里。
+3. `var dfs func()`：回溯的状态都在闭包外层（`path`、`used`、`res`），所以 dfs 不需要参数。
+4. 终止条件：`len(path) == len(nums)`，把 `slices.Clone(path)` 加入结果。
+5. 选择 → 递归 → 撤销，三步对称：`used[i] = true; path = append(...)` / `dfs()` / `path = path[:len(path)-1]; used[i] = false`。
+
+**易错点**
+
+- **最经典的 Go 回溯 bug**：`res = append(res, path)` 直接保存 path。所有结果共享 path 的底层数组，之后的修改会把已保存的结果全部改掉，最后得到一堆相同的排列。必须复制。
+- 撤销时漏掉 `used[i] = false`，后面的分支会少选数。
+
+**复杂度**
+
+时间 O(n·n!)，共 n! 个排列，每个复制 O(n)；空间 O(n)（不算结果）。
+
+=== lc-78
+no: 78
+title: 子集
+slug: subsets
+difficulty: 中等
+category: 回溯
+topics: 数组, 回溯, 位运算
+go: 递归的闭包, slices 包, 切片
+--- desc
+给定元素**互不相同**的整数数组 `nums`，返回它所有可能的子集（幂集），不能包含重复的子集，顺序不限。
+
+**示例**：`[1,2,3]` → `[[],[1],[2],[1,2],[3],[1,3],[2,3],[1,2,3]]`；`[0]` → `[[],[0]]`。
+--- solution
+package main
+
+import "slices"
+
+func subsets(nums []int) [][]int {
+	// @solution
+	var res [][]int
+	var path []int
+	var dfs func(start int)
+	dfs = func(start int) {
+		res = append(res, slices.Clone(path)) // 每个节点都是一个子集
+		for i := start; i < len(nums); i++ {
+			path = append(path, nums[i])
+			dfs(i + 1) // 只往后选，避免 [1,2] 和 [2,1] 重复
+			path = path[:len(path)-1]
+		}
+	}
+	dfs(0)
+	return res
+	// @starter
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"slices"
+	"testing"
+)
+
+func norm(x [][]int) string {
+	out := make([][]int, 0, len(x))
+	for _, s := range x {
+		c := slices.Clone(s)
+		slices.Sort(c)
+		out = append(out, c)
+	}
+	slices.SortFunc(out, slices.Compare[[]int])
+	return fmt.Sprint(out)
+}
+
+func TestSubsets(t *testing.T) {
+	cases := []struct {
+		nums []int
+		want [][]int
+	}{
+		{[]int{1, 2, 3}, [][]int{{}, {1}, {2}, {1, 2}, {3}, {1, 3}, {2, 3}, {1, 2, 3}}},
+		{[]int{0}, [][]int{{}, {0}}},
+		{[]int{1, 2}, [][]int{{}, {1}, {2}, {1, 2}}},
+	}
+	for _, c := range cases {
+		if got := subsets(c.nums); norm(got) != norm(c.want) {
+			t.Errorf("subsets(%v) = %v，期望 %v", c.nums, norm(got), norm(c.want))
+		}
+	}
+
+	got := subsets([]int{1, 2, 3, 4, 5})
+	seen := map[string]bool{}
+	for _, s := range got {
+		c := slices.Clone(s)
+		slices.Sort(c)
+		seen[fmt.Sprint(c)] = true
+	}
+	if len(got) != 32 || len(seen) != 32 {
+		t.Errorf("subsets([1 2 3 4 5]) 应该有 32 个不同的子集，得到 %d 个（不同的 %d 个）", len(got), len(seen))
+	}
+}
+--- explain
+**思路**
+
+回溯时**每到一个节点就记录一次**当前的 path（而不是只在叶子记录），就得到了所有子集。为了不重复，规定只能按下标递增的顺序选：选了 `nums[i]` 之后，下一层只能从 `i+1` 开始选。
+
+**代码讲解**
+
+1. `var path []int`：当前子集，nil 切片起步。
+2. `dfs(start int)`：`start` 表示这一层可以从哪个下标开始选。
+3. 进入函数第一件事就是 `res = append(res, slices.Clone(path))`：空集也会在第一次调用时被记录。
+4. 循环里选 `nums[i]` → `dfs(i + 1)` → 撤销。
+5. 没有显式的终止条件：`start == len(nums)` 时循环一次也不执行，自然返回。
+
+**易错点**
+
+- 和全排列一样，保存结果时必须**复制** path。
+- 下一层写成 `dfs(start + 1)` 而不是 `dfs(i + 1)`，会产生重复子集。
+
+**复杂度**
+
+时间 O(n·2ⁿ)，空间 O(n)（不算结果）。
+
+**延伸**
+
+位运算写法：n 个元素的子集和 0 到 2ⁿ−1 的二进制数一一对应，第 j 位是 1 就选 `nums[j]`：
+
+```go
+for mask := 0; mask < 1<<len(nums); mask++ {
+	var s []int
+	for j, v := range nums {
+		if mask>>j&1 == 1 {
+			s = append(s, v)
+		}
+	}
+	res = append(res, s)
+}
+```
+
+=== lc-39
+no: 39
+title: 组合总和
+slug: combination-sum
+difficulty: 中等
+category: 回溯
+topics: 数组, 回溯
+go: 递归的闭包, slices 包, 切片
+--- desc
+给定**无重复元素**的正整数数组 `candidates` 和目标值 `target`，找出所有和为 target 的组合。同一个数字可以**无限次重复**选取，两个组合中某个数字的出现次数不同才算不同的组合。顺序不限。
+
+**示例**：`candidates = [2,3,6,7], target = 7` → `[[2,2,3],[7]]`；`candidates = [2,3,5], target = 8` → `[[2,2,2,2],[2,3,3],[3,5]]`。
+--- solution
+package main
+
+import "slices"
+
+func combinationSum(candidates []int, target int) [][]int {
+	// @solution
+	slices.Sort(candidates)
+	var res [][]int
+	var path []int
+	var dfs func(start, rest int)
+	dfs = func(start, rest int) {
+		if rest == 0 {
+			res = append(res, slices.Clone(path))
+			return
+		}
+		for i := start; i < len(candidates); i++ {
+			c := candidates[i]
+			if c > rest {
+				break // 已排序，后面的数更大，也不可能
+			}
+			path = append(path, c)
+			dfs(i, rest-c) // 可以重复选，所以下一层还从 i 开始
+			path = path[:len(path)-1]
+		}
+	}
+	dfs(0, target)
+	return res
+	// @starter
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"slices"
+	"testing"
+)
+
+func norm(x [][]int) string {
+	out := make([][]int, 0, len(x))
+	for _, s := range x {
+		c := slices.Clone(s)
+		slices.Sort(c)
+		out = append(out, c)
+	}
+	slices.SortFunc(out, slices.Compare[[]int])
+	return fmt.Sprint(out)
+}
+
+func TestCombinationSum(t *testing.T) {
+	cases := []struct {
+		cand   []int
+		target int
+		want   [][]int
+	}{
+		{[]int{2, 3, 6, 7}, 7, [][]int{{2, 2, 3}, {7}}},
+		{[]int{2, 3, 5}, 8, [][]int{{2, 2, 2, 2}, {2, 3, 3}, {3, 5}}},
+		{[]int{2}, 1, nil},
+		{[]int{1}, 2, [][]int{{1, 1}}},
+		{[]int{8, 7, 4, 3}, 11, [][]int{{3, 4, 4}, {3, 8}, {4, 7}}},
+	}
+	for _, c := range cases {
+		if got := combinationSum(slices.Clone(c.cand), c.target); norm(got) != norm(c.want) {
+			t.Errorf("combinationSum(%v, %d) = %v，期望 %v", c.cand, c.target, norm(got), norm(c.want))
+		}
+	}
+}
+--- explain
+**思路**
+
+回溯 + 剪枝。和「子集」类似，用 `start` 保证组合按下标非递减的顺序选取（避免 `[2,3]` 和 `[3,2]` 重复）；不同的是**同一个数可以重复选**，所以下一层仍然从 `i` 开始而不是 `i+1`。用 `rest` 记录还差多少。
+
+**代码讲解**
+
+1. `slices.Sort(candidates)`：排序后可以剪枝。
+2. `dfs(start, rest int)`：两个同类型参数合写。
+3. `rest == 0`：凑够了，保存副本。
+4. `if c > rest { break }`：当前数已经超过剩余值，后面更大的数也不可能，直接结束循环（不是 `continue`）。
+5. `dfs(i, rest-c)`：允许重复使用 `candidates[i]`。
+
+**易错点**
+
+- 写成 `dfs(i+1, ...)` 就变成了“每个数只能用一次”（40 题的规则）。
+- 写成 `dfs(0, ...)` 会产生顺序不同的重复组合。
+- 没有剪枝也能得到正确结果，但会多搜索很多无效分支；没排序时只能 `continue` 不能 `break`。
+
+**复杂度**
+
+指数级，取决于 target 和最小候选数的比值；空间 O(target / min(candidates))（递归深度）。
+
+=== lc-22
+no: 22
+title: 括号生成
+slug: generate-parentheses
+difficulty: 中等
+category: 回溯
+topics: 字符串, 回溯, 动态规划
+go: 递归的闭包, byte 与 rune, 切片
+--- desc
+数字 `n` 代表括号的对数，生成所有**有效的**括号组合。
+
+**示例**：`n = 3` → `["((()))","(()())","(())()","()(())","()()()"]`；`n = 1` → `["()"]`。
+--- solution
+package main
+
+func generateParenthesis(n int) []string {
+	// @solution
+	var res []string
+	buf := make([]byte, 0, 2*n)
+	var dfs func(open, closed int)
+	dfs = func(open, closed int) {
+		if len(buf) == 2*n {
+			res = append(res, string(buf)) // string(buf) 会复制，不用担心 buf 之后被修改
+			return
+		}
+		if open < n { // 还能放左括号
+			buf = append(buf, '(')
+			dfs(open+1, closed)
+			buf = buf[:len(buf)-1]
+		}
+		if closed < open { // 右括号不能多于左括号
+			buf = append(buf, ')')
+			dfs(open, closed+1)
+			buf = buf[:len(buf)-1]
+		}
+	}
+	dfs(0, 0)
+	return res
+	// @starter
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func valid(s string) bool {
+	depth := 0
+	for _, c := range s {
+		if c == '(' {
+			depth++
+		} else {
+			depth--
+		}
+		if depth < 0 {
+			return false
+		}
+	}
+	return depth == 0
+}
+
+func TestGenerateParenthesis(t *testing.T) {
+	cases := []struct {
+		n    int
+		want []string
+	}{
+		{3, []string{"((()))", "(()())", "(())()", "()(())", "()()()"}},
+		{1, []string{"()"}},
+		{2, []string{"(())", "()()"}},
+	}
+	for _, c := range cases {
+		got := generateParenthesis(c.n)
+		slices.Sort(got)
+		if !slices.Equal(got, c.want) {
+			t.Errorf("generateParenthesis(%d) = %q，期望 %q", c.n, got, c.want)
+		}
+	}
+
+	got := generateParenthesis(5)
+	slices.Sort(got)
+	if len(slices.Compact(slices.Clone(got))) != 42 {
+		t.Errorf("n = 5 时应该有 42 个不同的组合，得到 %d 个", len(got))
+	}
+	for _, s := range got {
+		if len(s) != 10 || !valid(s) {
+			t.Errorf("n = 5 时生成了无效的组合 %q", s)
+		}
+	}
+}
+--- explain
+**思路**
+
+回溯时只生成**合法的前缀**，而不是生成所有 2²ⁿ 个字符串再筛选。一个前缀合法的条件：
+
+- 左括号数不超过 n；
+- 右括号数不超过左括号数（任何时候都不能出现多余的右括号）。
+
+满足这两个条件、长度达到 2n 的字符串一定是有效的。
+
+**代码讲解**
+
+1. `buf := make([]byte, 0, 2*n)`：用字节切片拼字符串，容量正好是最终长度。
+2. `dfs(open, closed int)`：已经放了多少个左、右括号。参数名没有用 `close`，因为它会遮蔽内置函数 `close`。
+3. `string(buf)`：转换时会**复制**数据，所以这里不需要像切片结果那样手动 Clone。
+4. 两个 `if` 分别尝试放左括号、右括号，每个都是“追加 → 递归 → 撤销”。
+
+**易错点**
+
+- 条件写成 `closed < n` 会生成 `"())(()"` 这类无效组合。
+- 用字符串 `s + "("` 传参也可以（字符串不可变，天然不需要撤销），但每一步都会分配新字符串。
+
+**复杂度**
+
+结果个数是第 n 个卡特兰数，约 4ⁿ/(n√n)；时间 O(4ⁿ/√n)，空间 O(n)（不算结果）。

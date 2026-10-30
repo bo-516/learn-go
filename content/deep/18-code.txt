@@ -1,0 +1,1200 @@
+=== code-01
+--- deep
+**原理展开**
+
+这道题揭示了 Go 并发编程中最核心的一条准则：**当主 goroutine 决定提前放弃等待（因超时或取消）时，必须确保后台子 goroutine 仍然有出路（要么结果能放进带缓冲的 channel，要么发送时用 `select` 监听取消信号）**。
+
+从运行时 `runtime.hchan` 的角度看：
+- 当 `ch := make(chan string)`（容量为 0）时，发送操作 `ch <- res` 必须直接把数据拷贝给正在等待的接收者（`recvq` 队列中的 `sudog`）。如果主协程已经走进 `<-time.After` 分支退出了，`ch` 的 `recvq` 为空，发送协程就会被封装成 `sudog` 挂进 `ch.sendq` 队列，并调用 `gopark` 将状态切换为 `_Gwaiting`。
+- 关键点：**Go 的垃圾回收器（GC）不会回收任何处于阻塞状态的 goroutine**，哪怕外部已经没有任何变量引用 `ch`，这个 goroutine 以及它栈上引用的全部变量都会永久驻留在内存中，直到进程结束。
+
+**代码示例**
+
+```go
+// 通用泛型包装器：将任意不支持 Context（或不可控的第三方阻塞调用）包装为可被 Context 提前唤醒的形式
+func DoWithContext[T any](ctx context.Context, fn func() (T, error)) (T, error) {
+	type res struct {
+		val T
+		err error
+	}
+	ch := make(chan res, 1) // 容量为 1：保证后台协程即使在超时后算完，写入 ch 时也绝不阻塞
+	go func() {
+		v, err := fn()
+		ch <- res{v, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.val, r.err
+	case <-ctx.Done():
+		var zero T
+		return zero, ctx.Err()
+	}
+}
+```
+
+**常见追问**
+
+- 如果把 `ch` 改成缓冲为 1（`make(chan string, 1)`），超时返回后，这个 `ch` 没人再去读了，里面的 1 个元素和 `ch` 本身会被 GC 回收吗？→ **会被正常回收**！因为后台协程把结果放进缓冲区后就立刻退出销毁了，此时没有任何存活的 goroutine 再持有 `ch` 的引用，下一次 GC 就会将 `ch` 及其缓冲区一并回收。
+- 如果 `slowCall(ctx)` 内部已经接收了 `ctx`，为什么有时候还是需要外层的 `select`？→ 有些老旧的驱动或第三方 SDK 虽然签名收了 `ctx`，但内部实现可能没有在每个阻塞步骤都检查 `ctx.Done()`；外层加 `select` 保证了调用方一定能按时返回，不会被动卡死。
+- 原代码里用 `time.After(time.Second)` 在 Go 1.23 之前和之后有什么区别？→ Go 1.23 之前，`time.After` 创建的底层定时器在到点触发前不会被 GC 回收（如果请求在 1ms 内就正常返回了，定时器还要在堆里躺够 999ms）；Go 1.23 起，未被引用的 `Timer` 可以立即被 GC 回收。
+
+**实战建议**
+
+- 凡是采用“1 个主协程等待 + N 个子协程汇报结果”的模型，结果 channel 的容量一律设为 **`N`**（子协程数量），从根源上杜绝发送端阻塞泄漏。
+- 永远优先把 `ctx` 透传给最底层的网络/数据库 I/O 调用，因为只有底层真正取消了 I/O，才能立即释放连接和 CPU，而不是仅仅让外层假装看不见。
+
+=== code-02
+--- deep
+**原理展开**
+
+为什么 `sync.Mutex` 绝对不能被复制，而复制 `map` 却表现为共享底层数据？这源于它们在运行时的底层结构差异：
+
+1. **`sync.Mutex` 是纯值结构体**：
+   ```go
+   type Mutex struct {
+       state int32 // 包含加锁位、唤醒标志、饥饿标志和等待者计数
+       sema  uint32 // 信号量，用作 futex 等待队列的关联地址
+   }
+   ```
+   当使用值接收者 `func (c Counter) Inc` 时，每次调用都会在栈上复制一份新的 `Counter`，里面的 `c.mu` 是一个全新的独立 `int32` 变量。10 个 goroutine 调用 `Inc`，实际上是各自锁了自己栈上的临时副本，彼此毫无感知。更糟糕的是，如果某个处于已加锁状态的 `Mutex` 被拷贝到新变量上，新变量一上来就是已锁定且永远没人解锁的死锁状态！
+2. **`map` 变量本质上是指针（`*runtime.hmap`）**：`Counter` 按值复制时，`c.n` 复制的只是 8 字节的 `*hmap` 指针，所有副本依然指向堆上的同一个哈希表。当两个 goroutine 同时执行 `c.n[key]++` 时，`runtime.mapassign` 检测到 `hmap.flags & hashWriting != 0`，立即调用 `fatal("concurrent map writes")` 直接终止整个进程（注意是 `fatal`，不是 `panic`，写多少层 `recover()` 都救不回来）。
+
+**代码示例**
+
+```go
+// sync.noCopy 哨兵惯用法：在自定义结构体中嵌入 noCopy，让 go vet 自动拦截任何意外的值拷贝
+type noCopy struct{}
+
+func (*noCopy) Lock()   {}
+func (*noCopy) Unlock() {}
+
+type SafeCounter struct {
+	noCopy noCopy
+	mu     sync.RWMutex
+	counts map[string]int
+}
+
+func NewSafeCounter() *SafeCounter {
+	return &SafeCounter{counts: make(map[string]int)}
+}
+
+func (c *SafeCounter) Inc(key string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.counts[key]++
+	return c.counts[key]
+}
+```
+
+**常见追问**
+
+- 除了值接收者，还有哪些容易不小心复制 `sync.Mutex` 的场景？→ ① 把含有 `Mutex` 的结构体按值作为函数参数传递或按值返回（如 `func NewCounter() Counter`）；② 用 `for _, v := range items` 遍历 `[]Counter` 值切片（每次迭代 `v` 都是拷贝，应改用下标 `for i := range items { items[i].mu.Lock() }`）；③ 结构体字面量浅拷贝 `c2 := c1`。
+- 标准库里的哪些类型同样包含 `noCopy`，不能在首次使用后复制？→ `sync.Mutex`、`sync.RWMutex`、`sync.WaitGroup`、`sync.Once`、`sync.Cond`、`sync.Pool`、`sync.Map` 以及 `strings.Builder`、`atomic.Value`。
+- 如果把 `Counter` 里的 `mu sync.Mutex` 改成指针 `mu *sync.Mutex`，是不是就可以用值接收者了？→ 虽然拷贝指针后大家指向同一把锁，但这严重违背 Go 的工程惯例（一旦将来结构体新增一个普通字段如 `total int`，值接收者修改 `c.total++` 又会丢失），**任何带状态或带锁的结构体方法一律使用指针接收者**。
+
+**实战建议**
+
+- 在 CI 流水线中强制运行 `go vet ./...`（或 `golangci-lint` 的 `govet`），它内置的 `copylocks` 分析器能在编译期 100% 揪出所有值接收者或按值传递锁的 bug。
+- 构造函数统一返回结构体指针（`*Counter`），并在内部完成 `make(map[...])` 初始化，避免外部拿到零值结构体直接写入 `nil` map 触发 panic。
+
+=== code-03
+--- deep
+**原理展开**
+
+理解 `defer` 的生命周期是避免资源泄漏的基础：**Go 的 `defer` 是函数作用域（Function-scoped），而不是块作用域（Block-scoped）**。
+
+在运行时实现上：
+- 对于普通确定次数的 `defer`（不在循环内、且函数内总数 $\le 8$ 个），Go 1.14+ 编译器采用**开放编码（Open-coded defers）**：直接在栈帧上用一个 1 字节的延迟位图（deferbit）记录哪些 `defer` 已被激活，并在每个 `return` 语句前直接内联插入清理函数调用，开销几乎等同于普通函数调用（几纳秒）。
+- **一旦 `defer` 出现在 `for` 循环内部**：由于编译期不知道循环会执行多少次，编译器**无法使用开放编码优化**，必须退化为每次循环都在堆上分配一个 `_defer` 结构体节点，并头插法挂到当前 goroutine 的 `g._defer` 单向链表上！
+  如果 `paths` 有 5 万个文件，循环结束前不仅 5 万个操作系统文件描述符（fd）全部开着不关（直接触发 `EMFILE: too many open files`），还会在当前协程的 `_defer` 链表上堆积 5 万个节点，发生严重的内存滞留。
+
+**代码示例**
+
+```go
+// 推荐做法：将单次资源的“获取 -> 使用 -> 释放”封装为独立的小函数
+func ProcessFiles(paths []string) error {
+	for _, p := range paths {
+		if err := processSingleFile(p); err != nil {
+			return fmt.Errorf("process %s: %w", p, err)
+		}
+	}
+	return nil
+}
+
+func processSingleFile(path string) (err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	// 利用命名返回值 + defer 捕获 Close() 的错误（对于写文件尤为关键！）
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+	return process(f)
+}
+```
+
+**常见追问**
+
+- 为什么不能把 `defer f.Close()` 直接改成在循环末尾调一句不带 defer 的 `f.Close()`？→ 如果 `process(f)` 在中途返回了 error 提前 `return`、或者内部发生了 panic，写在循环末尾的 `f.Close()` 就会被跳过导致泄漏；而独立小函数配合 `defer` 无论正常返回、错误返回还是 panic 都能保证 100% 释放。
+- 为什么说“写文件时忽略 `f.Close()` 的返回错误”会导致静默丢数据？→ 操作系统和 NFS/对象存储挂载盘往往在 `Write()` 时只把数据写进内存缓存就返回成功，直到调用 `Close()` 时才真正刷出剩余缓冲或提交元数据。如果此时磁盘满或网络断开，错误只会在 `Close()` 时返回。
+- 除了打开文件，还有哪些常见的“循环内 `defer`”陷阱？→ ① 循环里调 `http.Client.Do` 后写 `defer resp.Body.Close()`；② 循环里调 `db.Query` 后写 `defer rows.Close()`；③ 循环里调 `mu.Lock()` 后写 `defer mu.Unlock()`（这会更惨：第一轮循环加锁后不释放，第二轮循环自己把自己死锁！）。
+
+**实战建议**
+
+- 代码审查看到 `for` 循环体里出现 `defer` 关键字时，立刻警惕并重构为独立辅助函数。
+- 凡是修改或创建文件的操作，在 `Close()` 之前或之中务必检查错误，关键落盘数据要先调用 `f.Sync()`。
+
+=== code-04
+--- deep
+**原理展开**
+
+这段短短十几行的代码浓缩了初级 Go 开发者最常犯的三大并发错误，我们从底层内存模型逐一拆解：
+
+1. **`wg.Add(1)` 的 Happens-Before 顺序violation**：`sync.WaitGroup` 内部通过一个 64 位原子变量（高 32 位是计数器 counter，低 32 位是等待者数量 waiter）维护状态。`go func()` 只是把新协程放进 P 的运行队列，并不会立即执行。当外层 `for` 循环极快跑完并执行到 `wg.Wait()` 时，如果子协程还没来得及执行第一行 `wg.Add(1)`，`wg.Wait()` 看到计数器为 0 会立即放行返回！更危险的是，如果 `Wait()` 正在返回的同时子协程恰好执行 `Add(1)`，`WaitGroup` 检测到并发修改会直接触发 panic：`sync: WaitGroup misuse: Add called concurrently with Wait`。
+2. **并发 `append` 的内存破坏**：`results = append(results, body)` 包含读取 `len/cap`、写入底层数组 `ptr[len] = body`、更新 `results.len` 三个非原子步骤。多个 goroutine 同时执行时，不仅会互相覆盖同一个下标导致结果丢失，还可能在触发扩容时读写错乱。
+3. **无界并发（Unbounded Concurrency）**：如果 `urls` 有 10 万个，瞬间创建 10 万个 goroutine 同时发起 DNS 查询和 TCP 握手，会立刻打爆本机 ephemeral 端口、文件描述符和目标服务器，引发雪崩。
+
+**代码示例**
+
+```go
+// 纯标准库实现（不依赖 x/sync/errgroup）：
+// 使用带缓冲 channel 作为信号量限制最大并发度 + 预分配结果切片按下标无锁写入 + context.WithCancel 快速失败
+func FetchAllStd(ctx context.Context, urls []string, limit int) ([]string, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make([]string, len(urls))
+	sem := make(chan struct{}, max(1, limit))
+	var (
+		wg       sync.WaitGroup
+		firstErr error
+		errOnce  sync.Once
+	)
+
+	for i, u := range urls {
+		// 在启动 goroutine 之前先获取令牌并 Add(1)，避免瞬间创建海量阻塞的 goroutine
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break
+		}
+		wg.Add(1)
+		go func() {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+			body, err := fetch(ctx, u)
+			if err != nil {
+				errOnce.Do(func() {
+					firstErr = fmt.Errorf("fetch %s: %w", u, err)
+					cancel() // 第一个任务失败即通知其余任务取消
+				})
+				return
+			}
+			results[i] = body // 每个 i 唯一对应切片中的一个独立元素，无数据竞争
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return results, ctx.Err()
+}
+```
+
+**常见追问**
+
+- 多个 goroutine 不加锁同时写同一个切片的不同下标（`results[i] = body`），为什么在 Go 内存模型下是安全的，真的不会触发 `-race` 报错吗？→ Go 内存模型规定：切片预先分配好长度后，只要切片头本身不再扩容改变，底层数组的每个元素 `results[i]` 在内存中都是**独立的内存位置（distinct memory locations）**。只要元素的大小是字节寻址对齐的（非位域），不同 goroutine 各自写自己的 `results[i]` 完全不存在数据竞争，`go test -race` 100% 通过。
+- 在原代码中，如果是 Go 1.21 及以前的版本，`for _, u := range urls` 还有一个什么著名 bug？→ Go 1.22 之前，循环变量 `u` 在整个循环中共享同一个地址，子协程启动时读到的 `u` 往往全部变成了最后一个 URL；Go 1.22 起正式改为每次迭代创建新变量。
+- Go 1.25 新增的 `wg.Go(func() { ... })` 是怎么解决 `wg.Add(1)` 位置写错问题的？→ Go 1.25 为 `sync.WaitGroup` 新增了 `Go(f func())` 方法，内部自动在启动 goroutine 前调用 `Add(1)` 并在结束时 `defer Done()`，从 API 设计上彻底消除了手写错位的可能。
+
+**实战建议**
+
+- 并发扇出（Fan-out）收集固定数量结果的黄金范式：**预先 `make([]T, len(inputs))` + 每个协程按下标 `res[i] = val` 写入 + 必须限制最大并发度（`errgroup.SetLimit` 或信号量）**。
+- 在获取并发限流令牌（`sem <- struct{}{}`）时，尽量放在外层循环 `go func()` **之前**，这样即使有 100 万个任务，内存中也始终只有 `limit` 个活跃 goroutine。
+
+=== code-05
+--- deep
+**原理展开**
+
+这道题在面试中的真正考察目的不是打印数字本身，而是检验你对 **Go 并发同步原语的选型直觉**：
+
+1. **Channel 令牌传递法（CSP 风格）**：把空结构体 `struct{}{}` 当作“接力棒”，谁拿到接力棒谁打印，打完把棒交给下一个人。根据 Go 内存模型（The Go Memory Model）：**无缓冲 channel 上的第 $k$ 次发送完成 Happens-Before 第 $k$ 次接收完成；容量为 $C$ 的带缓冲 channel 上的第 $k$ 次接收完成 Happens-Before 第 $k+C$ 次发送完成**。因此通过 channel 传递信号天然建立了严格的跨协程可见性与顺序保证。
+2. **为什么用 `chan struct{}` 而不是 `chan bool` 或 `chan int`？**
+   在 Go 中，空结构体 `struct{}` 的内存大小是 **0 字节**（`unsafe.Sizeof(struct{}{}) == 0`）。编译器和运行时对元素大小为 0 的 channel 有专门优化，仅传递同步信号而不发生多余的数据拷贝，且代码语义上明确表达“我只关心事件发生，不关心值内容”。
+3. **替代方案对比**：除了双 channel 接力，还可以用 **`sync.Cond`（条件变量 + 共享状态 `turn`）** 或 **单共享变量 + 自旋/状态机**，其中 `sync.Cond` 在需要扩展到“任意复杂条件唤醒”时更加灵活。
+
+**代码示例**
+
+```go
+// 使用 sync.Cond + 共享状态机实现 N 个协程按固定顺序交替执行
+func PrintSequenceCond(n int) []int {
+	var (
+		mu   sync.Mutex
+		cond = sync.NewCond(&mu)
+		cur  = 1
+		out  = make([]int, 0, n)
+		wg   sync.WaitGroup
+	)
+	worker := func(remainder int) {
+		defer wg.Done()
+		for {
+			mu.Lock()
+			for cur <= n && cur%2 != remainder {
+				cond.Wait() // 原子地释放锁并挂起；被唤醒返回时会自动重新获取锁
+			}
+			if cur > n {
+				mu.Unlock()
+				cond.Broadcast() // 确保另一个协程也能看到结束条件并退出
+				return
+			}
+			out = append(out, cur)
+			cur++
+			mu.Unlock()
+			cond.Signal() // 唤醒对方
+		}
+	}
+	wg.Add(2)
+	go worker(1) // 奇数协程
+	go worker(0) // 偶数协程
+	wg.Wait()
+	return out
+}
+```
+
+**常见追问**
+
+- 如果只用 **1 个** 无缓冲 channel（而不是 `odd` 和 `even` 两个），能不能让两个 goroutine 严格交替打印奇偶数？→ **不能可靠实现**！如果只用 1 个 channel，当协程 A 发送或接收后，下一轮循环它可能比协程 B 更快再次抢到同一个 channel（因为刚运行完的协程还留在当前 P 的本地运行队列或寄存器热状态上），导致乱序或自己和自己死锁。
+- 为什么使用 `sync.Cond.Wait()` 时，检查条件必须用 `for` 循环（`for cur%2 != remainder`）而不能用 `if`？→ 因为存在**虚假唤醒（Spurious Wakeup）**以及 `Broadcast` 唤醒多个等待者时其他协程先一步抢走锁修改了状态的可能；被唤醒后必须重新检查业务条件是否依然成立。
+- 两个 goroutine 通过 channel 来回乒乓切换 100 万次，性能怎么样？→ 每次乒乓都涉及一次 `gopark` 和 `goready` 调度切换（约 150ns～300ns），比单线程直接循环慢约两个数量级；所以真实工程中绝不要为了“看起来并发”而把本该串行的微小操作拆给两个协程交替做。
+
+**实战建议**
+
+- 在面试手写此类多协程顺序协同代码时，**写完第一件事就是手动推演“最后一次循环（$i = N$）”的退出路径**：检查最后一个发送操作是否还有人接收，会不会导致其中一个协程永久卡死在最后一轮发送上。
+- 纯信号通知的 channel 类型一律写成 `chan struct{}`。
+
+=== code-06
+--- deep
+**原理展开**
+
+在 Go 中设计 Worker Pool（协程池）时，首先需要理解它与 Java/C++ 线程池的本质差异：Go 的 goroutine 创建开销极小（初始栈仅 2KB，分配耗时几百纳秒），在大多数常规 I/O 场景下直接 `go fn()` 配合信号量（`errgroup.SetLimit`）就足够了。Worker Pool 真正的工程价值在于**限制峰值并发资源消耗（CPU/内存/下游连接）**以及**提供明确的背压（Backpressure）与队列排队策略**。
+
+实现一个生产级 Worker Pool 最大的难点是：**如何安全地解决 `Submit` 与 `Close` 之间的并发竞态**？
+在基础版代码中，如果协程 A 正在调用 `Submit(task)`，而协程 B 同时调用了 `Close()` 执行 `close(p.tasks)`，协程 A 就会向已关闭的 channel 发送数据，直接触发运行时无法容忍的 **`panic: send on closed channel`**！要彻底消除这个竞态，必须保证“检查未关闭并发送任务”与“标记关闭并 `close(ch)`”是互斥的。
+
+**代码示例**
+
+```go
+// 并发安全的生产级 Pool：使用 RWMutex 消除 Submit 与 Close 的关门竞态，哪怕并发混调也绝不 panic
+var ErrPoolClosed = errors.New("worker pool is closed")
+
+type SafePool struct {
+	mu     sync.RWMutex
+	closed bool
+	tasks  chan func()
+	wg     sync.WaitGroup
+}
+
+func NewSafePool(workers, queueSize int) *SafePool {
+	p := &SafePool{tasks: make(chan func(), queueSize)}
+	p.wg.Add(workers)
+	for range workers {
+		go func() {
+			defer p.wg.Done()
+			for task := range p.tasks {
+				task()
+			}
+		}()
+	}
+	return p
+}
+
+func (p *SafePool) Submit(ctx context.Context, task func()) error {
+	// 持有读锁：允许多个 Submit 并发进行，但阻止 Close 在此时关闭 channel
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.closed {
+		return ErrPoolClosed
+	}
+	select {
+	case p.tasks <- task:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *SafePool) Close() {
+	// 获取写锁：等待所有正在尝试发送的 Submit 退出后，才标记 closed 并安全关闭 channel
+	p.mu.Lock()
+	if !p.closed {
+		p.closed = true
+		close(p.tasks)
+	}
+	p.mu.Unlock()
+	p.wg.Wait() // 在锁外等待已有任务排空完成，避免死锁
+}
+```
+
+**常见追问**
+
+- 在上面的 `SafePool` 中，如果队列满了，某个 `Submit` 拿着读锁 `RLock()` 阻塞在 `select` 等待空位，此时另一个协程调用 `Close()` 尝试拿写锁 `Lock()` 会发生什么？→ 如果所有 worker 还在正常消费队列，队列很快腾出空位，`Submit` 写入成功并释放读锁，`Close()` 顺利拿到写锁；但如果某个正在运行的 task 内部又递归调用了同一个 Pool 的 `Submit`，且队列已满，就会发生**自死锁（Pool Deadlock）**！因此严禁向同一个固定容量的同步协程池提交相互等待的父子任务。
+- 队列满时的四种背压策略分别适用什么场景？→ ① **阻塞等待（Block with Context）**：适合普通异步任务；② **立即拒绝（Fail-Fast，用 `select + default`）**：适合高并发网关快速降级；③ **调用者自执行（Caller-Runs）**：由当前调用 `Submit` 的协程自己同步把 `task()` 跑完，自然减慢上游生产速度；④ **丢弃最旧任务（Drop-Oldest）**：适合实时监控指标或行情推送。
+- 开源的高性能协程池（如 `panjf2000/ants`）相比固定 channel 的实现做了什么优化？→ 它不让所有 worker 争抢同一个全局 `chan func()`（高并发下全局 channel 内部的 `hchan.lock` 会成为瓶颈），而是维护一个空闲 worker 栈/队列（每个 worker 绑定自己独享的容量为 1 的 channel），实现 LIFO 局部性唤醒和按空闲超时动态缩容。
+
+**实战建议**
+
+- 如果业务只是在一个函数内并发跑一批任务并等待全部结束，**优先使用 `errgroup.Group` + `SetLimit(n)`**，代码量少且不需要维护 Pool 的生命周期。
+- 任何常驻后台的 Worker 协程都必须在 `run(task)` 外层包一层 `defer recover()` 并打印调用栈，防止某条脏数据触发空指针直接把整个进程搞挂。
+
+=== code-07
+--- deep
+**原理展开**
+
+`errgroup.WithContext(ctx)` 是 Go 并发编排中最优雅的构建块，但90% 的候选人在使用时都会踩中一个隐蔽的大坑：**`errgroup` 返回的衍生 `ctx` 不仅在某个子任务返回非 nil 错误时会被取消，在 `g.Wait()` 正常结束返回时也会被立即取消**！
+
+看一下 `golang.org/x/sync/errgroup` 的核心源码结构：
+```go
+func WithContext(ctx context.Context) (*Group, context.Context) {
+    ctx, cancel := withCancelCause(ctx)
+    return &Group{cancel: cancel}, ctx
+}
+```
+- 当第一个子协程返回 `err != nil` 时，通过 `errOnce.Do` 记录下第一个错误，并立即调用 `g.cancel(err)`，从而唤醒所有其他正在 `select` 监听 `ctx.Done()` 的兄弟协程（实现 **Fail-Fast 快速失败**）；
+- 当 `g.Wait()` 等到所有子协程退出后，它在 return 之前也会无条件执行 `if g.cancel != nil { g.cancel(nil) }`。如果你在 `g.Wait()` 之后继续把这个 `ctx` 传给后续的数据库操作或日志上报，后续操作会全部报 `context canceled` 错误！
+
+**代码示例**
+
+```go
+// 陷阱演示与正确变量命名规范：不要覆盖外层入参 ctx！
+func AggregateOrderPage(ctx context.Context, uid int64) (*PageView, error) {
+	// 注意：这里把衍生出的上下文命名为 gctx（而不是重名覆盖外层的 ctx！）
+	g, gctx := errgroup.WithContext(ctx)
+
+	var (
+		user   *UserInfo
+		orders []Order
+	)
+	g.Go(func() error {
+		var err error
+		user, err = fetchUser(gctx, uid) // 核心依赖：失败则返回 error，触发整体取消
+		return err
+	})
+	g.Go(func() error {
+		var err error
+		orders, err = fetchOrders(gctx, uid) // 核心依赖
+		return err
+	})
+	// 弱依赖（降级策略）：推荐位挂了不应该导致整个订单页报错取消！
+	var recs []Item
+	g.Go(func() error {
+		r, err := fetchRecommendations(gctx, uid)
+		if err != nil {
+			slog.Warn("degrade recommendations", "err", err)
+			return nil // 吞掉弱依赖错误返回 nil，不触发 gctx 取消
+		}
+		recs = r
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	// 此时 gctx 已经被 errgroup 自动 cancel 了！
+	// 后续操作必须使用外层未取消的原始 ctx：
+	_ = auditAccess(ctx, uid)
+	return &PageView{User: user, Orders: orders, Recs: recs}, nil
+}
+```
+
+**常见追问**
+
+- 在 `First`（取最快返回的一个副本结果）模式中，如果第 1 个副本刚连上就立刻报错返回了 `Connection Refused`，代码应该立刻向调用方返回失败吗？→ **绝对不能**！在多副本冗余请求中，我们想要的是**第一个成功的响应**，只有当**所有**副本都失败时才汇总返回错误（如答案代码中循环 `len(replicas)` 次，遇到 `res.err == nil` 才立即 `return`）。
+- 如果 `errgroup` 中某个子协程发生了 `panic`，`g.Wait()` 会怎么处理？→ 早期版本子协程 panic 会直接导致整个进程崩溃；新版 `errgroup` 内部会捕获子协程的 panic 并在 `g.Wait()` 调用方协程中重新 `panic` 抛出来，但为了清晰可控，在自定义并发中仍需注意 panic 边界。
+- 怎么知道 `gctx` 是因为上游调用方超时取消的，还是因为同组的兄弟协程报错取消的？→ Go 1.20+ 引入了 `context.Cause(gctx)`，新版 `errgroup` 使用 `withCancelCause(ctx)`，调用 `context.Cause(gctx)` 可以直接拿到导致取消的那个具体兄弟错误。
+
+**实战建议**
+
+- 永远把 `g, gctx := errgroup.WithContext(ctx)` 的第二个返回值命名为 **`gctx`**，严禁写成 `g, ctx := ...` 遮蔽父级 `ctx`，这是防止 `g.Wait()` 之后误用已取消 context 的最佳编码习惯。
+- 在微服务并行聚合（BFF 层）中，明确区分**强依赖**（返回 `err` 触发整体快速失败）和**弱依赖**（记录日志后返回 `nil` 局部降级）。
+
+=== code-08
+--- deep
+**原理展开**
+
+**令牌桶（Token Bucket）**与**漏桶（Leaky Bucket）**的核心区别在于对**突发流量（Burst）**的处理：
+- **漏桶**：无论输入流量多么波峰波谷，输出永远像水滴一样以恒定速率流出，虽然绝对平滑，但无法利用系统空闲算力快速处理合理的短时突发请求；
+- **令牌桶**：桶容量为 $B$，平时空闲时桶里攒满了 $B$ 个令牌，当瞬间涌入 $B$ 个请求时可以**零等待全部放行**，之后再限制为平均速率 $R\text{ req/s}$。
+
+在工程实现中，除了答案里的 `Allow() bool`（非阻塞立即判断），生产级限流器（如标准库扩展 `golang.org/x/time/rate`）还采用**预支未来令牌（Reservation / Debt）**的思想来支持阻塞等待 `Wait(ctx)`：当桶里当前只有 0.2 个令牌而请求需要 1 个令牌时，直接让 `tokens` 变成 `-0.8`，并计算出欠下的 0.8 个令牌需要等待 $\frac{0.8}{R}$ 秒才能补齐。只要这个等待时间不超过 `ctx` 的剩余超时时间（Deadline），就让当前协程 `select` 等待对应时长后放行！
+
+**代码示例**
+
+```go
+// 支持阻塞等待 Wait(ctx) 与一次性申请 n 个令牌的增强版令牌桶（无需后台定时器协程）
+func (b *TokenBucket) WaitN(ctx context.Context, n int) error {
+	need := float64(n)
+	b.mu.Lock()
+	if need > b.capacity {
+		b.mu.Unlock()
+		return fmt.Errorf("requested tokens %d exceeds capacity %v", n, b.capacity)
+	}
+	now := time.Now()
+	b.tokens = min(b.capacity, b.tokens+now.Sub(b.last).Seconds()*b.rate)
+	b.last = now
+
+	var waitDur time.Duration
+	if b.tokens < need {
+		// 预支令牌：计算补齐缺口需要等待的时间
+		deficit := need - b.tokens
+		waitDur = time.Duration(deficit / b.rate * float64(time.Second))
+		// 如果 context 的剩余寿命根本不够等，直接快速失败并归还状态，不白白干等！
+		if dl, ok := ctx.Deadline(); ok && now.Add(waitDur).After(dl) {
+			b.mu.Unlock()
+			return context.DeadlineExceeded
+		}
+	}
+	b.tokens -= need // 允许变为负数（代表已被当前协程预约的未来令牌）
+	b.mu.Unlock()
+
+	if waitDur <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(waitDur)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+```
+
+**常见追问**
+
+- 在计算时间差 `now.Sub(b.last)` 时，如果服务器正在进行 NTP 时间同步发生时钟回拨，会导致 `tokens` 算成负数或异常吗？→ **在 Go 中不会**！Go 1.9+ 的 `time.Now()` 返回的 `time.Time` 结构体同时包含了墙钟时间（Wall Clock）和**单调递增时钟（Monotonic Clock）**。调用 `now.Sub(b.last)` 时，标准库直接用两个单调时钟相减，完全不受操作系统修改系统时间或闰秒的影响。
+- 浮点数 `tokens float64` 长期累加会不会有精度漂移问题？→ 在常规限流速率下，`min(b.capacity, ...)` 每隔一小段空闲时间就会把 `tokens` 重新截断锚定回整数 `capacity`，误差不会无限累积；如果追求极致精确，可以将单位换算为“每个令牌多少纳秒（ns per token）”并用 `int64` 计算。
+- 分布式 Redis 令牌桶如果在高 QPS（比如每秒 50 万次调用）下每个请求都跑一次 Redis Lua 脚本，Redis 扛不住怎么办？→ 采用**批量预取（Batch Token Leasing）**：每个 Go 实例每次向 Redis 申请一批令牌（例如 100 个）缓存在进程本地内存消耗，用完或过期再向 Redis 续批，将 Redis 的请求压力降低两个数量级。
+
+**实战建议**
+
+- 在编写单元测试验证令牌桶或退避算法时，**不要在代码里写死 `time.Now`**，而是在结构体里注入一个 `now func() time.Time` 字段（默认指向 `time.Now`），测试时传入可控的假时钟函数，1 毫秒内就能精准测完几十分钟的限流边界逻辑。
+- 客户端调用下游接口限流优先用 `Wait(ctx)` 平滑削峰；服务端入口防刷保护优先用 `Allow()` 快速拒绝返回 `429 Too Many Requests`。
+
+=== code-09
+--- deep
+**原理展开**
+
+把常见的三种窗口限流算法放在一起对比，就能明白为什么**滑动窗口近似计数器（Sliding Window Counter）**是工业界（如 Cloudflare、Envoy）最青睐的折中方案：
+
+```text
+假设限制：1 分钟最多 100 次请求（limit = 100, window = 60s）
+
+1. 固定窗口 (Fixed Window)：
+   |--- 00:00 ~ 01:00 ---|--- 01:00 ~ 02:00 ---|
+                 [59s: 100次] [01s: 100次]
+   缺陷：边界双倍突发！在 00:59 涌入 100 次，01:01 又涌入 100 次，实际 2 秒内放行了 200 次（2 倍于限制）。
+
+2. 滑动日志 (Sliding Log / Redis ZSET)：
+   把每个请求的时间戳都存下来，每次统计 [now - 60s, now] 内的真实个数。
+   缺陷：内存开销为 O(limit * keys)！如果某个接口限流是 10 万次/分钟，单个 key 就要在 ZSET 里存 10 万个元素，极耗内存。
+
+3. 滑动窗口近似计数器（本题算法）：
+   假设当前是 01:15（进入了当前窗口 25% 的时间），那么过去 60s 窗口由“上一窗口的后 75%” + “当前窗口已发生的个数”组成：
+   估算请求数 = prev * (1 - 0.25) + cur = prev * 0.75 + cur
+   优势：每个 key 永远只需要 2 个整数计数器（O(1) 内存），且平滑消除了窗口边界的翻倍毛刺！
+```
+
+**代码示例**
+
+```go
+// 另一种高精度单机滑动窗口实现：环形分桶滑动窗口（Ring Buffer Buckets，类似 Hystrix / Sentinel）
+// 将 1 秒大窗口切分为 10 个 100ms 的小格子，既比两窗口估算更准，又只需固定 10 个 int64 的 O(1) 内存
+typeBucketWindow struct {
+	mu       sync.Mutex
+	buckets  []int
+	slotDur  time.Duration
+	lastSlot int64
+	limit    int
+}
+
+func NewBucketWindow(limit int, window time.Duration, slots int) *typeBucketWindow {
+	return &typeBucketWindow{
+		buckets: make([]int, slots),
+		slotDur: window / time.Duration(slots),
+		limit:   limit,
+	}
+}
+
+func (w *typeBucketWindow) Allow(now time.Time) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	curSlot := now.UnixNano() / int64(w.slotDur)
+	n := int64(len(w.buckets))
+
+	// 清零自上次访问以来已经过期的旧格子
+	if diff := curSlot - w.lastSlot; diff > 0 {
+		clearCount := min(diff, n)
+		for i := int64(1); i <= clearCount; i++ {
+			w.buckets[(w.lastSlot+i)%n] = 0
+		}
+		w.lastSlot = curSlot
+	}
+	sum := 0
+	for _, c := range w.buckets {
+		sum += c
+	}
+	if sum >= w.limit {
+		return false
+	}
+	w.buckets[curSlot%n]++
+	return true
+}
+```
+
+**常见追问**
+
+- 滑动窗口近似计数器（`prev*weight + cur`）在什么极端情况下会有误差？→ 它假设上一个窗口内的请求是**均匀分布**的。如果上一个窗口的 100 个请求全部集中在上一窗口的第 1 秒（00:01），那么到了 01:15 时这批请求其实早就超过 60 秒了，但公式仍然按 $75\%$ 算了 75 个配额占用（偏保守）；不过在真实高并发流量下误差极小（Cloudflare 实测误差 < 0.003%）。
+- Redis ZSET 滑动窗口脚本里，为什么 `ZADD` 的 member 必须传**唯一请求 ID（`ARGV[4]`）**而不能直接传时间戳？→ 因为在同一个毫秒内完全可能有几十个并发请求同时到达！如果把毫秒时间戳既当 score 又当 member，同一个毫秒内的多次请求会因为 ZSET 集合元素去重而覆盖成 1 条，导致限流彻底失效。
+- 在 Redis Cluster 集群模式下运行限流脚本需要注意什么？→ 必须保证单个限流操作只访问同一个 `KEYS[1]`，如果涉及多个 key 必须使用 Hash Tag（如 `{user:123}:rate`）保证落在同一个哈希槽（Slot）上，且绝不能在 Lua 脚本里拼接访问未在 `KEYS` 中声明的动态 key。
+
+**实战建议**
+
+- 按用户 IP 或 UID 做海量 Key 的防刷限流时，切忌用 Redis ZSET 存高阈值的请求日志；应改用 Redis `INCR` + 两窗口加权 Lua 脚本，或基于 `GCRA`（通用信元速率算法，仅存 1 个时间戳值）实现。
+- 单机内存中按用户 ID 维护限流器 map 时，必须配合 TTL 清理长时间不活跃用户的限流器实例，否则会被海量爬虫 IP 撑爆内存。
+
+=== code-10
+--- deep
+**原理展开**
+
+`singleflight`（防缓存击穿 / 并发请求合并）是 Go 面试出现频率最高的并发题之一。写出基础的 `WaitGroup + map` 只能拿及格分，真正区分工程功底的是以下**三个边界场景**：
+
+1. **调用方 Context 超时与“一人取消、全员陪葬”的陷阱**：
+   假设协程 A 第一个到达，调用 `Do(key, func() { queryDB(ctxA) })`，随后协程 B、C、D（它们各自的超时时间是 5s）也到达并复用等待协程 A 的结果。如果协程 A 自己的 `ctxA` 超时只有 50ms，50ms 到期后 `queryDB(ctxA)` 被取消失败，导致原本还有充足时间的 B、C、D 跟着一起收到 `context canceled` 失败！
+   解决方案有两种：① 执行 `fn` 时使用 `context.WithoutCancel(ctx)`（Go 1.21+）剥离单个调用方的取消信号，并加上合理的统一后端超时；② 使用 **`DoChan`** 模式，让每个调用方在自己的 `select` 中等待结果 channel 或自己的 `ctx.Done()`。
+2. **`Forget(key)` 的作用**：当慢查询或下游偶发卡住时，后续新来的请求不希望继续等这个快要超时的老请求，可以调用 `Forget(key)` 提前把 `key` 从 map 中删掉，让下一批新请求发起一次全新的尝试。
+3. **防止返回可变引用的并发篡改**：`singleflight` 把同一个返回值 `val` 同时发给 100 个等待的 goroutine。如果 `val` 是一个 `*User` 指针或 `[]Item` 切片，而某个调用方拿到后直接修改了里面的字段（`user.Name = "masked"`），就会引发严重的数据竞争和脏数据！
+
+**代码示例**
+
+```go
+// 支持 DoChan（允许每个等待者按自己的 Context 独立超时退出，互不阻塞）与 Forget 的增强版实现
+type Result[V any] struct {
+	Val    V
+	Err    error
+	Shared bool
+}
+
+type flightCall[V any] struct {
+	wg   sync.WaitGroup
+	val  V
+	err  error
+	dups int
+	chans []chan<- Result[V]
+}
+
+type FlightGroup[K comparable, V any] struct {
+	mu sync.Mutex
+	m  map[K]*flightCall[V]
+}
+
+// DoContext 让每个调用方都能响应自己的 ctx 取消，而不会因为第一个发起者超时把所有人都害死
+func (g *FlightGroup[K, V]) DoContext(ctx context.Context, key K, fn func(context.Context) (V, error)) (V, error) {
+	ch := g.DoChan(key, func() (V, error) {
+		// 使用 WithoutCancel 防止第一个请求单独取消连累所有合并等待的请求，同时加上兜底超时
+		bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer cancel()
+		return fn(bgCtx)
+	})
+	select {
+	case r := <-ch:
+		return r.Val, r.Err
+	case <-ctx.Done():
+		var zero V
+		return zero, ctx.Err()
+	}
+}
+
+func (g *FlightGroup[K, V]) DoChan(key K, fn func() (V, error)) <-chan Result[V] {
+	ch := make(chan Result[V], 1)
+	g.mu.Lock()
+	if g.m == nil {
+		g.m = make(map[K]*flightCall[V])
+	}
+	if c, ok := g.m[key]; ok {
+		c.dups++
+		c.chans = append(c.chans, ch)
+		g.mu.Unlock()
+		return ch
+	}
+	c := &flightCall[V]{chans: []chan<- Result[V]{ch}}
+	c.wg.Add(1)
+	g.m[key] = c
+	g.mu.Unlock()
+
+	go func() {
+		defer func() {
+			g.mu.Lock()
+			delete(g.m, key)
+			chans := c.chans
+			shared := c.dups > 0
+			g.mu.Unlock()
+			c.wg.Done()
+			for _, out := range chans {
+				out <- Result[V]{Val: c.val, Err: c.err, Shared: shared}
+			}
+		}()
+		c.val, c.err = fn()
+	}()
+	return ch
+}
+```
+
+**常见追问**
+
+- 在基础版 `Do` 的 `defer` 里，应该先调 `c.wg.Done()` 还是先加锁 `delete(g.m, key)`？→ **推荐先加锁 `delete(g.m, key)`，再调 `c.wg.Done()`**（或者像官方库一样，先把结果写好，再删 key 并唤醒）。如果先 `wg.Done()`，被唤醒的等待者或新请求在微秒级时间差里可能观察到旧 `call` 还没从 `g.m` 中删掉，虽然结果已经写好不影响正确性，但先从 map 移除在状态转移上更干净。
+- 如果 `fn()` 内部发生了死锁永远不返回，使用 `singleflight` 会带来什么灾难性后果？→ 所有后续请求同一个 `key` 的 goroutine 都会在 `c.wg.Wait()` 处永远挂起，瞬间把整个服务的数万个协程全部吸干卡死！因此 `fn()` 内部**必须**有严格的超时控制，或者配合定时 `Forget(key)` 使用。
+- 标准库 `golang.org/x/sync/singleflight` 的返回值 `(v any, err error, shared bool)` 里的第三个布尔值 `shared` 有什么用？→ 表示这个结果是不是被多个调用方共享了。如果 `shared == true` 且返回值包含可变对象（如切片或结构体指针），调用方在修改前就知道必须先做一次深拷贝（Clone）。
+
+**实战建议**
+
+- 在 Go 1.18+ 新项目中，可以把 `singleflight.Group` 薄封装一层泛型包装函数 `Do[T any](g, key, fn)`，消除业务代码里满天飞的 `v.(*MyStruct)` 类型断言。
+- 配合本地缓存和 Redis 使用 `singleflight` 时，回源函数内部一定要加 `context.WithTimeout` 兜底，绝对不允许无超时的回源调用进入 `singleflight`。
+
+=== code-11
+--- deep
+**原理展开**
+
+实现进程内发布订阅（In-Memory Pub/Sub Broker）时，最核心的两个并发安全与工程设计问题是：
+
+1. **为什么 `Publish` 持有读锁 `RLock` 期间向 `ch` 发送消息，能保证绝对不会触发 `send on closed channel` panic？**
+   因为唯一会调用 `close(ch)` 的地方是 `unsubscribe` 闭包，而 `unsubscribe` 必须先获取互斥的**写锁 `b.mu.Lock()`**，将 `ch` 从 `b.subs[topic]` 集合中删除后再关闭。只要 `Publish` 正拿着读锁 `RLock()`，`unsubscribe` 就必定阻塞在获取写锁门外；等 `unsubscribe` 拿到写锁把 `ch` 删掉并关闭后，后续的 `Publish` 再遍历 `b.subs[topic]` 时已经看不到这个 `ch` 了。读写锁在这里巧妙地充当了 channel 生命周期的护栏！
+2. **慢消费者问题（Slow Consumer / Head-of-Line Blocking）**：
+   如果不在 `Publish` 里用 `select { case ch <- msg: default: }`，而是直接阻塞写 `ch <- msg`，那么只要有 **1 个** 订阅者卡死没读 channel（而且此时 `Publish` 还拿着 `RLock`！），不仅所有其他正常订阅者收不到消息，连试图调用 `Subscribe` / `unsubscribe` 的协程也会因为拿不到写锁而全部卡死，引发全局雪崩。
+
+**代码示例**
+
+```go
+// 进阶策略：Drop-Oldest（环形覆盖最旧消息，保证消费者永远拿到最新状态，如配置更新或实时股价）
+// 以及 Broker 全局优雅关闭 Close()
+func publishDropOldest[T any](ch chan T, msg T) {
+	select {
+	case ch <- msg:
+	default:
+		// 缓冲区已满：尝试弹出丢弃最老的一条消息，再塞入新消息
+		select {
+		case <-ch:
+		default:
+		}
+		select {
+		case ch <- msg:
+		default:
+		}
+	}
+}
+
+func (b *Broker[T]) Close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for topic, subs := range b.subs {
+		for ch := range subs {
+			close(ch)
+		}
+		delete(b.subs, topic)
+	}
+}
+```
+
+**常见追问**
+
+- 在 `unsubscribe` 里面，为什么要先判断 `if _, ok := b.subs[topic][ch]; ok` 再 `close(ch)`？→ 为了保证 `unsubscribe()` 函数是**幂等**的。调用方经常既在业务逻辑里调一次 `unsubscribe()`，又在 `defer unsubscribe()` 里兜底调一次；如果不做存在性检查，第二次调用就会重复 `close(ch)` 触发 panic（也可以用 `sync.Once` 包装 `unsubscribe`）。
+- 如果某个业务场景既不能丢弃消息，又不能让慢消费者阻塞 `Publish` 的读锁，该怎么设计？→ 为每个订阅者维护一个在锁外独立运行的转发协程 + 内存可扩展环形队列（或有界队列满时主动断开剔除该慢订阅者并告警），`Publish` 只负责极快地把消息投递进队列后立即释放锁。
+- 最后一个订阅者取消订阅后，`b.subs[topic]` 变成了一个空的子 map，需要处理吗？→ 应该加一句 `if len(b.subs[topic]) == 0 { delete(b.subs, topic) }`，否则如果系统动态产生大量一次性临时 topic（比如按订单 ID 订阅状态），外层 `b.subs` 会无限积累空 map 导致内存泄漏。
+
+**实战建议**
+
+- 在生产代码中实现 `unsubscribe` 时，记得在删空某个 `topic` 的最后一个订阅者后顺手执行 `delete(b.subs, topic)` 回收外层 key。
+- 如果使用 `select + default` 丢弃了慢订阅者的消息，务必增加一个原子计数器或限频日志（如 `dropped_messages_total`），绝不能静默丢数据而不留任何监控痕迹。
+
+=== code-12
+--- deep
+**原理展开**
+
+多生产者、多消费者（MPMC）的优雅退出之所以是经典面试题，是因为它考察了 **Channel 关闭所有权原则**：
+
+- **原则**：永远不要在消费者端关闭 channel，也不要在有多个并发生产者时让某个生产者直接 `close(jobs)`（因为其他生产者还在并发写，一关就会触发 `send on closed channel` panic）。
+- **协调者模式（Coordinator Pattern）**：必须引入一个独立的协调步骤——等所有生产者都确认退出（`producers.Wait()` 返回）后，此时世上再也没有任何协程会往 `jobs` 发送数据了，由协调者唯一执行一次 `close(jobs)`。
+- **两阶段排空（Two-Phase Drain）**：
+  1. **第一阶段（停源头）**：收到 `SIGTERM` 信号，`ctx` 取消，通知所有**生产者**停止拉取新活；
+  2. **第二阶段（排存量）**：注意在生产者已经从 `fetchJob` 拿到一条消息、正准备放入 `jobs <- job` 的瞬间如果收到 `ctx.Done()`，若直接 `return` 会把这条刚拿出来的任务弄丢！严谨的做法是：只要 `fetchJob` 已经拿到了任务，就尽量放进 `jobs` 由消费者处理完，然后生产者再退出；消费者通过 `for job := range jobs` 把缓冲通道里剩余的所有存量任务全部处理完毕后，看到通道关闭并排空，自然退出循环。
+
+**代码示例**
+
+```go
+// 带停机总超时兜底（Shutdown Deadline）的完整两阶段排空实现
+func RunPipeline(ctx context.Context, shutdownTimeout time.Duration) error {
+	jobs := make(chan Job, 100)
+	var producers, consumers sync.WaitGroup
+
+	// 1. 启动多生产者：只在拉取新任务时响应 ctx 取消；一旦任务已到手，保证送入 jobs 不丢失
+	for p := range 3 {
+		producers.Add(1)
+		go func() {
+			defer producers.Done()
+			for {
+				job, err := fetchJob(ctx, p)
+				if err != nil {
+					return // ctx 取消或无新任务，安全退出
+				}
+				jobs <- job // 确保已取出的任务入队，不被中途丢弃
+			}
+		}()
+	}
+
+	// 2. 协调者：所有生产者停产后，安全关闭 jobs 通道
+	go func() {
+		producers.Wait()
+		close(jobs)
+	}()
+
+	// 3. 启动多消费者：排空通道中所有存量任务
+	for range 4 {
+		consumers.Add(1)
+		go func() {
+			defer consumers.Done()
+			for job := range jobs {
+				handle(job)
+			}
+		}()
+	}
+
+	// 4. 等待消费者全部排空，但设置最大停机容忍时间（防止某个任务卡死导致容器被 SIGKILL 强杀）
+	done := make(chan struct{})
+	go func() {
+		consumers.Wait()
+		close(done)
+	}()
+
+	// 先等待退出信号触发
+	<-ctx.Done()
+	timer := time.NewTimer(shutdownTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("graceful shutdown timed out after %v", shutdownTimeout)
+	}
+}
+```
+
+**常见追问**
+
+- 在原题代码中，生产者写的是 `select { case jobs <- job: case <-ctx.Done(): return }`，如果 `fetchJob` 是从 Redis `LPOP` 或消息队列无确认取出的任务，走进 `<-ctx.Done()` 分支会发生什么？→ 这条刚刚被取出来的 `job` 既没进 `jobs` 通道被消费，又已经从外部队列删掉了，造成**停机瞬间的数据丢失**！因此停机取消点应该设在 `fetchJob(ctx)` 获取任务之前，一旦拿到手就应当走完入队（或回滚放回队列）。
+- 为什么 `signal.NotifyContext` 收到一次 `Ctrl+C`（`SIGINT`）后会取消 `ctx`，如果此时程序卡住，用户再按第二次 `Ctrl+C` 会怎样？→ `signal.NotifyContext` 在收到第一次信号取消 `ctx` 后（或调用返回的 `stop()` 函数后），如果我们在收到 `<-ctx.Done()` 时立即调用一次 `stop()` 取消信号拦截，那么用户按第二次 `Ctrl+C` 就会恢复操作系统的默认行为——直接强制终止进程，这正是命令行工具的标准最佳实践。
+- 如果是 **1 个生产者、多个消费者**，还需要专门启动一个 `go func() { producers.Wait(); close(jobs) }()` 协程吗？→ 不需要，单生产者直接在自己的生产循环结束后 `defer close(jobs)` 即可。
+
+**实战建议**
+
+- 记住多方并发关闭 Channel 的通用公式：**N 个生产者用 `WaitGroup` 汇聚成 1 个协调者 `close(ch)`；或者用 `context.WithCancel`（其内部的 `cancel()` 函数天然是幂等且并发安全的，可以被任意多个协程同时调用）**。
+- 容器优雅退出等待排空的总时间（如 25s）必须小于 Kubernetes Pod 的 `terminationGracePeriodSeconds`（默认 30s），留出 5 秒余量打印未完成的残留状态日志。
+
+=== code-13
+--- deep
+**原理展开**
+
+**Fan-out（扇出）**与 **Fan-in（扇入 / Merge）**是构建流式数据处理管道（Pipeline）的核心算子：
+- **Fan-out**：1 个输入 channel 被 $M$ 个并发 worker 协程同时读取，用于将 CPU 密集或 I/O 密集的中间处理步骤并行化；
+- **Fan-in（本题的 `Merge`）**：将 $N$ 个输入 channel 的结果汇聚回 1 个输出 channel，供下游统一消费。
+
+在实现 `Merge` 时，最关键的是**反向传播取消信号（Cancellation Propagation）**：如果下游消费者只读了前 5 条数据就因为报错或满足条件提前退出了（比如 `take(5)`），如果下游不通过 `ctx` 通知上游，那么 `Merge` 内部启动的 $N$ 个搬运协程就会永久卡死在 `out <- v` 发送语句上，连带上游的所有生产者一起全部泄漏！
+
+此外，当输入的 channel 数量确定为 2 个时，还可以用**单协程 `select` + 置 `nil` 技巧**实现，连 `sync.WaitGroup` 和额外子协程都不需要。
+
+**代码示例**
+
+```go
+// 经典技巧：当固定合并 2 个 channel 时，利用“select 会自动忽略值为 nil 的 channel 分支”这一语言特性，
+// 只用 1 个 goroutine 即可完成合并，无需 WaitGroup！
+func MergeTwo[T any](ctx context.Context, a, b <-chan T) <-chan T {
+	out := make(chan T)
+	go func() {
+		defer close(out)
+		for a != nil || b != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case v, ok := <-a:
+				if !ok {
+					a = nil // a 已关闭，将其置为 nil 后，下一轮 select 将不再监听此分支！
+					continue
+				}
+				select {
+				case out <- v:
+				case <-ctx.Done():
+					return
+				}
+			case v, ok := <-b:
+				if !ok {
+					b = nil // b 已关闭，同样置为 nil
+					continue
+				}
+				select {
+				case out <- v:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return out
+}
+```
+
+**常见追问**
+
+- 在上面的 `MergeTwo` 中，如果 `a` 已经被关闭了，我不写 `a = nil`，下一轮循环会发生什么？→ **灾难性的死循环空转（CPU 100%）**！因为**从已关闭的 channel 接收永远不会阻塞，而是立即返回零值和 `ok == false`**。如果不把 `a` 置为 `nil` 屏蔽掉该分支，`select` 每一纳秒都会立刻选中 `case v, ok := <-a` 分支！
+- 在 N 路 `Merge` 中，为什么 `for v := range in` 里面写 `out <- v` 时，不能直接写 `out <- v` 而必须套一层 `select { case out <- v: case <-ctx.Done(): return }`？→ 因为 `for v := range in` 已经从 `in` 读出了一个值 `v`，此时如果下游消费者已经取消了 `ctx` 不再读 `out`，直接写 `out <- v` 就会永久阻塞在这个位置，永远走不到下一轮循环，导致协程泄漏。
+- 如果 `in` 本身一直没有新数据发过来，但也没有关闭，此时 `ctx` 取消了，`for v := range in` 怎么及时退出？→ 如果上游生产者在 `ctx` 取消时会主动 `close(in)`，那么 `for v := range in` 会自动结束；如果上游不受控（不会主动关 `in`），则连读取 `in` 也要改成 `select { case v, ok := <-in: ... case <-ctx.Done(): return }`。
+
+**实战建议**
+
+- 牢记 Go Channel 的黄金法则：**`nil` channel 在 `select` 中会被永久跳过（用于动态开关分支）；已关闭的 channel 在 `select` 中会永远立即命中返回零值（必须置 `nil` 或退出循环）**。
+- 编写任何返回 `<-chan T` 的流式生成函数时，函数的第一个参数永远是 `ctx context.Context`，保证消费者随时中断时整条管道能瞬间干净回收。
+
+=== code-14
+--- deep
+**原理展开**
+
+标准库 `container/list` 虽然写起来短，但在高性能工程实践中存在两个明显的短板：
+1. **双重堆分配与类型断言开销**：`list.Element` 的 `Value` 字段是 `any`（`interface{}`）。每次 `ll.PushFront(&entry[K, V]{key, val})` 实际上在堆上分配了**两个**独立的对象（一个 `entry` 结构体 + 内部再次 `new(Element)`），读取时还要做接口类型断言，且链表节点在内存中分散，对 CPU Cache 极不友好；
+2. **`Get` 操作退化为串行写锁**：因为 `Get` 命中后必须调用 `MoveToFront` 修改链表指针，所以**不能用 `sync.RWMutex` 的读锁 `RLock`**，只能用互斥锁 `Lock()`，高并发读场景下所有核全部争抢同一把锁。
+
+在生产级缓存（如 `groupcache`、知乎/字节内部组件）中，通常**手写侵入式双向链表（Intrusive Doubly Linked List）**，并使用**哈希分片锁（Sharded LRU）**将锁竞争降低 $N$ 倍。
+
+**代码示例**
+
+```go
+// 1. 零额外包装分配的侵入式泛型双向链表节点（带哨兵头尾节点 dummy head/tail，消除所有 nil 边界判断）
+type node[K comparable, V any] struct {
+	key        K
+	val        V
+	prev, next *node[K, V]
+}
+
+// 2. 分片并发 LRU（ShardedLRU）：按 key 哈希分散到 16/64 个独立分片，降低锁冲突一个数量级以上
+type ShardedLRU[K comparable, V any] struct {
+	shards []*LRU[K, V]
+	hash   func(K) uint64
+}
+
+func NewShardedLRU[K comparable, V any](totalCap, numShards int, hash func(K) uint64) *ShardedLRU[K, V] {
+	perCap := max(1, (totalCap+numShards-1)/numShards)
+	shards := make([]*LRU[K, V], numShards)
+	for i := range shards {
+		shards[i] = NewLRU[K, V](perCap)
+	}
+	return &ShardedLRU[K, V]{shards: shards, hash: hash}
+}
+
+func (s *ShardedLRU[K, V]) shardFor(key K) *LRU[K, V] {
+	idx := s.hash(key) % uint64(len(s.shards))
+	return s.shards[idx]
+}
+
+func (s *ShardedLRU[K, V]) Get(key K) (V, bool) { return s.shardFor(key).Get(key) }
+func (s *ShardedLRU[K, V]) Put(key K, val V)    { s.shardFor(key).Put(key, val) }
+```
+
+**常见追问**
+
+- 在双向链表实现中，为什么要引入一个不存真实数据的**虚拟哨兵节点（Dummy / Sentinel Root Node）**形成双向循环链表（这也是标准库 `container/list` 内部的做法）？→ 如果没有哨兵节点，每次删除或插入节点都要写一堆 `if n.prev != nil ... else head = n.next` 和 `if n.next != nil ... else tail = n.prev` 的分支判断，极易写错；用了哨兵环（初始 `root.next = &root; root.prev = &root`）后，任何节点的插入和删除都只有完全统一的 4 行指针赋值，没有任何 `nil` 特判！
+- 如果同一个热点 Key 被每秒 10 万次并发 `Get`，即使做了分片，这 10 万次请求还是落到同一个分片上抢同一把写锁，怎么进一步优化？→ 采用**读缓冲批量更新（Read Buffer / Lossy Ring Buffer，如 Ristretto 的做法）**：`Get` 操作只拿读锁（或读取无锁 map）查出数据立即返回，把“某 key 被访问了一次”的事件非阻塞地塞进一个环形缓冲区，后台异步批量更新链表顺序。
+- 什么是 LRU 的“缓存污染（Cache Pollution）”问题，W-TinyLFU 是怎么解决的？→ 当发生一次全表扫描式的大批量冷数据查询时，传统 LRU 会把这些只访问一次的冷数据全部放进链表头部，反而把真正高频访问的热点数据挤出淘汰掉。W-TinyLFU 使用一个极小的窗口缓存（1% 容量）加上基于 Count-Min Sketch（布隆过滤器的计数变体，用极少内存统计访问频率）的准入过滤器：新被淘汰出来的项只有历史访问频率高于旧项时才允许替换进入主缓存。
+
+**实战建议**
+
+- 面试手写 LRU 时，如果允许用标准库，直接用 `container/list` 最快且不易出错；如果面试官要求“不准用 `container/list`，自己写双向链表”，**一定要用 Dummy 哨兵节点（`head` 和 `tail` 两个伪节点连起来）**，代码量少一半且绝对不会写出空指针 bug。
+- 注意容量参数校验：`capacity <= 0` 时应妥善处理，防止 `Put` 后 `c.ll.Back()` 异常。
+
+=== code-15
+--- deep
+**原理展开**
+
+设计带过期时间（TTL）的本地缓存，本质上是在**内存回收及时性**与 **CPU / 锁停顿开销**之间做权衡，工业界普遍采用 **“惰性删除（Lazy Eviction） + 定期增量清理（Active Sampling Janitor）”** 双管齐下的策略：
+
+1. **为什么不能只靠 `Get` 时的惰性删除？**
+   如果有一批写入后就再也不会被读取的冷 Key，单靠 `Get` 检查永远不会触发清理，这些过期数据就会永远占着内存（内存泄漏）。
+2. **为什么原题里的 `Get` 在发现 `now.After(it.expireAt)` 时，没有顺手调用 `delete(c.data, key)`？**
+   因为 `Get` 为了高并发性能，拿的是**读锁 `c.mu.RLock()`**！在持有读锁期间**绝对不能修改 `map`**（调用 `delete` 属于写操作，并发执行会直接触发 `fatal error: concurrent map writes`）。如果想在 `Get` 里删，就必须先 `RUnlock()`，再拿写锁 `Lock()`，还得**二次检查（Double-Check）**该 key 是否在这期间已经被别的协程更新了新的有效期，然后再 `delete`；或者干脆在 `Get` 里只返回 `false`，把物理删除的工作完全交给后台 `janitor` 协程。
+3. **大 Map 全表扫描的 STW 级锁卡顿**：如果 `c.data` 里有 500 万个 key，`janitor` 拿着写锁 `c.mu.Lock()` 用 `for k, it := range c.data` 完整遍历一遍可能需要 **100ms 以上**，在这 100ms 内所有业务协程的 `Get` 和 `Set` 都会被彻底卡死！
+
+**代码示例**
+
+```go
+// Redis 风格的限量随机抽样清理（利用 Go map 遍历天然随机起点的特性，每次最多只检查 200 个 key，
+// 持锁时间严格控制在几微秒以内，绝不阻塞线上读写请求！）
+func (c *TTLCache[K, V]) sampleCleanup(now time.Time, batchSize int) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	expired := 0
+	checked := 0
+	for k, it := range c.data {
+		if now.After(it.expireAt) {
+			delete(c.data, k)
+			expired++
+		}
+		checked++
+		if checked >= batchSize {
+			break // 达到单批检查上限立即释放写锁
+		}
+	}
+	return expired
+}
+
+// Get 中若想做惰性物理删除，必须使用“读锁转写锁 + Double-Check 二次校验”模式
+func (c *TTLCache[K, V]) GetAndEvict(key K, now time.Time) (V, bool) {
+	c.mu.RLock()
+	it, ok := c.data[key]
+	c.mu.RUnlock()
+	if !ok {
+		var zero V
+		return zero, false
+	}
+	if !now.After(it.expireAt) {
+		return it.val, true
+	}
+	// 已过期：升级为写锁并二次检查（防止在 RUnlock 到 Lock 的间隙里，其他协程刚刚 Set 了新值！）
+	c.mu.Lock()
+	if it2, ok2 := c.data[key]; ok2 && now.After(it2.expireAt) {
+		delete(c.data, key)
+	}
+	c.mu.Unlock()
+	var zero V
+	return zero, false
+}
+```
+
+**常见追问**
+
+- 如果不启动后台 `janitor` 协程，也不给每个 key 创建 `time.AfterFunc`，还有什么办法能在 `Close()` 之外不泄漏任何后台 goroutine？→ **每次 `Set` 写入时顺带搭载微量的随机清理（Piggyback Cleanup）**：每次调用 `Set` 反正已经拿了写锁 `c.mu.Lock()`，顺手在 map 里随机 `range` 检查 2～4 个 key，过期的就删掉。这样整个 `TTLCache` 是纯被动数据结构，不需要任何后台 goroutine，连 `Close()` 都不用调！
+- Go 的 `map` 在经历了“高峰期写入 200 万个 key，随后全部过期被 `delete`”之后，底层桶内存不释放怎么解决？→ 在结构体中记录历史峰值容量 `peakSize` 和当前长度 `len(c.data)`；当 `janitor` 发现 `peakSize > 100000 && len(c.data) < peakSize/10` 时，分配一个新的 `make(map[K]item[V], len(c.data)*2)` 把存活元素拷过去替换旧 map，让 GC 回收旧的巨大桶数组。
+- 如果想按过期时间先后顺序精确清理（而不是遍历 map），用什么数据结构？→ **最小堆（Min-Heap，`container/heap`）** 或 **时间轮（Timing Wheel）**。
+
+**实战建议**
+
+- 任何在构造函数里启动了后台 `go c.janitor()` 的组件，必须同时提供幂等的 `Close()` 方法并在文档中标明，否则在单元测试或动态创建的实例中必然造成 goroutine 泄漏。
+- 生产环境缓存组件优先采用 **“哈希分片 + 写入时顺带抽样清理 / 时间轮”**，避免单把全局大锁全表遍历带来的延迟毛刺。
+
+=== code-16
+--- deep
+**原理展开**
+
+为什么分布式系统中无脑的“固定间隔重试”或“纯指数退避（不加 Jitter）”会把偶发抖动放大成全局雪崩？
+
+1. **重试同步共振（Thundering Herd / Retry Storm）**：假设下游数据库在 `t = 0` 秒因为网络闪断卡了 100ms，导致同一瞬间有 1000 个客户端请求失败。如果所有客户端都只按纯指数退避（第 1 次等 100ms、第 2 次等 200ms、第 3 次等 400ms）而不加随机抖动，那么这 1000 个客户端会在 `t = 100ms`、`t = 300ms`、`t = 700ms` **分秒不差地同时再次砸向下游**，形成一轮又一轮的脉冲洪峰，让下游永远缓不过气来。
+   AWS 架构团队在经典论文《Exponential Backoff And Jitter》中对比了三种抖动策略：
+   - **Full Jitter（全抖动）**：`sleep = rand(0, min(maxDelay, base * 2^attempt))`，打散效果最好，总重试次数最少；
+   - **Equal Jitter（等分抖动，本题代码采用）**：`sleep = temp/2 + rand(0, temp/2)`，既有保底的最小退避间隔，又能把脉冲平摊到半个窗口宽度上；
+   - **Decorrelated Jitter（去相关抖动）**：`sleep = min(maxDelay, rand(base, prevSleep * 3))`。
+2. **级联重试放大（Retry Amplification）**：如果网关层重试 3 次，BFF 服务层重试 3 次，DAO 数据库层又重试 3 次，那么底层数据库慢一下，会被放大成 $3 \times 3 \times 3 = 27$ 倍的请求风暴！
+
+**代码示例**
+
+```go
+// Google SRE 推荐的“客户端重试预算（Retry Budget）”保护机制：
+// 限制重试请求最多只能占正常请求总量的 10%！当下游已经全面崩溃（大量请求失败）时，
+// 令牌迅速耗尽，自动停止重试并快速失败，彻底阻止重试风暴压垮下游。
+type RetryBudget struct {
+	tokens atomic.Int64 // 当前可用积分（每次尝试消耗 1 分，每次重试额外消耗 10 分，上限 1000 分）
+}
+
+func NewRetryBudget() *RetryBudget {
+	b := &RetryBudget{}
+	b.tokens.Store(1000)
+	return b
+}
+
+func (b *RetryBudget) RecordRequest() {
+	for {
+		cur := b.tokens.Load()
+		next := min(int64(1000), cur+1) // 正常请求每次积攒 1 分（对应允许 10% 的重试率）
+		if b.tokens.CompareAndSwap(cur, next) {
+			return
+		}
+	}
+}
+
+func (b *RetryBudget) CanRetry() bool {
+	for {
+		cur := b.tokens.Load()
+		if cur < 10 {
+			return false // 重试预算耗尽，拒绝重试！
+		}
+		if b.tokens.CompareAndSwap(cur, cur-10) {
+			return true
+		}
+	}
+}
+```
+
+**常见追问**
+
+- 在 `Retry` 循环中，为什么等待退避时写的是 `timer := time.NewTimer(sleep)` + `select`，而不是直接在 `select` 里写 `case <-time.After(sleep):`？→ 虽然在单次请求最多重试 3～5 次的场景下 `time.After` 影响不大，但如果遇到调用方在 1ms 内立即取消了 `ctx`，显式使用 `NewTimer` 并在 `ctx.Done()` 分支调用 `timer.Stop()` 是最严谨的写法，兼容所有 Go 版本且立即释放定时器资源。
+- 哪些 HTTP 状态码或 gRPC 状态码绝对**不应该**重试？→ **客户端错误与确定性业务错误绝不重试**：如 HTTP `400 Bad Request`、`401 Unauthorized`、`403 Forbidden`、`404 Not Found`、`422 Unprocessable Entity`（重试一万次结果也一样）；只有 `502`/`503`/`504`、网络层的连接重置或超时才考虑对幂等接口重试。对于 `429 Too Many Requests`，除非响应头明确带有 `Retry-After` 且预算允许，否则盲目立即重试只会加剧限流。
+- 单次尝试的超时（Per-Try Timeout）和整个重试函数的总超时（Overall Context Timeout）怎么配合？→ 外层 `ctx` 控制用户能容忍的总耗时（如 1000ms），而在每次循环调用 `fn` 时，应派生一个更短的单次尝试超时 `tryCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)`，防止第一次尝试就把全部 1000ms 耗光，连发起第二次重试的机会都没有。
+
+**实战建议**
+
+- 多层微服务调用链遵循 **“单层重试原则”**：只在最贴近故障源的客户端（或统一在最外层网关）配置一处重试，严禁在调用链的每一层都开启重试。
+- 每次调用 `fn` 时为其包裹独立的单次超时（Per-Try Timeout），并在收尾时 `cancel()`。
+
+=== code-17
+--- deep
+**原理展开**
+
+编写 Go `net/http` 中间件看似简单，但标准库 `http.ResponseWriter` 的接口设计隐藏了三个极易踩坑的机制：
+
+1. **隐式状态码与重复 `WriteHeader`**：如果業務 Handler 直接调用了 `w.Write([]byte("ok"))` 而没有先调 `w.WriteHeader(200)`，标准库内部会自动以 `200 OK` 发送响应头；反之，如果中间件或 Handler 不小心调用了两次 `WriteHeader`，标准库会在日志里打出烦人的 `http: superfluous response.WriteHeader call` 警告。此外，统计响应体字节数（`bytes_written`）也需要拦截 `Write([]byte)` 方法。
+2. **接口隐藏（Interface Hiding）与 Go 1.20 `http.ResponseController`**：
+   底层的 `*http.response` 不仅实现了 `ResponseWriter`（只有 `Header`、`Write`、`WriteHeader` 三个方法），还实现了 `http.Flusher`（SSE 流式推送必需）、`http.Hijacker`（WebSocket 升级连接必需）、`io.ReaderFrom`（`sendfile` 零拷贝传输必需）。
+   一旦你用自定义的 `&statusRecorder{ResponseWriter: w}` 把 `w` 包装起来传给下游，下游做类型断言 `w.(http.Flusher)` 就会立刻失败！**Go 1.20 引入了 `http.NewResponseController(w)`**，它会自动循环调用包装层的 `Unwrap() http.ResponseWriter` 方法找到最底层的原始 `ResponseWriter`，因此所有自定义包装器都必须实现 `Unwrap()`。
+3. **为什么恢复 panic 时遇到 `v == http.ErrAbortHandler` 必须重新 `panic(v)`？**
+   `http.ErrAbortHandler` 是标准库 `net/http`（例如 `httputil.ReverseProxy` 在流式转发中断时）专门定义的一个哨兵 panic 值，用来通知顶层 `http.Server` 静默中止当前连接而不打印错误栈。如果中间件把它当成普通业务 bug 吞掉并试图往已经写了一半的响应里再写 `500 Internal Server Error`，反而会破坏协议流。
+
+**代码示例**
+
+```go
+// 完整生产级 ResponseWriter 包装器：支持记录状态码、统计响应字节数、防止重复 WriteHeader，并兼容 Unwrap 與 Flusher
+type responseRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+	bytes       int64
+}
+
+func (r *responseRecorder) WriteHeader(code int) {
+	if r.wroteHeader {
+		return // 忽略重复调用，避免 superfluous response.WriteHeader 警告
+	}
+	r.status = code
+	r.wroteHeader = true
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *responseRecorder) Write(p []byte) (int, error) {
+	if !r.wroteHeader {
+		r.WriteHeader(http.StatusOK)
+	}
+	n, err := r.ResponseWriter.Write(p)
+	r.bytes += int64(n)
+	return n, err
+}
+
+func (r *responseRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (r *responseRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
+}
+```
+
+**常见追问**
+
+- 如果业务 Handler 已经调用了 `w.Write(part1)` 发送了一半的数据，随后在处理第二半数据时触发了 `panic`，恢复中间件里还能调用 `http.Error(w, "internal error", 500)` 把状态码改成 500 吗？→ **不能**！HTTP 协议的响应状态行和 Header 已经在第一次 `Write` 时通过网卡发给客户端了（即 `r.wroteHeader == true`），此时再调 `WriteHeader(500)` 完全无效。恢复中间件应检查 `if !rec.wroteHeader` 时才写 500 响应。
+- 如果业务 Handler 内部自己启动了一个子协程 `go func() { panic("boom") }()`，外层的 HTTP Recovery 中间件能捕获到这个 panic 吗？→ **绝对捕获不到**！Go 的 `recover()` 只能捕获**当前同一个 goroutine 调用栈**上的 panic；任何野生子 goroutine 如果没有自己写 `defer recover()`，一旦 panic 就会直接导致整个 Go 进程崩溃退出。
+- 怎么把多个中间件按洋葱模型优雅地串联起来？→ 编写一个辅助函数 `Chain(h http.Handler, mws ...func(http.Handler) http.Handler) http.Handler`，从后往前依次包裹 `for i := len(mws) - 1; i >= 0; i-- { h = mws[i](h) }`，推荐顺序是：`Recovery -> TraceID -> AccessLog -> Timeout/RateLimit -> Auth -> BusinessHandler`。
+
+**实战建议**
+
+- 所有自定义 `http.ResponseWriter` 包装结构体，一律同时实现 `Unwrap() http.ResponseWriter` 和 `wroteHeader` 布尔状态守卫。
+- 在 Recovery 中间件写 `500` 错误响应前先判断 `if !rec.wroteHeader`，避免污染已经发出一半的流式响应。
+
+=== code-18
+--- deep
+**原理展开**
+
+熔断器（Circuit Breaker）的本质是一个**基于下游近期健康度反馈的自动状态机**，目的是在下游已经过载或宕机时**快速失败（Fail-Fast）**，既解放本服务的线程池/连接池，又给下游留出喘息恢复的时间：
+
+```text
+               连续失败达到阈值 / 窗口错误率超标
+        +-----------------------------------------+
+        |                                         v
+  +-----------+                             +-----------+
+  |  Closed   |                             |   Open    | (直接拒绝请求，返回 ErrOpen)
+  | (正常放行) |                             | (熔断打开) |
+  +-----------+                             +-----------+
+        ^                                         |
+        | 探测成功达到阈值                         | 经过 coolDown 冷却时间
+        |                                         v
+        |                                   +-----------+
+        +-----------------------------------| Half-Open | (仅放行少量探测请求试探下游)
+                                            +-----------+
+                                                  |
+                  探测请求再次失败                 |
+                  +-------------------------------+ (立即重新回到 Open 并重置冷却计时)
+```
+
+除了经典的“三态状态机熔断器（Hystrix / gobreaker）”，Google SRE 书中还提出了更先进的**自适应客户端节流（Adaptive Throttling，被 Kratos、go-zero 采用）**：它没有显式的 Open/Half-Open 状态切换跳变，而是维护滑动窗口内的总请求数 $requests$ 和下游接受成功数 $accepts$，计算客户端拒绝概率：
+$$P_{\text{drop}} = \max\left(0, \frac{requests - K \cdot accepts}{requests + 1}\right)$$
+其中倍乘因子 $K$ 通常取 $1.5 \sim 2.0$。当下游正常（$accepts = requests$）时，分子为负，拒绝概率为 $0$；当下游错误率超过 $1 - \frac{1}{K}$（如 $K=2$ 时错误率 $> 50\%$），拒绝概率随着错误率升高平滑线性上升，下游一旦恢复，$accepts$ 增加，流量自动平滑恢复，彻底消除了半开状态切换时的流量冲击台阶！
+
+**代码示例**
+
+```go
+// Google SRE 自适应熔断公式核心计算逻辑（无需三态跳变，按错误率平滑丢弃流量）
+type AdaptiveBreaker struct {
+	mu       sync.Mutex
+	requests float64
+	accepts  float64
+	k        float64 // 容忍系数，例如 1.5（代表错误率超过 33% 时开始按比例拦截）
+}
+
+func NewAdaptiveBreaker(k float64) *AdaptiveBreaker {
+	return &AdaptiveBreaker{k: max(1.1, k)}
+}
+
+func (b *AdaptiveBreaker) Allow() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// 计算最大允许请求水位线：K * accepts
+	maxRequests := b.k * b.accepts
+	if b.requests <= 10 || b.requests <= maxRequests {
+		return true // 请求量太少或错误率在安全范围内，100% 放行
+	}
+	// 超出安全水位后，按超标比例概率性放行（仍允许少量请求穿透过去探测下游是否恢复）
+	dropRatio := max(0.0, (b.requests-maxRequests)/(b.requests+1))
+	return rand.Float64() >= dropRatio
+}
+
+func (b *AdaptiveBreaker) Mark(success bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// 指数衰减滑动统计，让近期结果权重更高
+	b.requests = b.requests*0.99 + 1
+	if success {
+		b.accepts = b.accepts*0.99 + 1
+	} else {
+		b.accepts = b.accepts * 0.99
+	}
+}
+```
+
+**常见追问**
+
+- 在原题的三态熔断器中，为什么 `HalfOpen` 状态下必须有一个 `probing bool`（或原子计数器 `maxHalfOpenRequests`）标志？→ 如果没有 `probing` 限制，当 `coolDown` 冷却时间刚到的那一毫秒，假如有 1000 个并发请求同时进入 `allow()`，看到时间到了全部涌入刚缓过一口气的下游，这 1000 个并发探测瞬间又会把下游打挂！必须严格限制半开状态同一时刻只放行 1 个（或极少数几个）探测请求。
+- 如果正在执行的那唯一 1 个 `probing` 探测请求内部发生了 `panic`，没执行到 `b.record(err)`，原题代码会发生什么严重 bug？→ `b.probing` 会永远停留在 `true`，且状态永远卡在 `HalfOpen`，导致熔断器此后**永久锁死拒绝一切请求**！修复方法是在 `Do` 中使用 `defer` 确保即使 `fn()` panic 也会调用 `b.record(errPanic)` 重置 `probing = false`。
+- 下游返回“余额不足”或“用户不存在（404）”应该计入熔断器的失败次数吗？→ **绝对不应该**！熔断器只统计代表**服务端系统性故障**的错误（如网络超时、连接拒绝、HTTP 5xx、gRPC `Unavailable` / `DeadlineExceeded`），业务校验错误说明下游服务本身是完全健康的。
+
+**实战建议**
+
+- 在 `Breaker.Do(fn)` 的实现中，务必用 `defer` 保护状态回写（防止 `fn` 发生 panic 时卡死半开探测锁 `probing`）。
+- 熔断器的粒度应该按 **“下游服务 + 具体接口路由（Method/Route）”** 隔离，不要整个下游共用一个大熔断器——防止某一个慢报表接口报错，把同一个下游服务上完全正常的登录和下单接口也一并熔断了。

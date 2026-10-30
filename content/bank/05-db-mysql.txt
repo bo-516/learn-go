@@ -1,0 +1,1944 @@
+数据库 · MySQL（DB-01 ~ DB-16）的编程小任务。用 Go 对存储引擎的关键机制做简化建模。
+
+=== db-01-1
+title: 行锁：按 key 加锁的锁管理器
+race: true
+--- desc
+MyISAM 只有表锁，InnoDB 支持行锁：不同的行可以被不同事务同时修改。实现一个按 key 加锁的 `RowLocker`：
+
+- `Lock(key)` / `Unlock(key)`：同一个 key 互斥，不同 key 互不影响；
+- 不能给每个出现过的 key 永久保留一把锁，否则内存会无限增长：用引用计数，没有人持有或等待某个 key 时删除它的锁；
+- `Size()` 返回当前内部保存的锁数量。
+--- solution
+package main
+
+import "sync"
+
+type entry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+type RowLocker struct {
+	mu    sync.Mutex
+	locks map[string]*entry
+}
+
+func NewRowLocker() *RowLocker { return &RowLocker{locks: map[string]*entry{}} }
+
+func (l *RowLocker) Lock(key string) {
+	// @solution
+	l.mu.Lock()
+	e, ok := l.locks[key]
+	if !ok {
+		e = &entry{}
+		l.locks[key] = e
+	}
+	e.refs++
+	l.mu.Unlock()
+	e.mu.Lock() // 在全局锁之外等待，不阻塞其他 key
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (l *RowLocker) Unlock(key string) {
+	// @solution
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e := l.locks[key]
+	e.refs--
+	if e.refs == 0 {
+		delete(l.locks, key)
+	}
+	e.mu.Unlock()
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (l *RowLocker) Size() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.locks)
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestDifferentKeysParallel(t *testing.T) {
+	l := NewRowLocker()
+	l.Lock("row:1")
+	done := make(chan struct{})
+	go func() {
+		l.Lock("row:2")
+		l.Unlock("row:2")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("不同的 key 不应互相阻塞")
+	}
+	l.Unlock("row:1")
+}
+
+func TestSameKeyExclusive(t *testing.T) {
+	l := NewRowLocker()
+	l.Lock("row:1")
+	acquired := make(chan struct{})
+	go func() {
+		l.Lock("row:1")
+		close(acquired)
+		l.Unlock("row:1")
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("同一个 key 应该互斥")
+	case <-time.After(30 * time.Millisecond):
+	}
+	l.Unlock("row:1")
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("释放后等待者应拿到锁")
+	}
+}
+
+func TestCleanup(t *testing.T) {
+	l := NewRowLocker()
+	// 每个 key 一个计数器；map 本身只读，计数器由对应 key 的锁保护
+	counter := map[string]*int{}
+	for i := 0; i < 5; i++ {
+		counter[fmt.Sprint("row:", i)] = new(int)
+	}
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				k := fmt.Sprint("row:", i%5)
+				l.Lock(k)
+				*counter[k]++
+				l.Unlock(k)
+			}
+		}()
+	}
+	wg.Wait()
+	if *counter["row:0"] != 8*40 {
+		t.Fatalf("row:0 计数 = %d，期望 %d", *counter["row:0"], 8*40)
+	}
+	if n := l.Size(); n != 0 {
+		t.Fatalf("所有锁都释放后，内部还剩 %d 把锁", n)
+	}
+}
+--- explain
+关键在 `Lock`：先在全局锁里找到（或创建）这个 key 的锁并增加引用计数，然后**释放全局锁之后**再等待 key 锁。如果在持有全局锁时等待，一个 key 被长时间占用就会卡住所有 key，退化成表锁。
+
+=== db-02-1
+title: B+ 树能存多少行
+--- desc
+估算 InnoDB 一棵 B+ 树的容量：
+
+- `Fanout(pageSize, keySize, ptrSize)`：一个非叶子页能放多少个「键 + 子页指针」，即 `pageSize / (keySize + ptrSize)`；
+- `Capacity(height, fanout, rowsPerLeaf)`：高度为 `height` 的树最多能存多少行：`fanout^(height-1) * rowsPerLeaf`；
+- `MinHeight(rows, fanout, rowsPerLeaf)`：存下 `rows` 行最少需要几层（至少 1 层）。
+
+经典结论：16KB 页、BIGINT 主键（8 字节）+ 6 字节指针，扇出约 1170；每个叶子页放 16 行（每行约 1KB），3 层就能存两千多万行，所以主键查询一般只需要 2～3 次 IO。
+--- solution
+package main
+
+func Fanout(pageSize, keySize, ptrSize int) int {
+	// @solution
+	return pageSize / (keySize + ptrSize)
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+
+func Capacity(height, fanout, rowsPerLeaf int) int {
+	// @solution
+	c := rowsPerLeaf
+	for i := 1; i < height; i++ {
+		c *= fanout
+	}
+	return c
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+
+func MinHeight(rows, fanout, rowsPerLeaf int) int {
+	// @solution
+	h := 1
+	for Capacity(h, fanout, rowsPerLeaf) < rows {
+		h++
+	}
+	return h
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestBPlusTree(t *testing.T) {
+	f := Fanout(16384, 8, 6)
+	if f != 1170 {
+		t.Fatalf("Fanout = %d，期望 1170", f)
+	}
+	if c := Capacity(3, f, 16); c != 21902400 {
+		t.Fatalf("3 层容量 = %d，期望 21902400", c)
+	}
+	if c := Capacity(1, f, 16); c != 16 {
+		t.Fatalf("只有根（叶子）时容量 = %d", c)
+	}
+	cases := map[int]int{1: 1, 16: 1, 17: 2, 18720: 2, 18721: 3, 20_000_000: 3, 30_000_000: 4}
+	for rows, want := range cases {
+		if h := MinHeight(rows, f, 16); h != want {
+			t.Errorf("MinHeight(%d) = %d，期望 %d", rows, h, want)
+		}
+	}
+}
+
+=== db-02-2
+title: B+ 树的范围扫描
+--- desc
+B+ 树适合范围查询：先通过上层索引二分定位到起始叶子页，然后沿着叶子之间的链表顺序扫描。
+
+`Index` 里 `Leaves` 是按顺序排列的叶子页，叶子之间用 `Next` 连接；`Seps[i]` 是第 `i+1` 个叶子的最小 key（相当于上层的分隔键）。
+
+实现 `Range(lo, hi)`：返回 `[lo, hi]` 范围内的所有 key（升序），以及读取的叶子页数量。要求：
+
+- 用二分查找（`sort.Search` 或 `slices.BinarySearch`）定位起始叶子，不能从第一个叶子开始扫；
+- 沿 `Next` 指针扫描，遇到大于 `hi` 的 key 立即停止。
+--- solution
+package main
+
+import "sort"
+
+type Leaf struct {
+	Keys []int
+	Next *Leaf
+}
+
+type Index struct {
+	Seps   []int
+	Leaves []*Leaf
+}
+
+func Build(keys []int, perLeaf int) *Index {
+	ix := &Index{}
+	for i := 0; i < len(keys); i += perLeaf {
+		leaf := &Leaf{Keys: keys[i:min(i+perLeaf, len(keys))]}
+		if n := len(ix.Leaves); n > 0 {
+			ix.Leaves[n-1].Next = leaf
+			ix.Seps = append(ix.Seps, leaf.Keys[0])
+		}
+		ix.Leaves = append(ix.Leaves, leaf)
+	}
+	return ix
+}
+
+func (ix *Index) Range(lo, hi int) (keys []int, leavesRead int) {
+	if len(ix.Leaves) == 0 {
+		return nil, 0
+	}
+	// @solution
+	// 第一个分隔键 > lo 的位置，就是起始叶子的下标
+	start := sort.Search(len(ix.Seps), func(i int) bool { return ix.Seps[i] > lo })
+	for leaf := ix.Leaves[start]; leaf != nil; leaf = leaf.Next {
+		leavesRead++
+		for _, k := range leaf.Keys {
+			if k > hi {
+				return keys, leavesRead
+			}
+			if k >= lo {
+				keys = append(keys, k)
+			}
+		}
+	}
+	return keys, leavesRead
+	// @starter
+	// for leaf := ix.Leaves[0]; leaf != nil; leaf = leaf.Next { // TODO: 从头扫描太慢
+	// 	leavesRead++
+	// 	for _, k := range leaf.Keys {
+	// 		if k >= lo && k <= hi {
+	// 			keys = append(keys, k)
+	// 		}
+	// 	}
+	// }
+	// return keys, leavesRead
+	// @end
+}
+
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestRange(t *testing.T) {
+	var keys []int
+	for k := 10; k <= 1000; k += 10 {
+		keys = append(keys, k)
+	}
+	ix := Build(keys, 4) // 25 个叶子：[10..40] [50..80] ...
+	got, read := ix.Range(210, 260)
+	if !slices.Equal(got, []int{210, 220, 230, 240, 250, 260}) {
+		t.Fatalf("Range(210, 260) = %v", got)
+	}
+	if read != 2 {
+		t.Fatalf("读取了 %d 个叶子，期望 2（[210..240] 和 [250..280]）", read)
+	}
+	if got, read := ix.Range(995, 2000); len(got) != 1 || read != 1 {
+		t.Fatalf("Range(995, 2000) = %v，读取 %d 页", got, read)
+	}
+	if got, _ := ix.Range(1, 15); !slices.Equal(got, []int{10}) {
+		t.Fatalf("Range(1, 15) = %v", got)
+	}
+	if got, _ := ix.Range(11, 19); len(got) != 0 {
+		t.Fatalf("Range(11, 19) = %v，期望空", got)
+	}
+}
+
+=== db-03-1
+title: 回表与覆盖索引
+--- desc
+用 Go 模拟 InnoDB 的两种索引：
+
+- **聚簇索引** `rows`：主键 → 整行数据；
+- **二级索引** `byName`：按 `(name, id)` 排序的切片，叶子节点只存索引列和主键。
+
+实现：
+
+- `FindByName(name) []Row`：先在二级索引里二分找到所有匹配的主键，再逐个去聚簇索引取整行——每取一次计为一次**回表**（`t.Lookups++`）；
+- `IDsByName(name) []int`：只需要主键，二级索引里已经有了，这就是**覆盖索引**，不能回表。
+--- solution
+package main
+
+import (
+	"slices"
+	"strings"
+)
+
+type Row struct {
+	ID   int
+	Name string
+	Age  int
+}
+
+type secEntry struct {
+	Name string
+	ID   int
+}
+
+type Table struct {
+	rows    map[int]Row
+	byName  []secEntry
+	Lookups int
+}
+
+func NewTable(rows []Row) *Table {
+	t := &Table{rows: map[int]Row{}}
+	for _, r := range rows {
+		t.rows[r.ID] = r
+		t.byName = append(t.byName, secEntry{r.Name, r.ID})
+	}
+	slices.SortFunc(t.byName, func(a, b secEntry) int {
+		if c := strings.Compare(a.Name, b.Name); c != 0 {
+			return c
+		}
+		return a.ID - b.ID
+	})
+	return t
+}
+
+func (t *Table) IDsByName(name string) []int {
+	// @solution
+	i, _ := slices.BinarySearchFunc(t.byName, name, func(e secEntry, name string) int {
+		return strings.Compare(e.Name, name)
+	})
+	var ids []int
+	for ; i < len(t.byName) && t.byName[i].Name == name; i++ {
+		ids = append(ids, t.byName[i].ID)
+	}
+	return ids
+	// @starter
+	// return nil // TODO: 二分查找二级索引
+	// @end
+}
+
+func (t *Table) FindByName(name string) []Row {
+	// @solution
+	var out []Row
+	for _, id := range t.IDsByName(name) {
+		t.Lookups++
+		out = append(out, t.rows[id])
+	}
+	return out
+	// @starter
+	// return nil // TODO: 用 IDsByName 拿到主键后回表
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func table() *Table {
+	return NewTable([]Row{{1, "bob", 30}, {2, "alice", 25}, {3, "bob", 41}, {4, "carol", 22}, {5, "alice", 33}})
+}
+
+func TestCoveringIndex(t *testing.T) {
+	tb := table()
+	if ids := tb.IDsByName("alice"); !slices.Equal(ids, []int{2, 5}) {
+		t.Fatalf("IDsByName(alice) = %v", ids)
+	}
+	if tb.Lookups != 0 {
+		t.Fatalf("覆盖索引不应回表，Lookups = %d", tb.Lookups)
+	}
+}
+
+func TestLookups(t *testing.T) {
+	tb := table()
+	rows := tb.FindByName("bob")
+	if len(rows) != 2 || rows[0].Age != 30 || rows[1].Age != 41 {
+		t.Fatalf("FindByName(bob) = %v", rows)
+	}
+	if tb.Lookups != 2 {
+		t.Fatalf("应回表 2 次，实际 %d", tb.Lookups)
+	}
+	if rows := tb.FindByName("dave"); len(rows) != 0 {
+		t.Fatal("不存在的名字应返回空")
+	}
+}
+
+=== db-04-1
+title: 最左前缀：能用到索引的几列
+--- desc
+联合索引 `(a, b, c)` 按 a、b、c 依次排序。实现 `UsableColumns(index, conds)`，返回查询条件能用到索引的前几列：
+
+1. 按索引列的顺序检查；
+2. 这一列有等值条件（`=`、`in`）→ 可用，继续看下一列；
+3. 这一列有范围条件（`>`、`<`、`between`、`like-prefix` 即 `LIKE 'abc%'`）→ 可用，但**后面的列都用不上了**；
+4. 这一列没有条件，或者条件让索引失效（`like-suffix` 即 `LIKE '%abc'`、`func` 即对列用了函数）→ 停止。
+
+WHERE 里条件的书写顺序不影响结果（优化器会调整）。
+--- solution
+package main
+
+type Cond struct {
+	Col string
+	Op  string // "=", "in", ">", "<", "between", "like-prefix", "like-suffix", "func"
+}
+
+func UsableColumns(index []string, conds []Cond) int {
+	// @solution
+	ops := map[string]string{}
+	for _, c := range conds {
+		if _, seen := ops[c.Col]; !seen || c.Op == "=" || c.Op == "in" {
+			ops[c.Col] = c.Op
+		}
+	}
+	n := 0
+	for _, col := range index {
+		switch ops[col] {
+		case "=", "in":
+			n++
+		case ">", "<", "between", "like-prefix":
+			return n + 1
+		default:
+			return n
+		}
+	}
+	return n
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestUsableColumns(t *testing.T) {
+	idx := []string{"a", "b", "c"}
+	cases := []struct {
+		name  string
+		conds []Cond
+		want  int
+	}{
+		{"全部等值", []Cond{{"a", "="}, {"b", "="}, {"c", "="}}, 3},
+		{"顺序无关", []Cond{{"c", "="}, {"a", "="}, {"b", "in"}}, 3},
+		{"跳过中间列", []Cond{{"a", "="}, {"c", "="}}, 1},
+		{"没有最左列", []Cond{{"b", "="}, {"c", "="}}, 0},
+		{"范围之后断开", []Cond{{"a", "="}, {"b", ">"}, {"c", "="}}, 2},
+		{"第一列就是范围", []Cond{{"a", "between"}, {"b", "="}}, 1},
+		{"前缀 LIKE 可用", []Cond{{"a", "like-prefix"}}, 1},
+		{"后缀 LIKE 失效", []Cond{{"a", "like-suffix"}, {"b", "="}}, 0},
+		{"对列用函数", []Cond{{"a", "="}, {"b", "func"}, {"c", "="}}, 1},
+		{"无条件", nil, 0},
+	}
+	for _, c := range cases {
+		if got := UsableColumns(idx, c.conds); got != c.want {
+			t.Errorf("%s: UsableColumns = %d，期望 %d", c.name, got, c.want)
+		}
+	}
+}
+
+=== db-05-1
+title: 用 iota 定义隔离级别
+--- desc
+用 Go 的常量和方法给事务隔离级别建模：
+
+- `Level` 类型用 `iota` 定义四个级别，实现 `String()` 返回 `READ-UNCOMMITTED`、`READ-COMMITTED`、`REPEATABLE-READ`、`SERIALIZABLE`；
+- `ParseLevel(s)`：不区分大小写，空格和连字符都可以，如 `"read committed"`、`"REPEATABLE-READ"`；
+- `Allows(a Anomaly)`：按 SQL 标准，该级别是否**可能出现**某种异常：读未提交三种都可能，读已提交可能出现不可重复读和幻读，可重复读可能出现幻读，串行化都不会。
+
+（InnoDB 在 RR 下通过 MVCC + 临键锁在大多数情况下也避免了幻读，这里按标准回答。）
+--- solution
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+type Level int
+
+const (
+	ReadUncommitted Level = iota
+	ReadCommitted
+	RepeatableRead
+	Serializable
+)
+
+type Anomaly int
+
+const (
+	DirtyRead Anomaly = iota
+	NonRepeatableRead
+	PhantomRead
+)
+
+var levelNames = [...]string{"READ-UNCOMMITTED", "READ-COMMITTED", "REPEATABLE-READ", "SERIALIZABLE"}
+
+func (l Level) String() string {
+	// @solution
+	if l < 0 || int(l) >= len(levelNames) {
+		return fmt.Sprintf("Level(%d)", int(l))
+	}
+	return levelNames[l]
+	// @starter
+	// return "" // TODO
+	// @end
+}
+
+func ParseLevel(s string) (Level, error) {
+	// @solution
+	norm := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(s), " ", "-"))
+	for i, name := range levelNames {
+		if name == norm {
+			return Level(i), nil
+		}
+	}
+	return 0, fmt.Errorf("unknown isolation level %q", s)
+	// @starter
+	// return 0, fmt.Errorf("TODO")
+	// @end
+}
+
+func (l Level) Allows(a Anomaly) bool {
+	// @solution
+	// 级别越高，能避免的异常越多：RU 避免 0 种，RC 避免脏读，RR 再避免不可重复读，S 全部避免
+	return int(a) >= int(l)
+	// @starter
+	// return false // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"testing"
+)
+
+func TestString(t *testing.T) {
+	if fmt.Sprint(RepeatableRead) != "REPEATABLE-READ" || ReadUncommitted.String() != "READ-UNCOMMITTED" {
+		t.Fatal("String() 不对")
+	}
+}
+
+func TestParseLevel(t *testing.T) {
+	cases := map[string]Level{
+		"read committed":   ReadCommitted,
+		"REPEATABLE-READ":  RepeatableRead,
+		"Serializable":     Serializable,
+		" read-uncommitted": ReadUncommitted,
+	}
+	for in, want := range cases {
+		if got, err := ParseLevel(in); err != nil || got != want {
+			t.Errorf("ParseLevel(%q) = %v, %v", in, got, err)
+		}
+	}
+	if _, err := ParseLevel("snapshot"); err == nil {
+		t.Error("未知级别应返回错误")
+	}
+}
+
+func TestAllows(t *testing.T) {
+	want := map[Level][3]bool{
+		ReadUncommitted: {true, true, true},
+		ReadCommitted:   {false, true, true},
+		RepeatableRead:  {false, false, true},
+		Serializable:    {false, false, false},
+	}
+	for l, w := range want {
+		for a, exp := range w {
+			if got := l.Allows(Anomaly(a)); got != exp {
+				t.Errorf("%v.Allows(%d) = %v，期望 %v", l, a, got, exp)
+			}
+		}
+	}
+}
+
+=== db-06-1
+title: 读懂 EXPLAIN
+--- desc
+实现 `Diagnose(row)`，根据 EXPLAIN 的一行结果给出问题列表（按下面的顺序检查）：
+
+| 条件 | 结论 |
+| --- | --- |
+| `type == "ALL"` | `full-table-scan` |
+| `type == "index"` | `full-index-scan` |
+| `key` 为空 | `no-index` |
+| `Extra` 包含 `Using filesort` | `filesort` |
+| `Extra` 包含 `Using temporary` | `temporary-table` |
+| `rows > 10000` 且 `filtered < 10` | `low-selectivity` |
+
+`type` 从好到差大致是 `const > eq_ref > ref > range > index > ALL`；`Using index` 表示覆盖索引，是好事。
+--- solution
+package main
+
+import "strings"
+
+type ExplainRow struct {
+	Type     string
+	Key      string
+	Rows     int
+	Filtered float64
+	Extra    string
+}
+
+func Diagnose(r ExplainRow) []string {
+	var out []string
+	// @solution
+	switch r.Type {
+	case "ALL":
+		out = append(out, "full-table-scan")
+	case "index":
+		out = append(out, "full-index-scan")
+	}
+	if r.Key == "" {
+		out = append(out, "no-index")
+	}
+	if strings.Contains(r.Extra, "Using filesort") {
+		out = append(out, "filesort")
+	}
+	if strings.Contains(r.Extra, "Using temporary") {
+		out = append(out, "temporary-table")
+	}
+	if r.Rows > 10000 && r.Filtered < 10 {
+		out = append(out, "low-selectivity")
+	}
+	// @starter
+	// // TODO
+	// @end
+	return out
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestDiagnose(t *testing.T) {
+	cases := []struct {
+		row  ExplainRow
+		want []string
+	}{
+		{ExplainRow{Type: "ref", Key: "idx_user", Rows: 20, Filtered: 100, Extra: "Using index"}, nil},
+		{ExplainRow{Type: "ALL", Rows: 2000000, Filtered: 5, Extra: "Using where; Using filesort"},
+			[]string{"full-table-scan", "no-index", "filesort", "low-selectivity"}},
+		{ExplainRow{Type: "index", Key: "PRIMARY", Rows: 500, Filtered: 100, Extra: "Using index; Using temporary"},
+			[]string{"full-index-scan", "temporary-table"}},
+		{ExplainRow{Type: "range", Key: "idx_time", Rows: 50000, Filtered: 50}, nil},
+	}
+	for i, c := range cases {
+		if got := Diagnose(c.row); !slices.Equal(got, c.want) {
+			t.Errorf("case %d: Diagnose = %v，期望 %v", i, got, c.want)
+		}
+	}
+}
+
+=== db-07-1
+title: 实现 ReadView 可见性判断
+--- desc
+按 InnoDB 的规则实现 MVCC 可见性判断：
+
+- `NewReadView(active, nextTrxID, creator)`：`active` 是创建视图时的活跃事务列表；`MinTrxID` 取其中最小值（没有活跃事务时等于 `nextTrxID`）；`MaxTrxID = nextTrxID`；
+- `Visible(trxID)`：
+  1. 等于 `CreatorTrxID`（自己改的）→ 可见；
+  2. 小于 `MinTrxID`（视图创建前已提交）→ 可见；
+  3. 大于等于 `MaxTrxID`（视图创建后才开始）→ 不可见；
+  4. 在两者之间：在活跃列表中不可见，否则可见；
+- `Read(chain)`：`chain` 是一行数据的版本链（最新的在前），返回第一个可见版本的值；都不可见返回 false。
+--- solution
+package main
+
+import "slices"
+
+type ReadView struct {
+	Active       []int
+	MinTrxID     int
+	MaxTrxID     int
+	CreatorTrxID int
+}
+
+type Version struct {
+	TrxID int
+	Value string
+}
+
+func NewReadView(active []int, nextTrxID, creator int) ReadView {
+	// @solution
+	v := ReadView{Active: slices.Clone(active), MinTrxID: nextTrxID, MaxTrxID: nextTrxID, CreatorTrxID: creator}
+	if len(active) > 0 {
+		v.MinTrxID = slices.Min(active)
+	}
+	return v
+	// @starter
+	// return ReadView{} // TODO
+	// @end
+}
+
+func (v ReadView) Visible(trxID int) bool {
+	// @solution
+	switch {
+	case trxID == v.CreatorTrxID:
+		return true
+	case trxID < v.MinTrxID:
+		return true
+	case trxID >= v.MaxTrxID:
+		return false
+	default:
+		return !slices.Contains(v.Active, trxID)
+	}
+	// @starter
+	// return false // TODO
+	// @end
+}
+
+func (v ReadView) Read(chain []Version) (string, bool) {
+	// @solution
+	for _, ver := range chain {
+		if v.Visible(ver.TrxID) {
+			return ver.Value, true
+		}
+	}
+	return "", false
+	// @starter
+	// return "", false // TODO
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestVisible(t *testing.T) {
+	// 视图创建时活跃事务 5、8，下一个事务 ID 是 10，创建者是 8
+	v := NewReadView([]int{8, 5}, 10, 8)
+	if v.MinTrxID != 5 || v.MaxTrxID != 10 {
+		t.Fatalf("MinTrxID=%d MaxTrxID=%d", v.MinTrxID, v.MaxTrxID)
+	}
+	cases := map[int]bool{3: true, 5: false, 6: true, 8: true, 9: true, 10: false, 12: false}
+	for id, want := range cases {
+		if got := v.Visible(id); got != want {
+			t.Errorf("Visible(%d) = %v，期望 %v", id, got, want)
+		}
+	}
+}
+
+func TestReadChain(t *testing.T) {
+	v := NewReadView([]int{7}, 9, 6)
+	chain := []Version{{11, "v4"}, {7, "v3"}, {4, "v2"}, {1, "v1"}}
+	if got, ok := v.Read(chain); !ok || got != "v2" {
+		t.Fatalf("Read = %q, %v，期望 v2（11 和 7 不可见）", got, ok)
+	}
+	if _, ok := NewReadView(nil, 1, 0).Read([]Version{{5, "x"}}); ok {
+		t.Fatal("所有版本都不可见时应返回 false")
+	}
+	if v := NewReadView(nil, 20, 3); v.MinTrxID != 20 {
+		t.Fatal("没有活跃事务时 MinTrxID 应等于 nextTrxID")
+	}
+}
+
+=== db-07-2
+title: RC 和 RR 的区别：ReadView 何时创建
+--- desc
+`Engine` 模拟一行数据和事务系统，`ReadView` 已经实现好。实现 `Select(txID, level)`：
+
+- `"RC"`：**每次** Select 都基于当前活跃事务创建新的 ReadView；
+- `"RR"`：事务里**第一次** Select 时创建 ReadView，保存在 `e.views[txID]` 里，之后一直复用。
+
+测试会重现经典场景：T1 开始后，T2 修改并提交，T1 在 RC 下能读到新值，在 RR 下读到的还是旧值。
+--- solution
+package main
+
+import "slices"
+
+type ReadView struct {
+	active   []int
+	min, max int
+	creator  int
+}
+
+func (v ReadView) visible(id int) bool {
+	switch {
+	case id == v.creator, id < v.min:
+		return true
+	case id >= v.max:
+		return false
+	}
+	return !slices.Contains(v.active, id)
+}
+
+type Version struct {
+	TrxID int
+	Value string
+}
+
+type Engine struct {
+	nextID int
+	active map[int]bool
+	chain  []Version // 最新版本在前
+	views  map[int]ReadView
+}
+
+func NewEngine(initial string) *Engine {
+	return &Engine{nextID: 2, active: map[int]bool{}, chain: []Version{{1, initial}}, views: map[int]ReadView{}}
+}
+
+func (e *Engine) Begin() int {
+	id := e.nextID
+	e.nextID++
+	e.active[id] = true
+	return id
+}
+
+func (e *Engine) Commit(id int) { delete(e.active, id) }
+
+func (e *Engine) Write(id int, v string) {
+	e.chain = append([]Version{{id, v}}, e.chain...)
+}
+
+func (e *Engine) newView(creator int) ReadView {
+	v := ReadView{min: e.nextID, max: e.nextID, creator: creator}
+	for id := range e.active {
+		v.active = append(v.active, id)
+		v.min = min(v.min, id)
+	}
+	return v
+}
+
+func (e *Engine) Select(txID int, level string) string {
+	// @solution
+	var view ReadView
+	if level == "RR" {
+		v, ok := e.views[txID]
+		if !ok {
+			v = e.newView(txID)
+			e.views[txID] = v
+		}
+		view = v
+	} else {
+		view = e.newView(txID)
+	}
+	for _, ver := range e.chain {
+		if view.visible(ver.TrxID) {
+			return ver.Value
+		}
+	}
+	return ""
+	// @starter
+	// return e.chain[0].Value // TODO: 直接读最新版本会读到未提交的数据
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func scenario(level string) (before, afterCommit string, e *Engine) {
+	e = NewEngine("v1")
+	t1 := e.Begin()
+	before = e.Select(t1, level)
+	t2 := e.Begin()
+	e.Write(t2, "v2")
+	if got := e.Select(t1, level); got != "v1" {
+		panic("不应读到未提交的数据（脏读），got " + got)
+	}
+	e.Commit(t2)
+	afterCommit = e.Select(t1, level)
+	return
+}
+
+func TestReadCommitted(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatal(r)
+		}
+	}()
+	before, after, _ := scenario("RC")
+	if before != "v1" || after != "v2" {
+		t.Fatalf("RC: 提交前读到 %q，提交后读到 %q，期望 v1 / v2", before, after)
+	}
+}
+
+func TestRepeatableRead(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatal(r)
+		}
+	}()
+	before, after, e := scenario("RR")
+	if before != "v1" || after != "v1" {
+		t.Fatalf("RR: 两次都应读到 v1，实际 %q / %q", before, after)
+	}
+	t3 := e.Begin()
+	if got := e.Select(t3, "RR"); got != "v2" {
+		t.Fatalf("新事务应读到已提交的 v2，实际 %q", got)
+	}
+}
+
+func TestOwnWrite(t *testing.T) {
+	e := NewEngine("v1")
+	t1 := e.Begin()
+	e.Write(t1, "mine")
+	if got := e.Select(t1, "RR"); got != "mine" {
+		t.Fatalf("事务应能读到自己的修改，实际 %q", got)
+	}
+}
+
+=== db-08-1
+title: 临键锁锁住了哪些区间
+--- desc
+用简化模型理解 RR 下范围查询的加锁范围。`keys` 是**非唯一二级索引**上已有的值（升序）。执行 `SELECT ... WHERE k BETWEEN lo AND hi FOR UPDATE` 时：
+
+- 对扫描到的每条满足条件的记录加**临键锁** `(前一个值, 当前值]`；
+- 扫描还会多看一条：第一条大于 `hi` 的记录也加临键锁 `(前一个值, 它]`；如果后面没有记录，锁住 `(最后一个值, +∞)`。
+
+用 `math.MinInt` 和 `math.MaxInt` 表示 -∞ 和 +∞。实现：
+
+- `NextKeyLocks(keys, lo, hi) []Interval`：按顺序返回加锁的区间；
+- `Blocked(locks, v) bool`：插入值 `v` 会不会被这些锁阻塞（落在某个区间里）。
+--- solution
+package main
+
+import "math"
+
+type Interval struct {
+	Lo, Hi int // 左开右闭 (Lo, Hi]；Hi == math.MaxInt 表示 +∞
+}
+
+func NextKeyLocks(keys []int, lo, hi int) []Interval {
+	var locks []Interval
+	// @solution
+	prev := math.MinInt
+	for _, k := range keys {
+		if k < lo {
+			prev = k
+			continue
+		}
+		locks = append(locks, Interval{prev, k})
+		if k > hi {
+			return locks
+		}
+		prev = k
+	}
+	locks = append(locks, Interval{prev, math.MaxInt})
+	// @starter
+	// // TODO
+	// @end
+	return locks
+}
+
+func Blocked(locks []Interval, v int) bool {
+	// @solution
+	for _, l := range locks {
+		if v > l.Lo && v <= l.Hi {
+			return true
+		}
+	}
+	return false
+	// @starter
+	// return false // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"math"
+	"slices"
+	"testing"
+)
+
+func TestNextKeyLocks(t *testing.T) {
+	keys := []int{10, 20, 30}
+	got := NextKeyLocks(keys, 15, 25)
+	if want := []Interval{{10, 20}, {20, 30}}; !slices.Equal(got, want) {
+		t.Fatalf("BETWEEN 15 AND 25 锁住 %v，期望 %v", got, want)
+	}
+	for v, want := range map[int]bool{5: false, 11: true, 20: true, 25: true, 30: true, 31: false} {
+		if Blocked(got, v) != want {
+			t.Errorf("插入 %d 是否被阻塞 = %v，期望 %v", v, !want, want)
+		}
+	}
+
+	got = NextKeyLocks(keys, 25, 100)
+	if want := []Interval{{20, 30}, {30, math.MaxInt}}; !slices.Equal(got, want) {
+		t.Fatalf("BETWEEN 25 AND 100 锁住 %v，期望 %v", got, want)
+	}
+	if !Blocked(got, 1000) {
+		t.Error("(30, +∞) 被锁住后插入 1000 应被阻塞")
+	}
+
+	got = NextKeyLocks(keys, 1, 5)
+	if want := []Interval{{math.MinInt, 10}}; !slices.Equal(got, want) {
+		t.Fatalf("BETWEEN 1 AND 5 锁住 %v，期望 %v", got, want)
+	}
+}
+
+=== db-09-1
+title: 两阶段提交与崩溃恢复
+--- desc
+一次提交按顺序执行三步：`redo-prepare` → `binlog-write` → `redo-commit`。实现：
+
+- `Commit(crashAfter)`：返回实际执行了的步骤；`crashAfter` 表示在第几步之后崩溃（0 表示不崩溃，正常执行完三步）；
+- `StateAfter(steps)`：根据执行过的步骤推出崩溃后看到的状态：redo 是 `none` / `prepare` / `commit`，binlog 是否完整；
+- `Recover(redo, binlogComplete)`：崩溃恢复的决策：redo 已 commit → `commit`；redo 是 prepare 且 binlog 完整 → `commit`；其他情况 → `rollback`。
+
+测试会验证：无论在哪一步崩溃，恢复后「事务是否提交」都和「binlog 里有没有这个事务」一致，主从数据因此不会分叉。
+--- solution
+package main
+
+import "slices"
+
+var allSteps = []string{"redo-prepare", "binlog-write", "redo-commit"}
+
+func Commit(crashAfter int) []string {
+	// @solution
+	if crashAfter <= 0 || crashAfter > len(allSteps) {
+		crashAfter = len(allSteps)
+	}
+	return slices.Clone(allSteps[:crashAfter])
+	// @starter
+	// return nil // TODO
+	// @end
+}
+
+func StateAfter(steps []string) (redo string, binlogComplete bool) {
+	// @solution
+	redo = "none"
+	for _, s := range steps {
+		switch s {
+		case "redo-prepare":
+			redo = "prepare"
+		case "binlog-write":
+			binlogComplete = true
+		case "redo-commit":
+			redo = "commit"
+		}
+	}
+	return redo, binlogComplete
+	// @starter
+	// return "none", false // TODO
+	// @end
+}
+
+func Recover(redo string, binlogComplete bool) string {
+	// @solution
+	if redo == "commit" || (redo == "prepare" && binlogComplete) {
+		return "commit"
+	}
+	return "rollback"
+	// @starter
+	// return "rollback" // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestCommit(t *testing.T) {
+	if got := Commit(0); !slices.Equal(got, []string{"redo-prepare", "binlog-write", "redo-commit"}) {
+		t.Fatalf("Commit(0) = %v", got)
+	}
+	if got := Commit(1); !slices.Equal(got, []string{"redo-prepare"}) {
+		t.Fatalf("Commit(1) = %v", got)
+	}
+}
+
+func TestRecoverRules(t *testing.T) {
+	cases := []struct {
+		redo   string
+		binlog bool
+		want   string
+	}{
+		{"none", false, "rollback"},
+		{"prepare", false, "rollback"},
+		{"prepare", true, "commit"},
+		{"commit", true, "commit"},
+	}
+	for _, c := range cases {
+		if got := Recover(c.redo, c.binlog); got != c.want {
+			t.Errorf("Recover(%s, %v) = %s，期望 %s", c.redo, c.binlog, got, c.want)
+		}
+	}
+}
+
+func TestConsistentWithBinlog(t *testing.T) {
+	for crash := 1; crash <= 3; crash++ {
+		redo, binlog := StateAfter(Commit(crash))
+		committed := Recover(redo, binlog) == "commit"
+		if committed != binlog {
+			t.Errorf("第 %d 步后崩溃：恢复结果 committed=%v，但 binlog 完整=%v，主从会不一致", crash, committed, binlog)
+		}
+	}
+}
+
+=== db-10-1
+title: 解析慢查询日志
+--- desc
+慢查询日志的每条记录形如：
+
+```text
+# Time: 2026-10-13T10:00:00
+# User@Host: app[app] @ [10.0.0.1]
+# Query_time: 2.500000  Lock_time: 0.000100 Rows_sent: 10  Rows_examined: 1000000
+SET timestamp=1760320800;
+SELECT * FROM orders WHERE status = 1 LIMIT 10;
+```
+
+实现：
+
+- `ParseSlowLog(text)`：解析出每条记录的 `QueryTime`、`LockTime`、`RowsSent`、`RowsExamined` 和 SQL（跳过 `SET timestamp=` 和 `use xxx;` 行，多行 SQL 用空格拼接）；
+- `Worst(qs, n)`：按 `QueryTime` 从大到小返回前 n 条（不修改入参）；
+- `Suspicious(q)`：扫描行数超过返回行数 1000 倍（返回 0 行按 1 行算）时为 true——这通常意味着缺索引。
+--- solution
+package main
+
+import (
+	"cmp"
+	"slices"
+	"strconv"
+	"strings"
+)
+
+type SlowQuery struct {
+	QueryTime    float64
+	LockTime     float64
+	RowsSent     int
+	RowsExamined int
+	SQL          string
+}
+
+func ParseSlowLog(text string) ([]SlowQuery, error) {
+	// @solution
+	var out []SlowQuery
+	var cur *SlowQuery
+	var sql []string
+	flush := func() {
+		if cur != nil {
+			cur.SQL = strings.Join(sql, " ")
+			out = append(out, *cur)
+		}
+		cur, sql = nil, nil
+	}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == "":
+		case strings.HasPrefix(line, "# Query_time:"):
+			flush()
+			cur = &SlowQuery{}
+			f := strings.Fields(strings.TrimPrefix(line, "#"))
+			for i := 0; i+1 < len(f); i += 2 {
+				v := f[i+1]
+				var err error
+				switch f[i] {
+				case "Query_time:":
+					cur.QueryTime, err = strconv.ParseFloat(v, 64)
+				case "Lock_time:":
+					cur.LockTime, err = strconv.ParseFloat(v, 64)
+				case "Rows_sent:":
+					cur.RowsSent, err = strconv.Atoi(v)
+				case "Rows_examined:":
+					cur.RowsExamined, err = strconv.Atoi(v)
+				}
+				if err != nil {
+					return nil, err
+				}
+			}
+		case strings.HasPrefix(line, "#"):
+			flush()
+		case cur == nil, strings.HasPrefix(line, "SET timestamp="), strings.HasPrefix(strings.ToLower(line), "use "):
+		default:
+			sql = append(sql, line)
+		}
+	}
+	flush()
+	return out, nil
+	// @starter
+	// return nil, nil // TODO
+	// @end
+}
+
+func Worst(qs []SlowQuery, n int) []SlowQuery {
+	// @solution
+	s := slices.Clone(qs)
+	slices.SortStableFunc(s, func(a, b SlowQuery) int { return cmp.Compare(b.QueryTime, a.QueryTime) })
+	return s[:min(n, len(s))]
+	// @starter
+	// return nil // TODO
+	// @end
+}
+
+func Suspicious(q SlowQuery) bool {
+	// @solution
+	return q.RowsExamined > 1000*max(q.RowsSent, 1)
+	// @starter
+	// return false // TODO
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+const log = `# Time: 2026-10-13T10:00:00
+# User@Host: app[app] @ [10.0.0.1]
+# Query_time: 2.500000  Lock_time: 0.000100 Rows_sent: 10  Rows_examined: 1000000
+SET timestamp=1760320800;
+SELECT * FROM orders WHERE status = 1 LIMIT 10;
+# Time: 2026-10-13T10:00:05
+# User@Host: app[app] @ [10.0.0.2]
+# Query_time: 0.800000  Lock_time: 0.000050 Rows_sent: 1  Rows_examined: 1
+use shop;
+SET timestamp=1760320805;
+SELECT name
+  FROM users
+  WHERE id = 7;
+# Query_time: 5.100000  Lock_time: 3.000000 Rows_sent: 0  Rows_examined: 20000
+UPDATE stock SET n = n - 1 WHERE sku = 'x';
+`
+
+func TestParseSlowLog(t *testing.T) {
+	qs, err := ParseSlowLog(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(qs) != 3 {
+		t.Fatalf("应解析出 3 条，实际 %d 条：%+v", len(qs), qs)
+	}
+	q := qs[0]
+	if q.QueryTime != 2.5 || q.LockTime != 0.0001 || q.RowsSent != 10 || q.RowsExamined != 1000000 {
+		t.Fatalf("第一条字段不对：%+v", q)
+	}
+	if q.SQL != "SELECT * FROM orders WHERE status = 1 LIMIT 10;" {
+		t.Fatalf("SQL = %q", q.SQL)
+	}
+	if qs[1].SQL != "SELECT name FROM users WHERE id = 7;" {
+		t.Fatalf("多行 SQL 应拼接，并跳过 use / SET 行：%q", qs[1].SQL)
+	}
+}
+
+func TestWorstAndSuspicious(t *testing.T) {
+	qs, _ := ParseSlowLog(log)
+	w := Worst(qs, 2)
+	if len(w) != 2 || w[0].QueryTime != 5.1 || w[1].QueryTime != 2.5 {
+		t.Fatalf("Worst = %+v", w)
+	}
+	if qs[0].QueryTime != 2.5 {
+		t.Fatal("Worst 不应修改入参顺序")
+	}
+	if !Suspicious(qs[0]) || Suspicious(qs[1]) || !Suspicious(qs[2]) {
+		t.Fatal("Suspicious 判断不对")
+	}
+	if len(Worst(qs, 10)) != 3 {
+		t.Fatal("n 超过总数时返回全部")
+	}
+}
+
+=== db-11-1
+title: 游标分页代替 OFFSET
+--- desc
+`LIMIT 1000000, 10` 要先扫描并丢弃一百万行。游标分页记住上一页最后一条的 ID，下一页直接从它之后开始。
+
+`rows` 按 ID **降序**排列（最新的在前）。实现：
+
+- `PageByOffset(rows, offset, size)`：传统分页，返回结果和「扫描过的行数」（offset + 返回行数）；
+- `PageAfter(rows, lastID, size)`：返回 ID **小于** `lastID` 的前 `size` 行，`lastID <= 0` 表示第一页。用二分查找定位起点，扫描行数只算真正返回的行。
+--- solution
+package main
+
+import "sort"
+
+type Row struct {
+	ID    int
+	Title string
+}
+
+func PageByOffset(rows []Row, offset, size int) ([]Row, int) {
+	if offset >= len(rows) {
+		return nil, len(rows)
+	}
+	end := min(offset+size, len(rows))
+	return rows[offset:end], end
+}
+
+func PageAfter(rows []Row, lastID, size int) ([]Row, int) {
+	// @solution
+	start := 0
+	if lastID > 0 {
+		// rows 按 ID 降序，找到第一个 ID < lastID 的位置
+		start = sort.Search(len(rows), func(i int) bool { return rows[i].ID < lastID })
+	}
+	end := min(start+size, len(rows))
+	return rows[start:end], end - start
+	// @starter
+	// return nil, 0 // TODO
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func data(n int) []Row {
+	rows := make([]Row, n)
+	for i := range rows {
+		rows[i] = Row{ID: (n - i) * 2} // 降序，ID 为偶数
+	}
+	return rows
+}
+
+func TestPageAfter(t *testing.T) {
+	rows := data(100000)
+	first, _ := PageAfter(rows, 0, 3)
+	if len(first) != 3 || first[0].ID != 200000 || first[2].ID != 199996 {
+		t.Fatalf("第一页 = %v", first)
+	}
+	next, scanned := PageAfter(rows, first[2].ID, 3)
+	if len(next) != 3 || next[0].ID != 199994 {
+		t.Fatalf("第二页 = %v", next)
+	}
+	if scanned != 3 {
+		t.Fatalf("游标分页只应扫描 3 行，实际 %d", scanned)
+	}
+	deep, scanned := PageAfter(rows, 1001, 10)
+	if len(deep) != 10 || deep[0].ID != 1000 || scanned != 10 {
+		t.Fatalf("lastID=1001 的下一页 = %v（扫描 %d 行）", deep, scanned)
+	}
+	_, offScanned := PageByOffset(rows, 99000, 10)
+	if offScanned != 99010 {
+		t.Fatalf("OFFSET 分页扫描了 %d 行", offScanned)
+	}
+	if last, _ := PageAfter(rows, 4, 10); len(last) != 1 || last[0].ID != 2 {
+		t.Fatalf("最后一页 = %v", last)
+	}
+}
+
+=== db-11-2
+title: 编码分页游标
+--- desc
+游标不应该把内部字段直接暴露给前端。实现：
+
+- `EncodeCursor(c Cursor) string`：JSON 序列化后用 **URL 安全的 base64**（`base64.RawURLEncoding`）编码；
+- `DecodeCursor(s string) (Cursor, error)`：反向解码，格式非法或 `LastID <= 0` 时返回错误。
+
+按「创建时间 + ID」排序时，游标要同时记录两者，否则相同时间的记录会被跳过或重复。
+--- solution
+package main
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+)
+
+type Cursor struct {
+	LastID      int64 `json:"id"`
+	LastCreated int64 `json:"ts"`
+}
+
+func EncodeCursor(c Cursor) string {
+	// @solution
+	data, _ := json.Marshal(c)
+	return base64.RawURLEncoding.EncodeToString(data)
+	// @starter
+	// return "" // TODO
+	// @end
+}
+
+func DecodeCursor(s string) (Cursor, error) {
+	var c Cursor
+	// @solution
+	data, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return c, err
+	}
+	if err := json.Unmarshal(data, &c); err != nil {
+		return c, err
+	}
+	if c.LastID <= 0 {
+		return c, errors.New("invalid cursor")
+	}
+	return c, nil
+	// @starter
+	// return c, errors.New("TODO")
+	// @end
+}
+--- test
+package main
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestCursorRoundTrip(t *testing.T) {
+	c := Cursor{LastID: 9007199254740993, LastCreated: 1760320800}
+	s := EncodeCursor(c)
+	if strings.ContainsAny(s, "+/=") {
+		t.Fatalf("游标 %q 应使用 URL 安全且不带填充的 base64", s)
+	}
+	got, err := DecodeCursor(s)
+	if err != nil || got != c {
+		t.Fatalf("DecodeCursor = %+v, %v", got, err)
+	}
+}
+
+func TestCursorInvalid(t *testing.T) {
+	for _, s := range []string{"", "!!!", EncodeCursor(Cursor{LastID: 0}), "eyJpZCI6"} {
+		if _, err := DecodeCursor(s); err == nil {
+			t.Errorf("DecodeCursor(%q) 应返回错误", s)
+		}
+	}
+}
+
+=== db-12-1
+title: 等待图中的死锁检测
+--- desc
+InnoDB 维护一张「等待图」：事务 A 等待事务 B 持有的锁，就有一条 A → B 的边，出现环就是死锁，需要回滚其中一个事务。
+
+实现 `DetectDeadlock(waits)`：`waits[a]` 是事务 a 正在等待的事务列表。
+
+- 按事务 ID 从小到大作为起点做深度优先搜索（邻居也按从小到大），找到的**第一个环**就是死锁；
+- 返回环里 ID 最大的事务作为牺牲者（简化成「回滚最年轻的事务」），以及 `true`；
+- 没有环返回 `0, false`。
+--- solution
+package main
+
+import (
+	"maps"
+	"slices"
+)
+
+func DetectDeadlock(waits map[int][]int) (victim int, found bool) {
+	// @solution
+	const (
+		white = iota
+		grey
+		black
+	)
+	color := map[int]int{}
+	var path []int
+	var dfs func(u int) []int
+	dfs = func(u int) []int {
+		color[u] = grey
+		path = append(path, u)
+		next := slices.Sorted(slices.Values(waits[u]))
+		for _, v := range next {
+			switch color[v] {
+			case grey:
+				i := slices.Index(path, v)
+				return slices.Clone(path[i:])
+			case white:
+				if cycle := dfs(v); cycle != nil {
+					return cycle
+				}
+			}
+		}
+		path = path[:len(path)-1]
+		color[u] = black
+		return nil
+	}
+	for _, u := range slices.Sorted(maps.Keys(waits)) {
+		if color[u] == white {
+			if cycle := dfs(u); cycle != nil {
+				return slices.Max(cycle), true
+			}
+		}
+	}
+	return 0, false
+	// @starter
+	// return 0, false // TODO
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestDetectDeadlock(t *testing.T) {
+	cases := []struct {
+		name   string
+		waits  map[int][]int
+		victim int
+		found  bool
+	}{
+		{"两个事务互相等待", map[int][]int{1: {2}, 2: {1}}, 2, true},
+		{"三角环", map[int][]int{3: {7}, 7: {5}, 5: {3}, 9: {3}}, 7, true},
+		{"没有环", map[int][]int{1: {2}, 2: {3}, 4: {3}}, 0, false},
+		{"多条路径汇合但无环", map[int][]int{1: {2, 3}, 2: {3}, 3: {}}, 0, false},
+		{"环不经过起点", map[int][]int{1: {2}, 2: {3}, 3: {4}, 4: {2}}, 4, true},
+		{"空图", map[int][]int{}, 0, false},
+	}
+	for _, c := range cases {
+		v, ok := DetectDeadlock(c.waits)
+		if v != c.victim || ok != c.found {
+			t.Errorf("%s: DetectDeadlock = %d, %v，期望 %d, %v", c.name, v, ok, c.victim, c.found)
+		}
+	}
+}
+
+=== db-13-1
+title: 主从延迟下的读写路由
+--- desc
+主从复制有延迟，用户刚写完立刻去从库读，可能读不到自己写的数据。实现一个 `Router`：
+
+- `RecordWrite(user)`：记录用户最近一次写入的时间；
+- `ReadTarget(user)`：
+  1. 用户在最近 `window` 时间内写过 → 读主库 `"primary"`；
+  2. 否则在延迟不超过 `maxLag` 的从库里**轮询**选择一个；
+  3. 没有合格的从库 → `"primary"`。
+
+时间通过注入的 `now` 函数获取，方便测试。
+--- solution
+package main
+
+import "time"
+
+type Replica struct {
+	Name string
+	Lag  time.Duration
+}
+
+type Router struct {
+	now       func() time.Time
+	window    time.Duration
+	maxLag    time.Duration
+	replicas  []Replica
+	lastWrite map[string]time.Time
+	next      int
+}
+
+func NewRouter(now func() time.Time, window, maxLag time.Duration, replicas []Replica) *Router {
+	return &Router{now: now, window: window, maxLag: maxLag, replicas: replicas, lastWrite: map[string]time.Time{}}
+}
+
+func (r *Router) RecordWrite(user string) {
+	// @solution
+	r.lastWrite[user] = r.now()
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (r *Router) ReadTarget(user string) string {
+	// @solution
+	if t, ok := r.lastWrite[user]; ok && r.now().Sub(t) < r.window {
+		return "primary"
+	}
+	for range r.replicas {
+		rep := r.replicas[r.next%len(r.replicas)]
+		r.next++
+		if rep.Lag <= r.maxLag {
+			return rep.Name
+		}
+	}
+	return "primary"
+	// @starter
+	// return "primary" // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+func TestReadYourWrites(t *testing.T) {
+	now := time.Unix(1000, 0)
+	clock := func() time.Time { return now }
+	r := NewRouter(clock, 2*time.Second, time.Second, []Replica{{"r1", 100 * time.Millisecond}})
+	if got := r.ReadTarget("alice"); got != "r1" {
+		t.Fatalf("没写过时应读从库，实际 %s", got)
+	}
+	r.RecordWrite("alice")
+	now = now.Add(500 * time.Millisecond)
+	if got := r.ReadTarget("alice"); got != "primary" {
+		t.Fatalf("写后 2s 内应读主库，实际 %s", got)
+	}
+	if got := r.ReadTarget("bob"); got != "r1" {
+		t.Fatalf("其他用户不受影响，实际 %s", got)
+	}
+	now = now.Add(2 * time.Second)
+	if got := r.ReadTarget("alice"); got != "r1" {
+		t.Fatalf("窗口过后应回到从库，实际 %s", got)
+	}
+}
+
+func TestSkipLaggingReplica(t *testing.T) {
+	clock := func() time.Time { return time.Unix(0, 0) }
+	r := NewRouter(clock, time.Second, time.Second, []Replica{
+		{"r1", 50 * time.Millisecond}, {"slow", 30 * time.Second}, {"r3", 200 * time.Millisecond},
+	})
+	var got []string
+	for i := 0; i < 4; i++ {
+		got = append(got, r.ReadTarget("u"))
+	}
+	for _, g := range got {
+		if g == "slow" {
+			t.Fatalf("延迟过大的从库不应被选中：%v", got)
+		}
+	}
+	if got[0] == got[1] {
+		t.Fatalf("应在合格从库之间轮询：%v", got)
+	}
+	all := NewRouter(clock, time.Second, time.Second, []Replica{{"slow", time.Minute}})
+	if all.ReadTarget("u") != "primary" {
+		t.Fatal("没有合格从库时应读主库")
+	}
+}
+
+=== db-14-1
+title: 模拟 gh-ost 在线改表
+--- desc
+gh-ost 这类工具在线加字段的思路：建一张影子表，**分批**把原表数据拷过去，同时把拷贝期间产生的 binlog 变更也应用到影子表，最后原子地切换表名。
+
+实现 `Migrate(orig, chunk, batches)`：
+
+1. 按原表**开始时**的最小、最大 ID，每 `chunk` 个 ID 为一批；
+2. 每拷贝一批（从原表**当前**数据里取这个 ID 范围内的行，用 INSERT IGNORE 语义：影子表已有的行不覆盖），就把 `batches[i]`（这段时间产生的变更）应用到**原表和影子表**：`upsert` 写入，`delete` 删除；
+3. 拷贝结束后还剩下的 batches 也要应用；
+4. 返回影子表。最终影子表必须和原表完全一致。
+--- solution
+package main
+
+import (
+	"maps"
+	"slices"
+)
+
+type Event struct {
+	Op  string // "upsert" | "delete"
+	ID  int
+	Val string
+}
+
+func apply(m map[int]string, e Event) {
+	if e.Op == "delete" {
+		delete(m, e.ID)
+	} else {
+		m[e.ID] = e.Val
+	}
+}
+
+func Migrate(orig map[int]string, chunk int, batches [][]Event) map[int]string {
+	shadow := map[int]string{}
+	if len(orig) == 0 && len(batches) == 0 {
+		return shadow
+	}
+	// @solution
+	keys := slices.Sorted(maps.Keys(orig))
+	b := 0
+	applyNext := func() {
+		if b < len(batches) {
+			for _, e := range batches[b] {
+				apply(orig, e)
+				apply(shadow, e)
+			}
+			b++
+		}
+	}
+	if len(keys) > 0 {
+		lo, hi := keys[0], keys[len(keys)-1]
+		for start := lo; start <= hi; start += chunk {
+			for id := start; id < start+chunk && id <= hi; id++ {
+				if v, ok := orig[id]; ok {
+					if _, exists := shadow[id]; !exists {
+						shadow[id] = v
+					}
+				}
+			}
+			applyNext()
+		}
+	}
+	for b < len(batches) {
+		applyNext()
+	}
+	// @starter
+	// for id, v := range orig { // TODO: 只拷贝了数据，没有处理拷贝期间的变更
+	// 	shadow[id] = v
+	// }
+	// @end
+	return shadow
+}
+
+--- test
+package main
+
+import (
+	"maps"
+	"testing"
+)
+
+func TestMigrate(t *testing.T) {
+	orig := map[int]string{}
+	for i := 1; i <= 10; i++ {
+		orig[i] = "v1"
+	}
+	batches := [][]Event{
+		{{"upsert", 2, "updated"}, {"delete", 9, ""}},  // 拷贝第 1 批（1~3）后：改了已拷贝的行、删了未拷贝的行
+		{{"upsert", 8, "early"}},                       // 改了还没拷贝的行
+		{{"upsert", 11, "new"}, {"delete", 1, ""}},     // 新插入一行（超出初始最大 ID）、删除已拷贝的行
+		{{"upsert", 5, "late"}},                        // 拷贝结束后的变更
+		{{"upsert", 12, "tail"}},
+	}
+	shadow := Migrate(orig, 3, batches)
+	if !maps.Equal(shadow, orig) {
+		t.Fatalf("影子表与原表不一致\nshadow=%v\norig  =%v", shadow, orig)
+	}
+	want := map[int]string{2: "updated", 3: "v1", 4: "v1", 5: "late", 6: "v1", 7: "v1", 8: "early", 10: "v1", 11: "new", 12: "tail"}
+	if !maps.Equal(orig, want) {
+		t.Fatalf("原表 = %v", orig)
+	}
+}
+
+=== db-15-1
+title: 分库分表路由与基因法
+--- desc
+订单表按 `user_id` 分成 4 个库 × 8 张表，一共 32 个分片：
+
+- `Route(userID)`：`slot = userID % 32`，库号 `slot / 8`，表号 `slot % 8`；
+- 按订单号查询时不知道 user_id，怎么路由？**基因法**：生成订单号时把 user_id 的低 5 位（32 = 2⁵）嵌进订单号的低 5 位：`OrderID(seq, userID) = seq << 5 | userID & 31`；
+- `RouteByOrder(orderID)`：直接用订单号的低 5 位计算分片，必须和 `Route(userID)` 落到同一个分片。
+--- solution
+package main
+
+const (
+	dbCount    = 4
+	tablesPerDB = 8
+	slots      = dbCount * tablesPerDB // 32
+	geneBits   = 5
+)
+
+func Route(userID int64) (db, table int) {
+	// @solution
+	slot := int(userID % slots)
+	return slot / tablesPerDB, slot % tablesPerDB
+	// @starter
+	// return 0, 0 // TODO
+	// @end
+}
+
+func OrderID(seq, userID int64) int64 {
+	// @solution
+	return seq<<geneBits | userID&(slots-1)
+	// @starter
+	// return seq // TODO
+	// @end
+}
+
+func RouteByOrder(orderID int64) (db, table int) {
+	// @solution
+	return Route(orderID & (slots - 1))
+	// @starter
+	// return 0, 0 // TODO
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestRoute(t *testing.T) {
+	cases := map[int64][2]int{0: {0, 0}, 7: {0, 7}, 8: {1, 0}, 31: {3, 7}, 32: {0, 0}, 1000045: {1, 5}}
+	for uid, want := range cases {
+		if db, tb := Route(uid); db != want[0] || tb != want[1] {
+			t.Errorf("Route(%d) = (%d, %d)，期望 %v", uid, db, tb, want)
+		}
+	}
+}
+
+func TestGene(t *testing.T) {
+	for uid := int64(1); uid < 2000; uid += 37 {
+		for seq := int64(1); seq < 5; seq++ {
+			oid := OrderID(seq*1000+uid, uid)
+			if oid>>5 != seq*1000+uid {
+				t.Fatalf("OrderID 应保留序号部分")
+			}
+			db1, t1 := Route(uid)
+			db2, t2 := RouteByOrder(oid)
+			if db1 != db2 || t1 != t2 {
+				t.Fatalf("user %d 的订单 %d 路由到 (%d,%d)，用户在 (%d,%d)", uid, oid, db2, t2, db1, t1)
+			}
+		}
+	}
+}
+
+=== db-16-1
+title: 批量合并计数增量
+race: true
+--- desc
+大表 `count(*)` 很慢，常见做法是单独维护计数（Redis 或计数表）。但每次插入都去更新同一行计数，会形成热点。
+
+实现一个在内存中聚合增量、定期批量写出的 `Counter`：
+
+- `Add(key, delta)`：并发安全地累加增量；
+- `Flush(store)`：把每个 key 累积的增量**合并成一次**调用 `store(key, delta)`（按 key 字典序），跳过增量为 0 的 key，然后清空缓冲。调用 `store` 时不要持有锁，避免慢 IO 阻塞 `Add`。
+--- solution
+package main
+
+import (
+	"maps"
+	"slices"
+	"sync"
+)
+
+type Counter struct {
+	mu      sync.Mutex
+	pending map[string]int64
+}
+
+func NewCounter() *Counter { return &Counter{pending: map[string]int64{}} }
+
+func (c *Counter) Add(key string, delta int64) {
+	// @solution
+	c.mu.Lock()
+	c.pending[key] += delta
+	c.mu.Unlock()
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (c *Counter) Flush(store func(key string, delta int64)) {
+	// @solution
+	c.mu.Lock()
+	batch := c.pending
+	c.pending = map[string]int64{}
+	c.mu.Unlock()
+	for _, k := range slices.Sorted(maps.Keys(batch)) {
+		if d := batch[k]; d != 0 {
+			store(k, d)
+		}
+	}
+	// @starter
+	// // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"sync"
+	"testing"
+)
+
+func TestCounterFlush(t *testing.T) {
+	c := NewCounter()
+	var wg sync.WaitGroup
+	for g := 0; g < 10; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				c.Add("orders", 1)
+				c.Add("users", 2)
+				c.Add("zero", 1)
+				c.Add("zero", -1)
+			}
+		}()
+	}
+	wg.Wait()
+	var calls []string
+	got := map[string]int64{}
+	c.Flush(func(k string, d int64) {
+		calls = append(calls, k)
+		got[k] += d
+	})
+	if !slices.Equal(calls, []string{"orders", "users"}) {
+		t.Fatalf("store 调用 = %v，期望每个 key 一次、跳过 0、按字典序", calls)
+	}
+	if got["orders"] != 1000 || got["users"] != 2000 {
+		t.Fatalf("增量 = %v", got)
+	}
+	calls = nil
+	c.Flush(func(k string, d int64) { calls = append(calls, k) })
+	if len(calls) != 0 {
+		t.Fatal("Flush 之后缓冲应清空")
+	}
+}
+
+func TestFlushDoesNotBlockAdd(t *testing.T) {
+	c := NewCounter()
+	c.Add("a", 1)
+	c.Flush(func(string, int64) {
+		c.Add("b", 1) // store 期间调用 Add 不能死锁
+	})
+	var got int64
+	c.Flush(func(k string, d int64) { got = d })
+	if got != 1 {
+		t.Fatal("store 期间的 Add 应被下一次 Flush 写出")
+	}
+}

@@ -1,0 +1,1187 @@
+LeetCode · 二叉树、栈队列与设计、并发。题面为意译，函数签名与力扣的 Go 版本一致。
+
+=== lc-104
+no: 104
+title: 二叉树的最大深度
+slug: maximum-depth-of-binary-tree
+difficulty: 简单
+category: 二叉树
+topics: 树, 深度优先搜索
+go: 递归, 内置 min/max
+--- desc
+返回二叉树的最大深度：从根节点到最远叶子节点的最长路径上的**节点数**。空树深度为 0。
+
+**示例**：`[3,9,20,null,null,15,7]`（层序表示）→ `3`。
+--- solution
+package main
+
+type TreeNode struct {
+	Val   int
+	Left  *TreeNode
+	Right *TreeNode
+}
+
+func maxDepth(root *TreeNode) int {
+	// @solution
+	if root == nil {
+		return 0
+	}
+	return 1 + max(maxDepth(root.Left), maxDepth(root.Right))
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+// build 按层序构造二叉树，nil 表示空节点
+func build(vals ...any) *TreeNode {
+	if len(vals) == 0 || vals[0] == nil {
+		return nil
+	}
+	root := &TreeNode{Val: vals[0].(int)}
+	queue := []*TreeNode{root}
+	for i := 1; len(queue) > 0 && i < len(vals); i += 2 {
+		n := queue[0]
+		queue = queue[1:]
+		if vals[i] != nil {
+			n.Left = &TreeNode{Val: vals[i].(int)}
+			queue = append(queue, n.Left)
+		}
+		if i+1 < len(vals) && vals[i+1] != nil {
+			n.Right = &TreeNode{Val: vals[i+1].(int)}
+			queue = append(queue, n.Right)
+		}
+	}
+	return root
+}
+
+func TestMaxDepth(t *testing.T) {
+	cases := []struct {
+		tree []any
+		want int
+	}{
+		{[]any{3, 9, 20, nil, nil, 15, 7}, 3},
+		{[]any{1, nil, 2}, 2},
+		{nil, 0},
+		{[]any{1}, 1},
+		{[]any{1, 2, nil, 3, nil, 4}, 4},
+	}
+	for _, c := range cases {
+		if got := maxDepth(build(c.tree...)); got != c.want {
+			t.Errorf("maxDepth(%v) = %d，期望 %d", c.tree, got, c.want)
+		}
+	}
+}
+--- explain
+树的问题大多可以拆成「当前节点 + 左右子树的同类问题」。递归的终止条件是空节点（nil 指针）。
+
+Go 里对 nil 指针调用方法会 panic，所以访问 `root.Left` 之前一定要先判断 `root == nil`。
+
+=== lc-226
+no: 226
+title: 翻转二叉树
+slug: invert-binary-tree
+difficulty: 简单
+category: 二叉树
+topics: 树, 深度优先搜索
+go: 递归, 多重赋值
+--- desc
+翻转一棵二叉树：每个节点的左右子树互换，返回根节点。
+
+**示例**：`[4,2,7,1,3,6,9]` → `[4,7,2,9,6,3,1]`。
+--- solution
+package main
+
+type TreeNode struct {
+	Val   int
+	Left  *TreeNode
+	Right *TreeNode
+}
+
+func invertTree(root *TreeNode) *TreeNode {
+	// @solution
+	if root == nil {
+		return nil
+	}
+	root.Left, root.Right = invertTree(root.Right), invertTree(root.Left)
+	return root
+	// @starter
+	// return root
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func build(vals ...any) *TreeNode {
+	if len(vals) == 0 || vals[0] == nil {
+		return nil
+	}
+	root := &TreeNode{Val: vals[0].(int)}
+	queue := []*TreeNode{root}
+	for i := 1; len(queue) > 0 && i < len(vals); i += 2 {
+		n := queue[0]
+		queue = queue[1:]
+		if vals[i] != nil {
+			n.Left = &TreeNode{Val: vals[i].(int)}
+			queue = append(queue, n.Left)
+		}
+		if i+1 < len(vals) && vals[i+1] != nil {
+			n.Right = &TreeNode{Val: vals[i+1].(int)}
+			queue = append(queue, n.Right)
+		}
+	}
+	return root
+}
+
+// levels 按层序输出，空节点为 nil，去掉末尾的 nil
+func levels(root *TreeNode) []any {
+	var out []any
+	queue := []*TreeNode{root}
+	for len(queue) > 0 {
+		n := queue[0]
+		queue = queue[1:]
+		if n == nil {
+			out = append(out, nil)
+			continue
+		}
+		out = append(out, n.Val)
+		queue = append(queue, n.Left, n.Right)
+	}
+	for len(out) > 0 && out[len(out)-1] == nil {
+		out = out[:len(out)-1]
+	}
+	return out
+}
+
+func TestInvertTree(t *testing.T) {
+	cases := []struct{ in, want []any }{
+		{[]any{4, 2, 7, 1, 3, 6, 9}, []any{4, 7, 2, 9, 6, 3, 1}},
+		{[]any{2, 1, 3}, []any{2, 3, 1}},
+		{nil, nil},
+		{[]any{1, 2}, []any{1, nil, 2}},
+	}
+	for _, c := range cases {
+		if got := levels(invertTree(build(c.in...))); !slices.Equal(got, c.want) {
+			t.Errorf("invertTree(%v) = %v，期望 %v", c.in, got, c.want)
+		}
+	}
+}
+--- explain
+多重赋值在这里特别好用：右边两个递归调用先全部求值，再同时赋给左右子树，不需要临时变量，也不会出现「先改了左边、右边读到的是新值」的问题。
+
+=== lc-101
+no: 101
+title: 对称二叉树
+slug: symmetric-tree
+difficulty: 简单
+category: 二叉树
+topics: 树, 深度优先搜索
+go: 递归
+--- desc
+判断一棵二叉树是否**轴对称**（左子树和右子树互为镜像）。
+
+**示例**：`[1,2,2,3,4,4,3]` → `true`；`[1,2,2,null,3,null,3]` → `false`。
+--- solution
+package main
+
+type TreeNode struct {
+	Val   int
+	Left  *TreeNode
+	Right *TreeNode
+}
+
+func isSymmetric(root *TreeNode) bool {
+	// @solution
+	return root == nil || mirror(root.Left, root.Right)
+	// @starter
+	// return false
+	// @end
+}
+
+// @solution
+func mirror(a, b *TreeNode) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Val == b.Val && mirror(a.Left, b.Right) && mirror(a.Right, b.Left)
+}
+
+// @end
+--- test
+package main
+
+import "testing"
+
+func build(vals ...any) *TreeNode {
+	if len(vals) == 0 || vals[0] == nil {
+		return nil
+	}
+	root := &TreeNode{Val: vals[0].(int)}
+	queue := []*TreeNode{root}
+	for i := 1; len(queue) > 0 && i < len(vals); i += 2 {
+		n := queue[0]
+		queue = queue[1:]
+		if vals[i] != nil {
+			n.Left = &TreeNode{Val: vals[i].(int)}
+			queue = append(queue, n.Left)
+		}
+		if i+1 < len(vals) && vals[i+1] != nil {
+			n.Right = &TreeNode{Val: vals[i+1].(int)}
+			queue = append(queue, n.Right)
+		}
+	}
+	return root
+}
+
+func TestIsSymmetric(t *testing.T) {
+	cases := []struct {
+		tree []any
+		want bool
+	}{
+		{[]any{1, 2, 2, 3, 4, 4, 3}, true},
+		{[]any{1, 2, 2, nil, 3, nil, 3}, false},
+		{[]any{1}, true},
+		{nil, true},
+		{[]any{1, 2, 3}, false},
+		{[]any{1, 2, 2, 2, nil, 2}, false},
+	}
+	for _, c := range cases {
+		if got := isSymmetric(build(c.tree...)); got != c.want {
+			t.Errorf("isSymmetric(%v) = %v，期望 %v", c.tree, got, c.want)
+		}
+	}
+}
+--- explain
+对称的定义涉及**两棵子树**，所以写一个接收两个参数的辅助函数：两边的值相等，并且「左的左」和「右的右」镜像、「左的右」和「右的左」镜像。
+
+`if a == nil || b == nil { return a == b }` 一行处理了三种情况：都为空（对称）、只有一个为空（不对称）。
+
+=== lc-94
+no: 94
+title: 二叉树的中序遍历
+slug: binary-tree-inorder-traversal
+difficulty: 简单
+category: 二叉树
+topics: 树, 栈, 深度优先搜索
+go: 切片当栈, 闭包, 递归
+--- desc
+返回二叉树的**中序**遍历结果：左子树 → 根 → 右子树。
+
+**示例**：`[1,null,2,3]` → `[1,3,2]`。
+
+进阶：递归很简单，能否用迭代（显式栈）实现？
+--- solution
+package main
+
+type TreeNode struct {
+	Val   int
+	Left  *TreeNode
+	Right *TreeNode
+}
+
+func inorderTraversal(root *TreeNode) []int {
+	// @solution
+	var out []int
+	var stack []*TreeNode
+	cur := root
+	for cur != nil || len(stack) > 0 {
+		for cur != nil { // 一路向左，把经过的节点压栈
+			stack = append(stack, cur)
+			cur = cur.Left
+		}
+		cur = stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		out = append(out, cur.Val)
+		cur = cur.Right
+	}
+	return out
+	// @starter
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func build(vals ...any) *TreeNode {
+	if len(vals) == 0 || vals[0] == nil {
+		return nil
+	}
+	root := &TreeNode{Val: vals[0].(int)}
+	queue := []*TreeNode{root}
+	for i := 1; len(queue) > 0 && i < len(vals); i += 2 {
+		n := queue[0]
+		queue = queue[1:]
+		if vals[i] != nil {
+			n.Left = &TreeNode{Val: vals[i].(int)}
+			queue = append(queue, n.Left)
+		}
+		if i+1 < len(vals) && vals[i+1] != nil {
+			n.Right = &TreeNode{Val: vals[i+1].(int)}
+			queue = append(queue, n.Right)
+		}
+	}
+	return root
+}
+
+func TestInorder(t *testing.T) {
+	cases := []struct {
+		tree []any
+		want []int
+	}{
+		{[]any{1, nil, 2, 3}, []int{1, 3, 2}},
+		{nil, nil},
+		{[]any{1}, []int{1}},
+		{[]any{4, 2, 6, 1, 3, 5, 7}, []int{1, 2, 3, 4, 5, 6, 7}},
+	}
+	for _, c := range cases {
+		if got := inorderTraversal(build(c.tree...)); !slices.Equal(got, c.want) {
+			t.Errorf("inorderTraversal(%v) = %v，期望 %v", c.tree, got, c.want)
+		}
+	}
+}
+--- explain
+参考答案是迭代写法：用切片模拟栈，先一路向左压栈，弹出时访问节点，再转向右子树。
+
+递归写法常用**闭包**，让递归函数直接 append 到外层的结果切片：
+
+```go
+func inorderTraversal(root *TreeNode) (out []int) {
+	var dfs func(*TreeNode)
+	dfs = func(n *TreeNode) {
+		if n == nil {
+			return
+		}
+		dfs(n.Left)
+		out = append(out, n.Val)
+		dfs(n.Right)
+	}
+	dfs(root)
+	return
+}
+```
+
+这里还用到了**命名返回值** `out`，闭包里的 append 修改的就是它。
+
+=== lc-108
+no: 108
+title: 将有序数组转换为二叉搜索树
+slug: convert-sorted-array-to-binary-search-tree
+difficulty: 简单
+category: 二叉树
+topics: 树, 二叉搜索树, 分治
+go: 递归, 切片
+--- desc
+把一个**升序**数组转换为一棵**平衡**二叉搜索树（每个节点左右两个子树的高度差不超过 1）。答案不唯一。
+
+**示例**：`[-10,-3,0,5,9]` → 一种可能的答案是 `[0,-3,9,-10,null,5]`。
+--- solution
+package main
+
+type TreeNode struct {
+	Val   int
+	Left  *TreeNode
+	Right *TreeNode
+}
+
+func sortedArrayToBST(nums []int) *TreeNode {
+	// @solution
+	if len(nums) == 0 {
+		return nil
+	}
+	mid := len(nums) / 2
+	return &TreeNode{
+		Val:   nums[mid],
+		Left:  sortedArrayToBST(nums[:mid]),
+		Right: sortedArrayToBST(nums[mid+1:]),
+	}
+	// @starter
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func inorder(n *TreeNode, out *[]int) {
+	if n == nil {
+		return
+	}
+	inorder(n.Left, out)
+	*out = append(*out, n.Val)
+	inorder(n.Right, out)
+}
+
+// height 返回高度，不平衡时返回 -1
+func height(n *TreeNode) int {
+	if n == nil {
+		return 0
+	}
+	l, r := height(n.Left), height(n.Right)
+	if l < 0 || r < 0 || l-r > 1 || r-l > 1 {
+		return -1
+	}
+	return 1 + max(l, r)
+}
+
+func TestSortedArrayToBST(t *testing.T) {
+	for _, nums := range [][]int{{-10, -3, 0, 5, 9}, {1, 3}, {1}, {}, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}} {
+		root := sortedArrayToBST(nums)
+		var got []int
+		inorder(root, &got)
+		if len(nums) > 0 && !slices.Equal(got, nums) {
+			t.Errorf("中序遍历应还原出原数组：%v → %v", nums, got)
+		}
+		if height(root) < 0 {
+			t.Errorf("%v 生成的树不平衡", nums)
+		}
+	}
+}
+--- explain
+每次取中间的元素作为根，左半部分构造左子树、右半部分构造右子树，两边元素数量最多差 1，树自然是平衡的。
+
+`nums[:mid]` 和 `nums[mid+1:]` 是**切片截取**，不会拷贝数据，递归过程中没有额外的内存分配（除了节点本身）。结构体字面量里可以直接写递归调用来初始化字段。
+
+=== lc-543
+no: 543
+title: 二叉树的直径
+slug: diameter-of-binary-tree
+difficulty: 简单
+category: 二叉树
+topics: 树, 深度优先搜索
+go: 闭包, 递归
+--- desc
+二叉树的**直径**是任意两个节点之间最长路径的**边数**。这条路径可能不经过根节点。
+
+**示例**：`[1,2,3,4,5]` → `3`（路径 `4→2→1→3` 或 `5→2→1→3`）。
+--- solution
+package main
+
+type TreeNode struct {
+	Val   int
+	Left  *TreeNode
+	Right *TreeNode
+}
+
+func diameterOfBinaryTree(root *TreeNode) int {
+	// @solution
+	best := 0
+	var depth func(*TreeNode) int
+	depth = func(n *TreeNode) int {
+		if n == nil {
+			return 0
+		}
+		l, r := depth(n.Left), depth(n.Right)
+		best = max(best, l+r) // 经过 n 的最长路径
+		return 1 + max(l, r)
+	}
+	depth(root)
+	return best
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func build(vals ...any) *TreeNode {
+	if len(vals) == 0 || vals[0] == nil {
+		return nil
+	}
+	root := &TreeNode{Val: vals[0].(int)}
+	queue := []*TreeNode{root}
+	for i := 1; len(queue) > 0 && i < len(vals); i += 2 {
+		n := queue[0]
+		queue = queue[1:]
+		if vals[i] != nil {
+			n.Left = &TreeNode{Val: vals[i].(int)}
+			queue = append(queue, n.Left)
+		}
+		if i+1 < len(vals) && vals[i+1] != nil {
+			n.Right = &TreeNode{Val: vals[i+1].(int)}
+			queue = append(queue, n.Right)
+		}
+	}
+	return root
+}
+
+func TestDiameter(t *testing.T) {
+	cases := []struct {
+		tree []any
+		want int
+	}{
+		{[]any{1, 2, 3, 4, 5}, 3},
+		{[]any{1, 2}, 1},
+		{[]any{1}, 0},
+		// 最长路径不经过根：在左子树内部
+		{[]any{1, 2, nil, 3, 4, 5, nil, nil, 6, 7, nil, nil, 8}, 6},
+	}
+	for _, c := range cases {
+		if got := diameterOfBinaryTree(build(c.tree...)); got != c.want {
+			t.Errorf("diameterOfBinaryTree(%v) = %d，期望 %d", c.tree, got, c.want)
+		}
+	}
+}
+--- explain
+递归函数返回「以当前节点为端点向下的最大深度」，同时顺手更新「经过当前节点的最长路径 = 左深度 + 右深度」。
+
+用闭包捕获外层的 `best` 变量来记录全局最大值，比使用全局变量更安全（LeetCode 会在同一个进程里多次调用你的函数，全局变量不重置会导致错误）。
+
+=== lc-155
+no: 155
+title: 最小栈
+slug: min-stack
+difficulty: 简单
+category: 栈、队列与设计
+topics: 栈, 设计
+go: 结构体与方法, 切片当栈
+--- desc
+设计一个栈，除了 `Push`、`Pop`、`Top` 之外，还能在**常数时间**内返回栈中的最小元素 `GetMin`。
+
+题目保证 `Pop`、`Top`、`GetMin` 只会在栈非空时调用。
+
+**示例**：`Push(-2), Push(0), Push(-3), GetMin() = -3, Pop(), Top() = 0, GetMin() = -2`。
+--- solution
+package main
+
+type MinStack struct {
+	// @solution
+	vals []int
+	mins []int // mins[i] 是 vals[0..i] 的最小值
+	// @starter
+	// // TODO
+	// @end
+}
+
+func Constructor() MinStack {
+	return MinStack{}
+}
+
+func (s *MinStack) Push(val int) {
+	// @solution
+	s.vals = append(s.vals, val)
+	if len(s.mins) == 0 {
+		s.mins = append(s.mins, val)
+	} else {
+		s.mins = append(s.mins, min(val, s.mins[len(s.mins)-1]))
+	}
+	// @starter
+	// @end
+}
+
+func (s *MinStack) Pop() {
+	// @solution
+	s.vals = s.vals[:len(s.vals)-1]
+	s.mins = s.mins[:len(s.mins)-1]
+	// @starter
+	// @end
+}
+
+func (s *MinStack) Top() int {
+	// @solution
+	return s.vals[len(s.vals)-1]
+	// @starter
+	// return 0
+	// @end
+}
+
+func (s *MinStack) GetMin() int {
+	// @solution
+	return s.mins[len(s.mins)-1]
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestMinStack(t *testing.T) {
+	s := Constructor()
+	s.Push(-2)
+	s.Push(0)
+	s.Push(-3)
+	if s.GetMin() != -3 {
+		t.Fatalf("GetMin = %d，期望 -3", s.GetMin())
+	}
+	s.Pop()
+	if s.Top() != 0 || s.GetMin() != -2 {
+		t.Fatalf("Top = %d, GetMin = %d，期望 0, -2", s.Top(), s.GetMin())
+	}
+	s.Push(-2)
+	s.Push(5)
+	s.Pop()
+	s.Pop()
+	if s.GetMin() != -2 || s.Top() != 0 {
+		t.Fatalf("重复的最小值出栈后：GetMin = %d, Top = %d", s.GetMin(), s.Top())
+	}
+	s2 := Constructor()
+	for _, v := range []int{5, 4, 3, 6, 1} {
+		s2.Push(v)
+	}
+	want := []int{1, 3, 3, 4, 5}
+	for i := 0; i < 5; i++ {
+		if s2.GetMin() != want[i] {
+			t.Fatalf("第 %d 次 GetMin = %d，期望 %d", i, s2.GetMin(), want[i])
+		}
+		s2.Pop()
+	}
+}
+--- explain
+用一个辅助栈 `mins` 同步记录「到当前位置为止的最小值」，`GetMin` 直接看它的栈顶，所有操作都是 O(1)。
+
+Go 没有构造函数，惯例是写一个返回新值的函数（LeetCode 要求名字叫 `Constructor`，平时一般叫 `NewMinStack`）。方法用**指针接收者**，因为 Push / Pop 要修改结构体。LeetCode 模板里的接收者名叫 `this`，Go 的风格是用类型名的缩写，比如 `s`。
+
+=== lc-232
+no: 232
+title: 用栈实现队列
+slug: implement-queue-using-stacks
+difficulty: 简单
+category: 栈、队列与设计
+topics: 栈, 队列, 设计
+go: 结构体与方法, 切片当栈
+--- desc
+只用两个栈（只能使用压栈、弹出栈顶、查看栈顶、判断是否为空）实现一个先进先出的队列，支持 `Push`、`Pop`、`Peek`、`Empty`。
+
+要求每个操作的**均摊**时间复杂度为 O(1)。题目保证 `Pop` 和 `Peek` 只在队列非空时调用。
+--- solution
+package main
+
+type MyQueue struct {
+	// @solution
+	in, out []int
+	// @starter
+	// // TODO
+	// @end
+}
+
+func Constructor() MyQueue {
+	return MyQueue{}
+}
+
+func (q *MyQueue) Push(x int) {
+	// @solution
+	q.in = append(q.in, x)
+	// @starter
+	// @end
+}
+
+// @solution
+// move 只在 out 为空时把 in 整体倒进 out，每个元素最多被搬运一次
+func (q *MyQueue) move() {
+	if len(q.out) > 0 {
+		return
+	}
+	for len(q.in) > 0 {
+		q.out = append(q.out, q.in[len(q.in)-1])
+		q.in = q.in[:len(q.in)-1]
+	}
+}
+
+// @end
+
+func (q *MyQueue) Pop() int {
+	// @solution
+	q.move()
+	x := q.out[len(q.out)-1]
+	q.out = q.out[:len(q.out)-1]
+	return x
+	// @starter
+	// return 0
+	// @end
+}
+
+func (q *MyQueue) Peek() int {
+	// @solution
+	q.move()
+	return q.out[len(q.out)-1]
+	// @starter
+	// return 0
+	// @end
+}
+
+func (q *MyQueue) Empty() bool {
+	// @solution
+	return len(q.in) == 0 && len(q.out) == 0
+	// @starter
+	// return true
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestMyQueue(t *testing.T) {
+	q := Constructor()
+	if !q.Empty() {
+		t.Fatal("新队列应为空")
+	}
+	q.Push(1)
+	q.Push(2)
+	if q.Peek() != 1 || q.Pop() != 1 || q.Empty() {
+		t.Fatal("先进先出")
+	}
+	q.Push(3)
+	q.Push(4)
+	for _, want := range []int{2, 3, 4} {
+		if got := q.Pop(); got != want {
+			t.Fatalf("Pop = %d，期望 %d", got, want)
+		}
+	}
+	if !q.Empty() {
+		t.Fatal("应为空")
+	}
+	for i := 0; i < 1000; i++ {
+		q.Push(i)
+		if i%3 == 0 {
+			q.Pop()
+		}
+	}
+	prev := -1
+	for !q.Empty() {
+		v := q.Pop()
+		if v <= prev {
+			t.Fatal("出队顺序应保持递增")
+		}
+		prev = v
+	}
+}
+--- explain
+`in` 栈负责入队，`out` 栈负责出队。只有 `out` 为空时才把 `in` 里的元素全部倒过去——倒一次顺序就反过来了，栈顶正好是最早进来的元素。每个元素最多被搬运一次，所以均摊 O(1)。
+
+结构体里 `in, out []int` 可以在一行声明多个同类型字段。
+
+=== lc-703
+no: 703
+title: 数据流中的第 K 大元素
+slug: kth-largest-element-in-a-stream
+difficulty: 简单
+category: 栈、队列与设计
+topics: 堆, 设计, 数据流
+go: container/heap, 结构体与方法
+--- desc
+设计一个类，持续接收数据流中的数字，每次加入一个新数字后，返回当前所有数字中**第 k 大**的元素。
+
+- `Constructor(k, nums)`：用 k 和初始数组初始化；
+- `Add(val)`：加入 val，返回当前第 k 大的元素。题目保证调用 Add 时至少已有 k 个元素。
+
+**示例**：`k = 3, nums = [4,5,8,2]`；`Add(3) = 4`，`Add(5) = 5`，`Add(10) = 5`，`Add(9) = 8`，`Add(4) = 8`。
+--- solution
+package main
+
+import "container/heap"
+
+// IntHeap 实现 heap.Interface，是一个小顶堆
+type IntHeap []int
+
+func (h IntHeap) Len() int           { return len(h) }
+func (h IntHeap) Less(i, j int) bool { return h[i] < h[j] }
+func (h IntHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *IntHeap) Push(x any)        { *h = append(*h, x.(int)) }
+func (h *IntHeap) Pop() any {
+	old := *h
+	x := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return x
+}
+
+type KthLargest struct {
+	k int
+	h *IntHeap
+}
+
+func Constructor(k int, nums []int) KthLargest {
+	kl := KthLargest{k: k, h: &IntHeap{}}
+	for _, v := range nums {
+		kl.Add(v)
+	}
+	return kl
+}
+
+func (kl *KthLargest) Add(val int) int {
+	// @solution
+	heap.Push(kl.h, val)
+	if kl.h.Len() > kl.k {
+		heap.Pop(kl.h)
+	}
+	return (*kl.h)[0]
+	// @starter
+	// return 0 // TODO: 维护一个大小为 k 的小顶堆，堆顶就是第 k 大
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestKthLargest(t *testing.T) {
+	kl := Constructor(3, []int{4, 5, 8, 2})
+	for i, c := range []struct{ add, want int }{{3, 4}, {5, 5}, {10, 5}, {9, 8}, {4, 8}} {
+		if got := kl.Add(c.add); got != c.want {
+			t.Fatalf("第 %d 次 Add(%d) = %d，期望 %d", i+1, c.add, got, c.want)
+		}
+	}
+	k1 := Constructor(1, []int{})
+	if k1.Add(-3) != -3 || k1.Add(-2) != -2 || k1.Add(-4) != -2 {
+		t.Fatal("k=1 时应返回最大值")
+	}
+	k4 := Constructor(4, []int{7, 7, 7, 7, 8, 3})
+	if got := k4.Add(2); got != 7 {
+		t.Fatalf("有重复元素时 Add(2) = %d，期望 7", got)
+	}
+}
+--- explain
+维护一个**大小为 k 的小顶堆**：堆里始终是最大的 k 个数，堆顶就是其中最小的，也就是第 k 大。每次加入后如果超过 k 个，就弹出堆顶。Add 的时间复杂度是 O(log k)。
+
+`container/heap` 不是一个现成的堆类型，而是一组算法：你的类型实现 `heap.Interface`（`sort.Interface` 的 Len/Less/Swap，再加上 Push/Pop），然后调用 `heap.Push` / `heap.Pop` / `heap.Init`。注意 `Push` 和 `Pop` 要用**指针接收者**，因为它们会改变切片的长度。改 `Less` 为 `>` 就是大顶堆。
+
+=== lc-705
+no: 705
+title: 设计哈希集合
+slug: design-hashset
+difficulty: 简单
+category: 栈、队列与设计
+topics: 哈希表, 设计, 链表
+go: 结构体与方法, 数组值类型
+--- desc
+**不使用任何内置的哈希表**（也就是不能用 Go 的 map），实现一个整数哈希集合：
+
+- `Add(key)`：插入 key；
+- `Contains(key)`：是否包含 key；
+- `Remove(key)`：删除 key，不存在时什么也不做。
+
+`0 <= key <= 10⁶`，最多调用 10⁴ 次。
+--- solution
+package main
+
+const base = 769 // 质数作为桶的数量，让 key 分布更均匀
+
+type MyHashSet struct {
+	// @solution
+	buckets [base][]int
+	// @starter
+	// // TODO
+	// @end
+}
+
+func Constructor() MyHashSet {
+	return MyHashSet{}
+}
+
+func (s *MyHashSet) Add(key int) {
+	// @solution
+	if !s.Contains(key) {
+		b := &s.buckets[key%base]
+		*b = append(*b, key)
+	}
+	// @starter
+	// @end
+}
+
+func (s *MyHashSet) Remove(key int) {
+	// @solution
+	b := &s.buckets[key%base]
+	for i, v := range *b {
+		if v == key {
+			(*b)[i] = (*b)[len(*b)-1]
+			*b = (*b)[:len(*b)-1]
+			return
+		}
+	}
+	// @starter
+	// @end
+}
+
+func (s *MyHashSet) Contains(key int) bool {
+	// @solution
+	for _, v := range s.buckets[key%base] {
+		if v == key {
+			return true
+		}
+	}
+	return false
+	// @starter
+	// return false
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestMyHashSet(t *testing.T) {
+	s := Constructor()
+	s.Add(1)
+	s.Add(2)
+	if !s.Contains(1) || s.Contains(3) {
+		t.Fatal("Contains 判断不对")
+	}
+	s.Add(2)
+	if !s.Contains(2) {
+		t.Fatal("重复 Add 后仍应包含")
+	}
+	s.Remove(2)
+	if s.Contains(2) {
+		t.Fatal("Remove 后不应包含")
+	}
+	s.Remove(12345)
+
+	for k := 0; k <= 1000000; k += 769 { // 全部落在同一个桶
+		s.Add(k)
+	}
+	for k := 0; k <= 1000000; k += 769 {
+		if !s.Contains(k) {
+			t.Fatalf("应包含 %d", k)
+		}
+	}
+	s.Remove(769 * 10)
+	if s.Contains(769*10) || !s.Contains(769*11) {
+		t.Fatal("同一个桶里删除一个元素不应影响其他元素")
+	}
+}
+--- explain
+**拉链法**：用 `key % base` 选桶，每个桶是一个切片，冲突的元素都放在同一个桶里。
+
+几个 Go 细节：
+
+- `buckets [base][]int` 是一个**数组**（长度是常量），元素是切片，零值就能直接用，不需要初始化；
+- `b := &s.buckets[i]` 取到桶的地址，后面通过 `*b = append(*b, …)` 修改的才是结构体里的那个切片——如果写成 `b := s.buckets[i]`，append 修改的是副本；
+- 删除时把最后一个元素换到被删位置再截短，O(1) 且不需要移动其他元素（顺序无所谓时的常用技巧）。
+
+=== lc-1114
+no: 1114
+title: 按序打印
+slug: print-in-order
+difficulty: 简单
+category: 并发
+topics: 多线程
+go: goroutine 与 channel
+race: true
+--- desc
+`Foo` 有三个方法 `First`、`Second`、`Third`，它们会被**三个不同的 goroutine 以任意顺序**并发调用。请保证输出的顺序永远是 `first`、`second`、`third`：
+
+- `Second` 必须等 `First` 执行完；
+- `Third` 必须等 `Second` 执行完。
+
+`printFirst()` 等函数负责实际的输出，你只需要控制调用的时机。测试会以各种顺序启动这三个 goroutine，并开启 `-race`。
+--- solution
+package main
+
+type Foo struct {
+	// @solution
+	firstDone  chan struct{}
+	secondDone chan struct{}
+	// @starter
+	// // TODO
+	// @end
+}
+
+func NewFoo() *Foo {
+	// @solution
+	return &Foo{firstDone: make(chan struct{}), secondDone: make(chan struct{})}
+	// @starter
+	// return &Foo{}
+	// @end
+}
+
+func (f *Foo) First(printFirst func()) {
+	printFirst()
+	// @solution
+	close(f.firstDone)
+	// @end
+}
+
+func (f *Foo) Second(printSecond func()) {
+	// @solution
+	<-f.firstDone
+	// @end
+	printSecond()
+	// @solution
+	close(f.secondDone)
+	// @end
+}
+
+func (f *Foo) Third(printThird func()) {
+	// @solution
+	<-f.secondDone
+	// @end
+	printThird()
+}
+--- test
+package main
+
+import (
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestPrintInOrder(t *testing.T) {
+	orders := [][3]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
+	for _, order := range orders {
+		f := NewFoo()
+		var mu sync.Mutex
+		var out []string
+		p := func(s string) func() {
+			return func() { mu.Lock(); out = append(out, s); mu.Unlock() }
+		}
+		calls := []func(){
+			func() { f.First(p("first")) },
+			func() { f.Second(p("second")) },
+			func() { f.Third(p("third")) },
+		}
+		var wg sync.WaitGroup
+		for _, i := range order {
+			wg.Add(1)
+			go func() { defer wg.Done(); calls[i]() }()
+			time.Sleep(2 * time.Millisecond) // 让后启动的 goroutine 真的晚一点
+		}
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("启动顺序 %v：超时（死锁？）", order)
+		}
+		if got := strings.Join(out, ","); got != "first,second,third" {
+			t.Fatalf("启动顺序 %v：输出 %s", order, got)
+		}
+	}
+}
+--- explain
+用两个 channel 当作「完成信号」：`First` 执行完后 `close(firstDone)`，`Second` 一开始阻塞在 `<-firstDone` 上，直到它被关闭。
+
+为什么用 `close` 而不是发送一个值？关闭 channel 是**广播**，所有等待者都会被唤醒，而且不管接收方什么时候来、来几个都不会阻塞发送方。channel 的关闭操作和接收操作之间有 happens-before 关系，`First` 里做的所有写入对 `Second` 都可见，`-race` 不会报警。
+
+=== lc-1115
+no: 1115
+title: 交替打印 FooBar
+slug: print-foobar-alternately
+difficulty: 中等
+category: 并发
+topics: 多线程
+go: goroutine 与 channel
+race: true
+--- desc
+两个不同的 goroutine 分别调用同一个 `FooBar` 实例的 `Foo` 和 `Bar` 方法：`Foo` 循环 n 次调用 `printFoo()`，`Bar` 循环 n 次调用 `printBar()`。
+
+修改程序，使输出严格交替：`foobarfoobar…`，共 n 个 `foobar`。
+--- solution
+package main
+
+type FooBar struct {
+	n int
+	// @solution
+	fooTurn chan struct{}
+	barTurn chan struct{}
+	// @end
+}
+
+func NewFooBar(n int) *FooBar {
+	// @solution
+	fb := &FooBar{n: n, fooTurn: make(chan struct{}, 1), barTurn: make(chan struct{}, 1)}
+	fb.fooTurn <- struct{}{} // foo 先开始
+	return fb
+	// @starter
+	// return &FooBar{n: n}
+	// @end
+}
+
+func (fb *FooBar) Foo(printFoo func()) {
+	for i := 0; i < fb.n; i++ {
+		// @solution
+		<-fb.fooTurn
+		// @end
+		printFoo()
+		// @solution
+		fb.barTurn <- struct{}{}
+		// @end
+	}
+}
+
+func (fb *FooBar) Bar(printBar func()) {
+	for i := 0; i < fb.n; i++ {
+		// @solution
+		<-fb.barTurn
+		// @end
+		printBar()
+		// @solution
+		fb.fooTurn <- struct{}{}
+		// @end
+	}
+}
+--- test
+package main
+
+import (
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func run(t *testing.T, n int, barFirst bool) string {
+	t.Helper()
+	fb := NewFooBar(n)
+	var mu sync.Mutex
+	var sb strings.Builder
+	write := func(s string) func() {
+		return func() { mu.Lock(); sb.WriteString(s); mu.Unlock() }
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	startFoo := func() { go func() { defer wg.Done(); fb.Foo(write("foo")) }() }
+	startBar := func() { go func() { defer wg.Done(); fb.Bar(write("bar")) }() }
+	if barFirst {
+		startBar()
+		time.Sleep(5 * time.Millisecond)
+		startFoo()
+	} else {
+		startFoo()
+		time.Sleep(5 * time.Millisecond)
+		startBar()
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("超时（死锁？）")
+	}
+	return sb.String()
+}
+
+func TestFooBar(t *testing.T) {
+	for _, n := range []int{1, 2, 5, 100} {
+		for _, barFirst := range []bool{false, true} {
+			if got := run(t, n, barFirst); got != strings.Repeat("foobar", n) {
+				t.Fatalf("n=%d barFirst=%v：输出 %.60s…", n, barFirst, got)
+			}
+		}
+	}
+}
+--- explain
+两个容量为 1 的 channel 像一根接力棒：`fooTurn` 里有令牌时轮到 foo，打印后把令牌放进 `barTurn`；bar 拿到令牌打印后再放回 `fooTurn`。初始化时先往 `fooTurn` 里放一个令牌，保证 foo 先开始。
+
+用带缓冲的 channel，是为了最后一次 `Bar` 往 `fooTurn` 发送时不会因为没人接收而阻塞（Foo 已经退出了）。用无缓冲 channel 也能做，但需要额外处理最后一轮。

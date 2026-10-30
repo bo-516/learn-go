@@ -1,0 +1,729 @@
+LeetCode · 字符串。题面为意译，函数签名与力扣的 Go 版本一致。
+
+=== lc-344
+no: 344
+title: 反转字符串
+slug: reverse-string
+difficulty: 简单
+category: 字符串
+topics: 字符串, 双指针
+go: byte 与 rune, 多重赋值, 原地修改
+--- desc
+把以 `[]byte` 形式给出的字符串**原地**反转，只能使用 O(1) 的额外空间。
+
+**示例**：`["h","e","l","l","o"]` → `["o","l","l","e","h"]`。
+--- solution
+package main
+
+func reverseString(s []byte) {
+	// @solution
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		s[i], s[j] = s[j], s[i]
+	}
+	// @starter
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestReverseString(t *testing.T) {
+	cases := map[string]string{"hello": "olleh", "Hannah": "hannaH", "a": "a", "": "", "ab": "ba"}
+	for in, want := range cases {
+		b := []byte(in)
+		reverseString(b)
+		if string(b) != want {
+			t.Errorf("reverseString(%q) → %q，期望 %q", in, b, want)
+		}
+	}
+}
+--- explain
+`for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1` 在 for 语句里同时初始化和更新两个变量，是 Go 双指针的惯用写法。
+
+注意这里是按**字节**反转。Go 的 string 是 UTF-8 编码的字节序列，如果要反转包含中文的字符串，必须先转成 `[]rune`，否则一个汉字的 3 个字节会被拆开反转，得到乱码。
+
+=== lc-125
+no: 125
+title: 验证回文串
+slug: valid-palindrome
+difficulty: 简单
+category: 字符串
+topics: 字符串, 双指针
+go: byte 与 rune, 字符串标准库
+--- desc
+把字符串中的大写字母转换为小写，并去掉所有**非字母数字**的字符之后，如果正着读和反着读一样，就是回文串。判断给定字符串是否是回文串。
+
+**示例**：`"A man, a plan, a canal: Panama"` → `true`；`"race a car"` → `false`；`" "` → `true`。
+--- solution
+package main
+
+import "unicode"
+
+func isPalindrome(s string) bool {
+	// @solution
+	r := []rune(s)
+	i, j := 0, len(r)-1
+	for i < j {
+		if !isAlnum(r[i]) {
+			i++
+			continue
+		}
+		if !isAlnum(r[j]) {
+			j--
+			continue
+		}
+		if unicode.ToLower(r[i]) != unicode.ToLower(r[j]) {
+			return false
+		}
+		i++
+		j--
+	}
+	return true
+	// @starter
+	// return false
+	// @end
+}
+
+// @solution
+func isAlnum(c rune) bool { return unicode.IsLetter(c) || unicode.IsDigit(c) }
+
+// @end
+--- test
+package main
+
+import "testing"
+
+func TestIsPalindrome(t *testing.T) {
+	cases := map[string]bool{
+		"A man, a plan, a canal: Panama": true,
+		"race a car":                     false,
+		" ":                              true,
+		"0P":                             false,
+		"ab_a":                           true,
+		".,":                             true,
+		"No 'x' in Nixon":                true,
+	}
+	for in, want := range cases {
+		if got := isPalindrome(in); got != want {
+			t.Errorf("isPalindrome(%q) = %v，期望 %v", in, got, want)
+		}
+	}
+}
+--- explain
+`unicode` 包提供了判断字符类别的函数（`IsLetter`、`IsDigit`、`IsSpace`）和大小写转换（`ToLower`、`ToUpper`），它们都作用于 `rune`。
+
+题目只涉及 ASCII 时也可以直接操作字节：`c >= 'a' && c <= 'z'`，大写转小写是 `c + 'a' - 'A'`（即 `c | 0x20`）。先转成 `[]rune` 的写法对中文等多字节字符也正确。
+
+=== lc-242
+no: 242
+title: 有效的字母异位词
+slug: valid-anagram
+difficulty: 简单
+category: 字符串
+topics: 字符串, 哈希表, 排序
+go: byte 与 rune, 数组值类型
+--- desc
+判断字符串 `t` 是否是 `s` 的字母异位词：两个字符串里每个字母出现的次数都相同。字符串只包含小写字母。
+
+**示例**：`s = "anagram", t = "nagaram"` → `true`；`s = "rat", t = "car"` → `false`。
+--- solution
+package main
+
+func isAnagram(s string, t string) bool {
+	// @solution
+	var a, b [26]int
+	for i := 0; i < len(s); i++ {
+		a[s[i]-'a']++
+	}
+	for i := 0; i < len(t); i++ {
+		b[t[i]-'a']++
+	}
+	return a == b
+	// @starter
+	// return false
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestIsAnagram(t *testing.T) {
+	cases := []struct {
+		s, t string
+		want bool
+	}{
+		{"anagram", "nagaram", true},
+		{"rat", "car", false},
+		{"a", "ab", false},
+		{"", "", true},
+		{"aacc", "ccac", false},
+	}
+	for _, c := range cases {
+		if got := isAnagram(c.s, c.t); got != c.want {
+			t.Errorf("isAnagram(%q, %q) = %v，期望 %v", c.s, c.t, got, c.want)
+		}
+	}
+}
+--- explain
+`s[i]` 取到的是一个 `byte`，`s[i]-'a'` 得到 0~25，正好用作下标。
+
+用**数组** `[26]int` 而不是 map 计数：数组是值类型，元素可比较时数组本身可以直接用 `==` 比较——这是 Go 里数组相对切片的一个优势（切片不能用 `==`）。时间 O(n)，空间 O(1)。
+
+=== lc-14
+no: 14
+title: 最长公共前缀
+slug: longest-common-prefix
+difficulty: 简单
+category: 字符串
+topics: 字符串
+go: 字符串标准库
+--- desc
+找出字符串数组中所有字符串的**最长公共前缀**，没有公共前缀返回空字符串。
+
+**示例**：`["flower","flow","flight"]` → `"fl"`；`["dog","racecar","car"]` → `""`。
+--- solution
+package main
+
+import "strings"
+
+func longestCommonPrefix(strs []string) string {
+	// @solution
+	if len(strs) == 0 {
+		return ""
+	}
+	prefix := strs[0]
+	for _, s := range strs[1:] {
+		for !strings.HasPrefix(s, prefix) {
+			prefix = prefix[:len(prefix)-1]
+		}
+	}
+	return prefix
+	// @starter
+	// return ""
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestLongestCommonPrefix(t *testing.T) {
+	cases := []struct {
+		strs []string
+		want string
+	}{
+		{[]string{"flower", "flow", "flight"}, "fl"},
+		{[]string{"dog", "racecar", "car"}, ""},
+		{[]string{"alone"}, "alone"},
+		{[]string{"", "b"}, ""},
+		{[]string{"ab", "abc", "abcd"}, "ab"},
+		{[]string{"same", "same"}, "same"},
+	}
+	for _, c := range cases {
+		if got := longestCommonPrefix(c.strs); got != c.want {
+			t.Errorf("longestCommonPrefix(%q) = %q，期望 %q", c.strs, got, c.want)
+		}
+	}
+}
+--- explain
+以第一个字符串作为候选前缀，不断截短直到它是每个字符串的前缀。`prefix[:len(prefix)-1]` 对字符串切片**不会拷贝**，新字符串和原字符串共享底层字节——Go 的 string 不可变，所以这样共享是安全的。
+
+当 `prefix` 变成空字符串时，`strings.HasPrefix(s, "")` 永远为 true，循环自然结束。
+
+=== lc-20
+no: 20
+title: 有效的括号
+slug: valid-parentheses
+difficulty: 简单
+category: 字符串
+topics: 栈, 字符串
+go: 切片当栈, map, byte 与 rune
+--- desc
+字符串只包含 `()[]{}`，判断括号是否有效：左括号必须用相同类型的右括号闭合，并且按正确的顺序闭合。
+
+**示例**：`"()[]{}"` → `true`；`"(]"` → `false`；`"([)]"` → `false`；`"{[]}"` → `true`。
+--- solution
+package main
+
+func isValid(s string) bool {
+	// @solution
+	pairs := map[rune]rune{')': '(', ']': '[', '}': '{'}
+	var stack []rune
+	for _, c := range s {
+		if open, ok := pairs[c]; ok {
+			if len(stack) == 0 || stack[len(stack)-1] != open {
+				return false
+			}
+			stack = stack[:len(stack)-1]
+		} else {
+			stack = append(stack, c)
+		}
+	}
+	return len(stack) == 0
+	// @starter
+	// return false
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestIsValid(t *testing.T) {
+	cases := map[string]bool{
+		"()": true, "()[]{}": true, "(]": false, "([)]": false, "{[]}": true,
+		"(": false, ")": false, "": true, "((()))[{}]": true, "){": false,
+	}
+	for in, want := range cases {
+		if got := isValid(in); got != want {
+			t.Errorf("isValid(%q) = %v，期望 %v", in, got, want)
+		}
+	}
+}
+--- explain
+Go 没有内置的栈类型，用切片模拟：`append` 入栈，`s[len(s)-1]` 看栈顶，`s = s[:len(s)-1]` 出栈。
+
+`for _, c := range s` 遍历字符串时，`c` 是 **rune**（按 UTF-8 解码后的字符），而 `s[i]` 取到的是 byte。所以 map 的类型是 `map[rune]rune`，字符字面量 `'('` 的默认类型也是 rune。
+
+=== lc-387
+no: 387
+title: 字符串中的第一个唯一字符
+slug: first-unique-character-in-a-string
+difficulty: 简单
+category: 字符串
+topics: 字符串, 哈希表, 计数
+go: byte 与 rune, 数组值类型
+--- desc
+找到字符串中第一个**只出现一次**的字符，返回它的下标；不存在返回 `-1`。字符串只包含小写字母。
+
+**示例**：`"leetcode"` → `0`；`"loveleetcode"` → `2`；`"aabb"` → `-1`。
+--- solution
+package main
+
+func firstUniqChar(s string) int {
+	// @solution
+	var count [26]int
+	for i := 0; i < len(s); i++ {
+		count[s[i]-'a']++
+	}
+	for i := 0; i < len(s); i++ {
+		if count[s[i]-'a'] == 1 {
+			return i
+		}
+	}
+	return -1
+	// @starter
+	// return -1
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestFirstUniqChar(t *testing.T) {
+	cases := map[string]int{"leetcode": 0, "loveleetcode": 2, "aabb": -1, "z": 0, "aadadaad": -1, "abcabd": 2}
+	for in, want := range cases {
+		if got := firstUniqChar(in); got != want {
+			t.Errorf("firstUniqChar(%q) = %d，期望 %d", in, got, want)
+		}
+	}
+}
+--- explain
+两次遍历：第一遍计数，第二遍找第一个计数为 1 的位置。
+
+这里用 `for i := 0; i < len(s); i++` 按**字节下标**遍历，因为题目要求返回下标，并且只有 ASCII 字符。如果用 `for i, c := range s`，`i` 是每个 rune 的**起始字节位置**，遇到多字节字符时会跳跃（例如 `"中a"` 中 `a` 的 i 是 3）。
+
+=== lc-205
+no: 205
+title: 同构字符串
+slug: isomorphic-strings
+difficulty: 简单
+category: 字符串
+topics: 字符串, 哈希表
+go: map
+--- desc
+如果 `s` 中的字符可以按某种映射替换得到 `t`，那么两个字符串是同构的。映射必须一一对应：同一个字符只能映射到同一个字符，不同的字符不能映射到同一个字符（字符可以映射到自己）。
+
+**示例**：`"egg", "add"` → `true`；`"foo", "bar"` → `false`；`"badc", "baba"` → `false`。
+--- solution
+package main
+
+func isIsomorphic(s string, t string) bool {
+	// @solution
+	if len(s) != len(t) {
+		return false
+	}
+	st := map[byte]byte{}
+	ts := map[byte]byte{}
+	for i := 0; i < len(s); i++ {
+		a, b := s[i], t[i]
+		if x, ok := st[a]; ok && x != b {
+			return false
+		}
+		if y, ok := ts[b]; ok && y != a {
+			return false
+		}
+		st[a], ts[b] = b, a
+	}
+	return true
+	// @starter
+	// return false
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestIsIsomorphic(t *testing.T) {
+	cases := []struct {
+		s, t string
+		want bool
+	}{
+		{"egg", "add", true},
+		{"foo", "bar", false},
+		{"paper", "title", true},
+		{"badc", "baba", false},
+		{"a", "a", true},
+		{"ab", "aa", false},
+	}
+	for _, c := range cases {
+		if got := isIsomorphic(c.s, c.t); got != c.want {
+			t.Errorf("isIsomorphic(%q, %q) = %v，期望 %v", c.s, c.t, got, c.want)
+		}
+	}
+}
+--- explain
+「一一对应」需要**两个方向**都检查：只检查 s→t，`"badc" / "baba"` 会误判为同构（b→b、a→a、d→b、c→a，但 b 和 d 映射到了同一个字符）。
+
+`if x, ok := st[a]; ok && x != b` 是 if 带初始化语句的写法，`x` 和 `ok` 的作用域只在这个 if 里。
+
+=== lc-290
+no: 290
+title: 单词规律
+slug: word-pattern
+difficulty: 简单
+category: 字符串
+topics: 字符串, 哈希表
+go: 字符串标准库, map
+--- desc
+给定一种规律 `pattern` 和一个用空格分隔的字符串 `s`，判断 `s` 是否遵循这种规律：`pattern` 里的每个字母和 `s` 里的每个单词之间存在**一一对应**的关系。
+
+**示例**：`pattern = "abba", s = "dog cat cat dog"` → `true`；`"abba", "dog cat cat fish"` → `false`；`"aaaa", "dog cat cat dog"` → `false`。
+--- solution
+package main
+
+import "strings"
+
+func wordPattern(pattern string, s string) bool {
+	// @solution
+	words := strings.Fields(s)
+	if len(words) != len(pattern) {
+		return false
+	}
+	p2w := map[byte]string{}
+	w2p := map[string]byte{}
+	for i, w := range words {
+		p := pattern[i]
+		if x, ok := p2w[p]; ok && x != w {
+			return false
+		}
+		if y, ok := w2p[w]; ok && y != p {
+			return false
+		}
+		p2w[p], w2p[w] = w, p
+	}
+	return true
+	// @starter
+	// return false
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestWordPattern(t *testing.T) {
+	cases := []struct {
+		p, s string
+		want bool
+	}{
+		{"abba", "dog cat cat dog", true},
+		{"abba", "dog cat cat fish", false},
+		{"aaaa", "dog cat cat dog", false},
+		{"abba", "dog dog dog dog", false},
+		{"abc", "x y", false},
+		{"ab", "  go   lang ", true},
+	}
+	for _, c := range cases {
+		if got := wordPattern(c.p, c.s); got != c.want {
+			t.Errorf("wordPattern(%q, %q) = %v，期望 %v", c.p, c.s, got, c.want)
+		}
+	}
+}
+--- explain
+`strings.Fields` 按任意数量的空白切分，并且会忽略首尾空白，比 `strings.Split(s, " ")` 更稳妥——后者遇到连续空格会产生空字符串。
+
+和上一题一样，需要两个 map 保证双向一一对应。
+
+=== lc-13
+no: 13
+title: 罗马数字转整数
+slug: roman-to-integer
+difficulty: 简单
+category: 字符串
+topics: 字符串, 数学
+go: switch, byte 与 rune
+--- desc
+罗马数字由 `I(1) V(5) X(10) L(50) C(100) D(500) M(1000)` 组成，通常小的数字写在大的右边；特殊情况是小的写在大的左边时表示相减，例如 `IV = 4`、`IX = 9`、`XL = 40`、`CM = 900`。把罗马数字转换成整数。
+
+**示例**：`"III"` → `3`；`"LVIII"` → `58`；`"MCMXCIV"` → `1994`。
+--- solution
+package main
+
+func value(c byte) int {
+	// @solution
+	switch c {
+	case 'I':
+		return 1
+	case 'V':
+		return 5
+	case 'X':
+		return 10
+	case 'L':
+		return 50
+	case 'C':
+		return 100
+	case 'D':
+		return 500
+	case 'M':
+		return 1000
+	}
+	return 0
+	// @starter
+	// return 0
+	// @end
+}
+
+func romanToInt(s string) int {
+	// @solution
+	total := 0
+	for i := 0; i < len(s); i++ {
+		v := value(s[i])
+		if i+1 < len(s) && v < value(s[i+1]) {
+			total -= v
+		} else {
+			total += v
+		}
+	}
+	return total
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestRomanToInt(t *testing.T) {
+	cases := map[string]int{"III": 3, "IV": 4, "IX": 9, "LVIII": 58, "MCMXCIV": 1994, "MMMCMXCIX": 3999, "XLII": 42}
+	for in, want := range cases {
+		if got := romanToInt(in); got != want {
+			t.Errorf("romanToInt(%q) = %d，期望 %d", in, got, want)
+		}
+	}
+}
+--- explain
+规律：如果当前字符比右边的字符小，就减去它，否则加上它。
+
+`switch c { case 'I': ... }` 比 map 查表更快（编译器可能生成跳转表），也没有分配。Go 的 switch 默认不会贯穿（fallthrough），不需要写 break。
+
+=== lc-557
+no: 557
+title: 反转字符串中的单词 III
+slug: reverse-words-in-a-string-iii
+difficulty: 简单
+category: 字符串
+topics: 字符串, 双指针
+go: 字符串标准库, byte 与 rune
+--- desc
+反转句子中**每个单词**的字符顺序，同时保留空格和单词的初始顺序。单词之间恰好用一个空格分隔。
+
+**示例**：`"Let's take LeetCode contest"` → `"s'teL ekat edoCteeL tsetnoc"`。
+--- solution
+package main
+
+import "strings"
+
+func reverseWords(s string) string {
+	// @solution
+	words := strings.Split(s, " ")
+	for i, w := range words {
+		r := []rune(w)
+		for a, b := 0, len(r)-1; a < b; a, b = a+1, b-1 {
+			r[a], r[b] = r[b], r[a]
+		}
+		words[i] = string(r)
+	}
+	return strings.Join(words, " ")
+	// @starter
+	// return s
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestReverseWords(t *testing.T) {
+	cases := map[string]string{
+		"Let's take LeetCode contest": "s'teL ekat edoCteeL tsetnoc",
+		"Mr Ding":                     "rM gniD",
+		"a":                           "a",
+		"你好 世界":                       "好你 界世",
+	}
+	for in, want := range cases {
+		if got := reverseWords(in); got != want {
+			t.Errorf("reverseWords(%q) = %q，期望 %q", in, got, want)
+		}
+	}
+}
+--- explain
+`strings.Split` 切分、处理、`strings.Join` 拼回去，是 Go 处理字符串的常见套路。
+
+每个单词先转成 `[]rune` 再反转，这样中文这类多字节字符也能正确处理（测试里有一个中文用例）；如果按字节反转，一个汉字的 3 个字节顺序会被打乱，变成非法的 UTF-8。
+
+=== lc-412
+no: 412
+title: Fizz Buzz
+slug: fizz-buzz
+difficulty: 简单
+category: 字符串
+topics: 数学, 字符串
+go: 字符串标准库, switch, 切片
+--- desc
+返回一个字符串数组 `answer`（下标从 1 开始计数）：
+
+- i 同时是 3 和 5 的倍数：`"FizzBuzz"`；
+- i 是 3 的倍数：`"Fizz"`；
+- i 是 5 的倍数：`"Buzz"`；
+- 其他情况：i 本身的字符串形式。
+
+**示例**：`n = 5` → `["1","2","Fizz","4","Buzz"]`。
+--- solution
+package main
+
+import "strconv"
+
+func fizzBuzz(n int) []string {
+	// @solution
+	out := make([]string, 0, n)
+	for i := 1; i <= n; i++ {
+		switch {
+		case i%15 == 0:
+			out = append(out, "FizzBuzz")
+		case i%3 == 0:
+			out = append(out, "Fizz")
+		case i%5 == 0:
+			out = append(out, "Buzz")
+		default:
+			out = append(out, strconv.Itoa(i))
+		}
+	}
+	return out
+	// @starter
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestFizzBuzz(t *testing.T) {
+	want := []string{"1", "2", "Fizz", "4", "Buzz", "Fizz", "7", "8", "Fizz", "Buzz", "11", "Fizz", "13", "14", "FizzBuzz"}
+	if got := fizzBuzz(15); !slices.Equal(got, want) {
+		t.Fatalf("fizzBuzz(15) = %v", got)
+	}
+	if got := fizzBuzz(1); !slices.Equal(got, []string{"1"}) {
+		t.Fatalf("fizzBuzz(1) = %v", got)
+	}
+}
+--- explain
+整数转字符串用 `strconv.Itoa(i)`，**不要**写 `string(i)`——后者把整数当作 Unicode 码点，`string(65)` 得到的是 `"A"`（`go vet` 会对此报警）。
+
+`switch` 的 case 按顺序匹配，所以 15 的倍数要放在最前面。
+
+=== lc-67
+no: 67
+title: 二进制求和
+slug: add-binary
+difficulty: 简单
+category: 字符串
+topics: 数学, 字符串, 位运算
+go: byte 与 rune, 内置 min/max
+--- desc
+给定两个二进制字符串 `a` 和 `b`，以二进制字符串的形式返回它们的和。输入可能很长（超过 64 位），不能直接转成整数相加。
+
+**示例**：`a = "11", b = "1"` → `"100"`；`a = "1010", b = "1011"` → `"10101"`。
+--- solution
+package main
+
+func addBinary(a string, b string) string {
+	// @solution
+	out := make([]byte, 0, max(len(a), len(b))+1)
+	i, j, carry := len(a)-1, len(b)-1, 0
+	for i >= 0 || j >= 0 || carry > 0 {
+		sum := carry
+		if i >= 0 {
+			sum += int(a[i] - '0')
+			i--
+		}
+		if j >= 0 {
+			sum += int(b[j] - '0')
+			j--
+		}
+		out = append(out, byte('0'+sum%2))
+		carry = sum / 2
+	}
+	for l, r := 0, len(out)-1; l < r; l, r = l+1, r-1 {
+		out[l], out[r] = out[r], out[l]
+	}
+	return string(out)
+	// @starter
+	// return ""
+	// @end
+}
+--- test
+package main
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestAddBinary(t *testing.T) {
+	cases := []struct{ a, b, want string }{
+		{"11", "1", "100"},
+		{"1010", "1011", "10101"},
+		{"0", "0", "0"},
+		{"1", "111", "1000"},
+		{strings.Repeat("1", 100), "1", "1" + strings.Repeat("0", 100)},
+	}
+	for _, c := range cases {
+		if got := addBinary(c.a, c.b); got != c.want {
+			t.Errorf("addBinary(%q, %q) = %q，期望 %q", c.a, c.b, got, c.want)
+		}
+	}
+}
+--- explain
+从低位开始逐位相加，`a[i] - '0'` 把字符 `'0'`/`'1'` 转换成数字 0/1，`byte('0' + sum%2)` 再转回字符。
+
+结果先按低位到高位追加到 `[]byte`，最后反转一次，比每次在字符串前面拼接（每次都要分配新字符串）高效得多。

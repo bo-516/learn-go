@@ -1,0 +1,235 @@
+=== db-11-1
+--- explain
+**思路**
+
+`LIMIT offset, size` 必须先找到并丢弃前 offset 行，offset 越大越慢。**游标分页**（keyset pagination）记住上一页最后一条的 ID，下一页直接 `WHERE id < lastID ORDER BY id DESC LIMIT size`，借助索引一步定位起点，耗时和页码无关。
+
+**代码讲解**
+
+1. `PageByOffset`：模拟数据库的行为，扫描的行数是 `offset + 返回行数`（即 `end`）。offset 超出范围时扫描了全部行，返回 nil。
+2. `PageAfter`：rows 按 ID **降序**排列，`sort.Search` 要求条件对下标“先 false 后 true”，`rows[i].ID < lastID` 正好满足：前面的 ID 大（false），后面的小（true）。
+3. 返回 `rows[start:end]` 和真正读取的行数 `end - start`。
+
+**易错点**
+
+- 游标分页不能直接跳到第 N 页，适合“加载更多”、无限滚动这类场景。
+- 排序字段不唯一时（比如按时间排序），游标必须同时包含时间和 ID，条件写成 `(created, id) < (?, ?)`，否则相同时间的数据会丢失或重复（见下一题）。
+- 必须分页跳转时的另一种优化：**延迟关联**，先在覆盖索引上查出 ID：`SELECT ... FROM t JOIN (SELECT id FROM t ORDER BY id LIMIT 1000000, 10) x USING (id)`。
+
+=== db-11-2
+--- explain
+**思路**
+
+把游标编码成一个不透明的字符串交给前端：前端只需要原样传回来，不需要也不应该理解里面的内容，服务端将来改变游标结构也不会影响前端。JSON + base64 是最简单的实现；用 **URL 安全**的变体，游标可以直接放在查询参数里。
+
+**代码讲解**
+
+1. `Cursor` 的字段带 json tag，用短名字 `id`、`ts` 让编码结果更短。
+2. `EncodeCursor`：`json.Marshal` 一个只有基本类型的结构体不会失败，所以忽略了错误。
+3. `base64.RawURLEncoding`：用 `-`、`_` 代替 `+`、`/`，并且不带 `=` 填充，放在 URL 里不需要转义。
+4. `DecodeCursor`：base64 解码 → JSON 解析 → 校验 `LastID > 0`，任何一步失败都返回错误。
+
+**易错点**
+
+- 游标可以被用户篡改。如果游标里包含不应该被修改的信息（比如租户 ID、权限范围），要加 HMAC 签名，或者在服务端再次校验。
+- 用 `StdEncoding` 编码后放进 URL，`+` 会被解析成空格，解码失败。
+
+=== db-12-1
+--- explain
+**思路**
+
+死锁检测就是在**等待图**里找环。DFS 三色标记：白色未访问、灰色在当前递归路径上、黑色已经处理完。DFS 时遇到灰色节点，说明从它出发又回到了它，路径上从它开始的那一段就是环。
+
+**代码讲解**
+
+1. 函数内部用 `const ( white = iota; grey; black )` 定义局部常量。
+2. `color` map 不存在的 key 读出来是 0，正好是 white，不需要初始化。
+3. `path` 记录当前递归路径；递归闭包 `dfs` 要先 `var` 声明再赋值。
+4. `slices.Sorted(slices.Values(waits[u]))`：把邻居排序后遍历，保证结果确定；`slices.Values` 把切片变成迭代器，`slices.Sorted` 收集并排序（得到的是新切片，不修改原数据）。
+5. 遇到灰色节点 v：`slices.Index(path, v)` 找到它在路径中的位置，`path[i:]` 就是环，复制一份返回。
+6. 回溯时把 u 从路径中弹出并标黑。
+7. 外层按 ID 从小到大作为起点：`slices.Sorted(maps.Keys(waits))`。
+
+**易错点**
+
+- 只用 visited（两色）无法区分“在当前路径上”和“之前访问过”，会把 A → C、B → C 这样的汇合误判为环。
+- InnoDB 选择牺牲者的依据是“回滚代价最小”（修改的行数最少），这里简化成 ID 最大。`innodb_deadlock_detect` 在高并发热点行更新时检测本身的开销可能很大，有些场景会关闭它并依赖锁等待超时。
+
+=== db-13-1
+--- explain
+**思路**
+
+读写分离最大的问题是**主从延迟**导致“写后读不到”。常见的折中：用户刚写过的一段时间内，他的读请求走主库（读自己的写）；其他读请求在延迟可接受的从库之间轮询；没有健康的从库时降级到主库。
+
+**代码讲解**
+
+1. `now func() time.Time`：注入时间函数，测试可以模拟时间流逝，而不需要真的 sleep。
+2. `RecordWrite`：记录 `r.now()`。
+3. `ReadTarget`：先查最近写入时间，`r.now().Sub(t) < r.window` 计算距今多久。
+4. 轮询：`for range r.replicas` 最多尝试一圈，`r.next%len(r.replicas)` 取当前位置，然后 `r.next++`，跳过延迟太大的从库。
+5. 一圈都不合格就返回 `"primary"`。
+
+**易错点**
+
+- 这个 Router 没有加锁，在多个 goroutine 中使用需要加 Mutex（`lastWrite` 是 map，`next` 也会被并发修改）。
+- `lastWrite` 会一直增长，生产环境要定期清理过期的记录，或者把“最近写过”的标记放在用户会话 / Cookie 里。
+- 更精确的做法是记录写入后的 GTID，读之前确认从库已经回放到这个位置。
+
+=== db-14-1
+--- explain
+**思路**
+
+在线改表不能直接 `ALTER TABLE`（大表会长时间锁表或者产生巨大的复制延迟）。gh-ost 的做法：建影子表 → 分批拷贝旧数据 → 同时把拷贝期间的变更（从 binlog 读取）应用到影子表 → 数据追平后原子地 RENAME 切换。关键在于两种写入的冲突处理：
+
+- **拷贝**用 `INSERT IGNORE`：影子表里已经有这一行（说明是 binlog 应用的更新的数据）就不覆盖；
+- **binlog 应用**用 `REPLACE` / `DELETE`：以最新的变更为准。
+
+这样无论两者谁先谁后，最终结果都和原表一致。
+
+**代码讲解**
+
+1. `apply` 辅助函数：upsert 写入、delete 删除。
+2. `keys := slices.Sorted(maps.Keys(orig))` 取得开始时的 ID 范围 `[lo, hi]`。
+3. `applyNext` 闭包：把下一批变更同时应用到原表（模拟业务写入）和影子表（模拟 binlog 回放）。
+4. 每批按 ID 区间拷贝：从原表**当前**数据取值，影子表已有的跳过（INSERT IGNORE 语义）。
+5. 拷贝完后把剩余的变更全部应用。
+
+**易错点**
+
+- 拷贝时覆盖影子表已有的行：binlog 先写入了新值，拷贝又用旧值覆盖了它，数据错乱。
+- 拷贝开始后新插入的行（ID > hi）不在拷贝范围内，靠 binlog 回放进入影子表。
+- 真实的 gh-ost 还会根据从库延迟、负载自动限速，切换时只需要极短的锁。
+
+=== db-15-1
+--- explain
+**思路**
+
+按 `user_id` 分片后，同一个用户的订单都在同一个分片里，按用户查询很方便；但按订单号查询时不知道 user_id，只能查所有分片。**基因法**：生成订单号时把 user_id 中决定分片的那几位（低 5 位，因为 32 = 2⁵）嵌入订单号的低位，这样订单号本身就带着分片信息。
+
+**代码讲解**
+
+1. 用常量描述分片规则：`slots = dbCount * tablesPerDB`，常量表达式在编译期计算。
+2. `Route`：`slot := int(userID % slots)`，库号 `slot / 8`，表号 `slot % 8`。
+3. `OrderID`：`seq<<geneBits | userID&(slots-1)`。`slots-1` 是 31（二进制 11111），`&` 取低 5 位；`seq << 5` 把序号左移给基因位腾出空间；`|` 合并。注意 Go 的运算符优先级：`<<` 和 `&` 都高于 `|`，所以不需要括号。
+4. `RouteByOrder`：取出订单号的低 5 位当作 user_id 去路由，因为 `userID % 32` 只取决于低 5 位，两者一定落在同一个分片。
+
+**易错点**
+
+- 分片数必须是 2 的幂，`x % 32` 才等价于 `x & 31`（对非负数）。
+- 将来扩容到 64 个分片时，需要 6 位基因，旧订单号只有 5 位，这是基因法的局限，需要提前预留位数。
+- 分库分表的其他代价：跨分片查询和排序、分布式事务、全局唯一 ID、扩容时的数据迁移。
+
+=== db-16-1
+--- explain
+**思路**
+
+每次写入都 `UPDATE counter SET n = n + 1` 会让计数行成为热点（行锁串行化）。把增量先在内存里按 key **聚合**，定期一次性写出：1000 次 +1 变成 1 次 +1000，写入量大幅下降。代价是计数有短暂的延迟，进程崩溃时会丢失还没写出的增量。
+
+**代码讲解**
+
+1. `Add`：加锁后 `c.pending[key] += delta`，不存在的 key 从 0 开始。临界区非常短，没有用 defer。
+2. `Flush`：在锁内**交换**出整个 map（`batch := c.pending; c.pending = map[string]int64{}`），然后立即解锁。
+3. 在锁外按 key 排序后调用 `store`：慢 IO 不会阻塞并发的 `Add`。
+4. `if d := batch[k]; d != 0`：跳过正负抵消为 0 的 key。
+
+**易错点**
+
+- 在持锁的状态下调用 `store`：数据库变慢时所有 `Add` 都会被阻塞，影响业务请求。
+- `store` 失败时这批增量就丢了；需要可靠性时，可以把失败的增量加回 pending，或者先写本地日志。
+- 进程退出前要调用一次 Flush（比如在优雅关闭的流程里）。
+
+=== db-17-1
+--- explain
+**思路**
+
+**Little 定律**：系统中平均同时存在的请求数 = 到达速率 × 平均处理时间。每个实例需要的连接数 ≈ 每实例 QPS × 平均查询耗时，再留一些余量。同时所有实例的连接总数不能超过数据库的承受能力。
+
+**代码讲解**
+
+1. `ms := int(avgLatency.Milliseconds())`：`time.Duration` 转成毫秒。
+2. `need = ceil(peakQPS × ms × 1.5 / (instances × 1000))`：为了避免浮点数，把 1.5 写成 `× 3 / 2`，分子分母同时乘 2，然后用 `(num + den - 1) / den` 做向上取整的整数除法。
+3. `max(..., 2)` 保证至少 2 个连接；`min(need, maxConnections*8/10/instances)` 不超过分给每个实例的配额。
+4. `MaxIdle = MaxOpen`：空闲连接数太小，流量波动时连接被频繁关闭再新建，产生大量 TIME_WAIT。
+5. `MaxLifetime` 要小于 MySQL 的 `wait_timeout`，否则连接可能已经被服务端关掉，下次使用时报错（`invalid connection`）。
+
+**易错点**
+
+- 连接池不是越大越好：数据库的并发处理能力有限（大致和 CPU 核数相关），连接太多反而增加上下文切换和锁竞争。
+- `db.Stats()` 里的 `WaitCount`、`WaitDuration` 持续增长，说明连接池不够用，或者有连接泄漏。
+
+=== db-18-1
+--- explain
+**思路**
+
+`*sql.Rows` 持有一个连接，**只有在 `rows.Close()` 或者 `rows.Next()` 返回 false 后才会归还**。提前 return 而不 Close，连接就一直被占用；连接池用完后，所有查询都会阻塞。另外 `rows.Next()` 返回 false 有两种可能：正常读完，或者出错了，必须用 `rows.Err()` 区分。
+
+**代码讲解**
+
+1. `defer rows.Close()` 紧跟在错误检查之后，这是 Go 里处理“需要关闭的资源”的标准写法，任何返回路径都会关闭。
+2. `rows.Scan(&name)`：传指针，把当前行的列读到变量里。
+3. 拿够 n 行提前返回，defer 保证了连接被释放。
+4. 循环结束后 `return names, rows.Err()`：网络中断等错误会在这里暴露。
+
+**易错点**
+
+- 同样容易泄漏的写法：`db.QueryRow(...)` 后不调用 `Scan`（`Scan` 内部会关闭）；事务开启后在某个分支忘了 Commit / Rollback；把 `*sql.Rows` 返回给调用方但调用方忘了关闭。
+- 只需要一行时用 `QueryRowContext(...).Scan(...)`，没有结果时返回 `sql.ErrNoRows`。
+- 不要在循环里 `defer rows.Close()`（每次循环都查询的情况），defer 要等函数结束才执行。
+
+=== db-19-1
+--- explain
+**思路**
+
+把“开启事务 → 执行业务 → 根据结果提交或回滚”封装成一个函数，调用方只需要写业务逻辑：`return WithTx(ctx, db, func(tx *sql.Tx) error {...})`。所有收尾都放在一个 defer 里，它同时处理三种情况：正常返回、返回错误、panic。
+
+**代码讲解**
+
+1. 命名返回值 `(err error)`：defer 里可以读取 fn 的错误，也可以把 Commit 的错误写回去。
+2. `defer func() { ... }()` 里先 `recover()`：panic 时回滚，然后 `panic(p)` 重新抛出，让上层（比如 HTTP 框架的 recover 中间件）知道发生了什么。
+3. `err != nil`：回滚，返回原来的错误（Rollback 的错误用 `_` 忽略，原错误更重要）。
+4. 否则 `err = tx.Commit()`：提交失败也要报告给调用方。
+5. `return fn(tx)`：把 fn 的结果赋给命名返回值，然后执行 defer。
+
+**易错点**
+
+- 吞掉 panic（只回滚不重新 panic）：程序以为一切正常，实际上业务逻辑执行了一半。
+- 在 fn 里使用 `db` 而不是 `tx` 执行语句：那些语句不在事务中，回滚不了。
+- 事务里不要做耗时的外部调用（HTTP、MQ），事务越长持有锁的时间越长。
+
+=== db-20-1
+--- explain
+**思路**
+
+Go 的零值让“字段没传”和“字段传了零值”无法区分：`Age int` 在 JSON 里没有 age 和 `"age": 0` 解析出来都是 0。把字段改成**指针**，nil 表示没传，非 nil 表示传了（哪怕值是 0、false、空字符串）。GORM 用结构体 `Updates` 时会忽略零值字段，也是这个原因。
+
+**代码讲解**
+
+1. `Name *string`、`Age *int`、`Active *bool`：JSON 里没有这个键时保持 nil；有这个键时 `encoding/json` 会分配一个新值并让指针指向它。
+2. `ToUpdates`：逐个判断非 nil，解引用 `*p.Name` 放进 map。
+3. `ParsePatch`：解析 JSON 后转换。
+
+**易错点**
+
+- JSON 里显式写 `"age": null` 时指针也是 nil，和“没传”无法区分；需要支持“设置为 NULL”时要用 `sql.Null[T]` 或者自定义类型配合 `json.RawMessage`。
+- GORM 的其他坑：`Updates(map)` 不会执行钩子和自动更新时间之外的逻辑差异、`Save` 会更新所有字段、没有 WHERE 条件的批量更新默认被拒绝、`Find` 查不到不报错而 `First` 会返回 `ErrRecordNotFound`。
+
+=== db-21-1
+--- explain
+**思路**
+
+防 SQL 注入的原则：**值**一律用占位符 `?` 作为参数传给数据库驱动，由驱动负责转义或者使用服务端预处理；**标识符**（表名、列名、ORDER BY 的列和方向）不能用占位符，只能用**白名单**校验后拼接。
+
+**代码讲解**
+
+1. `allowed` 是包级的白名单 map。
+2. `slices.Sorted(maps.Keys(filters))`：按列名排序，生成的 SQL 稳定（也有利于数据库缓存执行计划）。
+3. 第一个条件前写 `WHERE`，之后写 `AND`；值追加到 `args`。
+4. `strings.CutPrefix(orderBy, "-")`（Go 1.20+）：有前缀时返回去掉前缀的字符串和 true，用来解析降序。
+5. 排序列同样走白名单；方向只可能是代码里写死的 `ASC` / `DESC`，不来自用户输入。
+6. `LIMIT ?` 也作为参数。
+
+**易错点**
+
+- `fmt.Sprintf("... WHERE name = '%s'", name)`：经典的注入漏洞，`name = "' OR '1'='1"` 就能绕过条件。
+- 对标识符做“转义”（比如加反引号）不如白名单可靠。
+- ORM 的原生 SQL 接口（如 GORM 的 `Raw`、`Where("name = " + x)`）同样会被注入，必须用参数形式 `Where("name = ?", x)`。

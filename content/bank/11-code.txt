@@ -1,0 +1,2449 @@
+手写代码与找 bug（CODE-01 ~ CODE-18）的编程小任务。
+
+=== code-01-1
+title: 修复带超时查询的 goroutine 泄漏
+--- desc
+下面是原题里的代码（为了便于测试，`slowCall` 和超时时间改成了参数）。它有两个问题：
+
+1. 超时返回后没人再接收 `ch`，执行 `slowCall` 的 goroutine 永远阻塞在发送上——**泄漏**；
+2. 没有使用传入的 `ctx`，上游取消时不会停止，`slowCall` 也拿不到截止时间。
+
+修复它：基于 `ctx` 派生超时 context 并传给 `slowCall`，channel 带 1 个缓冲，超时或取消时返回 `ctx.Err()`。
+--- solution
+package main
+
+import (
+	"context"
+	"time"
+)
+
+func Query(ctx context.Context, slowCall func(context.Context) string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ch := make(chan string, 1)
+	go func() {
+		ch <- slowCall(ctx)
+	}()
+	select {
+	case r := <-ch:
+		return r, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+--- starter
+package main
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+func Query(ctx context.Context, slowCall func(context.Context) string, timeout time.Duration) (string, error) {
+	ch := make(chan string)
+	go func() {
+		ch <- slowCall(context.Background())
+	}()
+	select {
+	case r := <-ch:
+		return r, nil
+	case <-time.After(timeout):
+		return "", errors.New("timeout")
+	}
+}
+--- test
+package main
+
+import (
+	"context"
+	"errors"
+	"runtime"
+	"testing"
+	"time"
+)
+
+func slow(cost time.Duration) func(context.Context) string {
+	return func(ctx context.Context) string {
+		select {
+		case <-time.After(cost):
+			return "result"
+		case <-ctx.Done():
+			return ""
+		}
+	}
+}
+
+func waitGoroutines(t *testing.T, before int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := runtime.NumGoroutine(); n > before {
+		t.Fatalf("goroutine 泄漏：之前 %d 个，现在 %d 个", before, n)
+	}
+}
+
+func TestFast(t *testing.T) {
+	if r, err := Query(context.Background(), slow(time.Millisecond), time.Second); err != nil || r != "result" {
+		t.Fatalf("got %q, %v", r, err)
+	}
+}
+
+func TestTimeoutNoLeak(t *testing.T) {
+	before := runtime.NumGoroutine()
+	for i := 0; i < 20; i++ {
+		_, err := Query(context.Background(), slow(300*time.Millisecond), 10*time.Millisecond)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("超时应返回 context.DeadlineExceeded，实际 %v", err)
+		}
+	}
+	waitGoroutines(t, before)
+}
+
+func TestParentCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(10 * time.Millisecond); cancel() }()
+	start := time.Now()
+	_, err := Query(ctx, slow(2*time.Second), 5*time.Second)
+	if !errors.Is(err, context.Canceled) || time.Since(start) > 500*time.Millisecond {
+		t.Fatalf("上游取消时应立即返回 context.Canceled：%v", err)
+	}
+}
+
+=== code-02-1
+title: 修复值接收者导致的锁失效
+race: true
+--- desc
+原题的计数器用了**值接收者**：每次调用 `Inc` 时 `c` 是一个副本，加锁的是副本里的 Mutex，goroutine 之间根本没有互斥；而 map 是引用类型，所有副本指向同一个哈希表，于是并发写 map 直接崩溃。
+
+修复它（`go vet` 的 copylocks 检查可以发现这类问题）。
+--- solution
+package main
+
+import "sync"
+
+type Counter struct {
+	mu sync.Mutex
+	n  map[string]int
+}
+
+func NewCounter() *Counter { return &Counter{n: map[string]int{}} }
+
+func (c *Counter) Inc(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n[key]++
+}
+
+func (c *Counter) Get(key string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n[key]
+}
+--- starter
+package main
+
+import "sync"
+
+type Counter struct {
+	mu sync.Mutex
+	n  map[string]int
+}
+
+func NewCounter() *Counter { return &Counter{n: map[string]int{}} }
+
+func (c Counter) Inc(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n[key]++
+}
+
+func (c Counter) Get(key string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n[key]
+}
+--- test
+package main
+
+import (
+	"sync"
+	"testing"
+)
+
+func TestCounter(t *testing.T) {
+	c := NewCounter()
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 500; i++ {
+				c.Inc("hits")
+			}
+		}()
+	}
+	wg.Wait()
+	if n := c.Get("hits"); n != 4000 {
+		t.Fatalf("hits = %d，期望 4000", n)
+	}
+}
+
+=== code-03-1
+title: 修复循环里的 defer
+--- desc
+原题的 `ProcessFiles` 在循环里 `defer f.Close()`：defer 要等**函数返回**时才执行，处理上万个文件时所有文件都一直开着，最终 `too many open files`。
+
+修复它：把每次循环的内容放进一个单独的函数（或闭包），让文件在每轮结束时就关闭。测试用一个假的 `open` 统计同时打开的文件数，必须始终不超过 1 个。
+--- solution
+package main
+
+import "io"
+
+type File interface {
+	io.Reader
+	Close() error
+}
+
+func ProcessFiles(open func(path string) (File, error), paths []string, process func(File) error) error {
+	for _, p := range paths {
+		if err := func() error {
+			f, err := open(p)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			return process(f)
+		}(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+--- starter
+package main
+
+import "io"
+
+type File interface {
+	io.Reader
+	Close() error
+}
+
+func ProcessFiles(open func(path string) (File, error), paths []string, process func(File) error) error {
+	for _, p := range paths {
+		f, err := open(p)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		if err := process(f); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+--- test
+package main
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+)
+
+type fakeFS struct {
+	open, maxOpen, closed int
+}
+
+type fakeFile struct {
+	*strings.Reader
+	fs *fakeFS
+}
+
+func (f fakeFile) Close() error {
+	f.fs.open--
+	f.fs.closed++
+	return nil
+}
+
+func (fs *fakeFS) Open(path string) (File, error) {
+	fs.open++
+	fs.maxOpen = max(fs.maxOpen, fs.open)
+	return fakeFile{strings.NewReader(path), fs}, nil
+}
+
+func TestOneFileAtATime(t *testing.T) {
+	fs := &fakeFS{}
+	var paths []string
+	for i := 0; i < 1000; i++ {
+		paths = append(paths, fmt.Sprintf("/data/%d.log", i))
+	}
+	err := ProcessFiles(fs.Open, paths, func(f File) error {
+		if fs.open > 1 {
+			return fmt.Errorf("同时打开了 %d 个文件", fs.open)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fs.maxOpen != 1 || fs.closed != 1000 {
+		t.Fatalf("最多同时打开 %d 个，关闭了 %d 个", fs.maxOpen, fs.closed)
+	}
+}
+
+func TestErrorStillCloses(t *testing.T) {
+	fs := &fakeFS{}
+	boom := errors.New("bad format")
+	n := 0
+	err := ProcessFiles(fs.Open, []string{"a", "b", "c"}, func(File) error {
+		n++
+		if n == 2 {
+			return boom
+		}
+		return nil
+	})
+	if !errors.Is(err, boom) || fs.open != 0 {
+		t.Fatalf("出错时也要关闭文件：err=%v 仍打开 %d 个", err, fs.open)
+	}
+}
+
+=== code-04-1
+title: 修复并发抓取 URL
+race: true
+--- desc
+原题代码有三个问题：`wg.Add(1)` 写在 goroutine 里；多个 goroutine 并发 `append` 同一个切片（数据竞争）；忽略错误且不限制并发数。
+
+重写 `FetchAll(ctx, urls, limit, fetch)`：
+
+- 结果按 `urls` 的顺序返回（预分配切片，每个 goroutine 写自己的下标）；
+- 同时最多 `limit` 个请求；
+- 任何一个请求出错时，返回 `fetch <url>: <原始错误>`（用 `%w`），并取消 ctx 让其他请求尽快停止。
+
+标准库里没有 errgroup，可以用 WaitGroup + 信号量 + `sync.Once` 记录第一个错误自己实现。
+--- solution
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync"
+)
+
+func FetchAll(ctx context.Context, urls []string, limit int,
+	fetch func(ctx context.Context, url string) (string, error)) ([]string, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make([]string, len(urls))
+	sem := make(chan struct{}, limit)
+	var (
+		wg       sync.WaitGroup
+		once     sync.Once
+		firstErr error
+	)
+	for i, u := range urls {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			body, err := fetch(ctx, u)
+			if err != nil {
+				once.Do(func() {
+					firstErr = fmt.Errorf("fetch %s: %w", u, err)
+					cancel()
+				})
+				return
+			}
+			results[i] = body
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return results, nil
+}
+--- starter
+package main
+
+import (
+	"context"
+	"sync"
+)
+
+func FetchAll(ctx context.Context, urls []string, limit int,
+	fetch func(ctx context.Context, url string) (string, error)) ([]string, error) {
+	var (
+		wg      sync.WaitGroup
+		results []string
+	)
+	for _, u := range urls {
+		go func() {
+			wg.Add(1)
+			defer wg.Done()
+			body, _ := fetch(ctx, u)
+			results = append(results, body)
+		}()
+	}
+	wg.Wait()
+	return results, nil
+}
+--- test
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestFetchAllOrderAndLimit(t *testing.T) {
+	var running, peak atomic.Int32
+	fetch := func(ctx context.Context, u string) (string, error) {
+		n := running.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+		running.Add(-1)
+		return "body of " + u, nil
+	}
+	var urls, want []string
+	for i := 0; i < 30; i++ {
+		u := fmt.Sprintf("https://example.com/%d", i)
+		urls = append(urls, u)
+		want = append(want, "body of "+u)
+	}
+	got, err := FetchAll(context.Background(), urls, 4, fetch)
+	if err != nil || !slices.Equal(got, want) {
+		t.Fatalf("结果顺序或内容不对：err=%v", err)
+	}
+	if p := peak.Load(); p > 4 || p < 2 {
+		t.Fatalf("并发峰值 %d，期望 2~4", p)
+	}
+}
+
+func TestFetchAllError(t *testing.T) {
+	boom := errors.New("connection refused")
+	var cancelled atomic.Int32
+	fetch := func(ctx context.Context, u string) (string, error) {
+		if u == "bad" {
+			return "", boom
+		}
+		select {
+		case <-ctx.Done():
+			cancelled.Add(1)
+			return "", ctx.Err()
+		case <-time.After(2 * time.Second):
+			return "ok", nil
+		}
+	}
+	start := time.Now()
+	_, err := FetchAll(context.Background(), []string{"a", "bad", "c", "d"}, 4, fetch)
+	if !errors.Is(err, boom) || !strings.Contains(err.Error(), "fetch bad") {
+		t.Fatalf("err = %v", err)
+	}
+	if time.Since(start) > time.Second || cancelled.Load() == 0 {
+		t.Fatal("出错后应取消其他请求并尽快返回")
+	}
+}
+
+=== code-05-1
+title: 两个 goroutine 交替打印奇偶数
+--- desc
+实现 `Alternate(n, odd, even)`：启动**两个** goroutine，一个只负责奇数、一个只负责偶数，按 `1, 2, 3, …, n` 的顺序交替调用 `odd(i)` / `even(i)`，全部完成后返回。
+
+测试会检查：所有 `odd` 调用来自同一个 goroutine，所有 `even` 调用来自另一个 goroutine，并且顺序严格交替。
+
+提示：用两个无缓冲 channel 互相「传球」。
+--- solution
+package main
+
+import "sync"
+
+func Alternate(n int, odd, even func(int)) {
+	// @solution
+	oddTurn := make(chan struct{})
+	evenTurn := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 1; i <= n; i += 2 {
+			<-oddTurn
+			odd(i)
+			if i+1 <= n {
+				evenTurn <- struct{}{}
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 2; i <= n; i += 2 {
+			<-evenTurn
+			even(i)
+			if i+1 <= n {
+				oddTurn <- struct{}{}
+			}
+		}
+	}()
+	if n >= 1 {
+		oddTurn <- struct{}{}
+	}
+	wg.Wait()
+	// @starter
+	// // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"bytes"
+	"runtime"
+	"strconv"
+	"sync"
+	"testing"
+)
+
+func gid() int {
+	buf := make([]byte, 64)
+	buf = buf[:runtime.Stack(buf, false)]
+	buf = bytes.TrimPrefix(buf, []byte("goroutine "))
+	id, _ := strconv.Atoi(string(buf[:bytes.IndexByte(buf, ' ')]))
+	return id
+}
+
+func TestAlternate(t *testing.T) {
+	for _, n := range []int{10, 7, 1} {
+		var mu sync.Mutex
+		var seq []int
+		oddG, evenG := map[int]bool{}, map[int]bool{}
+		Alternate(n,
+			func(i int) { mu.Lock(); seq = append(seq, i); oddG[gid()] = true; mu.Unlock() },
+			func(i int) { mu.Lock(); seq = append(seq, i); evenG[gid()] = true; mu.Unlock() })
+		if len(seq) != n {
+			t.Fatalf("n=%d：输出 %v", n, seq)
+		}
+		for i, v := range seq {
+			if v != i+1 {
+				t.Fatalf("n=%d：顺序不对 %v", n, seq)
+			}
+		}
+		if len(oddG) != 1 || len(evenG) > 1 || oddG[gid()] {
+			t.Fatalf("奇数和偶数应分别由一个固定的、不同于调用方的 goroutine 输出")
+		}
+		for g := range oddG {
+			if evenG[g] {
+				t.Fatal("奇数和偶数必须由不同的 goroutine 输出")
+			}
+		}
+	}
+}
+
+=== code-05-2
+title: 三个 goroutine 轮流打印 ABC
+--- desc
+扩展上一题：启动三个 goroutine，分别只打印 `A`、`B`、`C`，按 `ABCABC…` 的顺序轮流调用 `print`，共 `rounds` 轮。
+
+思路：准备三个 channel，第 i 个 goroutine 等待自己的 channel，打印后通知下一个。注意最后一轮结束时不要向没人接收的 channel 发送，否则会死锁或泄漏。
+--- solution
+package main
+
+import "sync"
+
+func ABC(rounds int, print func(string)) {
+	// @solution
+	letters := []string{"A", "B", "C"}
+	turns := make([]chan struct{}, 3)
+	for i := range turns {
+		turns[i] = make(chan struct{})
+	}
+	var wg sync.WaitGroup
+	for i, l := range letters {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for r := 0; r < rounds; r++ {
+				<-turns[i]
+				print(l)
+				if r == rounds-1 && i == 2 {
+					return
+				}
+				turns[(i+1)%3] <- struct{}{}
+			}
+		}()
+	}
+	if rounds > 0 {
+		turns[0] <- struct{}{}
+	}
+	wg.Wait()
+	// @starter
+	// // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"bytes"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func gid() int {
+	buf := make([]byte, 64)
+	buf = buf[:runtime.Stack(buf, false)]
+	buf = bytes.TrimPrefix(buf, []byte("goroutine "))
+	id, _ := strconv.Atoi(string(buf[:bytes.IndexByte(buf, ' ')]))
+	return id
+}
+
+func TestABC(t *testing.T) {
+	var mu sync.Mutex
+	var sb strings.Builder
+	owners := map[string]map[int]bool{"A": {}, "B": {}, "C": {}}
+	done := make(chan struct{})
+	go func() {
+		ABC(5, func(s string) {
+			mu.Lock()
+			defer mu.Unlock()
+			sb.WriteString(s)
+			owners[s][gid()] = true
+		})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("超时：可能发生了死锁")
+	}
+	if sb.String() != "ABCABCABCABCABC" {
+		t.Fatalf("输出 %q", sb.String())
+	}
+	seen := map[int]bool{}
+	for l, gs := range owners {
+		if len(gs) != 1 {
+			t.Fatalf("%s 应由同一个 goroutine 打印", l)
+		}
+		for g := range gs {
+			if seen[g] {
+				t.Fatal("A、B、C 应由三个不同的 goroutine 打印")
+			}
+			seen[g] = true
+		}
+	}
+}
+
+=== code-06-1
+title: 带优雅关闭的 worker 池
+race: true
+--- desc
+实现 worker 池 `Pool`：
+
+- `NewPool(workers, queue)`：启动 `workers` 个 worker，任务队列容量为 `queue`；
+- `Submit(task)`：提交任务，队列满时阻塞；池已关闭返回 `ErrClosed`（不能 panic）；
+- `Shutdown(ctx)`：停止接收新任务，等待**已提交的任务全部执行完**；`ctx` 先到期则返回 `ctx.Err()`。
+
+难点：`Submit` 和 `Shutdown` 并发执行时，不能向已关闭的 channel 发送。可以用读写锁：`Submit` 持读锁发送，`Shutdown` 持写锁设置关闭标记并关闭 channel。
+--- solution
+package main
+
+import (
+	"context"
+	"errors"
+	"sync"
+)
+
+var ErrClosed = errors.New("pool closed")
+
+type Pool struct {
+	mu     sync.RWMutex
+	closed bool
+	tasks  chan func()
+	wg     sync.WaitGroup
+}
+
+func NewPool(workers, queue int) *Pool {
+	p := &Pool{tasks: make(chan func(), queue)}
+	for i := 0; i < workers; i++ {
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			for task := range p.tasks {
+				task()
+			}
+		}()
+	}
+	return p
+}
+
+func (p *Pool) Submit(task func()) error {
+	// @solution
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.closed {
+		return ErrClosed
+	}
+	p.tasks <- task
+	return nil
+	// @starter
+	// p.tasks <- task // TODO: 关闭后再提交会 panic
+	// return nil
+	// @end
+}
+
+func (p *Pool) Shutdown(ctx context.Context) error {
+	// @solution
+	p.mu.Lock()
+	if !p.closed {
+		p.closed = true
+		close(p.tasks)
+	}
+	p.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	// @starter
+	// return nil // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestPool(t *testing.T) {
+	p := NewPool(3, 10)
+	var done, running, peak atomic.Int32
+	for i := 0; i < 30; i++ {
+		err := p.Submit(func() {
+			n := running.Add(1)
+			for {
+				m := peak.Load()
+				if n <= m || peak.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			time.Sleep(2 * time.Millisecond)
+			running.Add(-1)
+			done.Add(1)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := p.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if done.Load() != 30 {
+		t.Fatalf("Shutdown 返回时只完成了 %d 个任务", done.Load())
+	}
+	if peak.Load() > 3 {
+		t.Fatalf("并发峰值 %d 超过 worker 数", peak.Load())
+	}
+	if err := p.Submit(func() {}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("关闭后提交应返回 ErrClosed，实际 %v", err)
+	}
+	if err := p.Shutdown(context.Background()); err != nil {
+		t.Fatal("重复 Shutdown 不应出错")
+	}
+}
+
+func TestShutdownTimeout(t *testing.T) {
+	p := NewPool(1, 1)
+	p.Submit(func() { time.Sleep(300 * time.Millisecond) })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := p.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("等待超时应返回 DeadlineExceeded，实际 %v", err)
+	}
+}
+
+=== code-07-1
+title: 并发调用、任一失败取消其余、总超时
+race: true
+--- desc
+实现 `CallAll(ctx, timeout, calls)`：
+
+- 并发执行所有调用，整体超时 `timeout`；
+- 全部成功：按顺序返回结果；
+- 任何一个失败：**立即**返回这个错误，并取消其余调用（它们收到 ctx 取消后会退出）；
+- 超时：返回 `context.DeadlineExceeded`。
+
+返回前要保证不会留下阻塞的 goroutine（结果 channel 带足够的缓冲）。
+--- solution
+package main
+
+import (
+	"context"
+	"time"
+)
+
+func CallAll(ctx context.Context, timeout time.Duration, calls []func(ctx context.Context) (string, error)) ([]string, error) {
+	// @solution
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	type result struct {
+		i   int
+		v   string
+		err error
+	}
+	ch := make(chan result, len(calls))
+	for i, call := range calls {
+		go func() {
+			v, err := call(ctx)
+			ch <- result{i, v, err}
+		}()
+	}
+	out := make([]string, len(calls))
+	for range calls {
+		select {
+		case r := <-ch:
+			if r.err != nil {
+				return nil, r.err
+			}
+			out[r.i] = r.v
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return out, nil
+	// @starter
+	// out := make([]string, len(calls))
+	// for i, call := range calls { // TODO: 串行，失败也不会取消其他调用
+	// 	v, err := call(ctx)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// 	out[i] = v
+	// }
+	// return out, nil
+	// @end
+}
+--- starter
+package main
+
+import (
+	"context"
+	"time"
+)
+
+func CallAll(ctx context.Context, timeout time.Duration, calls []func(ctx context.Context) (string, error)) ([]string, error) {
+	out := make([]string, len(calls))
+	for i, call := range calls { // TODO: 串行执行，没有超时，失败也不会取消其他调用
+		v, err := call(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = v
+	}
+	return out, nil
+}
+--- test
+package main
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func call(d time.Duration, v string, err error, cancelled *atomic.Int32) func(context.Context) (string, error) {
+	return func(ctx context.Context) (string, error) {
+		select {
+		case <-time.After(d):
+			return v, err
+		case <-ctx.Done():
+			if cancelled != nil {
+				cancelled.Add(1)
+			}
+			return "", ctx.Err()
+		}
+	}
+}
+
+func TestAllOK(t *testing.T) {
+	start := time.Now()
+	got, err := CallAll(context.Background(), time.Second, []func(context.Context) (string, error){
+		call(30*time.Millisecond, "user", nil, nil),
+		call(20*time.Millisecond, "orders", nil, nil),
+		call(10*time.Millisecond, "coupons", nil, nil),
+	})
+	if err != nil || !slices.Equal(got, []string{"user", "orders", "coupons"}) {
+		t.Fatalf("got %v, %v", got, err)
+	}
+	if time.Since(start) > 200*time.Millisecond {
+		t.Fatal("应并发执行")
+	}
+}
+
+func TestOneFails(t *testing.T) {
+	boom := errors.New("orders unavailable")
+	var cancelled atomic.Int32
+	start := time.Now()
+	_, err := CallAll(context.Background(), 5*time.Second, []func(context.Context) (string, error){
+		call(2*time.Second, "user", nil, &cancelled),
+		call(10*time.Millisecond, "", boom, nil),
+		call(2*time.Second, "coupons", nil, &cancelled),
+	})
+	if !errors.Is(err, boom) || time.Since(start) > 500*time.Millisecond {
+		t.Fatalf("应立即返回失败：err=%v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if cancelled.Load() != 2 {
+		t.Fatalf("其余 2 个调用应被取消，实际 %d 个", cancelled.Load())
+	}
+}
+
+func TestTimeout(t *testing.T) {
+	_, err := CallAll(context.Background(), 30*time.Millisecond, []func(context.Context) (string, error){
+		call(time.Second, "slow", nil, nil),
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("应返回 DeadlineExceeded，实际 %v", err)
+	}
+}
+
+=== code-08-1
+title: 令牌桶限流器
+race: true
+--- desc
+实现令牌桶 `TokenBucket`：
+
+- 以每秒 `rate` 个的速度生成令牌，桶里最多 `burst` 个；初始时桶是满的；
+- `AllowN(n)`：先根据距离上次的时间补充令牌（不超过 burst），令牌够 n 个就扣减并返回 true，否则返回 false（不扣减）；
+- `Allow()` 等价于 `AllowN(1)`；
+- 并发安全，时间通过注入的 `now` 获取。
+
+和漏桶相比，令牌桶允许一定程度的突发（最多 burst 个），是最常用的限流算法（`golang.org/x/time/rate`）。
+--- solution
+package main
+
+import (
+	"sync"
+	"time"
+)
+
+type TokenBucket struct {
+	mu     sync.Mutex
+	rate   float64
+	burst  float64
+	tokens float64
+	last   time.Time
+	now    func() time.Time
+}
+
+func NewTokenBucket(rate float64, burst int, now func() time.Time) *TokenBucket {
+	return &TokenBucket{rate: rate, burst: float64(burst), tokens: float64(burst), last: now(), now: now}
+}
+
+func (b *TokenBucket) AllowN(n int) bool {
+	// @solution
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.now()
+	b.tokens = min(b.burst, b.tokens+now.Sub(b.last).Seconds()*b.rate)
+	b.last = now
+	if b.tokens < float64(n) {
+		return false
+	}
+	b.tokens -= float64(n)
+	return true
+	// @starter
+	// return true // TODO
+	// @end
+}
+
+func (b *TokenBucket) Allow() bool { return b.AllowN(1) }
+--- test
+package main
+
+import (
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestTokenBucket(t *testing.T) {
+	now := time.Unix(0, 0)
+	var mu sync.Mutex
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+
+	b := NewTokenBucket(10, 5, clock) // 每秒 10 个，桶容量 5
+	var ok atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if b.Allow() {
+				ok.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if ok.Load() != 5 {
+		t.Fatalf("初始突发最多 5 个，实际 %d", ok.Load())
+	}
+	advance(300 * time.Millisecond) // 补充 3 个
+	if !b.AllowN(3) || b.Allow() {
+		t.Fatal("300ms 后应正好有 3 个令牌")
+	}
+	advance(10 * time.Second) // 不能超过容量
+	if b.AllowN(6) {
+		t.Fatal("令牌数不能超过 burst")
+	}
+	if !b.AllowN(5) {
+		t.Fatal("应有 5 个令牌")
+	}
+}
+
+=== code-09-1
+title: 滑动窗口限流器
+--- desc
+按原题的「滑动窗口计数器」实现单机版限流：只保留当前窗口和上一个窗口的计数，用上一个窗口的计数乘以**重叠比例**近似滑动窗口内的请求数：
+
+1. 当前时刻距离当前窗口起点超过一个窗口时，切换窗口：超过两个窗口（中间空了一个完整窗口）`prev = 0`，否则 `prev = cur`；`cur = 0`，新的窗口起点为 `now.Truncate(window)`；
+2. `weight = 1 − (now − 当前窗口起点) / window`；
+3. `prev × weight + cur >= limit` 时拒绝，否则 `cur++` 并放行。
+
+时间通过注入的 `now` 获取。Redis 版本的实现（ZSET 滑动日志 + Lua）见原题答案。
+--- solution
+package main
+
+import (
+	"sync"
+	"time"
+)
+
+type SlidingWindow struct {
+	mu        sync.Mutex
+	limit     int
+	window    time.Duration
+	now       func() time.Time
+	curStart  time.Time
+	cur, prev int
+}
+
+func NewSlidingWindow(limit int, window time.Duration, now func() time.Time) *SlidingWindow {
+	return &SlidingWindow{limit: limit, window: window, now: now}
+}
+
+func (s *SlidingWindow) Allow() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// @solution
+	now := s.now()
+	if elapsed := now.Sub(s.curStart); elapsed >= s.window {
+		if elapsed >= 2*s.window {
+			s.prev = 0
+		} else {
+			s.prev = s.cur
+		}
+		s.cur = 0
+		s.curStart = now.Truncate(s.window)
+	}
+	weight := 1 - float64(now.Sub(s.curStart))/float64(s.window)
+	if float64(s.prev)*weight+float64(s.cur) >= float64(s.limit) {
+		return false
+	}
+	s.cur++
+	return true
+	// @starter
+	// return true // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+func count(s *SlidingWindow, n int) int {
+	ok := 0
+	for i := 0; i < n; i++ {
+		if s.Allow() {
+			ok++
+		}
+	}
+	return ok
+}
+
+func TestSlidingWindow(t *testing.T) {
+	base := time.Unix(100, 0)
+	now := base
+	s := NewSlidingWindow(10, time.Second, func() time.Time { return now })
+	if n := count(s, 20); n != 10 {
+		t.Fatalf("第一个窗口放行 %d 个，期望 10", n)
+	}
+	now = base.Add(1500 * time.Millisecond)
+	if n := count(s, 20); n != 5 {
+		t.Fatalf("1.5s 时上一窗口还占一半权重，应只放行 5 个，实际 %d", n)
+	}
+	now = base.Add(1900 * time.Millisecond)
+	if n := count(s, 20); n != 4 {
+		t.Fatalf("1.9s 时（上一窗口权重 0.1）应再放行 4 个，实际 %d", n)
+	}
+	now = base.Add(3500 * time.Millisecond)
+	if n := count(s, 20); n != 10 {
+		t.Fatalf("空了一个完整窗口后应重新放行 10 个，实际 %d", n)
+	}
+}
+
+=== code-10-1
+title: 实现 singleflight
+race: true
+--- desc
+实现简化版的 `singleflight.Group`：
+
+- `Do(key, fn)`：同一时刻对同一个 key 的多个调用只执行一次 `fn`，其他调用者等待并共享结果。返回 `(v, err, shared)`，`shared` 表示这个调用者**没有亲自执行** fn，而是拿到了别人的结果；
+- `Forget(key)`：让后续的调用不再等待正在进行的那次，而是重新执行（例如发现结果可能已经过期）；
+- fn 执行完后要删除记录，之后的调用会重新执行。
+--- solution
+package main
+
+import "sync"
+
+type call struct {
+	wg  sync.WaitGroup
+	val any
+	err error
+}
+
+type Group struct {
+	mu sync.Mutex
+	m  map[string]*call
+}
+
+func (g *Group) Do(key string, fn func() (any, error)) (v any, err error, shared bool) {
+	// @solution
+	g.mu.Lock()
+	if g.m == nil {
+		g.m = map[string]*call{}
+	}
+	if c, ok := g.m[key]; ok {
+		g.mu.Unlock()
+		c.wg.Wait()
+		return c.val, c.err, true
+	}
+	c := &call{}
+	c.wg.Add(1)
+	g.m[key] = c
+	g.mu.Unlock()
+
+	c.val, c.err = fn()
+	c.wg.Done()
+
+	g.mu.Lock()
+	if g.m[key] == c { // 可能已经被 Forget，并被新的调用替换
+		delete(g.m, key)
+	}
+	g.mu.Unlock()
+	return c.val, c.err, false
+	// @starter
+	// v, err = fn() // TODO
+	// return v, err, false
+	// @end
+}
+
+func (g *Group) Forget(key string) {
+	// @solution
+	g.mu.Lock()
+	delete(g.m, key)
+	g.mu.Unlock()
+	// @starter
+	// // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestDo(t *testing.T) {
+	var g Group
+	var calls, shared atomic.Int32
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			v, err, sh := g.Do("user:1", func() (any, error) {
+				calls.Add(1)
+				<-release
+				return "alice", nil
+			})
+			if v != "alice" || err != nil {
+				t.Errorf("v=%v err=%v", v, err)
+			}
+			if sh {
+				shared.Add(1)
+			}
+		}()
+	}
+	time.Sleep(30 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	if calls.Load() != 1 || shared.Load() != 49 {
+		t.Fatalf("fn 执行 %d 次（期望 1），共享结果 %d 次（期望 49）", calls.Load(), shared.Load())
+	}
+	g.Do("user:1", func() (any, error) { calls.Add(1); return nil, nil })
+	if calls.Load() != 2 {
+		t.Fatal("上一次完成后，新的调用应重新执行")
+	}
+}
+
+func TestForget(t *testing.T) {
+	var g Group
+	var calls atomic.Int32
+	release := make(chan struct{})
+	go g.Do("k", func() (any, error) { calls.Add(1); <-release; return 1, nil })
+	time.Sleep(20 * time.Millisecond)
+	g.Forget("k")
+	_, _, shared := g.Do("k", func() (any, error) { calls.Add(1); return 2, nil })
+	close(release)
+	if shared || calls.Load() != 2 {
+		t.Fatal("Forget 之后的调用应重新执行，而不是等待旧的那次")
+	}
+}
+
+=== code-11-1
+title: 发布订阅
+race: true
+--- desc
+实现进程内的发布订阅 `PubSub`：
+
+- `Subscribe(topic, buf)`：返回一个缓冲大小为 `buf` 的只读 channel 和一个取消函数；取消函数会退订并关闭 channel，可以重复调用；
+- `Publish(topic, msg)`：**非阻塞**地投递给该主题的所有订阅者，某个订阅者缓冲满了就丢弃给它的这条消息（不能拖慢发布者），返回成功投递的数量；
+- `Close()`：关闭所有订阅者的 channel；之后 `Publish` 返回 0，`Subscribe` 返回一个已关闭的 channel。
+
+注意并发安全，以及「关闭后不能再向 channel 发送」。
+--- solution
+package main
+
+import "sync"
+
+type PubSub struct {
+	mu     sync.RWMutex
+	subs   map[string]map[int]chan string
+	nextID int
+	closed bool
+}
+
+func NewPubSub() *PubSub { return &PubSub{subs: map[string]map[int]chan string{}} }
+
+func (ps *PubSub) Subscribe(topic string, buf int) (<-chan string, func()) {
+	// @solution
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	ch := make(chan string, buf)
+	if ps.closed {
+		close(ch)
+		return ch, func() {}
+	}
+	id := ps.nextID
+	ps.nextID++
+	if ps.subs[topic] == nil {
+		ps.subs[topic] = map[int]chan string{}
+	}
+	ps.subs[topic][id] = ch
+	cancel := func() {
+		ps.mu.Lock()
+		defer ps.mu.Unlock()
+		if c, ok := ps.subs[topic][id]; ok {
+			delete(ps.subs[topic], id)
+			close(c)
+		}
+	}
+	return ch, cancel
+	// @starter
+	// ch := make(chan string, buf) // TODO
+	// return ch, func() {}
+	// @end
+}
+
+func (ps *PubSub) Publish(topic, msg string) int {
+	// @solution
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	n := 0
+	for _, ch := range ps.subs[topic] {
+		select {
+		case ch <- msg:
+			n++
+		default:
+		}
+	}
+	return n
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+
+func (ps *PubSub) Close() {
+	// @solution
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if ps.closed {
+		return
+	}
+	ps.closed = true
+	for _, subs := range ps.subs {
+		for _, ch := range subs {
+			close(ch)
+		}
+	}
+	ps.subs = map[string]map[int]chan string{}
+	// @starter
+	// // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestPubSub(t *testing.T) {
+	ps := NewPubSub()
+	a, cancelA := ps.Subscribe("orders", 10)
+	b, _ := ps.Subscribe("orders", 10)
+	other, _ := ps.Subscribe("users", 10)
+	if n := ps.Publish("orders", "created"); n != 2 {
+		t.Fatalf("应投递给 2 个订阅者，实际 %d", n)
+	}
+	if <-a != "created" || <-b != "created" || len(other) != 0 {
+		t.Fatal("消息投递不对")
+	}
+	cancelA()
+	cancelA()
+	if _, ok := <-a; ok {
+		t.Fatal("取消订阅后 channel 应被关闭")
+	}
+	if n := ps.Publish("orders", "paid"); n != 1 {
+		t.Fatalf("取消后只剩 1 个订阅者，实际投递 %d", n)
+	}
+}
+
+func TestSlowSubscriber(t *testing.T) {
+	ps := NewPubSub()
+	slow, _ := ps.Subscribe("t", 1)
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 100; i++ {
+			ps.Publish("t", "x")
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("慢订阅者阻塞了发布")
+	}
+	if len(slow) != 1 {
+		t.Fatalf("缓冲为 1，应保留 1 条，实际 %d", len(slow))
+	}
+}
+
+func TestClose(t *testing.T) {
+	ps := NewPubSub()
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		ch, _ := ps.Subscribe("t", 100)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range ch {
+			}
+		}()
+	}
+	for i := 0; i < 50; i++ {
+		ps.Publish("t", "m")
+	}
+	ps.Close()
+	wg.Wait()
+	if ps.Publish("t", "late") != 0 {
+		t.Fatal("关闭后 Publish 应返回 0")
+	}
+	if ch, _ := ps.Subscribe("t", 1); func() bool { _, ok := <-ch; return ok }() {
+		t.Fatal("关闭后 Subscribe 应返回已关闭的 channel")
+	}
+}
+
+=== code-12-1
+title: 多生产者多消费者，收到退出信号时优雅停止
+race: true
+--- desc
+实现 `Run(ctx, producers, consumers, produce, consume)`：
+
+- 生产者循环调用 `produce(ctx)` 获取任务，返回 `false` 表示没有更多任务；发送任务时要同时监听 `ctx.Done()`，收到退出信号就停止；
+- 所有生产者退出后，由**单独的协调者**关闭任务 channel（只关闭一次）；
+- 消费者用 `for range` 消费，把**已经入队的任务处理完**再退出；
+- `Run` 等所有消费者退出后返回。
+
+测试会在中途取消 ctx：Run 必须很快返回，并且丢失的任务（已经被生产者取出、但没被消费的）不能超过生产者数量（每个生产者最多手里有一个没送出去）。
+--- solution
+package main
+
+import (
+	"context"
+	"sync"
+)
+
+func Run(ctx context.Context, producers, consumers int,
+	produce func(ctx context.Context) (int, bool), consume func(int)) {
+	jobs := make(chan int, 16)
+	// @solution
+	var prod, cons sync.WaitGroup
+	for p := 0; p < producers; p++ {
+		prod.Add(1)
+		go func() {
+			defer prod.Done()
+			for {
+				job, ok := produce(ctx)
+				if !ok {
+					return
+				}
+				select {
+				case jobs <- job:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		prod.Wait()
+		close(jobs)
+	}()
+	for c := 0; c < consumers; c++ {
+		cons.Add(1)
+		go func() {
+			defer cons.Done()
+			for job := range jobs {
+				consume(job)
+			}
+		}()
+	}
+	cons.Wait()
+	// @starter
+	// // TODO
+	// _ = jobs
+	// @end
+}
+--- test
+package main
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+type source struct {
+	next  atomic.Int64
+	total int64
+	taken atomic.Int64
+}
+
+func (s *source) produce(ctx context.Context) (int, bool) {
+	if ctx.Err() != nil {
+		return 0, false
+	}
+	n := s.next.Add(1)
+	if n > s.total {
+		return 0, false
+	}
+	s.taken.Add(1)
+	time.Sleep(200 * time.Microsecond)
+	return int(n), true
+}
+
+func TestDrainAll(t *testing.T) {
+	src := &source{total: 1000}
+	var mu sync.Mutex
+	seen := map[int]bool{}
+	Run(context.Background(), 3, 4, src.produce, func(j int) {
+		mu.Lock()
+		seen[j] = true
+		mu.Unlock()
+	})
+	if len(seen) != 1000 {
+		t.Fatalf("没有取消时应处理全部 1000 个任务，实际 %d", len(seen))
+	}
+}
+
+func TestGracefulStop(t *testing.T) {
+	src := &source{total: 1 << 40}
+	ctx, cancel := context.WithCancel(context.Background())
+	var consumed atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		Run(ctx, 3, 2, src.produce, func(int) {
+			time.Sleep(100 * time.Microsecond)
+			consumed.Add(1)
+		})
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("取消后 Run 应尽快返回")
+	}
+	lost := src.taken.Load() - consumed.Load()
+	if consumed.Load() == 0 || lost < 0 || lost > 3 {
+		t.Fatalf("取出 %d 个，消费 %d 个：已入队的任务应全部处理完", src.taken.Load(), consumed.Load())
+	}
+}
+
+=== code-13-1
+title: 泛型 fan-in：合并多个 channel
+race: true
+--- desc
+实现泛型函数 `Merge[T any](chs ...<-chan T) <-chan T`：把多个输入 channel 的数据合并到一个输出 channel。
+
+- 每个输入启动一个 goroutine 转发；
+- **所有**输入都关闭之后关闭输出（用 WaitGroup + 单独的关闭 goroutine）；
+- 没有输入时返回一个已关闭的 channel。
+--- solution
+package main
+
+import "sync"
+
+func Merge[T any](chs ...<-chan T) <-chan T {
+	out := make(chan T)
+	// @solution
+	var wg sync.WaitGroup
+	for _, ch := range chs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for v := range ch {
+				out <- v
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	// @starter
+	// // TODO
+	// @end
+	return out
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+	"time"
+)
+
+func gen[T any](vals ...T) <-chan T {
+	ch := make(chan T)
+	go func() {
+		defer close(ch)
+		for _, v := range vals {
+			ch <- v
+		}
+	}()
+	return ch
+}
+
+func collect[T any](t *testing.T, ch <-chan T) []T {
+	t.Helper()
+	var out []T
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case v, ok := <-ch:
+			if !ok {
+				return out
+			}
+			out = append(out, v)
+		case <-timeout:
+			t.Fatal("超时：输出 channel 没有被关闭")
+		}
+	}
+}
+
+func TestMerge(t *testing.T) {
+	got := collect(t, Merge(gen(1, 2, 3), gen(10, 20), gen[int]()))
+	slices.Sort(got)
+	if !slices.Equal(got, []int{1, 2, 3, 10, 20}) {
+		t.Fatalf("got %v", got)
+	}
+	words := collect(t, Merge(gen("go"), gen("is", "fun")))
+	if len(words) != 3 {
+		t.Fatalf("泛型版本：got %v", words)
+	}
+	if got := collect(t, Merge[int]()); len(got) != 0 {
+		t.Fatal("没有输入时应返回已关闭的 channel")
+	}
+}
+
+=== code-13-2
+title: 有序合并两个有序 channel
+--- desc
+两个 channel 各自按升序输出整数。实现 `MergeSorted(a, b)`，返回一个按升序输出所有元素的 channel（类似归并排序的合并步骤），两个输入都读完后关闭输出。
+
+提示：分别缓存两边「当前读到的值」，每次输出较小的那个，再从那一边补读一个。
+--- solution
+package main
+
+func MergeSorted(a, b <-chan int) <-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)
+		// @solution
+		va, okA := <-a
+		vb, okB := <-b
+		for okA || okB {
+			if okA && (!okB || va <= vb) {
+				out <- va
+				va, okA = <-a
+			} else {
+				out <- vb
+				vb, okB = <-b
+			}
+		}
+		// @starter
+		// // TODO
+		// @end
+	}()
+	return out
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func gen(vals ...int) <-chan int {
+	ch := make(chan int)
+	go func() {
+		defer close(ch)
+		for _, v := range vals {
+			ch <- v
+		}
+	}()
+	return ch
+}
+
+func TestMergeSorted(t *testing.T) {
+	cases := []struct{ a, b, want []int }{
+		{[]int{1, 4, 9}, []int{2, 3, 10, 11}, []int{1, 2, 3, 4, 9, 10, 11}},
+		{nil, []int{5, 6}, []int{5, 6}},
+		{[]int{1, 1, 2}, []int{1}, []int{1, 1, 1, 2}},
+		{nil, nil, nil},
+	}
+	for _, c := range cases {
+		var got []int
+		for v := range MergeSorted(gen(c.a...), gen(c.b...)) {
+			got = append(got, v)
+		}
+		if !slices.Equal(got, c.want) {
+			t.Errorf("MergeSorted(%v, %v) = %v", c.a, c.b, got)
+		}
+	}
+}
+
+=== code-14-1
+title: 并发安全的 LRU 缓存
+race: true
+--- desc
+用 `container/list`（双向链表）+ map 实现 LRU 缓存：
+
+- `Get(key)`：命中时把元素移到链表头部（最近使用）；
+- `Put(key, val)`：已存在则更新并移到头部；不存在则插入头部，超过容量时淘汰**尾部**（最久未使用）的元素；
+- `Len()`；
+- 所有方法并发安全。注意 `Get` 也会修改链表顺序，所以要用写锁（`sync.Mutex`），不能用读锁。
+--- solution
+package main
+
+import (
+	"container/list"
+	"sync"
+)
+
+type entry struct {
+	key string
+	val int
+}
+
+type LRU struct {
+	mu    sync.Mutex
+	cap   int
+	ll    *list.List
+	items map[string]*list.Element
+}
+
+func NewLRU(capacity int) *LRU {
+	return &LRU{cap: capacity, ll: list.New(), items: map[string]*list.Element{}}
+}
+
+func (c *LRU) Get(key string) (int, bool) {
+	// @solution
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.items[key]; ok {
+		c.ll.MoveToFront(e)
+		return e.Value.(*entry).val, true
+	}
+	return 0, false
+	// @starter
+	// return 0, false // TODO
+	// @end
+}
+
+func (c *LRU) Put(key string, val int) {
+	// @solution
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.items[key]; ok {
+		e.Value.(*entry).val = val
+		c.ll.MoveToFront(e)
+		return
+	}
+	c.items[key] = c.ll.PushFront(&entry{key, val})
+	if c.ll.Len() > c.cap {
+		oldest := c.ll.Back()
+		c.ll.Remove(oldest)
+		delete(c.items, oldest.Value.(*entry).key)
+	}
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (c *LRU) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ll.Len()
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"sync"
+	"testing"
+)
+
+func TestLRU(t *testing.T) {
+	c := NewLRU(2)
+	c.Put("a", 1)
+	c.Put("b", 2)
+	if v, ok := c.Get("a"); !ok || v != 1 {
+		t.Fatal("Get(a)")
+	}
+	c.Put("c", 3) // 淘汰 b（a 刚被访问过）
+	if _, ok := c.Get("b"); ok {
+		t.Fatal("b 应该被淘汰")
+	}
+	c.Put("a", 10) // 更新
+	c.Put("d", 4)  // 淘汰 c
+	if _, ok := c.Get("c"); ok {
+		t.Fatal("c 应该被淘汰")
+	}
+	if v, _ := c.Get("a"); v != 10 || c.Len() != 2 {
+		t.Fatalf("a=%d len=%d", v, c.Len())
+	}
+}
+
+func TestConcurrent(t *testing.T) {
+	c := NewLRU(100)
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 1000; i++ {
+				k := fmt.Sprint(i % 150)
+				c.Put(k, i)
+				c.Get(k)
+			}
+		}()
+	}
+	wg.Wait()
+	if c.Len() != 100 {
+		t.Fatalf("Len = %d，期望 100", c.Len())
+	}
+}
+
+=== code-15-1
+title: 带过期时间和后台清理的本地缓存
+race: true
+--- desc
+实现 `TTLCache`：
+
+- `Set(key, val, ttl)` / `Get(key)`：`Get` 遇到已过期的条目返回不存在（惰性删除）；
+- 后台 goroutine 每隔 `interval` 清理一次所有过期条目（定期删除），否则不再访问的 key 会一直占用内存；
+- `Stop()`：停止后台 goroutine（可以重复调用），否则每创建一个缓存就泄漏一个 goroutine；
+- `Len()`：当前存储的条目数（包括已过期但还没清理的）。
+
+时间通过注入的 `now` 获取，清理间隔使用真实时间。
+--- solution
+package main
+
+import (
+	"sync"
+	"time"
+)
+
+type item struct {
+	val    string
+	expire time.Time
+}
+
+type TTLCache struct {
+	mu   sync.Mutex
+	data map[string]item
+	now  func() time.Time
+	stop chan struct{}
+	once sync.Once
+	done chan struct{}
+}
+
+func NewTTLCache(interval time.Duration, now func() time.Time) *TTLCache {
+	c := &TTLCache{data: map[string]item{}, now: now, stop: make(chan struct{}), done: make(chan struct{})}
+	// @solution
+	go func() {
+		defer close(c.done)
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				c.cleanup()
+			case <-c.stop:
+				return
+			}
+		}
+	}()
+	// @starter
+	// close(c.done) // TODO: 启动后台清理 goroutine
+	// @end
+	return c
+}
+
+// @solution
+func (c *TTLCache) cleanup() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.now()
+	for k, it := range c.data {
+		if !now.Before(it.expire) {
+			delete(c.data, k)
+		}
+	}
+}
+
+// @end
+
+func (c *TTLCache) Set(key, val string, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.data[key] = item{val, c.now().Add(ttl)}
+}
+
+func (c *TTLCache) Get(key string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	it, ok := c.data[key]
+	if !ok {
+		return "", false
+	}
+	// @solution
+	if !c.now().Before(it.expire) {
+		delete(c.data, key)
+		return "", false
+	}
+	// @starter
+	// // TODO: 检查是否过期
+	// @end
+	return it.val, true
+}
+
+func (c *TTLCache) Stop() {
+	// @solution
+	c.once.Do(func() { close(c.stop) })
+	<-c.done
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (c *TTLCache) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.data)
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"sync"
+	"testing"
+	"time"
+)
+
+type clock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *clock) Now() time.Time          { c.mu.Lock(); defer c.mu.Unlock(); return c.t }
+func (c *clock) Advance(d time.Duration) { c.mu.Lock(); c.t = c.t.Add(d); c.mu.Unlock() }
+
+func TestLazyExpire(t *testing.T) {
+	clk := &clock{t: time.Unix(0, 0)}
+	c := NewTTLCache(time.Hour, clk.Now)
+	defer c.Stop()
+	c.Set("token", "abc", time.Minute)
+	if v, ok := c.Get("token"); !ok || v != "abc" {
+		t.Fatal("未过期时应命中")
+	}
+	clk.Advance(2 * time.Minute)
+	if _, ok := c.Get("token"); ok {
+		t.Fatal("过期后不应命中")
+	}
+}
+
+func TestJanitor(t *testing.T) {
+	clk := &clock{t: time.Unix(0, 0)}
+	c := NewTTLCache(10*time.Millisecond, clk.Now)
+	defer c.Stop()
+	for i := 0; i < 100; i++ {
+		c.Set(fmt.Sprint(i), "v", time.Duration(i%2+1)*time.Minute)
+	}
+	clk.Advance(90 * time.Second) // 一半过期
+	deadline := time.Now().Add(time.Second)
+	for c.Len() != 50 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if c.Len() != 50 {
+		t.Fatalf("后台清理后应剩 50 个，实际 %d", c.Len())
+	}
+}
+
+func TestStopNoLeak(t *testing.T) {
+	before := runtime.NumGoroutine()
+	for i := 0; i < 10; i++ {
+		c := NewTTLCache(time.Millisecond, time.Now)
+		c.Stop()
+		c.Stop()
+	}
+	time.Sleep(20 * time.Millisecond)
+	if n := runtime.NumGoroutine(); n > before {
+		t.Fatalf("Stop 之后 goroutine 没有退出：之前 %d，现在 %d", before, n)
+	}
+}
+
+=== code-16-1
+title: 指数退避 + 随机抖动的重试
+--- desc
+实现 `Retry(ctx, attempts, base, maxDelay, randN, sleep, fn)`：
+
+1. 最多执行 `attempts` 次 `fn`，成功立即返回 nil；
+2. 只重试可重试的错误：错误链上有 `ErrUnavailable`，或者实现了 `Timeout() bool` 且返回 true（如网络超时）；其他错误直接返回；
+3. 每次失败后等待 `backoff/2 + randN(backoff/2 + 1)`（Equal Jitter），`backoff` 从 `base` 开始每次翻倍，不超过 `maxDelay`；最后一次失败后不再等待；
+4. 等待通过注入的 `sleep(ctx, d)` 完成（测试会记录等待时长）；它返回错误（ctx 被取消）时，返回 `errors.Join(最后一次的错误, ctx 错误)`。
+
+`TimerSleep` 已经给出：它用 `select` 同时等待 Timer 和 `ctx.Done()`——不要用 `time.Sleep`，否则无法及时响应取消。
+--- solution
+package main
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+var ErrUnavailable = errors.New("service unavailable")
+
+func TimerSleep(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func retryable(err error) bool {
+	var te interface{ Timeout() bool }
+	if errors.As(err, &te) && te.Timeout() {
+		return true
+	}
+	return errors.Is(err, ErrUnavailable)
+}
+
+func Retry(ctx context.Context, attempts int, base, maxDelay time.Duration,
+	randN func(n int64) int64,
+	sleep func(context.Context, time.Duration) error,
+	fn func(context.Context) error) error {
+	// @solution
+	var err error
+	backoff := base
+	for i := 0; i < attempts; i++ {
+		if err = fn(ctx); err == nil {
+			return nil
+		}
+		if !retryable(err) || i == attempts-1 {
+			return err
+		}
+		d := backoff/2 + time.Duration(randN(int64(backoff/2)+1))
+		if serr := sleep(ctx, d); serr != nil {
+			return errors.Join(err, serr)
+		}
+		backoff = min(backoff*2, maxDelay)
+	}
+	return err
+	// @starter
+	// var err error
+	// for i := 0; i < attempts; i++ {
+	// 	if err = fn(ctx); err == nil {
+	// 		return nil
+	// 	}
+	// 	sleep(ctx, base) // TODO: 固定间隔、没有抖动、不区分错误类型
+	// }
+	// return err
+	// @end
+}
+--- test
+package main
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"testing"
+	"time"
+)
+
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string { return "i/o timeout" }
+func (timeoutErr) Timeout() bool { return true }
+
+const ms = time.Millisecond
+
+func TestBackoffDelays(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		randN func(int64) int64
+		want  []time.Duration
+	}{
+		{"抖动取最大", func(n int64) int64 { return n - 1 }, []time.Duration{100 * ms, 200 * ms, 400 * ms, 800 * ms, 1000 * ms}},
+		{"抖动取最小", func(int64) int64 { return 0 }, []time.Duration{50 * ms, 100 * ms, 200 * ms, 400 * ms, 500 * ms}},
+	} {
+		var delays []time.Duration
+		calls := 0
+		err := Retry(context.Background(), 6, 100*ms, time.Second, tc.randN,
+			func(_ context.Context, d time.Duration) error { delays = append(delays, d); return nil },
+			func(context.Context) error { calls++; return ErrUnavailable })
+		if !errors.Is(err, ErrUnavailable) || calls != 6 {
+			t.Fatalf("%s：err=%v calls=%d", tc.name, err, calls)
+		}
+		if !slices.Equal(delays, tc.want) {
+			t.Fatalf("%s：等待时长 %v\n期望 %v", tc.name, delays, tc.want)
+		}
+	}
+}
+
+func TestRetryableOnly(t *testing.T) {
+	noSleep := func(context.Context, time.Duration) error { return nil }
+	calls := 0
+	Retry(context.Background(), 5, ms, ms, func(int64) int64 { return 0 }, noSleep,
+		func(context.Context) error { calls++; return errors.New("invalid argument") })
+	if calls != 1 {
+		t.Fatalf("不可重试的错误不应重试，调用了 %d 次", calls)
+	}
+	calls = 0
+	err := Retry(context.Background(), 5, ms, ms, func(int64) int64 { return 0 }, noSleep,
+		func(context.Context) error {
+			calls++
+			if calls < 3 {
+				return timeoutErr{}
+			}
+			return nil
+		})
+	if err != nil || calls != 3 {
+		t.Fatalf("超时错误应重试直到成功：err=%v calls=%d", err, calls)
+	}
+}
+
+func TestCancelDuringSleep(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*ms)
+	defer cancel()
+	start := time.Now()
+	err := Retry(ctx, 10, time.Second, 10*time.Second, func(n int64) int64 { return n - 1 }, TimerSleep,
+		func(context.Context) error { return ErrUnavailable })
+	if !errors.Is(err, ErrUnavailable) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("应同时包含最后的错误和 ctx 错误：%v", err)
+	}
+	if time.Since(start) > 500*ms {
+		t.Fatal("等待期间 ctx 取消应立即返回")
+	}
+}
+
+=== code-17-1
+title: 日志与 panic 恢复中间件
+--- desc
+实现中间件 `Logging(log, now, next)`：
+
+- 每个请求结束后调用一次 `log(Entry)`，记录方法、路径、状态码、耗时；
+- 状态码：包装 `http.ResponseWriter`（嵌入它，重写 `WriteHeader` 记录状态码），handler 没调用 `WriteHeader` 直接 `Write` 时是 200；
+- handler panic 时：恢复，响应 `500`（如果还没写过响应头），日志里 `Panic` 为 true、状态码为 500，不能让 panic 继续传播。
+
+时间通过注入的 `now` 获取。
+--- solution
+package main
+
+import (
+	"net/http"
+	"time"
+)
+
+type Entry struct {
+	Method   string
+	Path     string
+	Status   int
+	Duration time.Duration
+	Panic    bool
+}
+
+type recorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (r *recorder) WriteHeader(code int) {
+	if !r.wroteHeader {
+		r.status, r.wroteHeader = code, true
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *recorder) Write(b []byte) (int, error) {
+	if !r.wroteHeader {
+		r.WriteHeader(http.StatusOK)
+	}
+	return r.ResponseWriter.Write(b)
+}
+
+func Logging(log func(Entry), now func() time.Time, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// @solution
+		start := now()
+		rec := &recorder{ResponseWriter: w, status: http.StatusOK}
+		e := Entry{Method: r.Method, Path: r.URL.Path}
+		defer func() {
+			if p := recover(); p != nil {
+				e.Panic = true
+				if !rec.wroteHeader {
+					http.Error(rec, "internal server error", http.StatusInternalServerError)
+				}
+				rec.status = http.StatusInternalServerError
+			}
+			e.Status = rec.status
+			e.Duration = now().Sub(start)
+			log(e)
+		}()
+		next.ServeHTTP(rec, r)
+		// @starter
+		// start := now()
+		// next.ServeHTTP(w, r) // TODO: 拿不到状态码，panic 也没处理
+		// log(Entry{Method: r.Method, Path: r.URL.Path, Status: 200, Duration: now().Sub(start)})
+		// @end
+	})
+}
+--- test
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
+
+func run(h http.HandlerFunc) (Entry, *httptest.ResponseRecorder) {
+	var e Entry
+	t := time.Unix(0, 0)
+	now := func() time.Time { t = t.Add(25 * time.Millisecond); return t }
+	rec := httptest.NewRecorder()
+	Logging(func(x Entry) { e = x }, now, h).ServeHTTP(rec, httptest.NewRequest("POST", "/orders", nil))
+	return e, rec
+}
+
+func TestStatus(t *testing.T) {
+	e, _ := run(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
+	if e.Status != 200 || e.Method != "POST" || e.Path != "/orders" || e.Duration != 25*time.Millisecond {
+		t.Fatalf("Entry = %+v", e)
+	}
+	e, rec := run(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "nope", 404) })
+	if e.Status != 404 || rec.Code != 404 {
+		t.Fatalf("应记录 404：%+v", e)
+	}
+}
+
+func TestPanic(t *testing.T) {
+	e, rec := run(func(w http.ResponseWriter, r *http.Request) { panic("boom") })
+	if !e.Panic || e.Status != 500 || rec.Code != 500 {
+		t.Fatalf("panic 应被恢复并返回 500：entry=%+v code=%d", e, rec.Code)
+	}
+}
+
+=== code-18-1
+title: 实现熔断器
+race: true
+--- desc
+按原题实现一个简化版熔断器 `Breaker.Do(fn)`：
+
+- **关闭**：正常调用，统计连续失败次数，达到 `threshold` 时打开；成功则清零；
+- **打开**：直接返回 `ErrOpen`，不调用 fn；经过 `coolDown` 后进入半开；
+- **半开**：只放行**一个**探测请求（其他请求返回 `ErrOpen`）；探测成功则关闭，失败则重新打开并重新计时。
+
+时间通过注入的 `now` 获取。并发安全：判断是否放行（allow）和记录结果（record）分别加锁，调用 fn 时不持有锁。
+--- solution
+package main
+
+import (
+	"errors"
+	"sync"
+	"time"
+)
+
+type State int
+
+const (
+	Closed State = iota
+	Open
+	HalfOpen
+)
+
+var ErrOpen = errors.New("circuit breaker is open")
+
+type Breaker struct {
+	mu        sync.Mutex
+	state     State
+	failures  int
+	threshold int
+	coolDown  time.Duration
+	openedAt  time.Time
+	probing   bool
+	now       func() time.Time
+}
+
+func NewBreaker(threshold int, coolDown time.Duration, now func() time.Time) *Breaker {
+	return &Breaker{threshold: threshold, coolDown: coolDown, now: now}
+}
+
+func (b *Breaker) State() State {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.state
+}
+
+func (b *Breaker) Do(fn func() error) error {
+	if !b.allow() {
+		return ErrOpen
+	}
+	err := fn()
+	b.record(err)
+	return err
+}
+
+func (b *Breaker) allow() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// @solution
+	switch b.state {
+	case Open:
+		if b.now().Sub(b.openedAt) < b.coolDown {
+			return false
+		}
+		b.state, b.probing = HalfOpen, true
+		return true
+	case HalfOpen:
+		if b.probing {
+			return false
+		}
+		b.probing = true
+		return true
+	default:
+		return true
+	}
+	// @starter
+	// return true // TODO
+	// @end
+}
+
+func (b *Breaker) record(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// @solution
+	switch {
+	case b.state == HalfOpen && err == nil:
+		b.state, b.failures, b.probing = Closed, 0, false
+	case b.state == HalfOpen:
+		b.state, b.openedAt, b.probing = Open, b.now(), false
+	case err == nil:
+		b.failures = 0
+	default:
+		b.failures++
+		if b.failures >= b.threshold {
+			b.state, b.openedAt = Open, b.now()
+		}
+	}
+	// @starter
+	// // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"errors"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+var boom = errors.New("downstream error")
+
+func TestStateMachine(t *testing.T) {
+	now := time.Unix(0, 0)
+	var mu sync.Mutex
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+
+	b := NewBreaker(3, 5*time.Second, clock)
+	fail := func() error { return boom }
+	ok := func() error { return nil }
+
+	b.Do(fail)
+	b.Do(fail)
+	b.Do(ok) // 成功清零
+	b.Do(fail)
+	b.Do(fail)
+	if b.State() != Closed {
+		t.Fatal("没有连续 3 次失败，不应打开")
+	}
+	b.Do(fail)
+	if b.State() != Open {
+		t.Fatal("连续 3 次失败应打开")
+	}
+	called := false
+	if err := b.Do(func() error { called = true; return nil }); !errors.Is(err, ErrOpen) || called {
+		t.Fatal("打开状态应直接返回 ErrOpen，不调用 fn")
+	}
+
+	advance(6 * time.Second)
+	if err := b.Do(fail); !errors.Is(err, boom) || b.State() != Open {
+		t.Fatal("半开探测失败应重新打开")
+	}
+	advance(3 * time.Second)
+	if err := b.Do(ok); !errors.Is(err, ErrOpen) {
+		t.Fatal("重新打开后要重新计时冷却时间")
+	}
+	advance(3 * time.Second)
+	if err := b.Do(ok); err != nil || b.State() != Closed {
+		t.Fatal("半开探测成功应关闭")
+	}
+}
+
+func TestSingleProbe(t *testing.T) {
+	now := time.Unix(0, 0)
+	b := NewBreaker(1, time.Second, func() time.Time { return now })
+	b.Do(func() error { return boom })
+	now = now.Add(2 * time.Second)
+
+	release := make(chan struct{})
+	var probes atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			b.Do(func() error { probes.Add(1); <-release; return nil })
+		}()
+	}
+	time.Sleep(30 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	if probes.Load() != 1 {
+		t.Fatalf("半开状态只应放行 1 个探测请求，实际 %d 个", probes.Load())
+	}
+	if b.State() != Closed {
+		t.Fatal("探测成功后应关闭")
+	}
+}

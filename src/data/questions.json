@@ -1,0 +1,2162 @@
+{
+  "title": "Go 后端实战题库",
+  "footer": "内容以 Go 1.22+ 为基准，标注了 1.23 至 1.26 的主要行为变化；数据库部分以 MySQL 8.0 InnoDB 和 Redis 7 为准。",
+  "categories": [
+    {
+      "id": "go",
+      "code": "GO",
+      "name": "Go 语言基础",
+      "desc": "语法细节、类型系统、接口、泛型与错误处理。"
+    },
+    {
+      "id": "conc",
+      "code": "CONC",
+      "name": "并发编程",
+      "desc": "goroutine、channel、锁、context 与常用并发原语。"
+    },
+    {
+      "id": "rt",
+      "code": "RT",
+      "name": "运行时与内存",
+      "desc": "GMP 调度、垃圾回收、内存分配与运行时调优。"
+    },
+    {
+      "id": "db",
+      "code": "DB",
+      "name": "数据库",
+      "desc": "MySQL 索引、事务与锁，Redis 缓存设计，以及 Go 里使用数据库的正确姿势。"
+    },
+    {
+      "id": "web",
+      "code": "WEB",
+      "name": "Web 平台开发",
+      "desc": "net/http 与框架原理、中间件、鉴权、限流、超时、幂等和工程化实践。"
+    },
+    {
+      "id": "net",
+      "code": "NET",
+      "name": "通信",
+      "desc": "TCP/HTTP 网络基础、gRPC 与 protobuf、WebSocket 长连接、消息队列。"
+    },
+    {
+      "id": "arch",
+      "code": "ARCH",
+      "name": "架构设计",
+      "desc": "分布式理论、服务治理、高可用，以及秒杀、短链、Feed 流等经典系统设计题。"
+    },
+    {
+      "id": "perf",
+      "code": "PERF",
+      "name": "问题定位与性能排查",
+      "desc": "一台正在运行的机器如何定位瓶颈：Linux 系统工具、Go 的 pprof 与 trace、典型线上故障的排查路径。"
+    },
+    {
+      "id": "code",
+      "code": "CODE",
+      "name": "手写代码与找 bug",
+      "desc": "常见的并发编码题和代码审查题，重点是写出能正确退出、不泄漏、并发安全的代码。"
+    }
+  ],
+  "questions": [
+    {
+      "id": "go-01",
+      "code": "GO-01",
+      "cat": "go",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "slice 和数组有什么区别？slice 的底层结构是什么？",
+      "answer": "-   **数组**是值类型，长度是类型的一部分（`[3]int` 和 `[4]int` 是不同类型），赋值和传参会整体拷贝。\n-   **slice** 是对底层数组的引用视图，本身是一个 24 字节（64 位）的结构体：\n\n```go\ntype slice struct {\n    array unsafe.Pointer // 指向底层数组\n    len   int\n    cap   int\n}\n```\n\n传 slice 是拷贝这个头部，多个 slice 可以共享同一个底层数组，所以函数内修改元素会影响调用方，但函数内 `append` 导致扩容后就不再共享。\n\n实战建议：已知元素数量时用 `make([]T, 0, n)` 预分配，避免多次扩容和拷贝。"
+    },
+    {
+      "id": "go-02",
+      "code": "GO-02",
+      "cat": "go",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "slice 的扩容规则是怎样的？",
+      "answer": "Go 1.18 之后（`runtime.growslice`）：\n\n1.  如果需要的新长度大于旧容量的 2 倍，直接用新长度；\n2.  否则旧容量 < 256 时，容量翻倍；\n3.  旧容量 ≥ 256 时，按 `newcap += (newcap + 3*256) / 4` 循环增长，直到满足需求。增长系数从 2 平滑过渡到约 1.25。\n\n最后还会按内存分配器的 size class **向上取整**，所以实际 cap 往往比公式算出来的略大。例如 `append([]int64{}, 1, 2, 3, 4, 5)` 需要 40 字节，向上取整到 48 字节的 size class，所以 cap 是 6 而不是 5。\n\nGo 1.18 之前的阈值是 1024，超过后固定 1.25 倍增长。"
+    },
+    {
+      "id": "go-03",
+      "code": "GO-03",
+      "cat": "go",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "下面代码输出什么？为什么？",
+      "answer": "```go\nfunc add(s []int) {\n    s = append(s, 4)\n    s[0] = 100\n}\n\nfunc main() {\n    s1 := make([]int, 3, 10)\n    add(s1)\n    fmt.Println(s1, len(s1)) // ?\n\n    s2 := []int{1, 2, 3}\n    add(s2)\n    fmt.Println(s2) // ?\n}\n```\n\n-   `s1` 输出 `[100 0 0] 3`：cap 足够，`append` 写入了共享的底层数组下标 3，`s[0]=100` 也作用在共享数组上；但调用方的 len 仍是 3，看不到第 4 个元素。\n-   `s2` 输出 `[1 2 3]`：cap=3 不够，`append` 分配了新数组，之后的修改都发生在新数组上。\n\n结论：函数需要修改 slice 长度时，应返回新 slice（`s = add(s)`），或传 `*[]int`。"
+    },
+    {
+      "id": "go-04",
+      "code": "GO-04",
+      "cat": "go",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "map 是并发安全的吗？并发读写会发生什么？",
+      "answer": "不安全。运行时检测到并发写（或读写同时进行）会直接 `fatal error: concurrent map writes`，这是 `throw` 而非 `panic`，**无法被 recover**，进程直接退出。\n\n解决方案：\n\n-   `sync.RWMutex` + map：最通用，读多写少时效果好；\n-   分片锁（例如 32 个 shard，按 key 哈希选锁）：降低锁竞争；\n-   `sync.Map`：适合 key 写一次读多次，或各 goroutine 操作不相交的 key 集合。\n\n用 `go test -race` 或 `go run -race` 能在测试阶段提前发现。"
+    },
+    {
+      "id": "go-05",
+      "code": "GO-05",
+      "cat": "go",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "map 遍历为什么是无序的？能对 map 元素取地址吗？",
+      "answer": "-   遍历无序：运行时每次 `range` 都从随机位置开始，目的是防止开发者依赖遍历顺序。另外扩容后元素位置也会变化。需要有序时，先把 key 取出来排序（`slices.Sorted(maps.Keys(m))`，Go 1.23+）。\n-   不能取地址：`&m[\"a\"]` 编译报错。因为扩容会搬迁元素，地址不稳定。同理 `m[\"a\"].Field = 1` 对结构体值也会报错，需要取出、修改、再写回，或者把 value 定义成指针类型。"
+    },
+    {
+      "id": "go-06",
+      "code": "GO-06",
+      "cat": "go",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "new 和 make 的区别？",
+      "answer": "|  | new | make |\n| --- | --- | --- |\n| 适用类型 | 任意类型 | 仅 slice、map、channel |\n| 返回值 | `*T`，指向零值 | `T` 本身，已初始化可用 |\n| 作用 | 分配内存并清零 | 初始化内部数据结构（底层数组、哈希表、环形缓冲） |\n\n`var m map[string]int` 得到的是 nil map，读可以，写会 panic；必须 `make` 后才能写。`new(map[string]int)` 得到的是指向 nil map 的指针，同样不能直接写。\n\nGo 1.26 起 `new` 还可以接受表达式，如 `new(42)` 得到指向 42 的 `*int`，方便给可选的指针字段赋值。"
+    },
+    {
+      "id": "go-07",
+      "code": "GO-07",
+      "cat": "go",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "string 和 \\[\\]byte 互相转换会拷贝吗？怎么做零拷贝？",
+      "answer": "正常转换会分配内存并拷贝，因为 string 不可变而 \\[\\]byte 可变，共享会破坏不可变语义。\n\n编译器会对一些场景做优化，不发生拷贝：`m[string(b)]` 查 map、`string(b) == \"x\"` 比较、`for i, c := range []byte(s)`、字符串拼接中的临时转换。\n\n确实需要零拷贝（热点路径、确认不会修改）时，Go 1.20+ 用：\n\n```go\nfunc b2s(b []byte) string { return unsafe.String(unsafe.SliceData(b), len(b)) }\nfunc s2b(s string) []byte { return unsafe.Slice(unsafe.StringData(s), len(s)) }\n```\n\n注意 `s2b` 得到的切片**绝不能修改**，否则会破坏字符串常量区或其他引用者，属于未定义行为。"
+    },
+    {
+      "id": "go-08",
+      "code": "GO-08",
+      "cat": "go",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "defer 的执行顺序和参数求值时机？defer 能修改返回值吗？",
+      "answer": "-   多个 defer 按 **后进先出** 执行。\n-   defer 语句的**参数在声明时求值**，函数体在函数返回前执行。\n-   `return x` 不是原子操作：先给返回值赋值，再执行 defer，最后真正返回。因此 defer 可以修改**命名返回值**。\n\n```go\nfunc f() (n int) {\n    defer func() { n++ }()\n    return 1 // 返回 2\n}\n\nfunc g() int {\n    n := 1\n    defer func() { n++ }()\n    return n // 返回 1，修改的是局部变量\n}\n\nfunc h() {\n    i := 1\n    defer fmt.Println(i) // 打印 1，参数已求值\n    i = 2\n}\n```\n\n实战常用：`defer func() { if err != nil { tx.Rollback() } }()` 根据命名返回值 err 决定回滚。Go 1.14 起大部分 defer 被编译器\"开放编码\"，开销已接近普通函数调用。"
+    },
+    {
+      "id": "go-09",
+      "code": "GO-09",
+      "cat": "go",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "panic 和 recover 怎么用？子 goroutine 的 panic 能被主 goroutine 捕获吗？",
+      "answer": "-   `recover` 只有在 **defer 函数中直接调用** 才生效，嵌套一层函数调用就拿不到。\n-   recover 只能捕获**当前 goroutine** 的 panic。子 goroutine panic 未被捕获会导致**整个进程崩溃**，主 goroutine 的 recover 无能为力。\n-   有些错误是 fatal error，不可恢复：map 并发写、栈溢出、内存耗尽、死锁检测等。\n\n实战：所有业务 goroutine 都应该自带 recover，通常封装一个工具函数：\n\n```go\nfunc SafeGo(fn func()) {\n    go func() {\n        defer func() {\n            if r := recover(); r != nil {\n                slog.Error(\"goroutine panic\", \"err\", r, \"stack\", string(debug.Stack()))\n            }\n        }()\n        fn()\n    }()\n}\n```\n\n注意 net/http 会 recover 每个请求处理函数里的 panic，但 handler 里自己起的 goroutine 不受保护。"
+    },
+    {
+      "id": "go-10",
+      "code": "GO-10",
+      "cat": "go",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "为什么返回的 error 明明是 nil，判断 err != nil 却是 true？",
+      "answer": "接口值由 **(类型, 值)** 两部分组成，只有两者都为 nil 时接口才等于 nil。\n\n```go\ntype MyErr struct{}\nfunc (*MyErr) Error() string { return \"my err\" }\n\nfunc do() error {\n    var p *MyErr = nil\n    return p // 接口值 = (*MyErr, nil)，不等于 nil\n}\n\nfunc main() {\n    fmt.Println(do() != nil) // true\n}\n```\n\n规范写法：返回 error 的函数里，没错误时直接 `return nil`，不要返回具体类型的 nil 指针。这是线上\"明明成功却走了错误分支\"的经典原因。"
+    },
+    {
+      "id": "go-11",
+      "code": "GO-11",
+      "cat": "go",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "值接收者和指针接收者有什么区别？什么是方法集？",
+      "answer": "-   值接收者操作的是副本，修改不影响原对象；指针接收者可以修改原对象，也避免了大结构体拷贝。\n-   方法集规则：类型 `T` 的方法集只包含值接收者方法；`*T` 的方法集包含值和指针接收者方法。\n-   所以如果接口方法用指针接收者实现，只有 `*T` 实现了该接口，`var i I = T{}` 会编译失败。\n\n选择原则：需要修改状态、结构体较大、包含 `sync.Mutex` 等不可拷贝字段时用指针接收者；同一个类型的方法接收者保持一致。"
+    },
+    {
+      "id": "go-12",
+      "code": "GO-12",
+      "cat": "go",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "for range 循环变量在 Go 1.22 有什么变化？",
+      "answer": "Go 1.22 之前，循环变量在整个循环中只有一份，闭包和 goroutine 捕获的都是同一个变量：\n\n```go\nfor _, v := range []int{1, 2, 3} {\n    go func() { fmt.Println(v) }() // 1.22 前常打印 3 3 3\n}\n```\n\n旧代码常见的修复是 `v := v` 或把 v 作为参数传入。\n\nGo 1.22 起（go.mod 中 `go 1.22` 及以上），**每次迭代都是新变量**，上述问题消失；`for i := 0; i < n; i++` 这种三段式循环同样适用。另外 1.22 新增 `for i := range 10` 遍历整数，1.23 支持 `range` 迭代器函数（`iter.Seq`）。"
+    },
+    {
+      "id": "go-13",
+      "code": "GO-13",
+      "cat": "go",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "哪些类型可以比较？哪些类型可以做 map 的 key？",
+      "answer": "-   可比较：布尔、数值、字符串、指针、channel、接口，以及字段全部可比较的结构体和元素可比较的数组。\n-   不可比较：slice、map、func（只能和 nil 比较）。\n-   map 的 key 必须可比较。\n\n坑：接口类型本身可比较，但如果动态类型不可比较（比如里面装的是 slice），比较时会**运行时 panic**。例如 `map[any]int` 用 `[]int` 做 key 编译能过，运行时报错。\n\n结构体比较 slice 字段可以用 `reflect.DeepEqual`（慢）或 `slices.Equal`；测试里常用 `cmp.Diff`。"
+    },
+    {
+      "id": "go-14",
+      "code": "GO-14",
+      "cat": "go",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "空结构体 struct{} 有什么用？",
+      "answer": "`struct{}` 不占内存（size 为 0），所有零大小对象都指向同一个地址 `runtime.zerobase`。常见用法：\n\n-   实现集合：`map[string]struct{}`，比 `map[string]bool` 省内存，语义也更清楚；\n-   只传信号的 channel：`done := make(chan struct{})`，`close(done)` 广播通知；\n-   只有方法、没有状态的类型，比如实现某个接口的空实现。\n\n注意：空结构体放在另一个结构体的**最后一个字段**时，编译器会给它补齐填充，防止指针越界指向下一个对象。"
+    },
+    {
+      "id": "go-15",
+      "code": "GO-15",
+      "cat": "go",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "Go 有继承吗？结构体嵌入和接口嵌入怎么用？",
+      "answer": "Go 没有继承，用**组合**和**嵌入**实现复用。嵌入的字段方法会被\"提升\"到外层类型，但接收者仍然是内层对象，不存在多态的\"重写调用\"。\n\n```go\ntype Logger struct{}\nfunc (Logger) Log(msg string) {}\n\ntype Service struct {\n    Logger // 嵌入，Service 可直接调用 s.Log()\n    db *sql.DB\n}\n```\n\n实战技巧：\n\n-   在结构体里嵌入接口，可以只实现部分方法（常用于测试 mock，未实现的方法调用会 panic）；\n-   包装 `http.ResponseWriter` 时嵌入它，只重写 `WriteHeader` 来记录状态码；\n-   小心嵌入 `sync.Mutex` 会把 `Lock/Unlock` 暴露成公开方法，通常改为具名字段 `mu sync.Mutex`。"
+    },
+    {
+      "id": "go-16",
+      "code": "GO-16",
+      "cat": "go",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "Go 的错误处理有哪些最佳实践？errors.Is 和 errors.As 的区别？",
+      "answer": "-   用 `fmt.Errorf(\"query user %d: %w\", id, err)` 包装错误，保留错误链并补充上下文；\n-   `errors.Is(err, target)`：沿错误链判断是否**等于**某个哨兵错误，如 `errors.Is(err, sql.ErrNoRows)`；\n-   `errors.As(err, &target)`：沿错误链查找**某种类型**的错误并取出，如取出 `*mysql.MySQLError` 判断错误码 1062（唯一键冲突）；\n-   Go 1.20 起 `errors.Join` 合并多个错误，`%w` 也可以出现多次。\n\n实战规范：\n\n1.  错误只处理一次：要么记录日志，要么向上返回，不要每层都打日志；\n2.  底层包装上下文，顶层（handler）统一记录并转换为错误码；\n3.  不要用字符串匹配判断错误；\n4.  对外 API 不要直接把内部错误信息返回给用户。"
+    },
+    {
+      "id": "go-17",
+      "code": "GO-17",
+      "cat": "go",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "init 函数和包的初始化顺序是怎样的？",
+      "answer": "1.  先初始化被导入的包（深度优先，每个包只初始化一次）；\n2.  再初始化本包的包级变量（按依赖关系排序）；\n3.  然后按文件顺序执行本包的 `init()` 函数，一个文件可以有多个 init；\n4.  最后执行 `main()`。\n\n实战建议：init 中不要做耗时或可能失败的操作（连数据库、读远程配置），错误无法返回，也让测试变得困难。依赖显式在 main 里初始化并注入更好。`import _ \"net/http/pprof\"` 就是利用 init 做注册的典型例子。"
+    },
+    {
+      "id": "go-18",
+      "code": "GO-18",
+      "cat": "go",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "interface 的底层结构是什么？类型断言的开销大吗？",
+      "answer": "接口有两种底层表示：\n\n-   `eface`（空接口 `any`）：`_type` 指针 + `data` 指针；\n-   `iface`（带方法的接口）：`tab *itab` + `data`。`itab` 里缓存了接口类型、动态类型和**方法表**（函数指针数组），调用接口方法就是查表间接调用。\n\n开销来源：\n\n-   值装箱：把非指针值赋给接口通常会发生堆分配（小整数等有优化）；\n-   方法调用是间接调用，无法内联；\n-   类型断言到具体类型只需比较类型指针，很便宜；断言到另一个接口需要查 itab（有全局缓存）。\n\n在热点路径上，避免 `[]any`、`map[string]any` 这类大量装箱的写法，GC 压力会明显增加。"
+    },
+    {
+      "id": "go-19",
+      "code": "GO-19",
+      "cat": "go",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "泛型怎么用？什么时候用泛型，什么时候用接口？",
+      "answer": "```go\ntype Number interface {\n    ~int | ~int64 | ~float64 // ~ 表示底层类型为 int 的自定义类型也满足\n}\n\nfunc Sum[T Number](xs []T) T {\n    var s T\n    for _, x := range xs {\n        s += x\n    }\n    return s\n}\n```\n\n选择原则：\n\n-   写**容器和通用算法**（集合、缓存、slices/maps 工具函数），元素类型不同但逻辑相同 → 泛型；\n-   关注**行为**，不同类型有不同实现（存储、通知渠道） → 接口；\n-   不要为了用泛型而用泛型。\n\n实现原理：Go 用 **GC Shape Stenciling + 字典**。底层形状相同的类型（比如所有指针类型）共享一份代码，通过字典传递类型信息。因此对指针类型参数调用方法时，性能可能还不如直接用接口。"
+    },
+    {
+      "id": "go-20",
+      "code": "GO-20",
+      "cat": "go",
+      "group": null,
+      "level": 2,
+      "hot": true,
+      "title": "map 的底层是怎么实现的？",
+      "answer": "**Go 1.24 之后**采用 Swiss Table：\n\n-   数据按 group 组织，每组 8 个槽位，配一个 8 字节控制字，存每个槽位哈希值的低 7 位；\n-   查找时用位运算一次性比较 8 个控制字节，命中率高、缓存友好；\n-   表按目录拆分为多个子表，扩容时只翻倍单个子表，避免一次性大搬迁，最大负载因子 7/8。\n\n**Go 1.24 之前**是经典实现：\n\n-   `hmap` 包含 2^B 个 bucket，每个 bucket 存 8 个 kv 和 tophash，冲突时挂溢出桶；\n-   负载因子超过 6.5 触发翻倍扩容；溢出桶过多触发等量扩容（整理碎片）；\n-   扩容是**渐进式**的，每次写操作搬迁一两个 bucket。\n\n共同点：遍历随机、不可并发写、删除元素后内存不会收缩（大 map 清空后需要重建才能释放内存）。"
+    },
+    {
+      "id": "go-21",
+      "code": "GO-21",
+      "cat": "go",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "结构体的内存对齐是怎么回事？字段顺序会影响大小吗？",
+      "answer": "会。每个字段按自身对齐系数对齐，结构体整体大小是最大对齐系数的整数倍。\n\n```go\ntype A struct { a bool; b int64; c bool } // 24 字节\ntype B struct { b int64; a bool; c bool } // 16 字节\n```\n\n实战：\n\n-   对数量巨大的结构体（缓存条目、日志事件），按字段大小降序排列可以显著省内存；\n-   工具：`fieldalignment`（golang.org/x/tools）可以自动检查；\n-   在 32 位平台对 64 位整数做原子操作需要 8 字节对齐，用 `atomic.Int64` 类型可自动保证；\n-   高并发计数器之间加 padding 避免伪共享。"
+    },
+    {
+      "id": "go-22",
+      "code": "GO-22",
+      "cat": "go",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "reflect 怎么用？有什么代价？",
+      "answer": "三条定律：\n\n1.  接口值可以转换为反射对象（`reflect.TypeOf` / `reflect.ValueOf`）；\n2.  反射对象可以转换回接口值（`v.Interface()`）；\n3.  要修改反射对象，值必须**可设置**：传指针再 `.Elem()`。\n\n```go\nv := reflect.ValueOf(&cfg).Elem()\nf := v.FieldByName(\"Port\")\nif f.CanSet() {\n    f.SetInt(8080)\n}\n```\n\n典型使用场景：encoding/json、ORM、参数校验（读取 struct tag）、依赖注入。\n\n代价：比直接调用慢 1～2 个数量级、绕过编译期类型检查、更多堆分配。热点路径上的 JSON 序列化可以换代码生成方案（easyjson）或高性能库（sonic）。"
+    },
+    {
+      "id": "go-23",
+      "code": "GO-23",
+      "cat": "go",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "unsafe.Pointer 和 uintptr 有什么区别？",
+      "answer": "-   `unsafe.Pointer` 是通用指针，GC 会追踪它指向的对象；\n-   `uintptr` 只是一个整数，GC 不认为它引用了任何对象，对象可能被回收或（栈上对象）被移动。\n\n因此 uintptr 不能跨语句保存再转回指针：\n\n```go\n// 正确：在同一个表达式中完成指针运算\np := unsafe.Pointer(uintptr(unsafe.Pointer(&s)) + unsafe.Offsetof(s.b))\n\n// 错误：中间变量 u 期间对象可能被移动或回收\nu := uintptr(unsafe.Pointer(&s))\np := unsafe.Pointer(u + 8)\n```\n\nGo 1.17 起推荐用 `unsafe.Add(ptr, n)` 做指针偏移。`go vet` 会检查部分不安全用法。"
+    },
+    {
+      "id": "go-24",
+      "code": "GO-24",
+      "cat": "go",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "字符串拼接有哪些方式？性能如何？",
+      "answer": "| 方式 | 特点 |\n| --- | --- |\n| `a + b + c` | 少量固定拼接最快，编译器一次性分配 |\n| `fmt.Sprintf` | 最灵活，但有反射和装箱，最慢 |\n| `strings.Builder` | 循环拼接首选，`Grow` 预分配后几乎零浪费，`String()` 不拷贝 |\n| `bytes.Buffer` | 需要同时当 `io.Writer` 使用时用，`String()` 会拷贝 |\n| `strings.Join` | 已有 `[]string` 时最方便，内部用 Builder |\n\n热点路径（日志、指标标签）上避免 `fmt.Sprintf`，可以用 `strconv.AppendInt` 往复用的 `[]byte` 里追加。"
+    },
+    {
+      "id": "go-25",
+      "code": "GO-25",
+      "cat": "go",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "encoding/json 有哪些常见的坑？",
+      "answer": "-   只处理**导出字段**（大写开头），小写字段被静默忽略；\n-   解析到 `any` 时数字统一变成 `float64`，大整数（如雪花 ID）会**丢失精度**。解决：`decoder.UseNumber()`，或字段用 `json:\",string\"`，前端交互的 int64 ID 建议直接用字符串；\n-   `omitempty` 对零值生效，`0`、`false`、`\"\"` 都会被省略，可能让对方分不清\"没传\"和\"传了零值\"，需要区分时用指针字段；\n-   `time.Time` 默认 RFC3339 格式，自定义格式需实现 `MarshalJSON`；\n-   nil slice 序列化为 `null`，空 slice 为 `[]`，前端可能因此报错；\n-   未知字段默认忽略，严格校验用 `DisallowUnknownFields()`。\n\n性能敏感时可考虑 bytedance/sonic 或 goccy/go-json。"
+    },
+    {
+      "id": "go-26",
+      "code": "GO-26",
+      "cat": "go",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "context 是什么？WithValue 应该存什么？",
+      "answer": "context 用于在调用链中传递**取消信号、截止时间和请求级元数据**，是 Go 服务里控制超时和级联取消的标准方式。\n\n使用规范：\n\n-   作为函数第一个参数显式传递，命名为 ctx，不要存到结构体里；\n-   不要传 nil，不确定时用 `context.TODO()`；\n-   `WithCancel/WithTimeout` 返回的 cancel 必须调用（通常 `defer cancel()`），否则会泄漏到父 context 被取消为止；\n-   `WithValue` 只存**请求范围的元数据**：trace ID、用户身份、请求 ID。不要用它传可选参数或依赖（数据库连接、配置）；\n-   key 用自定义的非导出类型，避免不同包冲突：`type ctxKey struct{}`。\n\n`WithValue` 是链表结构，查找是 O(n) 逐层向上找，层数多了也有成本。Go 1.21 新增 `context.WithoutCancel`（脱离父级取消，适合请求结束后继续执行的异步任务）和 `context.AfterFunc`。"
+    },
+    {
+      "id": "go-27",
+      "code": "GO-27",
+      "cat": "go",
+      "group": null,
+      "level": 3,
+      "hot": true,
+      "title": "什么是逃逸分析？哪些情况会导致变量逃逸到堆上？",
+      "answer": "编译器在编译期判断变量的生命周期：如果变量在函数返回后不再被引用，就分配在栈上（函数返回自动回收，零 GC 成本）；否则分配在堆上。\n\n常见逃逸场景：\n\n-   返回局部变量的指针；\n-   变量被闭包捕获并且闭包逃逸（比如 go 语句）；\n-   赋值给接口类型（`fmt.Println(x)` 的参数是 `any`）；\n-   slice、map 中存放指针，或 `make` 的大小在编译期未知，或对象太大（超过栈上限）；\n-   发送指针到 channel。\n\n查看方法：\n\n```bash\ngo build -gcflags='-m' ./...     # 输出逃逸决策\ngo build -gcflags='-m -m' ./...  # 输出更详细的原因\n```\n\n实战：逃逸本身不是 bug，只在 pprof 显示分配是热点时才针对性优化，比如把返回指针改成传入结构体由调用方分配。"
+    },
+    {
+      "id": "go-28",
+      "code": "GO-28",
+      "cat": "go",
+      "group": null,
+      "level": 3,
+      "hot": false,
+      "title": "什么是内联？如何查看和影响编译器优化？",
+      "answer": "内联是把被调用函数的函数体直接展开到调用处，省去调用开销，更重要的是能让逃逸分析看到更多上下文，从而减少堆分配。\n\n-   编译器按函数复杂度预算（约 80 个节点）决定是否内联；\n-   查看：`go build -gcflags='-m'` 输出 `can inline xxx`；\n-   `//go:noinline` 禁止内联（写 benchmark 时偶尔用）；\n-   Go 1.21 起支持 **PGO**：把线上 CPU profile 放到 main 包目录命名为 `default.pgo`，编译器会对热点函数更积极地内联和去虚化，一般有 2%～14% 的提升。\n\n另一个常见优化是**边界检查消除**：循环前写 `_ = s[n-1]` 提示编译器，后续访问就不再检查越界。用 `-gcflags='-d=ssa/check_bce'` 可以查看哪里仍有检查。"
+    },
+    {
+      "id": "go-29",
+      "code": "GO-29",
+      "cat": "go",
+      "group": null,
+      "level": 3,
+      "hot": false,
+      "title": "cgo 有什么代价？使用时要注意什么？",
+      "answer": "-   每次 Go 调 C 有固定开销（几十纳秒级），需要切换栈、通知调度器，频繁调用小函数得不偿失；\n-   C 代码执行期间占用一个系统线程，大量并发阻塞的 C 调用会导致**线程数暴涨**；\n-   C 分配的内存不受 Go GC 管理，`heap profile` 看不到，容易成为\"RSS 涨但 pprof 正常\"的原因；\n-   Go 指针传给 C 有严格规则：C 不能长期持有 Go 指针，Go 内存里不能存 Go 指针后再交给 C；\n-   交叉编译和静态链接变复杂（`CGO_ENABLED=0` 才能得到纯静态二进制）；\n-   默认 DNS 解析在某些情况下会走 cgo，可用 `GODEBUG=netdns=go` 强制纯 Go 实现。\n\n能用纯 Go 实现的就避免 cgo，比如 SQLite 可以选 modernc.org/sqlite。"
+    },
+    {
+      "id": "conc-01",
+      "code": "CONC-01",
+      "cat": "conc",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "goroutine 和线程有什么区别？",
+      "answer": "|  | goroutine | 系统线程 |\n| --- | --- | --- |\n| 调度 | Go 运行时在用户态调度（GMP） | 操作系统内核调度 |\n| 栈 | 初始约 2KB，按需增长和收缩 | 固定，通常 1～8MB |\n| 创建/切换开销 | 纳秒～百纳秒级，只需保存少量寄存器 | 微秒级，需要陷入内核 |\n| 数量 | 单机轻松几十万到上百万 | 通常几千个就有压力 |\n\ngoroutine 是 M:N 模型：大量 goroutine 复用少量系统线程。但 goroutine 不是免费的，每个至少占 2KB 栈加调度结构，泄漏的 goroutine 会持续占用内存，并让它引用的对象无法回收。"
+    },
+    {
+      "id": "conc-02",
+      "code": "CONC-02",
+      "cat": "conc",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "有缓冲和无缓冲 channel 的区别？对 nil 或已关闭的 channel 操作会怎样？",
+      "answer": "-   **无缓冲**：发送和接收必须同时就绪，是同步交接，天然具有 happens-before 保证；\n-   **有缓冲**：缓冲未满时发送不阻塞，适合削峰和解耦生产消费速度。\n\n| 操作 | nil channel | 已关闭 channel | 正常 channel |\n| --- | --- | --- | --- |\n| 发送 | 永久阻塞 | **panic** | 阻塞或成功 |\n| 接收 | 永久阻塞 | 先读完缓冲，之后立即返回零值，`ok=false` | 阻塞或成功 |\n| 关闭 | **panic** | **panic** | 成功 |\n\n关闭原则：**只由发送方关闭**，并且只在确定不会再发送时关闭；有多个发送方时，不要直接关闭数据 channel，而是用额外的信号 channel 或 WaitGroup 协调。"
+    },
+    {
+      "id": "conc-03",
+      "code": "CONC-03",
+      "cat": "conc",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "sync.WaitGroup 怎么用？有哪些常见错误？",
+      "answer": "```go\nvar wg sync.WaitGroup\nfor _, url := range urls {\n    wg.Add(1) // 必须在启动 goroutine 之前调用\n    go func() {\n        defer wg.Done()\n        fetch(url)\n    }()\n}\nwg.Wait()\n```\n\n常见错误：\n\n-   在 goroutine 内部调用 `Add`，可能主协程先执行到 `Wait` 直接返回；\n-   WaitGroup 被值拷贝（作为参数传值），Done 加在副本上，`go vet` 会报 copylocks；\n-   Done 调用次数多于 Add，计数变负直接 panic；\n-   忘记 Done（某个分支提前 return），Wait 永远阻塞，所以 Done 一定用 defer。\n\nGo 1.25 新增 `wg.Go(func(){...})`，自动完成 Add 和 Done，推荐在新代码中使用。"
+    },
+    {
+      "id": "conc-04",
+      "code": "CONC-04",
+      "cat": "conc",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "Mutex 和 RWMutex 怎么选？",
+      "answer": "-   `RWMutex` 允许多个读者并发，写者独占，适合**读远多于写且读临界区较长**的场景，比如配置、路由表；\n-   读写比例接近或临界区很短时，RWMutex 自身的维护开销可能比 Mutex 还大，直接用 Mutex；\n-   RWMutex 写优先：有写者等待时，新来的读者会被阻塞，防止写者饥饿。\n\n常见坑：\n\n-   **RWMutex 不可重入**，持有读锁时再次 `RLock`，如果中间有写者在等待就会死锁；\n-   持有读锁时去获取写锁，必定死锁；\n-   锁的粒度过大，在锁内做网络 IO 或数据库查询，导致整体串行。\n\n对于读多写少且数据可以整体替换的场景（配置热更新），用 `atomic.Pointer[Config]` 做写时复制，读取完全无锁。"
+    },
+    {
+      "id": "conc-05",
+      "code": "CONC-05",
+      "cat": "conc",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "select 有哪些用法和特性？",
+      "answer": "-   多个 case 同时就绪时**随机选择**一个，避免饥饿；\n-   有 `default` 时变成非阻塞操作；\n-   没有任何 case 的 `select {}` 永久阻塞；\n-   把某个 channel 变量设为 nil 可以**禁用**这个 case，常用于多路合并时某一路已关闭。\n\n```go\n// 超时控制\nselect {\ncase res := <-ch:\n    return res, nil\ncase <-ctx.Done():\n    return nil, ctx.Err()\n}\n\n// 非阻塞发送，队列满时丢弃\nselect {\ncase queue <- msg:\ndefault:\n    dropped.Inc()\n}\n```\n\n注意：`for { select { ... default: } }` 如果 default 分支什么都不做，就是一个空转死循环，会把一个 CPU 核打满，这是线上 CPU 100% 的常见原因之一。"
+    },
+    {
+      "id": "conc-06",
+      "code": "CONC-06",
+      "cat": "conc",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "如何控制并发的 goroutine 数量？",
+      "answer": "1.  **带缓冲 channel 当信号量**：\n\n```go\nsem := make(chan struct{}, 10)\nfor _, job := range jobs {\n    sem <- struct{}{}\n    go func() {\n        defer func() { <-sem }()\n        handle(job)\n    }()\n}\n```\n\n2.  **errgroup.SetLimit**（推荐，同时处理错误和取消）：\n\n```go\ng, ctx := errgroup.WithContext(ctx)\ng.SetLimit(10)\nfor _, job := range jobs {\n    g.Go(func() error { return handle(ctx, job) })\n}\nerr := g.Wait()\n```\n\n3.  **固定数量的 worker 池**：N 个 goroutine 从任务 channel 中消费，适合长期运行的后台任务；\n4.  `golang.org/x/sync/semaphore`：带权重的信号量，适合不同任务消耗不同资源的情况。"
+    },
+    {
+      "id": "conc-07",
+      "code": "CONC-07",
+      "cat": "conc",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "sync.Once 怎么用？有什么注意点？",
+      "answer": "保证函数只执行一次，常用于懒加载单例、只初始化一次的资源。\n\n```go\nvar (\n    client     *Client\n    clientOnce sync.Once\n)\n\nfunc GetClient() *Client {\n    clientOnce.Do(func() { client = newClient() })\n    return client\n}\n```\n\n注意：\n\n-   如果 Do 里的函数 panic，Once 也视为已执行，之后不会再执行；\n-   初始化可能失败时，Once 不会重试，需要自己处理错误。Go 1.21 新增 `sync.OnceValue` / `sync.OnceValues`，可以同时返回值和错误；\n-   Do 内部再调用同一个 Once 的 Do 会死锁。\n\n实现：先用原子操作快速检查 done 标志，未完成再加锁执行（双重检查），并用原子写保证可见性。"
+    },
+    {
+      "id": "conc-08",
+      "code": "CONC-08",
+      "cat": "conc",
+      "group": null,
+      "level": 2,
+      "hot": true,
+      "title": "goroutine 泄漏有哪些常见原因？怎么排查？",
+      "answer": "goroutine 永久阻塞而无法退出，就是泄漏。常见原因：\n\n1.  **向无人接收的 channel 发送**：超时后调用方返回了，工作 goroutine 还在等待发送结果；\n2.  **从无人发送也不关闭的 channel 接收**：比如 `for range ch` 但生产者忘记 close；\n3.  没有监听 `ctx.Done()` 的死循环任务；\n4.  HTTP 响应 Body 没有 Close，连接对应的读写 goroutine 一直存在；\n5.  锁或 WaitGroup 使用错误导致永久等待；\n6.  `time.Ticker` 没有 Stop，配套的 goroutine 一直存在。\n\n```go\n// 经典泄漏：超时后 ch 无人接收，goroutine 永久阻塞\nch := make(chan result)        // 改为 make(chan result, 1) 即可修复\ngo func() { ch <- doWork() }()\nselect {\ncase r := <-ch:\n    return r\ncase <-time.After(time.Second):\n    return timeoutErr\n}\n```\n\n排查方法：\n\n-   监控 `runtime.NumGoroutine()`（Prometheus 指标 `go_goroutines`），持续上涨就是泄漏信号；\n-   抓 `/debug/pprof/goroutine?debug=1`，看哪个调用栈下堆积了成千上万个 goroutine；\n-   `debug=2` 能看到每个 goroutine 的阻塞时长，如 `[chan send, 35 minutes]`；\n-   单元测试中用 `go.uber.org/goleak` 自动检测。"
+    },
+    {
+      "id": "conc-09",
+      "code": "CONC-09",
+      "cat": "conc",
+      "group": null,
+      "level": 2,
+      "hot": true,
+      "title": "context 的取消是如何传播的？怎样正确使用超时控制？",
+      "answer": "-   `WithCancel` 创建的 cancelCtx 会把自己注册到父节点的 children 中；\n-   父 context 取消时，会递归取消所有子 context，并关闭各自的 `Done()` channel；\n-   子 context 的取消不影响父节点；\n-   所有监听 `<-ctx.Done()` 的 goroutine 都会被唤醒，因为关闭 channel 是广播。\n\n正确用法：\n\n```go\nfunc (s *Service) GetOrder(ctx context.Context, id int64) (*Order, error) {\n    // 给下游调用单独设置更短的超时，但仍受上游截止时间约束\n    ctx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)\n    defer cancel()\n    return s.repo.Find(ctx, id) // 底层 QueryContext / http.NewRequestWithContext 会响应取消\n}\n```\n\n要点：\n\n-   超时会层层传递，下游拿到的截止时间不会晚于上游；\n-   context 取消只是\"通知\"，被调用的代码必须主动检查 `ctx.Done()` 或使用支持 ctx 的 API，否则不会停止；\n-   请求结束后还要继续执行的异步任务（如写审计日志），用 `context.WithoutCancel(ctx)` 脱离请求生命周期，但保留 trace 信息。"
+    },
+    {
+      "id": "conc-10",
+      "code": "CONC-10",
+      "cat": "conc",
+      "group": null,
+      "level": 2,
+      "hot": true,
+      "title": "sync.Mutex 的实现原理是什么？什么是饥饿模式？",
+      "answer": "Mutex 用一个 int32 的 state 表示状态：已加锁、有被唤醒的 goroutine、饥饿模式，以及等待者数量。加锁先用 CAS 快速尝试，失败后进入慢路径。\n\n**正常模式**：\n\n-   等待者按 FIFO 排队，但被唤醒的 goroutine 要和**新到达的 goroutine 竞争**；\n-   新来的 goroutine 正在 CPU 上运行，还可能自旋，通常更容易抢到锁；\n-   吞吐量高，但可能让队列中的 goroutine 长时间饿死。\n\n**饥饿模式**：\n\n-   某个等待者等待超过 **1ms** 后切换到饥饿模式；\n-   锁直接**交接**给队首等待者，新来的 goroutine 不自旋、不抢锁，直接排到队尾；\n-   当等待者是队列中最后一个，或者它的等待时间小于 1ms 时，退回正常模式。\n\n自旋条件：多核、GOMAXPROCS > 1、至少有一个其他运行中的 P、本地运行队列为空，且最多自旋 4 次。"
+    },
+    {
+      "id": "conc-11",
+      "code": "CONC-11",
+      "cat": "conc",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "sync.Map 适合什么场景？原理是什么？",
+      "answer": "官方说明的两个适用场景：\n\n1.  key 只写一次但读很多次，比如只增长的缓存；\n2.  多个 goroutine 读写的 key 集合互不相交。\n\n其他场景（频繁更新同一批 key）普通 map 加锁通常更好，而且类型更安全。\n\n实现演进：\n\n-   Go 1.24 之前：`read`（只读 map，原子读取，无锁）+ `dirty`（加锁写入）。读 read 未命中时加锁查 dirty 并累计 misses，misses 达到 dirty 长度时把 dirty 提升为新的 read；\n-   Go 1.24 起：改为基于并发哈希前缀树（HashTrieMap）实现，修改操作的性能和可扩展性明显提升。\n\n注意：sync.Map 没有 Len 方法，Range 不是一致性快照。"
+    },
+    {
+      "id": "conc-12",
+      "code": "CONC-12",
+      "cat": "conc",
+      "group": null,
+      "level": 2,
+      "hot": true,
+      "title": "sync.Pool 的原理和注意事项？",
+      "answer": "用途：复用临时对象（buffer、编码器、大结构体），降低分配和 GC 压力。fmt、encoding/json、net/http 内部都在用。\n\n原理：\n\n-   每个 P 有本地池：private（单个对象，无锁）+ shared（无锁双端队列），Get 优先取本地，再从其他 P 偷；\n-   每次 GC 时，池中对象移到 **victim cache**，下一次 GC 才真正清除，避免 GC 后瞬间大量重新分配。\n\n注意事项：\n\n-   池中对象**随时可能被回收**，不能用它做连接池或存放有状态、需要显式关闭的资源；\n-   Put 前要重置对象状态（`buf.Reset()`）；\n-   不要把超大对象放回池中，否则一次大请求会让池长期占用大量内存，通常判断 `if buf.Cap() > 64<<10 { return }`；\n-   Put 之后不能再使用该对象，否则会出现数据错乱。\n\n```go\nvar bufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}\n\nfunc encode(v any) ([]byte, error) {\n    buf := bufPool.Get().(*bytes.Buffer)\n    defer func() {\n        if buf.Cap() <= 64<<10 {\n            buf.Reset()\n            bufPool.Put(buf)\n        }\n    }()\n    if err := json.NewEncoder(buf).Encode(v); err != nil {\n        return nil, err\n    }\n    return bytes.Clone(buf.Bytes()), nil // 必须拷贝，buf 会被复用\n}\n```"
+    },
+    {
+      "id": "conc-13",
+      "code": "CONC-13",
+      "cat": "conc",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "atomic 和 Mutex 有什么区别？什么时候用 atomic？",
+      "answer": "-   atomic 依赖 CPU 原子指令（如 x86 的 `LOCK XADD`、`CMPXCHG`），无上下文切换，适合**单个变量**的计数、标志位、指针替换；\n-   Mutex 保护一段**临界区**，可以维护多个变量之间的一致性。\n\nGo 1.19 起推荐用类型化的原子类型：`atomic.Int64`、`atomic.Bool`、`atomic.Pointer[T]`，比 `atomic.AddInt64(&x, 1)` 更安全，也自动保证 64 位对齐。\n\n```go\nvar cfg atomic.Pointer[Config]\n\nfunc Reload(newCfg *Config) { cfg.Store(newCfg) }      // 写时复制\nfunc Current() *Config     { return cfg.Load() }       // 读取无锁\n```\n\n注意：多个原子操作组合起来不是原子的，比如\"先 Load 判断再 Store\"有竞态，应使用 `CompareAndSwap`。"
+    },
+    {
+      "id": "conc-14",
+      "code": "CONC-14",
+      "cat": "conc",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "errgroup 怎么用？和 WaitGroup 有什么区别？",
+      "answer": "errgroup（golang.org/x/sync/errgroup）在 WaitGroup 的基础上增加了：\n\n-   收集**第一个**错误并在 Wait 时返回；\n-   `WithContext` 创建的 ctx 在任一任务出错时自动取消，其他任务可以感知并提前退出；\n-   `SetLimit(n)` 限制并发数，`TryGo` 非阻塞提交。\n\n```go\nfunc loadPage(ctx context.Context, uid int64) (*Page, error) {\n    var (\n        user  *User\n        posts []Post\n    )\n    g, ctx := errgroup.WithContext(ctx)\n    g.Go(func() (err error) { user, err = userSvc.Get(ctx, uid); return })\n    g.Go(func() (err error) { posts, err = postSvc.List(ctx, uid); return })\n    if err := g.Wait(); err != nil {\n        return nil, err\n    }\n    return &Page{User: user, Posts: posts}, nil\n}\n```\n\n注意：errgroup 不会 recover panic；需要\"部分失败也继续\"的场景（收集所有错误）不适合用它，可以自己用 WaitGroup 加 `errors.Join`。"
+    },
+    {
+      "id": "conc-15",
+      "code": "CONC-15",
+      "cat": "conc",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "singleflight 是什么？在什么场景下使用？",
+      "answer": "`golang.org/x/sync/singleflight` 把**同一时刻**对同一个 key 的多个并发调用合并成一次，其他调用者等待并共享结果。\n\n典型场景：**缓存击穿**。热点 key 过期瞬间，大量请求同时回源数据库，用 singleflight 后每个实例只有一个请求真正查库。\n\n```go\nvar sf singleflight.Group\n\nfunc GetUser(ctx context.Context, id string) (*User, error) {\n    if u, ok := cache.Get(id); ok {\n        return u, nil\n    }\n    v, err, _ := sf.Do(\"user:\"+id, func() (any, error) {\n        u, err := db.QueryUser(ctx, id)\n        if err == nil {\n            cache.Set(id, u, 5*time.Minute)\n        }\n        return u, err\n    })\n    if err != nil {\n        return nil, err\n    }\n    return v.(*User), nil\n}\n```\n\n注意：\n\n-   只在单个进程内合并，多个实例之间仍各有一次回源；\n-   第一个调用如果卡住，所有等待者一起卡住。可用 `DoChan` 配合超时，或用 `Forget` 让后续请求重新发起；\n-   第一个调用者的 ctx 被取消会让所有共享者都失败，需要时可用 `context.WithoutCancel`。"
+    },
+    {
+      "id": "conc-16",
+      "code": "CONC-16",
+      "cat": "conc",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "channel 的底层结构是怎样的？",
+      "answer": "`runtime.hchan` 主要字段：\n\n-   `buf`：环形缓冲区，`qcount` 当前元素数，`dataqsiz` 容量，`sendx/recvx` 读写下标；\n-   `sendq / recvq`：阻塞的发送者和接收者队列（`sudog` 链表）；\n-   `lock`：互斥锁，所以 channel 本质上是**加锁的队列**；\n-   `closed`：关闭标志。\n\n发送流程：\n\n1.  如果 recvq 有等待的接收者，**直接把数据拷贝到接收者的栈上**并唤醒它，不经过缓冲区；\n2.  否则缓冲区有空间就写入缓冲区；\n3.  否则把当前 goroutine 包装成 sudog 挂到 sendq 并休眠。\n\n由于有锁，极高并发下 channel 不一定比 Mutex 快，选择 channel 主要是为了表达\"所有权转移\"和协程间的编排关系。"
+    },
+    {
+      "id": "conc-17",
+      "code": "CONC-17",
+      "cat": "conc",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "多个生产者、多个消费者时，如何安全地关闭 channel？",
+      "answer": "原则：channel 由**发送方**关闭，并且只在所有发送方都结束后关闭一次。\n\n```go\njobs := make(chan Job, 100)\nvar producers sync.WaitGroup\nfor range 3 {\n    producers.Add(1)\n    go func() {\n        defer producers.Done()\n        produce(ctx, jobs) // 内部 select 监听 ctx.Done()\n    }()\n}\n\n// 单独的协调者：所有生产者结束后关闭\ngo func() {\n    producers.Wait()\n    close(jobs)\n}()\n\n// 消费者用 range，channel 关闭且缓冲读空后自动退出\nfor range 4 {\n    go func() {\n        for j := range jobs {\n            handle(j)\n        }\n    }()\n}\n```\n\n如果是消费者想提前通知生产者停止，不要让消费者去关闭数据 channel，而是关闭一个单独的 `done` channel 或取消 ctx。"
+    },
+    {
+      "id": "conc-18",
+      "code": "CONC-18",
+      "cat": "conc",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "\\-race 竞态检测的原理是什么？能在生产环境开吗？",
+      "answer": "`-race` 基于 ThreadSanitizer：编译时给每次内存访问插桩，运行时用**向量时钟**记录 happens-before 关系，发现两次访问没有同步关系且至少一次是写，就报告数据竞争。\n\n特点：\n\n-   只能发现**实际执行到**的竞争，没覆盖的代码路径查不出来；\n-   内存开销约 5～10 倍，CPU 开销约 2～20 倍。\n\n实践：CI 中所有单元测试和集成测试都加 `-race`；可以在灰度的一两个实例上短时间开启 race 版本做压测；不建议全量生产开启。"
+    },
+    {
+      "id": "conc-19",
+      "code": "CONC-19",
+      "cat": "conc",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "什么是 Go 内存模型的 happens-before？为什么不能自己写\"双重检查锁\"？",
+      "answer": "Go 内存模型规定：没有同步关系时，一个 goroutine 的写不保证被另一个 goroutine 看到，甚至看到的顺序可能被重排。建立 happens-before 的方式有：channel 的发送和接收、关闭、Mutex 的 Unlock 和 Lock、`sync.Once`、原子操作、WaitGroup 等。\n\n```go\n// 错误的双重检查：读取 instance 没有同步，可能看到未完全初始化的对象\nif instance == nil {\n    mu.Lock()\n    if instance == nil {\n        instance = &Obj{...}\n    }\n    mu.Unlock()\n}\nreturn instance\n```\n\n正确做法：直接用 `sync.Once`，或者用 `atomic.Pointer` 读写 instance。Go 1.19 正式修订了内存模型，对无数据竞争的程序保证顺序一致性（DRF-SC）。"
+    },
+    {
+      "id": "conc-20",
+      "code": "CONC-20",
+      "cat": "conc",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "time.After、Ticker、Timer 在使用中有什么坑？",
+      "answer": "-   在 `for-select` 循环里每次调用 `time.After(time.Minute)`，每轮都会创建新的 Timer。**Go 1.23 之前**这些 Timer 在到期前不会被回收，高频循环会造成内存堆积；Go 1.23 起未引用的 Timer 即使没 Stop 也可以被 GC 回收；\n-   `time.NewTicker` 用完必须 `Stop()`，否则 1.23 之前会一直占用资源；\n-   Go 1.23 之前，`Reset` 一个已经触发但 channel 没被读走的 Timer，channel 中会残留旧值，导致下一次读到错误的触发。1.23 起 Timer 的 channel 改为同步语义，Stop/Reset 后不会再收到旧值；\n-   以上 1.23 的新行为需要 go.mod 声明 `go 1.23` 及以上才生效。\n\n循环中需要超时的推荐写法：在循环外创建一个 Timer，每轮 `Reset`。"
+    },
+    {
+      "id": "conc-21",
+      "code": "CONC-21",
+      "cat": "conc",
+      "group": null,
+      "level": 3,
+      "hot": false,
+      "title": "什么是伪共享？如何避免？CAS 的 ABA 问题在 Go 里存在吗？",
+      "answer": "**伪共享**：CPU 缓存以 cache line（通常 64 字节）为单位。两个被不同核心频繁写入的变量如果落在同一个 cache line，会导致缓存行在核心之间来回失效，性能大幅下降，尽管它们逻辑上毫无关系。\n\n```go\ntype Counter struct {\n    a atomic.Int64\n    _ [56]byte // 填充到 64 字节，或使用 cpu.CacheLinePad\n    b atomic.Int64\n}\n```\n\n典型场景：分片计数器、每个 worker 的统计数据数组。\n\n**ABA 问题**：CAS 只比较值，值从 A 变成 B 又变回 A，CAS 仍会成功，但中间状态已经变化。在 Go 中因为有 GC，被引用的节点不会被回收后复用地址，所以基于指针的无锁结构 ABA 风险比 C/C++ 小很多；但对整数状态做 CAS 时仍要考虑，常用解法是加版本号（把版本和值打包进一个 64 位整数）。\n\n实际业务中，无锁结构很少比分片锁有明显优势，先用锁并压测，确认锁竞争是瓶颈后再考虑无锁。"
+    },
+    {
+      "id": "conc-22",
+      "code": "CONC-22",
+      "cat": "conc",
+      "group": null,
+      "level": 3,
+      "hot": false,
+      "title": "单机维持百万 goroutine 或百万连接会遇到什么问题？如何优化？",
+      "answer": "问题：\n\n-   **内存**：每个连接一个读 goroutine 加一个写 goroutine，栈至少 2KB×2，再加读写缓冲区，百万连接就是数 GB 到十几 GB；\n-   **GC**：大量 goroutine 栈和缓冲区都要扫描，GC 耗时上升；\n-   **调度**：海量就绪 goroutine 时调度延迟增加；\n-   **定时器**：每个连接一个心跳 Timer，定时器堆巨大。\n\n优化：\n\n-   读写缓冲区按需分配并池化（连接空闲时不持有 buffer）；\n-   写 goroutine 改为按需启动，或者合并为批量写；\n-   用时间轮管理心跳超时，取代每个连接一个 Timer；\n-   极端场景改用基于 epoll 的事件驱动网络库（cloudwego/netpoll、gnet），用少量 goroutine 处理所有连接；\n-   系统层面调大 `ulimit -n`、`fs.file-max`、TCP 内存参数。"
+    },
+    {
+      "id": "conc-23",
+      "code": "CONC-23",
+      "cat": "conc",
+      "group": null,
+      "level": 3,
+      "hot": false,
+      "title": "如何排查死锁？",
+      "answer": "**全局死锁**：所有 goroutine 都阻塞时，运行时报 `fatal error: all goroutines are asleep - deadlock!`，并打印栈。\n\n**部分死锁**更常见、更难发现：服务还活着（有监听 goroutine），但部分请求永远挂起。排查方法：\n\n1.  抓 `/debug/pprof/goroutine?debug=2`，搜索 `sync.(*Mutex).Lock`、`semacquire`，看哪些 goroutine 等锁很久；\n2.  找到持有锁的 goroutine 正在做什么（往往是在锁内做 IO、等待 channel，或者形成了 A→B、B→A 的加锁顺序）；\n3.  开启 mutex profile 和 block profile，定位竞争最严重的锁。\n\n预防：\n\n-   固定加锁顺序；\n-   锁内不做 IO、不调用外部回调；\n-   用 defer 解锁避免遗漏；\n-   尽量缩小锁粒度，必要时使用带超时的获取方式（channel 实现的锁或 semaphore 配合 ctx）。"
+    },
+    {
+      "id": "rt-01",
+      "code": "RT-01",
+      "cat": "rt",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "什么是 GMP 模型？",
+      "answer": "-   **G（goroutine）**：要执行的任务，包含栈、程序计数器和状态；\n-   **M（machine）**：操作系统线程，真正执行代码的实体；\n-   **P（processor）**：逻辑处理器，持有本地运行队列（最多 256 个 G）、mcache 等资源。M 必须绑定一个 P 才能执行 Go 代码。P 的数量由 `GOMAXPROCS` 决定。\n\n调度循环（`schedule` → `findRunnable`）获取 G 的顺序：\n\n1.  P 的 `runnext`（刚被唤醒、优先执行的 G）；\n2.  P 的本地队列，每调度 61 次会先查一次全局队列，防止全局队列饥饿；\n3.  全局队列；\n4.  网络轮询器中已就绪的 G；\n5.  从其他 P 的本地队列**偷取一半**（work stealing）。\n\n为什么需要 P：早期只有 GM 模型，所有 M 竞争一个全局队列锁，扩展性差。引入 P 后大部分调度操作是无锁的本地操作，并且 M 因系统调用阻塞时可以把 P 交给其他 M（hand off）。"
+    },
+    {
+      "id": "rt-02",
+      "code": "RT-02",
+      "cat": "rt",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "goroutine 在什么时候会被调度切换？什么是抢占式调度？",
+      "answer": "主动让出：\n\n-   channel 阻塞、锁等待、`time.Sleep`、`select` 阻塞；\n-   网络 IO 未就绪（交给 netpoller，G 挂起）；\n-   `runtime.Gosched()` 主动让出。\n\n系统调用：阻塞的系统调用会让 M 和 G 一起阻塞，sysmon 发现后把 P 交给其他 M 继续执行其他 G。\n\n抢占：\n\n-   **Go 1.14 之前**：协作式抢占，只在函数调用的序言处检查抢占标志，`for {}` 这类没有函数调用的死循环会一直占用 P，甚至导致 GC 的 STW 无法完成；\n-   **Go 1.14 起**：基于信号的**异步抢占**。sysmon 发现某个 G 连续运行超过 10ms，就向对应线程发送 `SIGURG` 信号，在信号处理函数中让 G 让出。"
+    },
+    {
+      "id": "rt-03",
+      "code": "RT-03",
+      "cat": "rt",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "GOMAXPROCS 应该怎么设置？容器里有什么坑？",
+      "answer": "默认值是机器的 CPU 核数。\n\n**容器中的坑**：Go 1.25 之前，运行时读取的是**宿主机**的核数。比如在 64 核机器上给容器限制了 2 核 CPU quota，GOMAXPROCS 仍是 64：\n\n-   64 个 P 并发执行，很快用完 CFS 配额，被内核**限流（throttle）**，延迟出现周期性尖刺；\n-   GC 后台标记协程按 P 数量的 25% 启动，抢占更多 CPU。\n\n解决：\n\n-   Go 1.25 起，Linux 上运行时会读取 cgroup 的 CPU 限制自动设置 GOMAXPROCS，并且在限制变化时动态调整（显式设置了 `GOMAXPROCS` 环境变量时不生效）；\n-   更早的版本使用 `go.uber.org/automaxprocs`，在 main 包导入即可；\n-   也可以直接用环境变量 `GOMAXPROCS=2`。\n\nIO 密集型服务把 GOMAXPROCS 调大到远超核数通常没有收益，因为网络 IO 不占用线程。"
+    },
+    {
+      "id": "rt-04",
+      "code": "RT-04",
+      "cat": "rt",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "系统调用阻塞时调度器怎么处理？为什么网络 IO 不会阻塞线程？",
+      "answer": "**普通阻塞系统调用**（如文件读写）：\n\n1.  G 进入系统调用前调用 `entersyscall`，P 与 M 解绑但仍标记为 syscall 状态；\n2.  如果系统调用很快返回，M 直接重新拿回原来的 P；\n3.  如果阻塞较久，sysmon 会把 P 抢走（retake），交给空闲或新建的 M 继续运行其他 G；\n4.  系统调用返回后，M 尝试获取空闲 P，拿不到就把 G 放入全局队列，M 自身休眠。\n\n**网络 IO**：Go 把 socket 设为**非阻塞**模式，读写返回 `EAGAIN` 时，G 被挂起并注册到 netpoller（Linux 上是 epoll），M 继续执行其他 G。fd 就绪后，调度器从 netpoller 取出对应的 G 放回运行队列。\n\n所以写网络代码可以使用\"一个连接一个 goroutine\"的同步风格，底层却是 IO 多路复用。注意：**普通文件 IO 不走 netpoller**，大量并发读写磁盘会创建大量线程。"
+    },
+    {
+      "id": "rt-05",
+      "code": "RT-05",
+      "cat": "rt",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "goroutine 的栈是如何增长的？",
+      "answer": "-   初始栈约 2KB（Go 1.19 起会根据历史平均使用量调整初始大小）；\n-   每个函数开头有编译器插入的栈检查，空间不足时调用 `morestack`；\n-   采用**连续栈**：分配一块 2 倍大小的新栈，把旧栈内容拷贝过去，并调整栈上的指针；\n-   GC 时如果发现栈使用不足 1/4，会缩容一半。\n\n影响：\n\n-   深度递归或栈上大数组会触发多次扩容拷贝，有额外开销；\n-   因为栈会被移动，所以栈上对象的地址不稳定，这也是 uintptr 不能长期保存地址的原因之一；\n-   默认最大栈 1GB（64 位），超过时报 `goroutine stack exceeds` 的 fatal error，通常是无限递归。"
+    },
+    {
+      "id": "rt-06",
+      "code": "RT-06",
+      "cat": "rt",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "Go 的 GC 是怎么工作的？三色标记和写屏障是什么？",
+      "answer": "Go 使用**并发、非分代、非移动**的三色标记清除算法。\n\n三色标记：\n\n-   白色：尚未访问，标记结束后仍为白色的对象会被回收；\n-   灰色：已访问，但它引用的对象还没扫描；\n-   黑色：自身和它引用的对象都已扫描。\n\n从根对象（全局变量、各 goroutine 栈、寄存器）出发，把根标灰，然后不断取出灰色对象扫描它引用的对象，直到没有灰色对象。\n\n**写屏障**：标记和用户代码并发执行，用户代码可能把白色对象挂到黑色对象下，同时删除灰色对象对它的引用，导致存活对象被误回收。Go 1.8 起使用**混合写屏障**（插入屏障 + 删除屏障结合），保证不会漏标，且栈不需要在结束时重新扫描。\n\nGC 周期中的 STW 只有两次很短的停顿：\n\n1.  开启写屏障（清理终止 → 标记开始）；\n2.  标记终止。\n\n通常在几十到几百微秒，大部分工作并发完成。"
+    },
+    {
+      "id": "rt-07",
+      "code": "RT-07",
+      "cat": "rt",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "GC 什么时候触发？GOGC 和 GOMEMLIMIT 怎么用？",
+      "answer": "触发条件：\n\n1.  **堆增长达到目标**：目标堆大小 ≈ 上次 GC 后的存活堆 ×（1 + GOGC/100）。Go 1.18 起目标值还会计入栈和全局变量；\n2.  距离上次 GC 超过 **2 分钟**，sysmon 强制触发；\n3.  手动调用 `runtime.GC()`。\n\n参数：\n\n-   `GOGC`（默认 100）：调大则 GC 更少、内存占用更高；`GOGC=off` 关闭基于比例的触发；\n-   `GOMEMLIMIT`（Go 1.19+）：**软内存上限**，接近上限时运行时会更积极地 GC。\n\n容器内推荐配置：`GOMEMLIMIT` 设为容器内存限制的 80%～90%，同时保持 GOGC 默认或适当调大。这样内存充裕时少做 GC，接近上限时再加大回收力度，避免 OOM。\n\n注意：如果存活对象本身就超过了 GOMEMLIMIT，运行时会持续 GC，CPU 被大量消耗（运行时会把 GC CPU 占用限制在约 50% 来避免完全卡死）。"
+    },
+    {
+      "id": "rt-08",
+      "code": "RT-08",
+      "cat": "rt",
+      "group": null,
+      "level": 2,
+      "hot": true,
+      "title": "线上服务 GC 压力大，有哪些实战优化手段？",
+      "answer": "先确认问题：`GODEBUG=gctrace=1` 看 GC 频率和耗时；CPU profile 中 `runtime.gcBgMarkWorker`、`runtime.mallocgc`、`runtime.scanobject` 占比高；`allocs` profile 找出分配热点。\n\n**减少分配**：\n\n-   slice、map 按预期大小预分配，`strings.Builder` 先 `Grow`；\n-   热点对象用 `sync.Pool` 复用；\n-   避免热点路径上 `fmt.Sprintf`、`[]byte` 和 string 反复转换、`any` 装箱；\n-   返回值改为由调用方传入缓冲区（如 `AppendXxx(dst []byte)` 风格的 API）。\n\n**减少指针**（降低扫描成本）：\n\n-   GC 只扫描包含指针的对象，`map[int64]int64`、`[]struct{ID int64; Score float64}` 这类无指针结构几乎不需要扫描；\n-   大型本地缓存用 bigcache、freecache 这类把数据序列化到大块 `[]byte` 的实现；\n-   用数组下标代替指针建立对象之间的关系。\n\n**调参**：适当调大 GOGC，并配合 GOMEMLIMIT 兜底。\n\n**旧方案**：Go 1.19 之前常用\"内存压舱石\"（分配一个大的、不被访问的 \\[\\]byte 抬高堆基数），现在用 GOMEMLIMIT 替代即可。"
+    },
+    {
+      "id": "rt-09",
+      "code": "RT-09",
+      "cat": "rt",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "Go 的内存分配器是怎样设计的？",
+      "answer": "借鉴 TCMalloc，分层缓存：\n\n-   **mcache**：每个 P 一个，分配时**无锁**；\n-   **mcentral**：每种 span class 一个，mcache 不够时从这里加锁获取 span；\n-   **mheap**：全局堆，管理页，向操作系统申请内存（以 arena 为单位，64 位 Linux 上 64MB 一个）。\n\n对象分类：\n\n-   **微对象**（< 16B 且不含指针）：tiny 分配器把多个小对象合并到一个 16B 块中，比如小字符串；\n-   **小对象**（≤ 32KB）：按约 68 种 size class 向上取整，从 mcache 对应的 mspan 中分配；\n-   **大对象**（> 32KB）：直接从 mheap 分配专属 span。\n\n每种 size class 又区分含指针（scan）和不含指针（noscan）两种 span，noscan 对象 GC 不需要扫描其内容。"
+    },
+    {
+      "id": "rt-10",
+      "code": "RT-10",
+      "cat": "rt",
+      "group": null,
+      "level": 2,
+      "hot": true,
+      "title": "为什么 Go 程序的 RSS 一直不下降？pprof 显示的 heap 比 RSS 小很多，是内存泄漏吗？",
+      "answer": "不一定是泄漏。常见原因：\n\n1.  **内存归还有延迟**：GC 释放的内存先留在 Go 堆中（HeapIdle），由后台 scavenger 逐步归还操作系统。`HeapIdle - HeapReleased` 就是\"空闲但未归还\"的部分；\n2.  **归还方式差异**：Go 1.12～1.15 在 Linux 上默认用 `MADV_FREE`，内核在没有内存压力时不会真正回收，RSS 看起来不降。Go 1.16 起默认改回 `MADV_DONTNEED`；\n3.  **heap profile 只统计 Go 堆**：goroutine 栈、cgo 分配的内存、mmap、运行时元数据都不在 heap profile 里；\n4.  **碎片**：span 中只要有一个对象存活，整个 span 就不能释放。\n\n排查步骤：\n\n-   对比 `runtime.MemStats` 或 `runtime/metrics` 中的 HeapInuse、HeapIdle、HeapReleased、StackInuse；\n-   看 goroutine 数量（栈内存）；\n-   检查是否用了 cgo。\n\n需要立即归还时可以调用 `debug.FreeOSMemory()`，但不要放在热点路径上，它会强制一次完整 GC。"
+    },
+    {
+      "id": "rt-11",
+      "code": "RT-11",
+      "cat": "rt",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "程序的线程数为什么会暴涨？有上限吗？",
+      "answer": "GOMAXPROCS 只限制**同时执行 Go 代码**的线程数，不限制总线程数。线程暴涨常见于：\n\n-   大量**阻塞系统调用**：文件 IO（尤其是慢磁盘、NFS）、某些 DNS 解析；\n-   大量并发的 **cgo 调用**，每个占用一个线程；\n-   使用了 `runtime.LockOSThread` 而没有解锁。\n\n线程默认上限是 **10000**，超过会 `fatal error: thread exhaustion`，可以用 `debug.SetMaxThreads` 调整。\n\n排查：`/debug/pprof/threadcreate` 看线程创建的调用栈；`ls /proc/<pid>/task | wc -l` 看当前线程数。\n\n注意：Go 运行时很少把多余的 M 销毁，暴涨后线程数通常不会降回来，只是处于休眠状态。"
+    },
+    {
+      "id": "rt-12",
+      "code": "RT-12",
+      "cat": "rt",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "GODEBUG=gctrace=1 的输出怎么看？",
+      "answer": "```text\ngc 52 @38.124s 3%: 0.041+4.2+0.065 ms clock, 0.33+1.1/8.0/12+0.52 ms cpu, 412->420->205 MB, 418 MB goal, 0 MB stacks, 0 MB globals, 8 P\n```\n\n-   `gc 52`：第 52 次 GC；`@38.124s`：程序启动后的时间；`3%`：启动以来 GC 占用 CPU 的比例；\n-   `0.041+4.2+0.065 ms clock`：STW 清理终止 + 并发标记 + STW 标记终止的墙钟时间。两个 STW 都在 0.1ms 以内，正常；\n-   `cpu` 部分：分别是 STW、辅助标记（mutator assist）/ 后台标记 / 空闲标记、STW 的 CPU 时间。assist 占比高说明业务 goroutine 被迫帮忙做 GC，会直接拖慢请求；\n-   `412->420->205 MB`：GC 开始时堆大小 → 标记结束时堆大小 → 存活堆大小；\n-   `418 MB goal`：本轮目标堆大小；`8 P`：使用的 P 数量。\n\n判断依据：GC 频率过高（每秒多次）、CPU 占比超过 10%～25%、assist 时间长，都说明需要优化分配或调整 GOGC/GOMEMLIMIT。"
+    },
+    {
+      "id": "rt-13",
+      "code": "RT-13",
+      "cat": "rt",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "sysmon 是什么？负责哪些工作？",
+      "answer": "sysmon 是一个特殊的系统监控线程，**不需要 P** 就能运行，休眠间隔从 20μs 起动态增长到最多 10ms。主要职责：\n\n-   **抢占**：G 运行超过 10ms，发送抢占信号；\n-   **retake**：把阻塞在系统调用中的 P 抢回来交给其他 M；\n-   **netpoll**：如果超过 10ms 没有轮询网络，主动检查就绪的网络 IO；\n-   **强制 GC**：超过 2 分钟没有 GC 时触发；\n-   协助 scavenger 归还空闲内存。"
+    },
+    {
+      "id": "rt-14",
+      "code": "RT-14",
+      "cat": "rt",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "Go 的定时器是如何实现的？",
+      "answer": "-   Go 1.14 之前：全局若干个四叉堆，由专门的 timerproc goroutine 管理，大量定时器时锁竞争严重；\n-   Go 1.14 起：每个 P 维护自己的**四叉最小堆**，由调度器在调度循环和 sysmon 中检查到期的定时器，不再需要独立 goroutine；\n-   Go 1.23 起：未被引用的 Timer/Ticker 即使没有 Stop 也能被 GC 回收；Timer 的 channel 变为同步（无缓冲）语义。\n\n实战：海量连接的心跳超时检测，用**时间轮**批量处理比给每个连接创建 Timer 更省资源。"
+    },
+    {
+      "id": "rt-15",
+      "code": "RT-15",
+      "cat": "rt",
+      "group": null,
+      "level": 3,
+      "hot": false,
+      "title": "什么是 GC 辅助标记（mutator assist）？为什么会导致延迟抖动？",
+      "answer": "GC 并发标记期间，如果业务 goroutine 分配内存的速度太快，后台标记跟不上，堆可能在标记完成前超过目标。为此运行时要求**正在分配内存的 goroutine 先帮忙做一部分标记工作**，分配越多，承担的标记工作越多。\n\n影响：处理请求的 goroutine 突然被拖去做 GC 工作，单个请求的延迟会变长，体现为 p99 毛刺。在 `go tool trace` 中可以看到 \"MARK ASSIST\" 片段。\n\n缓解：\n\n-   减少分配速率（最根本的方法）；\n-   调大 GOGC，给标记留出更多余量；\n-   避免突发的大批量分配（比如一次性加载上百万行数据）。"
+    },
+    {
+      "id": "rt-16",
+      "code": "RT-16",
+      "cat": "rt",
+      "group": null,
+      "level": 3,
+      "hot": false,
+      "title": "什么是 Green Tea GC？",
+      "answer": "Green Tea 是 Go 团队针对现代多核和 CPU 缓存特性设计的新标记算法：\n\n-   传统标记以**对象**为单位遍历，访问内存跳跃，缓存命中率低；\n-   Green Tea 以 **span（页）** 为单位批量扫描小对象，内存访问更连续，对多核扩展性也更好。\n\n官方数据显示，对大量小对象的程序可以减少 10%～40% 的 GC CPU 开销。\n\n版本：Go 1.25 作为实验特性引入（`GOEXPERIMENT=greenteagc`），Go 1.26 起默认启用。"
+    },
+    {
+      "id": "rt-17",
+      "code": "RT-17",
+      "cat": "rt",
+      "group": null,
+      "level": 3,
+      "hot": false,
+      "title": "finalizer 和 runtime.AddCleanup 有什么区别？能用来释放资源吗？",
+      "answer": "-   `runtime.SetFinalizer(obj, fn)`：对象不可达时执行 fn。问题：对象会在多一轮 GC 后才真正释放；不能处理循环引用；一个对象只能有一个 finalizer；fn 中可以\"复活\"对象，语义复杂；\n-   `runtime.AddCleanup`（Go 1.24+）：清理函数不能访问对象本身（参数是单独的值），因此不会复活对象，可以附加多个，也支持循环引用中的对象，是推荐的新 API。\n\n无论哪种，执行时机**都不确定**，甚至进程退出前可能根本不执行。所以文件、连接、锁这些资源必须显式 `Close`，finalizer 只能作为兜底（例如 os.File 用它防止 fd 泄漏）。"
+    },
+    {
+      "id": "rt-18",
+      "code": "RT-18",
+      "cat": "rt",
+      "group": null,
+      "level": 3,
+      "hot": false,
+      "title": "如何观察调度器的状态？GODEBUG=schedtrace 怎么看？",
+      "answer": "```text\nGODEBUG=schedtrace=1000 ./app\nSCHED 2003ms: gomaxprocs=8 idleprocs=0 threads=25 spinningthreads=0 idlethreads=10 runqueue=127 [34 51 12 40 66 9 28 80]\n```\n\n-   `idleprocs=0` 且 `runqueue`（全局队列）和方括号中各 P 的本地队列都很长，说明 CPU 已经饱和，goroutine 在排队等待执行；\n-   `threads` 远大于 GOMAXPROCS，说明有大量阻塞系统调用或 cgo；\n-   加上 `scheddetail=1` 可以输出每个 G、M、P 的详细状态。\n\n更直观的方式：`go tool trace` 查看每个 P 的时间线，以及 Goroutine analysis 中的调度等待时间（Scheduler wait）；`runtime/metrics` 中的 `/sched/latencies:seconds` 直方图可以直接接入监控。"
+    },
+    {
+      "id": "db-01",
+      "code": "DB-01",
+      "cat": "db",
+      "group": "MySQL",
+      "level": 1,
+      "hot": false,
+      "title": "InnoDB 和 MyISAM 有什么区别？",
+      "answer": "|  | InnoDB | MyISAM |\n| --- | --- | --- |\n| 事务 | 支持 | 不支持 |\n| 锁粒度 | 行锁 | 表锁 |\n| 外键 | 支持 | 不支持 |\n| 崩溃恢复 | 依靠 redo log 自动恢复 | 容易损坏，需要修复 |\n| 索引结构 | 聚簇索引，数据和主键索引存在一起 | 非聚簇，索引和数据分开存放 |\n| `count(*)` | 需要扫描 | 直接存有行数 |\n\nMySQL 5.5 起默认使用 InnoDB，现在业务中基本没有使用 MyISAM 的理由。"
+    },
+    {
+      "id": "db-02",
+      "code": "DB-02",
+      "cat": "db",
+      "group": "MySQL",
+      "level": 1,
+      "hot": true,
+      "title": "MySQL 索引为什么使用 B+ 树？",
+      "answer": "对比其他结构：\n\n-   **哈希**：等值查询 O(1)，但不支持范围查询和排序；\n-   **二叉树 / 红黑树**：树太高，每层一次磁盘 IO，千万数据要二十多层；\n-   **B 树**：非叶子节点也存数据，单个页能放的 key 少，扇出低，范围查询需要中序遍历。\n\nB+ 树的优势：\n\n-   非叶子节点只存 key 和指针，一个 16KB 的页能存上千个索引项，**树非常矮**；\n-   所有数据都在叶子节点，查询路径长度稳定；\n-   叶子节点之间用双向链表连接，**范围查询和排序**只需顺序扫描。\n\n估算：主键 bigint（8B）+ 指针（6B）≈ 14B，一个页约存 1170 个索引项；叶子节点每行按 1KB 算存 16 行。三层 B+ 树能存 1170 × 1170 × 16 ≈ **2000 万行**，查询只需要 3 次 IO（根节点通常还在内存中）。"
+    },
+    {
+      "id": "db-03",
+      "code": "DB-03",
+      "cat": "db",
+      "group": "MySQL",
+      "level": 1,
+      "hot": true,
+      "title": "什么是聚簇索引、二级索引、回表和覆盖索引？",
+      "answer": "-   **聚簇索引**：InnoDB 的主键索引，叶子节点存放**整行数据**，表数据本身就是按主键组织的 B+ 树。没有主键时使用第一个非空唯一索引，再没有则使用隐藏的 row\\_id；\n-   **二级索引**：叶子节点存放**索引列 + 主键值**；\n-   **回表**：通过二级索引找到主键后，再到聚簇索引查询完整行数据，多一次 B+ 树查找；\n-   **覆盖索引**：查询所需的列都在二级索引中，无需回表，EXPLAIN 的 Extra 显示 `Using index`。\n\n```sql\n-- 有联合索引 idx_uid_status(user_id, status)\nSELECT id, status FROM orders WHERE user_id = 42;  -- 覆盖索引，不回表\nSELECT * FROM orders WHERE user_id = 42;           -- 需要回表\n```\n\n实战建议：\n\n-   主键用**自增或趋势递增**的 ID（雪花算法），随机 UUID 做主键会导致页分裂、写入放大；\n-   高频查询只取需要的列，配合联合索引实现覆盖。"
+    },
+    {
+      "id": "db-04",
+      "code": "DB-04",
+      "cat": "db",
+      "group": "MySQL",
+      "level": 1,
+      "hot": true,
+      "title": "什么是最左前缀原则？哪些情况会导致索引失效？",
+      "answer": "联合索引 `(a, b, c)` 按 a、b、c 的顺序排序，查询条件必须从最左列开始连续匹配才能用上索引：\n\n-   `WHERE a=1 AND b=2` ✅；`WHERE b=2` ❌；\n-   `WHERE a=1 AND b>2 AND c=3`：a、b 能用于定位，c 在范围查询之后，不能用于定位，但 5.6 起可以通过**索引下推**在索引层过滤；\n-   等值条件的书写顺序无关，优化器会自动调整。\n\n常见索引失效场景：\n\n1.  对索引列使用**函数或运算**：`WHERE DATE(created_at) = '2026-10-01'`，应改写为范围查询；\n2.  **隐式类型转换**：`phone` 是 varchar，却写 `WHERE phone = 13800000000`（数字），会对每行做转换导致全表扫描。Go 里用 int 变量绑定字符串列时要特别注意；\n3.  `LIKE '%abc'` 左模糊；\n4.  `OR` 连接的条件中有一列没有索引；\n5.  联表时两边字段**字符集或排序规则不同**；\n6.  优化器估算扫描行数太多（区分度低，或者查询范围过大），主动放弃索引走全表扫描。"
+    },
+    {
+      "id": "db-05",
+      "code": "DB-05",
+      "cat": "db",
+      "group": "MySQL",
+      "level": 1,
+      "hot": true,
+      "title": "事务的 ACID 是什么？隔离级别有哪些？分别能解决什么问题？",
+      "answer": "ACID：\n\n-   原子性：由 undo log 保证；\n-   一致性：由其余三者共同保证；\n-   隔离性：由锁和 MVCC 保证；\n-   持久性：由 redo log 保证。\n\n| 隔离级别 | 脏读 | 不可重复读 | 幻读 |\n| --- | --- | --- | --- |\n| 读未提交 RU | 可能 | 可能 | 可能 |\n| 读已提交 RC | 否 | 可能 | 可能 |\n| 可重复读 RR（MySQL 默认） | 否 | 否 | 快照读不会；当前读靠间隙锁避免 |\n| 串行化 | 否 | 否 | 否 |\n\n实战：很多互联网公司会把隔离级别改成 **RC**：间隙锁更少，死锁概率更低，并发更好。需要注意 binlog 格式必须为 ROW。"
+    },
+    {
+      "id": "db-06",
+      "code": "DB-06",
+      "cat": "db",
+      "group": "MySQL",
+      "level": 1,
+      "hot": false,
+      "title": "EXPLAIN 的结果主要看哪些字段？",
+      "answer": "-   **type**（访问类型，从好到差）：`system` > `const` > `eq_ref` > `ref` > `range` > `index`（全索引扫描）> `ALL`（全表扫描）。线上查询至少应达到 `range`；\n-   **key**：实际使用的索引，NULL 表示没用到索引；\n-   **key\\_len**：使用了索引的多少字节，可以判断联合索引用到了几列；\n-   **rows**：预估扫描行数；\n-   **filtered**：按条件过滤后剩余行数的百分比；\n-   **Extra**：\n    -   `Using index`：覆盖索引，好；\n    -   `Using where`：在 server 层过滤；\n    -   `Using index condition`：索引下推；\n    -   `Using filesort`：额外排序，需要关注；\n    -   `Using temporary`：使用了临时表，通常出现在 group by 或 distinct 中，需要优化。\n\nMySQL 8.0.18 起可以用 `EXPLAIN ANALYZE` 实际执行并输出真实耗时和行数。"
+    },
+    {
+      "id": "db-07",
+      "code": "DB-07",
+      "cat": "db",
+      "group": "MySQL",
+      "level": 2,
+      "hot": true,
+      "title": "MVCC 的原理是什么？RC 和 RR 在实现上有什么区别？",
+      "answer": "InnoDB 每行有隐藏列：\n\n-   `DB_TRX_ID`：最后修改该行的事务 ID；\n-   `DB_ROLL_PTR`：指向 undo log 中的上一个版本。\n\n多次修改形成一条**版本链**。\n\n**ReadView**（一致性视图）包含：\n\n-   `m_ids`：创建视图时活跃（未提交）的事务 ID 列表；\n-   `min_trx_id`：m\\_ids 中的最小值；\n-   `max_trx_id`：下一个将要分配的事务 ID；\n-   `creator_trx_id`：创建视图的事务 ID。\n\n可见性判断：\n\n1.  行的 trx\\_id 等于 creator\\_trx\\_id，是自己改的，可见；\n2.  trx\\_id < min\\_trx\\_id，已提交，可见；\n3.  trx\\_id ≥ max\\_trx\\_id，视图创建后才开始的事务，不可见；\n4.  在两者之间：在 m\\_ids 中则不可见，否则可见；\n5.  不可见就沿版本链找上一个版本，继续判断。\n\n**RC 与 RR 的区别**：\n\n-   RC：**每条 SELECT** 都生成新的 ReadView，所以能读到其他事务刚提交的数据；\n-   RR：**事务中第一次 SELECT** 时生成 ReadView，之后一直复用，所以可重复读。\n\n注意：MVCC 只作用于**快照读**（普通 SELECT）。`SELECT ... FOR UPDATE`、`UPDATE`、`DELETE` 是**当前读**，读取最新版本并加锁。"
+    },
+    {
+      "id": "db-08",
+      "code": "DB-08",
+      "cat": "db",
+      "group": "MySQL",
+      "level": 2,
+      "hot": true,
+      "title": "InnoDB 有哪些锁？什么是间隙锁和临键锁？",
+      "answer": "-   **记录锁**：锁住索引上的一条记录；\n-   **间隙锁**：锁住两条索引记录之间的间隙，阻止其他事务在间隙中插入数据，只在 RR 级别下存在；\n-   **临键锁（Next-Key Lock）**：记录锁 + 前面的间隙，左开右闭区间，是 RR 下当前读的默认加锁单位；\n-   **插入意向锁**：插入前在间隙上加的一种特殊间隙锁，与间隙锁互斥；\n-   **意向锁**（IS/IX）：表级锁，用于快速判断表中是否有行锁。\n\n加锁规则要点：\n\n-   锁加在**索引**上，不是加在行上；\n-   唯一索引的等值查询命中时，临键锁退化为记录锁；\n-   **UPDATE 的 WHERE 条件没有走索引时，会锁住所有扫描到的记录**，效果接近锁表。这是线上大面积锁等待的常见原因。"
+    },
+    {
+      "id": "db-09",
+      "code": "DB-09",
+      "cat": "db",
+      "group": "MySQL",
+      "level": 2,
+      "hot": true,
+      "title": "redo log、undo log、binlog 分别是什么？什么是两阶段提交？",
+      "answer": "|  | redo log | undo log | binlog |\n| --- | --- | --- | --- |\n| 所属层 | InnoDB 引擎层 | InnoDB 引擎层 | Server 层，所有引擎通用 |\n| 内容 | 物理日志：\"某页某处改成了什么\" | 逻辑反向操作，用于回滚 | 逻辑日志（SQL 或行变更） |\n| 作用 | 崩溃恢复，保证持久性 | 事务回滚 + MVCC 版本链 | 主从复制、按时间点恢复 |\n| 写入方式 | 固定大小循环写 | 随事务产生 | 追加写 |\n\nredo log 实现了 **WAL**（先写日志再写数据页），把随机写变成顺序写。\n\n**两阶段提交**保证 redo log 和 binlog 一致：\n\n1.  写 redo log，状态为 prepare；\n2.  写 binlog；\n3.  redo log 改为 commit。\n\n崩溃恢复时：redo 处于 prepare 且 binlog 完整，则提交；binlog 不完整则回滚。\n\n最安全的配置是\"双 1\"：`innodb_flush_log_at_trx_commit=1` + `sync_binlog=1`，每次提交都刷盘。"
+    },
+    {
+      "id": "db-10",
+      "code": "DB-10",
+      "cat": "db",
+      "group": "MySQL",
+      "level": 2,
+      "hot": true,
+      "title": "遇到慢查询，你的优化流程是什么？",
+      "answer": "1.  **发现**：开启慢查询日志（`long_query_time=1` 或更小），用 pt-query-digest 聚合分析；也可以从 APM 链路追踪中找出耗时长的 SQL；\n2.  **分析**：`EXPLAIN` / `EXPLAIN ANALYZE` 看执行计划，关注 type、key、rows、Extra；\n3.  **常见优化手段**：\n    -   补充合适的联合索引，让高频查询走覆盖索引；\n    -   改写 SQL：消除对索引列的函数运算、避免隐式转换、拆分 OR、深分页改游标；\n    -   避免 `SELECT *`，只取需要的列；\n    -   大事务、大批量操作拆分成小批次；\n    -   去掉低效的 JOIN 或子查询，或在应用层分步查询；\n4.  **数据层面**：冷热数据分离、归档历史数据、引入缓存、读写分离；\n5.  **验证**：对比优化前后的执行计划和实际耗时，注意新增索引对写入性能的影响。\n\n还要注意：查询慢不一定是 SQL 本身的问题，也可能是**锁等待**（查 `sys.innodb_lock_waits`）、机器 IO 饱和，或者应用端连接池等待。"
+    },
+    {
+      "id": "db-11",
+      "code": "DB-11",
+      "cat": "db",
+      "group": "MySQL",
+      "level": 2,
+      "hot": true,
+      "title": "深分页 LIMIT 1000000, 10 很慢，怎么优化？",
+      "answer": "慢的原因：MySQL 需要先扫描并丢弃前 100 万行，而且如果需要回表，这 100 万行都会回表一次。\n\n方案一：**游标分页**（推荐），记住上一页最后一条记录的 ID：\n\n```sql\nSELECT * FROM orders WHERE user_id = 42 AND id < ? ORDER BY id DESC LIMIT 20;\n```\n\n缺点是不能直接跳到任意页，适合 App 的下拉加载。\n\n方案二：**延迟关联**，先通过覆盖索引查出主键，再关联取数据：\n\n```sql\nSELECT o.* FROM orders o\nJOIN (SELECT id FROM orders WHERE status = 1 ORDER BY id LIMIT 1000000, 10) t USING (id);\n```\n\n方案三：产品层面限制最大页数（搜索引擎通常只允许翻到第 100 页左右），超深分页的查询交给 ES 或离线系统处理。"
+    },
+    {
+      "id": "db-12",
+      "code": "DB-12",
+      "cat": "db",
+      "group": "MySQL",
+      "level": 2,
+      "hot": false,
+      "title": "线上出现死锁，怎么排查和避免？",
+      "answer": "排查：\n\n-   `SHOW ENGINE INNODB STATUS` 中的 `LATEST DETECTED DEADLOCK`，能看到两个事务各自持有和等待的锁，以及对应的 SQL；\n-   开启 `innodb_print_all_deadlocks=ON`，把所有死锁记录到错误日志；\n-   Go 中死锁表现为 MySQL 错误码 **1213**（`Deadlock found when trying to get lock`），可以在代码中识别并重试。\n\n常见原因：\n\n-   两个事务以**不同顺序**更新相同的多行数据（比如转账 A→B 和 B→A 同时进行）；\n-   RR 级别下间隙锁互相阻塞插入意向锁（比如并发执行\"先查是否存在，不存在就插入\"）；\n-   更新语句没走索引，锁定范围过大。\n\n避免方法：\n\n-   按**固定顺序**访问资源（比如按 ID 排序后再更新）；\n-   事务尽量短小，不在事务中进行 RPC 调用；\n-   保证更新语句走索引；\n-   考虑使用 RC 隔离级别；\n-   用 `INSERT ... ON DUPLICATE KEY UPDATE` 替代\"先查后插\"；\n-   业务层对死锁错误做有限次数的重试。"
+    },
+    {
+      "id": "db-13",
+      "code": "DB-13",
+      "cat": "db",
+      "group": "MySQL",
+      "level": 2,
+      "hot": true,
+      "title": "主从复制的原理是什么？主从延迟怎么办？",
+      "answer": "原理：\n\n1.  主库提交事务时写 binlog；\n2.  从库的 IO 线程连接主库，接收 binlog 写入本地的 relay log；\n3.  从库的 SQL 线程（或多个并行 worker）重放 relay log。\n\n默认是**异步复制**；半同步复制要求至少一个从库收到 binlog 才向客户端返回成功。\n\n延迟原因：\n\n-   大事务（一次删除几百万行），从库重放需要同样长的时间；\n-   从库单线程重放，跟不上主库的并发写入；\n-   从库机器配置低或者承担了大量慢查询；\n-   ROW 格式下表没有主键，从库每条变更都要全表扫描。\n\n解决：\n\n-   开启并行复制（MySQL 5.7+ 基于逻辑时钟，8.0 支持基于 WRITESET 的并行）；\n-   拆分大事务，批量操作分批执行；\n-   每张表都要有主键；\n-   业务层处理\"写后立即读\"的问题：\n    -   写操作之后的关键读请求强制走主库（比如在 ctx 中打标记，或在一段时间内对该用户的请求路由到主库）；\n    -   或者使用 GTID 等待（`WAIT_FOR_EXECUTED_GTID_SET`）确认从库已追上。"
+    },
+    {
+      "id": "db-14",
+      "code": "DB-14",
+      "cat": "db",
+      "group": "MySQL",
+      "level": 2,
+      "hot": false,
+      "title": "大表加字段或加索引，如何避免锁表影响线上？",
+      "answer": "-   MySQL 5.6+ 支持 **Online DDL**（`ALGORITHM=INPLACE, LOCK=NONE`），加索引期间可以读写；\n-   MySQL 8.0 支持 **INSTANT** 加列（8.0.12 起支持在末尾加列，8.0.29 起支持任意位置），只修改元数据，秒级完成；\n-   不支持在线执行的变更，使用 **gh-ost**（基于 binlog，无触发器，可暂停、可限流）或 **pt-online-schema-change**（基于触发器）。\n\n**最大的坑是 MDL 锁**：DDL 需要获取元数据写锁，如果前面有一个长事务或长查询持有 MDL 读锁，DDL 会一直等待；而 DDL 等待期间，后续所有对该表的查询都会排在 DDL 后面，**整张表瞬间不可用**。\n\n对策：\n\n-   执行前检查 `information_schema.innodb_trx` 中有没有长事务；\n-   设置较小的 `lock_wait_timeout`，拿不到锁就快速失败，稍后重试；\n-   选择业务低峰期执行。"
+    },
+    {
+      "id": "db-15",
+      "code": "DB-15",
+      "cat": "db",
+      "group": "MySQL",
+      "level": 3,
+      "hot": true,
+      "title": "什么时候需要分库分表？怎么做？会带来什么问题？",
+      "answer": "时机：单表数据量达到几千万行且持续增长、单库写入 QPS 或连接数接近瓶颈、单库容量过大导致备份恢复时间过长。先考虑归档、索引优化、读写分离、缓存，这些都不够时再分。\n\n方式：\n\n-   **垂直拆分**：按业务拆库（用户库、订单库），或把大字段拆到扩展表；\n-   **水平拆分**：同一张表按**分片键**拆成多张表或多个库。\n\n分片键选择：选择查询最频繁的维度，比如订单按 user\\_id 分片，保证\"查询某个用户的订单\"只命中一个分片。商家维度的查询可以通过冗余一份按 shop\\_id 分片的数据，或者同步到 ES 解决。\n\n路由策略：\n\n-   哈希取模：分布均匀，但扩容需要迁移数据；\n-   范围分片：方便扩容，但容易产生热点；\n-   常见折中方案：预先分成 1024 张逻辑表，映射到少量物理库，扩容时只迁移逻辑表。\n\n带来的问题：\n\n-   跨分片 JOIN、聚合、排序、分页变得困难；\n-   分布式事务；\n-   全局唯一 ID；\n-   数据迁移和扩容复杂。\n\n中间件：ShardingSphere、Vitess。也可以直接选用 TiDB 这类分布式数据库，避免在应用层处理分片。"
+    },
+    {
+      "id": "db-16",
+      "code": "DB-16",
+      "cat": "db",
+      "group": "MySQL",
+      "level": 3,
+      "hot": false,
+      "title": "count(\\*) 在大表上很慢，怎么办？",
+      "answer": "原因：InnoDB 支持 MVCC，不同事务看到的行数可能不同，所以不能像 MyISAM 那样直接存储行数，只能扫描。优化器会选择**最小的二级索引**来扫描。\n\n`count(*)` ≈ `count(1)` > `count(主键)` > `count(字段)`：前两者不需要取值，`count(字段)` 还需要判断是否为 NULL。\n\n方案：\n\n-   允许近似值：用 `SHOW TABLE STATUS` 或 EXPLAIN 的 rows 估算；\n-   要求精确：维护一张计数表，**在同一个事务中**同时更新业务表和计数；\n-   用 Redis 计数：性能好，但与数据库之间存在不一致的窗口；\n-   产品层面妥协：比如显示\"999+\"，只计算到某个上限。"
+    },
+    {
+      "id": "db-17",
+      "code": "DB-17",
+      "cat": "db",
+      "group": "Go",
+      "level": 2,
+      "hot": true,
+      "title": "Go 的 database/sql 连接池参数应该怎么配置？",
+      "answer": "`sql.DB` 本身就是**连接池**，并发安全，应该全局创建一次、长期复用，而不是每次请求都 Open。\n\n```go\ndb, err := sql.Open(\"mysql\", dsn)\ndb.SetMaxOpenConns(50)                  // 最大连接数，默认 0 表示不限制\ndb.SetMaxIdleConns(50)                  // 最大空闲连接数，默认只有 2\ndb.SetConnMaxLifetime(30 * time.Minute) // 连接最长存活时间\ndb.SetConnMaxIdleTime(5 * time.Minute)  // 空闲连接最长保留时间\n```\n\n配置要点：\n\n-   **MaxOpenConns 必须设置**，否则突发流量下会打出大量连接，压垮数据库。总连接数 = 实例数 × MaxOpenConns，要小于数据库的 `max_connections`；\n-   **MaxIdleConns 默认只有 2**，高并发下连接用完就关闭，下次又要重新建立，产生大量 TIME\\_WAIT 和建连开销。稳定负载下可以设为接近 MaxOpenConns；\n-   **ConnMaxLifetime** 要小于 MySQL 的 `wait_timeout` 以及中间代理、负载均衡的空闲超时，否则会拿到已经被服务端断开的连接，报 `invalid connection` 或 `broken pipe`；\n-   用 `db.Stats()` 暴露监控：`WaitCount`、`WaitDuration` 持续增长，说明连接池不够用，或者有慢查询、连接泄漏。"
+    },
+    {
+      "id": "db-18",
+      "code": "DB-18",
+      "cat": "db",
+      "group": "Go",
+      "level": 2,
+      "hot": false,
+      "title": "使用 database/sql 时，有哪些会导致连接泄漏的写法？",
+      "answer": "```go\nrows, err := db.QueryContext(ctx, \"SELECT id, name FROM users WHERE age > ?\", 18)\nif err != nil {\n    return err\n}\ndefer rows.Close() // 必须关闭，否则连接一直被占用\nfor rows.Next() {\n    var u User\n    if err := rows.Scan(&u.ID, &u.Name); err != nil {\n        return err // 有 defer Close，提前返回也安全\n    }\n    users = append(users, u)\n}\nreturn rows.Err() // 遍历过程中的错误在这里返回\n```\n\n常见泄漏方式：\n\n1.  `Query` 之后忘记 `rows.Close()`，并且没有遍历完所有行；\n2.  只需要查询单行时用了 `Query`，正确做法是用 `QueryRow`，它在 Scan 后会自动释放连接；\n3.  开启事务后某个分支既没有 Commit 也没有 Rollback；\n4.  用 `db.Conn()` 获取的专用连接忘记 Close。\n\n表现：连接池耗尽，所有请求都卡在获取连接上，`db.Stats().InUse` 等于 MaxOpenConns 且不下降。"
+    },
+    {
+      "id": "db-19",
+      "code": "DB-19",
+      "cat": "db",
+      "group": "Go",
+      "level": 2,
+      "hot": false,
+      "title": "在 Go 中如何正确地编写事务？",
+      "answer": "```go\nfunc Transfer(ctx context.Context, db *sql.DB, from, to int64, amount int64) (err error) {\n    tx, err := db.BeginTx(ctx, nil)\n    if err != nil {\n        return err\n    }\n    defer func() {\n        if err != nil {\n            _ = tx.Rollback()\n        }\n    }()\n\n    // 按 ID 从小到大更新，避免两笔反向转账互相等锁形成死锁\n    type op struct{ id, delta int64 }\n    ops := []op{{from, -amount}, {to, amount}}\n    if from > to {\n        ops[0], ops[1] = ops[1], ops[0]\n    }\n    for _, o := range ops {\n        var res sql.Result\n        res, err = tx.ExecContext(ctx,\n            \"UPDATE accounts SET balance = balance + ? WHERE id = ? AND balance + ? >= 0\",\n            o.delta, o.id, o.delta)\n        if err != nil {\n            return err\n        }\n        if n, _ := res.RowsAffected(); n == 0 {\n            return ErrTransferFailed // 账户不存在或余额不足\n        }\n    }\n    return tx.Commit()\n}\n```\n\n要点：\n\n-   事务内的所有操作都必须用 **tx** 执行，误用 `db.Exec` 会从连接池取另一个连接，不在事务中；\n-   事务绑定在一个连接上，事务持续多久，这个连接就被占用多久，**不要在事务中调用 RPC 或 HTTP**；\n-   ctx 被取消时，database/sql 会自动回滚事务；\n-   常见的封装方式是 `WithTx(ctx, func(tx *sql.Tx) error)`，统一处理提交、回滚和 panic。"
+    },
+    {
+      "id": "db-20",
+      "code": "DB-20",
+      "cat": "db",
+      "group": "Go",
+      "level": 2,
+      "hot": false,
+      "title": "使用 GORM 时有哪些常见的坑？",
+      "answer": "1.  **用结构体 Updates 时零值字段不会更新**：`db.Model(&u).Updates(User{Status: 0})` 不会把 status 改成 0。应使用 map 或 `Select(\"status\")` 显式指定字段；\n2.  **复用带条件的 \\*gorm.DB**：`q := db.Where(\"a = ?\", 1)` 之后多次基于 q 链式调用，条件可能互相污染。需要复用时使用 `Session(&gorm.Session{})`；\n3.  **First 和 Find 的区别**：没有记录时 `First` 返回 `gorm.ErrRecordNotFound`，`Find` 不返回错误；\n4.  **软删除**：模型包含 `gorm.DeletedAt` 字段时，Delete 只是设置删除时间，查询会自动过滤，唯一索引需要包含 deleted\\_at，否则删除后无法重新插入相同的数据；\n5.  **N+1 查询**：循环中查询关联数据，应使用 `Preload` 或 `Joins`；\n6.  **Save 会更新所有字段**，包括零值，并发场景下可能覆盖其他请求的修改；\n7.  不带条件的全局更新或删除默认会被拦截（`ErrMissingWhereClause`），不要轻易开启 `AllowGlobalUpdate`。\n\n建议开启慢查询日志（logger 的 SlowThreshold），并定期检查生成的 SQL。"
+    },
+    {
+      "id": "db-21",
+      "code": "DB-21",
+      "cat": "db",
+      "group": "Go",
+      "level": 2,
+      "hot": false,
+      "title": "Go 中如何防范 SQL 注入？",
+      "answer": "-   **永远使用占位符**：`db.Query(\"SELECT * FROM users WHERE name = ?\", name)`，驱动会对参数做转义或使用预编译语句；\n-   禁止用 `fmt.Sprintf` 把用户输入拼接进 SQL；\n-   **表名、列名、ORDER BY 字段**不能用占位符，必须使用**白名单**映射：\n\n```go\nvar sortable = map[string]string{\"created\": \"created_at\", \"price\": \"price\"}\n\ncol, ok := sortable[req.Sort]\nif !ok {\n    col = \"created_at\"\n}\nquery := \"SELECT id, name FROM products ORDER BY \" + col + \" DESC LIMIT ?\"\n```\n\n-   GORM 中 `db.Where(userInput)` 直接传入字符串也存在注入风险，应写成 `db.Where(\"name = ?\", userInput)`；\n-   数据库账号遵循最小权限原则，业务账号不授予 DROP 等高危权限。"
+    },
+    {
+      "id": "db-22",
+      "code": "DB-22",
+      "cat": "db",
+      "group": "Redis",
+      "level": 1,
+      "hot": true,
+      "title": "Redis 有哪些数据结构？分别适合什么场景？",
+      "answer": "| 类型 | 底层编码 | 典型场景 |\n| --- | --- | --- |\n| String | int / embstr / raw（SDS） | 缓存对象、计数器、分布式锁、限流 |\n| Hash | listpack / hashtable | 存储对象的多个字段，可以单独修改某个字段 |\n| List | quicklist（由 listpack 组成） | 简单队列、最新消息列表 |\n| Set | intset / listpack / hashtable | 标签、共同关注、抽奖去重 |\n| ZSet | listpack / 跳表 + 哈希表 | 排行榜、延迟队列、滑动窗口限流 |\n| Bitmap | String | 签到、在线状态、布隆过滤器 |\n| HyperLogLog | String | UV 统计（误差约 0.81%，固定占用 12KB） |\n| GEO | ZSet | 附近的人 |\n| Stream | 基数树 + listpack | 带消费组的消息队列 |\n\n元素少的时候使用紧凑的 listpack 编码（Redis 7.0 用它替代了 ziplist），超过阈值后转换为哈希表或跳表。\n\nZSet 为什么用跳表而不是红黑树：实现简单，范围查询更方便，可以通过调整层数概率在内存和性能之间取舍。"
+    },
+    {
+      "id": "db-23",
+      "code": "DB-23",
+      "cat": "db",
+      "group": "Redis",
+      "level": 1,
+      "hot": true,
+      "title": "什么是缓存穿透、缓存击穿和缓存雪崩？怎么解决？",
+      "answer": "**缓存穿透**：查询**根本不存在**的数据，缓存和数据库都没有，每次请求都打到数据库（常见于恶意攻击）。\n\n-   缓存空值，设置较短的过期时间；\n-   布隆过滤器预先拦截不存在的 key；\n-   接口层做参数校验，比如 ID 必须大于 0。\n\n**缓存击穿**：某个**热点 key 过期**的瞬间，大量并发请求同时回源数据库。\n\n-   互斥加载：进程内用 singleflight，跨进程用分布式锁，只让一个请求回源；\n-   逻辑过期：缓存不设置物理过期时间，value 中保存过期时间，发现逻辑过期后由一个协程异步刷新，其他请求先返回旧数据；\n-   热点数据提前续期，或者永不过期。\n\n**缓存雪崩**：**大量 key 同时过期**，或者 Redis 整体宕机。\n\n-   过期时间加随机值：`ttl = base + rand(0, 300s)`；\n-   Redis 高可用部署（哨兵或集群）；\n-   多级缓存（本地缓存 + Redis）；\n-   服务端限流、熔断、降级，保护数据库；\n-   服务启动时预热缓存。"
+    },
+    {
+      "id": "db-24",
+      "code": "DB-24",
+      "cat": "db",
+      "group": "Redis",
+      "level": 1,
+      "hot": false,
+      "title": "Redis 为什么这么快？它是单线程的吗？",
+      "answer": "快的原因：\n\n-   数据存储在内存中；\n-   针对场景设计了高效的数据结构（SDS、跳表、listpack 等）；\n-   命令执行是单线程的，没有锁竞争和线程切换开销；\n-   使用 IO 多路复用（epoll）处理大量连接。\n\n单线程指的是**命令执行**是单线程的。后台的持久化、异步删除等由其他线程完成。Redis 6.0 引入了 **IO 多线程**（`io-threads`），用多个线程处理网络读写和协议解析，命令执行仍然是单线程。\n\n因此，Redis 中任何耗时的命令都会阻塞所有请求：`KEYS *`、对大集合执行 `HGETALL` / `SMEMBERS`、`FLUSHALL` 等。生产环境应使用 `SCAN` 系列命令，并通过 rename-command 禁用危险命令。"
+    },
+    {
+      "id": "db-25",
+      "code": "DB-25",
+      "cat": "db",
+      "group": "Redis",
+      "level": 2,
+      "hot": true,
+      "title": "如何保证缓存和数据库的一致性？",
+      "answer": "最常用的是 **Cache Aside 旁路缓存**：\n\n-   读：先读缓存，未命中则查数据库，再写入缓存；\n-   写：**先更新数据库，再删除缓存**。\n\n为什么是删除缓存而不是更新缓存：并发更新时，缓存的写入顺序可能和数据库不一致，导致缓存中是旧值；而且很多缓存值需要经过计算，频繁更新但很少读取的数据会浪费资源。\n\n为什么先更新数据库再删缓存：如果先删缓存再更新数据库，在两步之间有读请求进来，会把旧数据重新写回缓存，这个窗口很大。\n\n仍然存在的小概率问题：读请求未命中缓存，读到旧值后，写请求更新数据库并删除缓存，读请求再把旧值写入缓存。\n\n改进措施：\n\n-   **延迟双删**：更新数据库并删除缓存后，延迟几百毫秒再删一次；\n-   **订阅 binlog 删除缓存**：用 Canal 等工具监听 binlog，通过 MQ 异步删除缓存并支持重试，业务代码与缓存解耦，是大厂常用方案；\n-   删除失败时进入重试队列；\n-   **所有缓存都设置过期时间**作为最终兜底。\n\n需要明确的是：缓存和数据库之间只能做到**最终一致**，对强一致有要求的数据（比如余额）直接读数据库。"
+    },
+    {
+      "id": "db-26",
+      "code": "DB-26",
+      "cat": "db",
+      "group": "Redis",
+      "level": 2,
+      "hot": false,
+      "title": "Redis 的持久化方式有哪些？怎么选？",
+      "answer": "-   **RDB**：定时生成内存快照。`bgsave` 时 fork 子进程，利用写时复制完成。文件小、恢复快，但两次快照之间的数据可能丢失；fork 在大内存实例上可能阻塞数百毫秒；\n-   **AOF**：记录每条写命令。`appendfsync` 可选 always（最安全但最慢）、everysec（推荐，最多丢 1 秒）、no。文件会越来越大，需要定期重写（rewrite）；\n-   **混合持久化**（Redis 4.0 引入，5.0 起默认开启）：AOF 重写时，文件前半部分是 RDB 格式，后半部分是增量 AOF，兼顾恢复速度和数据安全。\n\n建议：作为缓存时可以只开 RDB 甚至关闭持久化；存储重要数据时开启 AOF everysec 和混合持久化，同时注意 fork 时的内存翻倍风险，留足内存余量。"
+    },
+    {
+      "id": "db-27",
+      "code": "DB-27",
+      "cat": "db",
+      "group": "Redis",
+      "level": 2,
+      "hot": true,
+      "title": "如何用 Redis 实现分布式锁？有哪些坑？",
+      "answer": "加锁：\n\n```text\nSET lock:order:123 <唯一值> NX PX 30000\n```\n\n-   `NX` 保证互斥，`PX` 设置过期时间，防止持有者宕机后死锁；\n-   两个参数必须在**一条命令**中完成，不能先 SETNX 再 EXPIRE。\n\n解锁：必须**判断是自己的锁才删除**，用 Lua 脚本保证原子性：\n\n```lua\nif redis.call(\"GET\", KEYS[1]) == ARGV[1] then\n    return redis.call(\"DEL\", KEYS[1])\nend\nreturn 0\n```\n\n坑：\n\n1.  **业务执行时间超过锁的过期时间**：锁被自动释放，另一个客户端获得锁。解决方法是启动\"看门狗\"协程定期续期，业务完成后停止续期；\n2.  **主从切换导致锁丢失**：主节点加锁成功后宕机，锁还没同步到从节点，从节点升为主节点后，其他客户端又能加锁。Redlock 算法要求在多数独立节点上加锁成功，但它的正确性在业界有争议（依赖时钟，以及 GC 停顿等问题）；\n3.  **GC 停顿或网络延迟**：客户端以为自己还持有锁，实际已经过期。\n\n结论：Redis 锁适合**提升效率**的场景（避免重复计算），偶尔失效可以接受。对正确性要求高的场景：\n\n-   使用 etcd 或 ZooKeeper（基于租约和共识算法）；\n-   在存储层增加 **fencing token**（单调递增的版本号），拒绝持有旧 token 的写入；\n-   最后再加一层数据库唯一约束或乐观锁兜底。\n\nGo 中常用的库是 go-redsync/redsync。"
+    },
+    {
+      "id": "db-28",
+      "code": "DB-28",
+      "cat": "db",
+      "group": "Redis",
+      "level": 2,
+      "hot": false,
+      "title": "如何发现和处理大 key 与热 key？",
+      "answer": "**大 key**（String 超过 10KB 量级、集合元素数超过数千个）的危害：\n\n-   操作耗时长，阻塞单线程，导致其他请求超时；\n-   网络带宽被占满；\n-   删除时可能卡顿；\n-   集群中数据分布不均。\n\n发现：`redis-cli --bigkeys`、`--memkeys`、`MEMORY USAGE key`，或者离线分析 RDB 文件。\n\n处理：\n\n-   拆分，比如把大 Hash 按字段哈希拆成多个小 Hash；\n-   压缩 value；\n-   使用 `UNLINK` 异步删除，或者用 `HSCAN` / `SSCAN` 分批删除；\n-   开启 `lazyfree` 相关配置。\n\n**热 key**（单个 key 的 QPS 极高）的危害：所在分片的 CPU 打满，集群扩容也无法分摊。\n\n发现：`redis-cli --hotkeys`（需要 LFU 淘汰策略），客户端或代理层统计，`MONITOR`（仅限短时间使用）。\n\n处理：\n\n-   **本地缓存**：把热 key 缓存在应用进程中，设置很短的过期时间，最有效；\n-   复制多份：`key:1` 到 `key:N` 分布在不同分片上，读取时随机选择一个；\n-   读写分离，用从节点分担读压力。"
+    },
+    {
+      "id": "db-29",
+      "code": "DB-29",
+      "cat": "db",
+      "group": "Redis",
+      "level": 2,
+      "hot": false,
+      "title": "Redis 的过期删除和内存淘汰策略有哪些？",
+      "answer": "**过期删除**：\n\n-   惰性删除：访问 key 时检查是否过期，过期则删除；\n-   定期删除：后台每秒多次随机抽样带过期时间的 key，删除已过期的，如果过期比例高就继续抽样。\n\n两者结合，在 CPU 消耗和内存占用之间取得平衡，但仍可能有部分过期 key 未被及时删除。\n\n**内存淘汰**（达到 maxmemory 时）：\n\n-   `noeviction`（默认）：拒绝写入，返回错误；\n-   `allkeys-lru` / `volatile-lru`：在所有 key 或带过期时间的 key 中淘汰最近最少使用的；\n-   `allkeys-lfu` / `volatile-lfu`（4.0+）：淘汰访问频率最低的；\n-   `allkeys-random` / `volatile-random`、`volatile-ttl`。\n\nRedis 的 LRU 是**近似实现**：随机采样若干个 key（`maxmemory-samples`，默认 5），淘汰其中最久未访问的。\n\n纯缓存场景通常选择 `allkeys-lru` 或 `allkeys-lfu`。"
+    },
+    {
+      "id": "db-30",
+      "code": "DB-30",
+      "cat": "db",
+      "group": "Redis",
+      "level": 2,
+      "hot": false,
+      "title": "Redis 哨兵和 Cluster 集群有什么区别？",
+      "answer": "**主从 + 哨兵**：\n\n-   一主多从，哨兵监控主节点，主节点故障时自动选出新主节点并通知客户端；\n-   写能力和存储容量受限于单个主节点。\n\n**Redis Cluster**：\n\n-   数据分成 **16384 个槽**，`CRC16(key) % 16384` 决定 key 所属的槽，每个主节点负责一部分槽；\n-   节点之间通过 gossip 协议通信，内置故障转移；\n-   客户端访问错误节点时收到 `MOVED` 重定向（迁移中收到 `ASK`），智能客户端会缓存槽的映射；\n-   多 key 操作（MGET、事务、Lua）要求所有 key 位于同一个槽，可以用**哈希标签** `{user:1}:profile`、`{user:1}:orders` 强制分配到同一个槽。\n\n两者的复制都是**异步**的，故障切换时可能丢失少量写入。"
+    },
+    {
+      "id": "db-31",
+      "code": "DB-31",
+      "cat": "db",
+      "group": "Redis",
+      "level": 2,
+      "hot": false,
+      "title": "Redis 如何保证多个操作的原子性？Pipeline、事务和 Lua 有什么区别？",
+      "answer": "-   **Pipeline**：把多条命令一次性发送，减少网络往返次数（RTT），**不保证原子性**，其他客户端的命令可能穿插执行。适合批量写入、批量读取；\n-   **MULTI/EXEC 事务**：命令排队后一起执行，执行期间不会插入其他命令。但**不支持回滚**，某条命令运行时出错，其他命令依然会执行；配合 `WATCH` 可以实现乐观锁；\n-   **Lua 脚本**：整个脚本原子执行，可以包含条件判断，是实现\"检查并修改\"类逻辑（库存扣减、限流、释放锁）的首选。注意脚本不能执行太久，否则会阻塞整个实例。\n\n```go\n// go-redis 中执行 Lua：库存充足时扣减\nvar deduct = redis.NewScript(`\nlocal stock = tonumber(redis.call(\"GET\", KEYS[1]) or \"0\")\nif stock >= tonumber(ARGV[1]) then\n    return redis.call(\"DECRBY\", KEYS[1], ARGV[1])\nend\nreturn -1\n`)\n\nleft, err := deduct.Run(ctx, rdb, []string{\"stock:sku:1001\"}, 1).Int64()\n```\n\n`Script.Run` 内部会先尝试 EVALSHA，脚本不存在时自动回退到 EVAL。"
+    },
+    {
+      "id": "web-01",
+      "code": "WEB-01",
+      "cat": "web",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "net/http 处理一个请求的完整流程是怎样的？",
+      "answer": "1.  `http.ListenAndServe` 创建 Listener，在循环中 `Accept` 新连接；\n2.  每个连接启动**一个 goroutine**（`conn.serve`）；\n3.  在这个 goroutine 中循环读取请求（HTTP/1.1 keep-alive 时一个连接可以处理多个请求），解析为 `*http.Request`；\n4.  根据 Handler（默认 `DefaultServeMux`）路由，调用 `ServeHTTP(w, r)`；\n5.  写回响应，继续等待同一连接上的下一个请求，直到连接关闭或空闲超时。\n\n如果启用了 TLS 并通过 ALPN 协商为 HTTP/2，则一个连接上的多个 stream 会分别在不同的 goroutine 中并发处理。\n\n几个实战细节：\n\n-   同一个连接上的 HTTP/1.1 请求是串行处理的；\n-   net/http 会 recover handler 中的 panic，记录日志并关闭连接，但不会保护 handler 中另外启动的 goroutine；\n-   `r.Context()` 在客户端断开连接或请求处理结束时被取消，可以用于停止下游调用。"
+    },
+    {
+      "id": "web-02",
+      "code": "WEB-02",
+      "cat": "web",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "中间件的原理是什么？Gin 的 c.Next() 是怎么工作的？",
+      "answer": "标准库的中间件就是一个**包装 Handler 的函数**：\n\n```go\ntype Middleware func(http.Handler) http.Handler\n\nfunc Chain(h http.Handler, ms ...Middleware) http.Handler {\n    for i := len(ms) - 1; i >= 0; i-- {\n        h = ms[i](h) // 倒序包装，保证 ms[0] 在最外层\n    }\n    return h\n}\n```\n\nGin 的实现：路由匹配后，把全局中间件、分组中间件和最终处理函数组成一个 `HandlersChain` 切片，`Context` 中保存当前执行到的下标 `index`：\n\n-   `c.Next()`：下标加一并执行后续的处理函数，全部返回后，再继续执行当前中间件 `c.Next()` 之后的代码，形成**洋葱模型**，适合统计耗时、记录响应；\n-   `c.Abort()`：把下标设置为一个很大的值，后续处理函数不再执行，但**当前函数仍会继续执行到结束**，所以 Abort 后通常需要 return；\n-   不调用 `c.Next()` 的中间件，执行完后框架会自动执行下一个处理函数。\n\n注意：Gin 的 Context 是**对象池复用**的，如果要在新的 goroutine 中使用，必须先 `c.Copy()`。"
+    },
+    {
+      "id": "web-03",
+      "code": "WEB-03",
+      "cat": "web",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "Go 1.22 增强后的 ServeMux 能做什么？和 Gin 的路由有什么区别？",
+      "answer": "Go 1.22 起标准库路由支持**请求方法**和**路径参数**：\n\n```go\nmux := http.NewServeMux()\nmux.HandleFunc(\"GET /orders/{id}\", getOrder)\nmux.HandleFunc(\"POST /orders\", createOrder)\nmux.HandleFunc(\"GET /static/{path...}\", serveStatic) // 匹配剩余路径\n\nfunc getOrder(w http.ResponseWriter, r *http.Request) {\n    id := r.PathValue(\"id\")\n    // ...\n}\n```\n\n匹配规则按**最具体优先**，模式冲突会在注册时 panic，方法不匹配会自动返回 405。\n\n与 Gin（httprouter 风格的基数树）相比：\n\n-   标准库无依赖、兼容性最好，对简单服务已经足够；\n-   Gin 提供了参数绑定与校验、中间件分组、渲染等全套功能，开发效率更高；\n-   两者的路由性能对一般业务都不是瓶颈。"
+    },
+    {
+      "id": "web-04",
+      "code": "WEB-04",
+      "cat": "web",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "如何实现服务的优雅关闭？在 Kubernetes 中还需要注意什么？",
+      "answer": "```go\nfunc main() {\n    srv := &http.Server{Addr: \":8080\", Handler: router()}\n\n    ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)\n    defer stop()\n\n    go func() {\n        if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {\n            log.Fatalf(\"listen: %v\", err)\n        }\n    }()\n\n    <-ctx.Done() // 等待退出信号\n\n    shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)\n    defer cancel()\n    if err := srv.Shutdown(shutdownCtx); err != nil { // 停止接收新连接，等待处理中的请求完成\n        log.Printf(\"shutdown: %v\", err)\n    }\n    // 再关闭消费者、后台任务、数据库连接，刷新日志和指标\n}\n```\n\n要点：\n\n-   `Shutdown` 会关闭监听、关闭空闲连接，并等待活跃请求完成，但**不会等待被 Hijack 的连接**（比如 WebSocket），需要通过 `RegisterOnShutdown` 自行通知；\n-   关闭顺序：先停止接收流量，再停止生产新任务，等待正在执行的任务完成，最后释放资源；\n-   **Kubernetes 中**：Pod 删除时，从 Service 的 Endpoints 中摘除和发送 SIGTERM **是并行发生的**，流量可能在收到信号后还会继续进来几秒。常见做法是加一个 `preStop` 睡眠几秒，或者收到信号后先把就绪探针标记为失败，等待一段时间后再调用 Shutdown；\n-   总的等待时间要小于 `terminationGracePeriodSeconds`（默认 30 秒），否则会被 SIGKILL 强制杀掉。"
+    },
+    {
+      "id": "web-05",
+      "code": "WEB-05",
+      "cat": "web",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "使用 http.Client 有哪些必须注意的地方？",
+      "answer": "1.  **必须设置超时**。`http.DefaultClient` 没有超时，下游卡住时 goroutine 会永远挂起：\n\n```go\nvar client = &http.Client{\n    Timeout: 5 * time.Second, // 整个请求的总超时，包括读取 Body\n}\n```\n\n或者使用 `http.NewRequestWithContext` 为单个请求设置超时，以便继承上游的截止时间。\n\n2.  **必须关闭 Body**，而且最好读完，才能把连接放回连接池复用：\n\n```go\nresp, err := client.Do(req)\nif err != nil {\n    return err\n}\ndefer resp.Body.Close()\nif resp.StatusCode != http.StatusOK {\n    io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10)) // 读完少量剩余内容以复用连接\n    return fmt.Errorf(\"unexpected status %d\", resp.StatusCode)\n}\n```\n\n3.  **复用 Client**：不要每个请求都创建新的 Client 或 Transport，连接池在 Transport 中，每次新建就无法复用连接。\n4.  非 2xx 的状态码不会返回 error，需要自己检查 `StatusCode`。"
+    },
+    {
+      "id": "web-06",
+      "code": "WEB-06",
+      "cat": "web",
+      "group": null,
+      "level": 1,
+      "hot": true,
+      "title": "Cookie、Session 和 JWT 有什么区别？JWT 如何实现注销和续期？",
+      "answer": "-   **Session**：服务端保存会话状态（通常放在 Redis 中），客户端只在 Cookie 中保存 session ID。服务端可以随时让会话失效，但需要共享存储；\n-   **JWT**：服务端签名的令牌，自身携带用户信息和过期时间，服务端只需验签，**无状态**，适合分布式和跨服务调用；\n-   **Cookie** 只是一种传输载体，Session ID 和 JWT 都可以放在 Cookie 中。设置 `HttpOnly`（防止 XSS 读取）、`Secure`、`SameSite`（防止 CSRF）。\n\nJWT 的难点是**无法主动失效**：\n\n-   **注销**：把令牌的 `jti` 放入 Redis 黑名单，过期时间等于令牌剩余有效期，中间件验签后再检查黑名单；\n-   **续期**：使用短期的 access token（如 15 分钟）配合长期的 refresh token（如 7 天）。refresh token 存储在服务端，每次刷新后轮换，发现旧的 refresh token 被重复使用时，判定为泄露，吊销该用户的全部令牌；\n-   密钥轮换：在 header 中使用 `kid` 标识密钥版本。\n\nJWT 的 payload 只是 Base64 编码，**不是加密**，不要存放敏感信息。"
+    },
+    {
+      "id": "web-07",
+      "code": "WEB-07",
+      "cat": "web",
+      "group": null,
+      "level": 1,
+      "hot": false,
+      "title": "什么是跨域？CORS 的预检请求是怎么回事？",
+      "answer": "浏览器的**同源策略**限制页面脚本读取不同源（协议、域名、端口任一不同）的响应。CORS 是服务端通过响应头声明允许哪些来源访问。\n\n-   **简单请求**（GET/HEAD/POST，且只有常见的请求头和 Content-Type）直接发送，浏览器检查响应中的 `Access-Control-Allow-Origin`；\n-   其他请求（如 PUT、DELETE、`Content-Type: application/json`、带自定义头）会先发送 **OPTIONS 预检请求**，服务端返回允许的方法和请求头后，浏览器才发送真正的请求。\n\n常见问题：\n\n-   带 Cookie 的请求（`credentials: include`）时，`Allow-Origin` 不能是 `*`，必须是具体的源，并设置 `Allow-Credentials: true`；\n-   认证中间件拦截了 OPTIONS 请求导致预检失败，CORS 中间件需要放在认证中间件之前；\n-   用 `Access-Control-Max-Age` 缓存预检结果，减少请求次数；\n-   CORS 是浏览器的限制，不能代替服务端鉴权。"
+    },
+    {
+      "id": "web-08",
+      "code": "WEB-08",
+      "cat": "web",
+      "group": null,
+      "level": 2,
+      "hot": true,
+      "title": "如何保证接口的幂等性？",
+      "answer": "幂等：同一个请求执行一次和执行多次，产生的效果相同。重试、网络超时、用户重复点击、MQ 重复投递都会导致重复请求。\n\n常用方案：\n\n1.  **唯一索引**：比如订单表的业务单号、支付回调的交易流水号建立唯一索引，重复插入时报错（MySQL 1062），视为已处理；\n2.  **幂等键（Idempotency Key）**：客户端为每次操作生成唯一 ID 放在请求头中，服务端处理前先用 `SET key NX` 占位，处理完成后保存结果，重复请求直接返回首次的结果。处理中再次收到请求时，返回\"处理中\"；\n3.  **状态机 + 条件更新**：\n\n```sql\nUPDATE orders SET status = 'PAID', paid_at = NOW()\nWHERE order_no = ? AND status = 'UNPAID';\n```\n\n影响行数为 0 说明已经处理过；\n\n4.  **乐观锁**：`UPDATE ... SET version = version + 1 WHERE id = ? AND version = ?`；\n5.  **防重 token**：进入页面时下发 token，提交时校验并删除，用于防止表单重复提交。\n\n注意：查询和删除天然幂等；`UPDATE x = x + 1` 这类相对更新、新增操作需要重点处理。"
+    },
+    {
+      "id": "web-09",
+      "code": "WEB-09",
+      "cat": "web",
+      "group": null,
+      "level": 2,
+      "hot": true,
+      "title": "常见的限流算法有哪些？Go 中怎么实现单机和分布式限流？",
+      "answer": "| 算法 | 特点 |\n| --- | --- |\n| 固定窗口计数器 | 实现最简单，窗口边界处可能出现 2 倍的突发流量 |\n| 滑动窗口 | 把窗口细分，或者结合上一个窗口加权计算，更平滑 |\n| 漏桶 | 以恒定速率处理请求，平滑输出，无法应对合理的突发 |\n| 令牌桶 | 以恒定速率生成令牌，允许桶容量大小的突发，最常用 |\n\n**单机限流**：`golang.org/x/time/rate` 实现了令牌桶：\n\n```go\nlimiter := rate.NewLimiter(rate.Limit(100), 200) // 每秒 100 个，桶容量 200\n\nfunc handler(w http.ResponseWriter, r *http.Request) {\n    if !limiter.Allow() { // 拿不到令牌立即拒绝\n        http.Error(w, \"too many requests\", http.StatusTooManyRequests)\n        return\n    }\n    // ...\n}\n// limiter.Wait(ctx) 会阻塞直到拿到令牌或 ctx 取消，适合后台任务控制速率\n```\n\n按用户或 IP 限流时，用 map 保存每个 key 的 Limiter，并且需要定期清理长期不活跃的 key，否则内存会一直增长。\n\n**分布式限流**：\n\n-   Redis + Lua 原子执行令牌桶或滑动窗口（ZSET 记录请求时间戳）；\n-   在网关层（Nginx `limit_req`、Envoy、APISIX）统一限流；\n-   单机限流 + 按实例数平分全局配额，是一种简单且没有额外依赖的近似方案。\n\n被限流时返回 **429** 状态码，并可以通过 `Retry-After` 头告诉客户端何时重试。"
+    },
+    {
+      "id": "web-10",
+      "code": "WEB-10",
+      "cat": "web",
+      "group": null,
+      "level": 2,
+      "hot": true,
+      "title": "一个 HTTP 服务应该如何设置超时？",
+      "answer": "**服务端超时**（`http.Server` 的超时默认都是 0，即不限制）：\n\n```go\nsrv := &http.Server{\n    ReadHeaderTimeout: 5 * time.Second,  // 防御 Slowloris 慢速攻击\n    ReadTimeout:       15 * time.Second, // 读取整个请求（含 Body）\n    WriteTimeout:      30 * time.Second, // 从读完请求头到写完响应\n    IdleTimeout:       90 * time.Second, // keep-alive 空闲连接的保留时间\n}\n```\n\n**请求级别超时**：在中间件中设置 `context.WithTimeout`，并在所有下游调用中传递 ctx；也可以用 `http.TimeoutHandler` 包装，超时后返回 503。\n\n**调用链超时**：\n\n-   上游的超时要大于下游超时之和（考虑重试），否则下游还在处理，上游已经放弃；\n-   通过 ctx 传递截止时间，gRPC 会自动通过 `grpc-timeout` 头把剩余时间传给下游；\n-   发现剩余时间已经不够完成一次下游调用时，直接快速失败。\n\n**注意**：`WriteTimeout` 对 SSE、大文件下载等长连接响应会导致连接被中途断开，可以用 Go 1.20 的 `http.ResponseController` 针对单个请求调整截止时间。"
+    },
+    {
+      "id": "web-11",
+      "code": "WEB-11",
+      "cat": "web",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "如何设计统一的错误码和响应格式？参数校验怎么做？",
+      "answer": "响应格式：\n\n```json\n{ \"code\": 40001, \"message\": \"手机号格式不正确\", \"data\": null, \"request_id\": \"a1b2c3\" }\n```\n\n设计要点：\n\n-   HTTP 状态码表达大类（400 参数错误、401 未认证、403 无权限、404 不存在、409 冲突、429 限流、500 服务错误），业务码表达具体原因；\n-   定义业务错误类型，携带错误码和对外展示的消息，在 handler 或中间件中统一转换：\n\n```go\ntype BizError struct {\n    Code    int\n    Message string // 对外展示\n    cause   error  // 内部原因，只记录日志\n}\n\nfunc (e *BizError) Error() string { return e.Message }\nfunc (e *BizError) Unwrap() error { return e.cause }\n\n// 统一出口\nvar be *BizError\nif errors.As(err, &be) {\n    writeJSON(w, httpStatus(be.Code), be.Code, be.Message)\n} else {\n    slog.ErrorContext(ctx, \"internal error\", \"err\", err)\n    writeJSON(w, 500, 50000, \"服务繁忙，请稍后再试\") // 不泄露内部细节\n}\n```\n\n参数校验：使用 go-playground/validator，通过 struct tag 声明规则（Gin 的 `binding` 标签底层就是它），复杂的业务校验写在 service 层。每个响应都返回 request\\_id，方便用户反馈时快速定位日志。"
+    },
+    {
+      "id": "web-12",
+      "code": "WEB-12",
+      "cat": "web",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "如何在服务中实现全链路的日志和 trace ID 追踪？",
+      "answer": "1.  **入口中间件**：从请求头读取 trace ID（W3C 标准的 `traceparent`，或者自定义的 `X-Request-ID`），没有则生成一个，放入 context，并写回响应头；\n2.  **日志**：使用 `log/slog`（Go 1.21+）记录结构化日志，自定义 Handler 从 context 中取出 trace ID 自动附加到每条日志：\n\n```go\ntype traceHandler struct{ slog.Handler }\n\nfunc (h traceHandler) Handle(ctx context.Context, r slog.Record) error {\n    if id, ok := ctx.Value(traceKey{}).(string); ok {\n        r.AddAttrs(slog.String(\"trace_id\", id))\n    }\n    return h.Handler.Handle(ctx, r)\n}\n\n// 业务代码中\nslog.InfoContext(ctx, \"order created\", \"order_id\", id)\n```\n\n3.  **跨服务传递**：调用下游时，在 HTTP 请求头或 gRPC metadata 中带上 trace ID；\n4.  **标准化方案**：接入 OpenTelemetry，自动为 HTTP、gRPC、数据库、Redis 调用创建 span，导出到 Jaeger 或 Tempo，并在日志中关联 trace\\_id 和 span\\_id；\n5.  MQ 消息也要在消息头中携带 trace 信息，否则异步链路会断开。"
+    },
+    {
+      "id": "web-13",
+      "code": "WEB-13",
+      "cat": "web",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "大文件上传应该怎么处理？",
+      "answer": "-   **限制大小**：用 `http.MaxBytesReader` 包装 Body，超出时直接报错，防止恶意上传耗尽资源；\n-   **流式处理**：`r.ParseMultipartForm(maxMemory)` 超出内存部分会写入临时文件；更好的方式是用 `r.MultipartReader()` 逐个读取 part，直接 `io.Copy` 到目标存储，不把整个文件读入内存；\n-   **分片上传 + 断点续传**：前端把文件切成固定大小的分片（如 5MB），带上文件哈希和分片序号上传；服务端记录已上传的分片，中断后客户端先查询已上传的分片，只补传缺失部分；全部上传完成后合并，并校验整体哈希；\n-   **最佳实践：直传对象存储**。服务端只负责签发**预签名 URL**，客户端直接上传到 S3/OSS，上传完成后回调通知服务端，业务服务完全不承担文件流量；\n-   安全：校验文件类型（检查文件内容的魔数，而不只是扩展名）、重命名存储文件、限制可访问的路径。"
+    },
+    {
+      "id": "web-14",
+      "code": "WEB-14",
+      "cat": "web",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "如何设计权限系统？RBAC 怎么落地？",
+      "answer": "**RBAC**：用户 → 角色 → 权限。表结构通常是 users、roles、permissions，以及 user\\_roles、role\\_permissions 两张关联表。权限定义为\"资源 + 操作\"，比如 `order:read`、`order:refund`。\n\nGo 中的落地方式：\n\n-   鉴权中间件：从 token 中解析出用户，加载角色和权限（缓存在 Redis 或本地缓存中，权限变更时清除缓存），按路由声明的权限进行校验；\n-   也可以使用 Casbin，用模型配置文件描述 RBAC 或 ABAC 规则，策略存储在数据库中。\n\n需要区分两种权限：\n\n-   **功能权限**：能不能调用某个接口，由中间件统一处理；\n-   **数据权限**：能看到哪些数据（比如只能看本部门的订单），需要在 service 或 repository 层拼接查询条件，最容易遗漏，也是越权漏洞的主要来源。\n\n越权漏洞的典型例子：`GET /orders/123` 只校验了登录状态，没有校验订单是否属于当前用户。"
+    },
+    {
+      "id": "web-15",
+      "code": "WEB-15",
+      "cat": "web",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "配置热更新应该怎么实现？",
+      "answer": "-   配置来源：本地文件（viper + fsnotify 监听变化）、配置中心（Nacos、Apollo、etcd 的 watch 机制）、Kubernetes ConfigMap（挂载为文件时会自动更新，但有延迟）；\n-   **线程安全地替换配置**：解析出新的配置对象，校验通过后用 `atomic.Pointer` 整体替换，读取时 `Load()`，避免读取到更新了一半的配置：\n\n```go\nvar current atomic.Pointer[Config]\n\nfunc onChange(raw []byte) {\n    cfg, err := parse(raw)\n    if err != nil || cfg.Validate() != nil {\n        slog.Error(\"invalid config, keep old one\", \"err\", err)\n        return // 校验失败时保留旧配置\n    }\n    current.Store(cfg)\n}\n```\n\n-   不是所有配置都能热更新：监听端口、连接池大小等通常需要重启或重建对象，要区分清楚；\n-   记录配置变更日志，支持快速回滚。"
+    },
+    {
+      "id": "web-16",
+      "code": "WEB-16",
+      "cat": "web",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "Go Web 项目一般如何分层？依赖注入怎么做？",
+      "answer": "常见结构：\n\n```text\ncmd/server/main.go      // 入口：读配置、组装依赖、启动服务\ninternal/\n    handler/            // 协议层：参数解析、校验、调用 service、组装响应\n    service/            // 业务逻辑\n    repository/         // 数据访问：MySQL、Redis、外部 API\n    model/              // 领域对象\npkg/                    // 可以被其他项目复用的通用库（可选）\n```\n\n原则：\n\n-   `internal` 目录下的包不能被其他模块导入，保护内部实现；\n-   **接口由使用方定义**：service 包中定义它需要的 `UserRepo` 接口，repository 包提供实现，方便单元测试中替换为 mock；\n-   依赖通过构造函数显式传入，避免全局变量和 init 中初始化；\n-   依赖较多时使用 google/wire（编译期代码生成）或 uber-go/fx（运行时）进行依赖注入；\n-   不要过度分层，小服务三层就足够了。"
+    },
+    {
+      "id": "web-17",
+      "code": "WEB-17",
+      "cat": "web",
+      "group": null,
+      "level": 2,
+      "hot": false,
+      "title": "Go 服务如何写单元测试和集成测试？",
+      "answer": "-   **表格驱动测试** + `t.Run` 子测试，覆盖正常和边界情况；\n-   **HTTP 测试**：`httptest.NewRecorder()` 直接测试 handler，`httptest.NewServer()` 启动一个真实的测试服务器来模拟下游；\n-   **Mock**：基于接口，使用 gomock 或 mockery 生成 mock，或者手写简单的 fake 实现；\n-   **数据库**：sqlmock 只能验证 SQL 文本，可信度有限；更推荐用 testcontainers-go 在测试中启动真实的 MySQL、Redis 容器；\n-   **并发**：CI 中所有测试都加 `-race`；Go 1.25 正式提供的 `testing/synctest` 可以在虚拟时间中测试依赖定时器和并发的代码，不需要真的 sleep；\n-   **模糊测试**：Go 1.18 起支持 `go test -fuzz`，适合测试解析器、编解码器；\n-   **基准测试**：`go test -bench . -benchmem`，配合 benchstat 比较优化前后的差异。"
+    },
+    {
+      "id": "web-18",
+      "code": "WEB-18",
+      "cat": "web",
+      "group": null,
+      "level": 3,
+      "hot": true,
+      "title": "http.Transport 的连接池有哪些参数？配置不当会导致什么问题？",
+      "answer": "| 参数 | 默认值 | 含义 |\n| --- | --- | --- |\n| `MaxIdleConns` | 100 | 所有 host 的空闲连接总数上限 |\n| `MaxIdleConnsPerHost` | **2** | 每个 host 的空闲连接上限 |\n| `MaxConnsPerHost` | 0（不限） | 每个 host 的连接总数上限 |\n| `IdleConnTimeout` | 90s | 空闲连接的保留时间 |\n\n**经典问题**：服务高并发调用同一个下游时，`MaxIdleConnsPerHost` 只有 2，请求结束后多余的连接无法放回池中被直接关闭，下一个请求又要重新建立连接。结果是：\n\n-   本机出现**大量 TIME\\_WAIT**，甚至耗尽本地端口，报 `cannot assign requested address`；\n-   每个请求都多了 TCP 和 TLS 握手的耗时，延迟上升，CPU 增加。\n\n修复：\n\n```go\ntransport := http.DefaultTransport.(*http.Transport).Clone()\ntransport.MaxIdleConns = 500\ntransport.MaxIdleConnsPerHost = 100 // 按对单个下游的并发量设置\ntransport.MaxConnsPerHost = 200     // 防止下游变慢时无限制地新建连接\nclient := &http.Client{Transport: transport, Timeout: 3 * time.Second}\n```\n\n另外 `IdleConnTimeout` 要小于下游服务或负载均衡器的空闲超时，否则可能复用到已经被对端关闭的连接，导致偶发的 `connection reset` 或 `EOF` 错误。"
+    },
+    {
+      "id": "web-19",
+      "code": "WEB-19",
+      "cat": "web",
+      "group": null,
+      "level": 3,
+      "hot": false,
+      "title": "高并发场景下，如何优化 Go Web 服务的性能？fasthttp 值得用吗？",
+      "answer": "优化思路（先用 pprof 找到瓶颈，再有针对性地优化）：\n\n-   **序列化**：JSON 往往是 CPU 热点，可以换用 sonic 或 go-json，或者对内部服务使用 protobuf；\n-   **减少分配**：sync.Pool 复用 buffer、gzip writer；避免在热点路径上使用反射；\n-   **连接**：调整 Transport 和数据库连接池，避免频繁建连；\n-   **缓存**：本地缓存 + Redis，配合 singleflight；\n-   **异步化**：非关键路径（日志、通知、统计）通过 channel 或 MQ 异步处理；\n-   **日志**：避免同步写磁盘，控制日志量。\n\nfasthttp：通过复用请求和响应对象、worker 池等手段实现接近零分配，性能比 net/http 高不少。但代价是：\n\n-   与 net/http 生态（中间件、OpenTelemetry 等）不兼容；\n-   请求对象在 handler 返回后会被复用，**不能在其他 goroutine 中继续持有**，容易产生隐蔽的 bug；\n-   不支持 HTTP/2。\n\n结论：大多数业务的瓶颈在数据库和下游，换框架收益有限。只有在网关、代理这种 HTTP 处理本身就是主要开销的场景下才值得考虑。"
+    },
+    {
+      "id": "web-20",
+      "code": "WEB-20",
+      "cat": "web",
+      "group": null,
+      "level": 3,
+      "hot": false,
+      "title": "如何保证 Webhook 或回调接口的安全？",
+      "answer": "1.  **签名校验**：双方共享密钥，发送方对\"时间戳 + 请求体\"计算 HMAC-SHA256 签名放在请求头中，接收方重新计算并比较：\n\n```go\nfunc verify(secret, body []byte, ts, sig string) bool {\n    t, err := strconv.ParseInt(ts, 10, 64)\n    if err != nil || time.Since(time.Unix(t, 0)).Abs() > 5*time.Minute {\n        return false // 时间戳超出窗口，防止重放\n    }\n    mac := hmac.New(sha256.New, secret)\n    mac.Write([]byte(ts + \".\"))\n    mac.Write(body)\n    expected := hex.EncodeToString(mac.Sum(nil))\n    return hmac.Equal([]byte(expected), []byte(sig)) // 常量时间比较，防止时序攻击\n}\n```\n\n2.  **防重放**：时间戳窗口 + 记录已处理的事件 ID（nonce）；\n3.  **幂等处理**：回调可能重复投递，按事件 ID 去重；\n4.  **快速响应**：收到后先持久化、立即返回 200，再异步处理，避免发送方超时重试；\n5.  只接受 HTTPS，可选 IP 白名单；\n6.  对于支付回调，还应主动调用支付平台的查询接口确认结果，不要只相信回调内容。"
+    },
+    {
+      "id": "web-21",
+      "code": "WEB-21",
+      "cat": "web",
+      "group": null,
+      "level": 3,
+      "hot": false,
+      "title": "如何实现灰度发布和功能开关？",
+      "answer": "**灰度发布**（金丝雀）：\n\n-   先部署少量新版本实例，在网关或服务网格上按比例、按用户 ID 哈希、按请求头（内部员工、特定城市）把流量路由到新版本；\n-   观察错误率、延迟、业务指标，逐步放量，发现异常立即回滚；\n-   Kubernetes 中可以使用 Argo Rollouts 或 Istio 实现按权重切流和自动分析。\n\n**功能开关（Feature Flag）**：\n\n-   新功能的代码合入主干但默认关闭，通过配置中心按用户、租户、比例打开；\n-   发布（部署代码）和上线（开放功能）解耦，出问题时关闭开关即可，不需要回滚代码；\n-   要定期清理已经全量的开关，否则代码中会积累大量分支。\n\n两者都需要配合完善的监控和告警，否则灰度就失去了意义。"
+    },
+    {
+      "id": "web-22",
+      "code": "WEB-22",
+      "cat": "web",
+      "group": null,
+      "level": 3,
+      "hot": false,
+      "title": "API 如何做版本管理和兼容？",
+      "answer": "-   版本放在 URL 中（`/api/v1/orders`）最直观，也方便网关路由；也可以放在请求头中；\n-   **兼容的变更**不需要升级版本：新增可选字段、新增接口、新增枚举值（前提是客户端能处理未知值）；\n-   **不兼容的变更**需要新版本：删除或重命名字段、修改字段类型或含义、修改错误码语义；\n-   旧版本需要维护一段时间，通过响应头（如 `Deprecation`、`Sunset`）提前通知调用方，并监控旧版本的调用量，确认没有流量后再下线；\n-   protobuf 接口遵循字段编号不变的规则，天然具有更好的向前和向后兼容性。"
+    },
+    {
+      "id": "net-01",
+      "code": "NET-01",
+      "cat": "net",
+      "group": "网络",
+      "level": 1,
+      "hot": true,
+      "title": "TCP 三次握手和四次挥手的过程？为什么需要 TIME\\_WAIT？",
+      "answer": "**三次握手**：\n\n1.  客户端发送 SYN（seq=x），进入 SYN\\_SENT；\n2.  服务端回复 SYN+ACK（seq=y, ack=x+1），进入 SYN\\_RCVD；\n3.  客户端发送 ACK（ack=y+1），双方进入 ESTABLISHED。\n\n为什么是三次：确认双方的发送和接收能力都正常，同步双方的初始序列号，并防止历史上延迟到达的 SYN 建立错误的连接。\n\n**四次挥手**：TCP 是全双工的，每个方向需要单独关闭：\n\n1.  主动方发送 FIN，进入 FIN\\_WAIT\\_1；\n2.  被动方回复 ACK，进入 CLOSE\\_WAIT，此时被动方还可以继续发送数据；\n3.  被动方处理完毕后发送 FIN，进入 LAST\\_ACK；\n4.  主动方回复 ACK，进入 **TIME\\_WAIT**，等待 2MSL 后关闭。\n\nTIME\\_WAIT 的作用：\n\n-   如果最后一个 ACK 丢失，被动方会重传 FIN，主动方还能再次响应；\n-   让本连接中残留在网络中的数据包全部过期，避免被之后相同四元组的新连接误收。\n\nLinux 中 TIME\\_WAIT 固定为 **60 秒**。"
+    },
+    {
+      "id": "net-02",
+      "code": "NET-02",
+      "cat": "net",
+      "group": "网络",
+      "level": 1,
+      "hot": false,
+      "title": "TCP 和 UDP 有什么区别？分别适合什么场景？",
+      "answer": "|  | TCP | UDP |\n| --- | --- | --- |\n| 连接 | 面向连接 | 无连接 |\n| 可靠性 | 确认、重传、排序、流量控制、拥塞控制 | 不保证到达和顺序 |\n| 数据形式 | 字节流，没有消息边界 | 数据报，保留消息边界 |\n| 头部开销 | 20 字节起 | 8 字节 |\n| 场景 | HTTP、RPC、数据库、文件传输 | DNS、音视频、游戏、QUIC（HTTP/3） |\n\nUDP 并不意味着不可靠，而是把可靠性的控制权交给应用层，QUIC 就是在 UDP 之上实现了可靠传输、多路复用和加密。"
+    },
+    {
+      "id": "net-03",
+      "code": "NET-03",
+      "cat": "net",
+      "group": "网络",
+      "level": 1,
+      "hot": true,
+      "title": "什么是 TCP 粘包和拆包？在 Go 中怎么处理？",
+      "answer": "TCP 是**字节流**协议，没有消息边界。发送方连续写入的多条消息可能被合并成一次读取（粘包），一条消息也可能被分成多次读取（拆包）。这不是 TCP 的 bug，而是应用层必须自己定义消息边界。\n\n常见方案：\n\n1.  固定长度消息；\n2.  分隔符（比如换行符），可以使用 `bufio.Scanner`，注意它默认单条消息最大 64KB，超出需要调用 `Buffer` 调大；\n3.  **长度前缀**（最常用）：消息头部用 4 字节表示消息体的长度。\n\n```go\nconst maxFrame = 4 << 20 // 限制单条消息大小，防止恶意的超大长度把内存耗尽\n\nfunc WriteFrame(w io.Writer, payload []byte) error {\n    var hdr [4]byte\n    binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))\n    if _, err := w.Write(hdr[:]); err != nil {\n        return err\n    }\n    _, err := w.Write(payload)\n    return err\n}\n\nfunc ReadFrame(r io.Reader) ([]byte, error) {\n    var hdr [4]byte\n    if _, err := io.ReadFull(r, hdr[:]); err != nil { // ReadFull 保证读满\n        return nil, err\n    }\n    n := binary.BigEndian.Uint32(hdr[:])\n    if n > maxFrame {\n        return nil, fmt.Errorf(\"frame too large: %d\", n)\n    }\n    buf := make([]byte, n)\n    _, err := io.ReadFull(r, buf)\n    return buf, err\n}\n```\n\n关键在于必须用 `io.ReadFull`，单次 `conn.Read` 返回的字节数可能少于请求的长度。"
+    },
+    {
+      "id": "net-04",
+      "code": "NET-04",
+      "cat": "net",
+      "group": "网络",
+      "level": 1,
+      "hot": true,
+      "title": "HTTP/1.1、HTTP/2 和 HTTP/3 有什么区别？",
+      "answer": "-   **HTTP/1.1**：文本协议；支持 keep-alive 复用连接，但一个连接同一时间只能处理一个请求（管线化基本没人用），存在**队头阻塞**，浏览器只能对每个域名开多个连接；\n-   **HTTP/2**：\n    -   二进制分帧；\n    -   **多路复用**：一个 TCP 连接上并发多个 stream；\n    -   HPACK 头部压缩；\n    -   流优先级、服务端推送（已被主流浏览器废弃）；\n    -   解决了 HTTP 层的队头阻塞，但 TCP 层丢包时，所有 stream 仍然一起等待重传；\n-   **HTTP/3**：基于 **QUIC（UDP）**：\n    -   每个 stream 独立处理丢包，彻底解决队头阻塞；\n    -   建连更快（1-RTT，恢复连接可以 0-RTT）；\n    -   通过连接 ID 支持**连接迁移**（手机在 Wi-Fi 和 4G 之间切换时连接不断）。\n\nGo 的 net/http 在 TLS 下默认自动支持 HTTP/2；HTTP/3 可以使用 quic-go。gRPC 基于 HTTP/2。"
+    },
+    {
+      "id": "net-05",
+      "code": "NET-05",
+      "cat": "net",
+      "group": "网络",
+      "level": 1,
+      "hot": false,
+      "title": "HTTPS 的握手过程是怎样的？",
+      "answer": "以 TLS 1.2 + ECDHE 为例：\n\n1.  ClientHello：客户端发送支持的 TLS 版本、加密套件和一个随机数；\n2.  ServerHello + Certificate：服务端选择加密套件，返回随机数和证书，以及 ECDHE 公钥参数（带签名）；\n3.  客户端**验证证书**：证书链能否追溯到受信任的根 CA、域名是否匹配、是否过期或吊销；\n4.  客户端发送自己的 ECDHE 公钥；双方根据 ECDHE 算法和两个随机数计算出相同的**会话密钥**；\n5.  双方发送 Finished 消息，验证握手过程没有被篡改，之后使用对称加密通信。\n\n**TLS 1.3** 的改进：\n\n-   握手只需要 **1-RTT**，会话恢复支持 0-RTT；\n-   删除了不安全的算法，只保留支持前向保密的密钥交换方式。\n\n实战中常见的 TLS 问题：证书链不完整、服务器时钟错误导致证书\"未生效\"、客户端未信任内部 CA（在 Go 中通过 `tls.Config.RootCAs` 添加）。"
+    },
+    {
+      "id": "net-06",
+      "code": "NET-06",
+      "cat": "net",
+      "group": "网络",
+      "level": 2,
+      "hot": true,
+      "title": "线上出现大量 TIME\\_WAIT 或 CLOSE\\_WAIT，分别是什么原因？怎么处理？",
+      "answer": "**TIME\\_WAIT 多**：出现在**主动关闭连接**的一方，说明有大量短连接。\n\n-   常见原因：HTTP 客户端没有复用连接（每次新建 Client，Body 没有关闭或没读完，`MaxIdleConnsPerHost` 太小）；数据库连接池的 MaxIdleConns 太小导致连接频繁关闭；\n-   危害：作为客户端时会占用本地端口，耗尽后报 `cannot assign requested address`；\n-   处理：首先是**复用连接**；调整 `net.ipv4.ip_local_port_range` 扩大端口范围；开启 `net.ipv4.tcp_tw_reuse=1`（只对作为客户端主动发起的连接有效）。**不要使用 `tcp_tw_recycle`**，它在 NAT 环境下会导致连接失败，Linux 4.12 已经删除了这个参数。\n\n**CLOSE\\_WAIT 多**：出现在**被动关闭**的一方，表示对方已经关闭，但**本方程序一直没有调用 Close**。\n\n-   这几乎都是**代码 bug**：错误处理路径中忘记关闭连接、HTTP 响应 Body 没有 Close、处理连接的 goroutine 被阻塞没有走到 Close；\n-   排查：`ss -tanp state close-wait` 找到所属的进程和对端地址，再结合 goroutine profile 看相关的 goroutine 卡在哪里。"
+    },
+    {
+      "id": "net-07",
+      "code": "NET-07",
+      "cat": "net",
+      "group": "网络",
+      "level": 2,
+      "hot": false,
+      "title": "TCP keepalive、HTTP keep-alive 和应用层心跳有什么区别？",
+      "answer": "-   **TCP keepalive**：内核层面的保活探测。连接空闲一段时间后发送探测包，对方无响应则判定连接失效。Linux 默认空闲 2 小时才开始探测，太长；Go 的 `net.Dialer` 和 `net.ListenConfig` 默认把空闲时间设置为 **15 秒**，Go 1.23 起可以用 `KeepAliveConfig` 精细配置；\n-   **HTTP keep-alive**：持久连接，一个 TCP 连接处理多个 HTTP 请求，避免重复握手。和保活探测无关；\n-   **应用层心跳**：应用自己定义的 ping/pong 消息。TCP keepalive 只能证明对端内核还在，无法证明应用进程是否正常（比如进程卡死）。此外很多 NAT 设备和负载均衡器会清理空闲连接，需要更频繁的心跳维持连接。长连接服务（WebSocket、IM、推送）一般都要实现应用层心跳。"
+    },
+    {
+      "id": "net-08",
+      "code": "NET-08",
+      "cat": "net",
+      "group": "网络",
+      "level": 2,
+      "hot": false,
+      "title": "Go 的 netpoller 是如何工作的？",
+      "answer": "1.  Go 创建的所有 socket 都设置为**非阻塞**模式；\n2.  goroutine 调用 `conn.Read`，如果内核缓冲区没有数据，系统调用返回 `EAGAIN`；\n3.  运行时把 fd 注册到 **epoll**（macOS 上是 kqueue，Windows 上是 IOCP），将当前 goroutine 挂起（gopark），对应的线程 M 继续执行其他 goroutine；\n4.  调度器在寻找可运行的 goroutine 时（以及 sysmon 定期检查时）调用 `netpoll`，获取已就绪的 fd，把对应的 goroutine 重新放回运行队列；\n5.  goroutine 被唤醒后再次执行 Read，此时能读到数据。\n\n效果：开发者用同步的方式写代码，每个连接一个 goroutine，底层却是 IO 多路复用的事件驱动模型，兼顾了开发效率和性能。读写的超时（`SetDeadline`）也是通过 netpoller 中的定时器实现的。"
+    },
+    {
+      "id": "net-09",
+      "code": "NET-09",
+      "cat": "net",
+      "group": "网络",
+      "level": 3,
+      "hot": false,
+      "title": "服务端的全连接队列和半连接队列是什么？溢出会有什么现象？",
+      "answer": "-   **半连接队列（SYN 队列）**：收到 SYN、还没完成三次握手的连接，大小与 `tcp_max_syn_backlog` 有关。SYN 洪水攻击会把它填满，开启 `tcp_syncookies` 可以缓解；\n-   **全连接队列（accept 队列）**：已完成握手、等待应用调用 `accept` 的连接，大小为 `min(listen 的 backlog 参数, net.core.somaxconn)`。Go 会读取系统的 somaxconn 作为 backlog。\n\n全连接队列溢出的原因是应用 `accept` 太慢（进程卡顿，或者 CPU 打满）。现象：客户端连接超时，或者偶发连接被重置。\n\n排查：\n\n```bash\nss -lnt                           # LISTEN 状态下，Recv-Q 是当前队列长度，Send-Q 是队列上限\nnetstat -s | grep -i listen       # \"times the listen queue of a socket overflowed\" 持续增长\n```\n\n处理：调大 `somaxconn`；更重要的是找出进程处理慢的原因。"
+    },
+    {
+      "id": "net-10",
+      "code": "NET-10",
+      "cat": "net",
+      "group": "网络",
+      "level": 3,
+      "hot": false,
+      "title": "什么是 Nagle 算法？它会导致什么问题？",
+      "answer": "Nagle 算法：如果还有已发送但未被确认的数据，就把小数据包攒起来，等收到 ACK 或者攒够一个 MSS 再发送，以减少网络中的小包数量。\n\n问题：与对端的**延迟确认**（Delayed ACK）同时开启时，发送方在等 ACK，接收方在等更多数据才发送 ACK，两者互相等待，造成约 40ms 的额外延迟。在\"写-写-读\"模式（比如先写请求头、再写请求体）的 RPC 场景中尤其明显。\n\nGo 的 TCP 连接**默认设置了 `TCP_NODELAY`**，即关闭了 Nagle 算法（`SetNoDelay(true)`），小包会立即发送。所以在 Go 中应该自己在应用层合并写入（使用 `bufio.Writer` 后统一 Flush，或者使用 `net.Buffers` 进行批量写），减少系统调用的次数。"
+    },
+    {
+      "id": "net-11",
+      "code": "NET-11",
+      "cat": "net",
+      "group": "RPC",
+      "level": 2,
+      "hot": true,
+      "title": "gRPC 的原理是什么？有哪几种调用模式？",
+      "answer": "-   **传输**：基于 HTTP/2，一次 RPC 调用对应一个 stream，多个调用复用同一个 TCP 连接；\n-   **序列化**：默认使用 protobuf，体积小、编解码快，通过 `.proto` 文件生成强类型代码；\n-   **四种调用模式**：\n    1.  Unary：一元调用，一个请求对应一个响应；\n    2.  Server Streaming：服务端流，比如订阅、推送大量结果；\n    3.  Client Streaming：客户端流，比如上传文件或批量上报；\n    4.  Bidirectional Streaming：双向流，比如聊天、实时协作。\n-   消息格式：每条消息前有 5 字节的前缀（1 字节压缩标志 + 4 字节长度）；状态码和错误信息放在 HTTP/2 的 trailer（`grpc-status`、`grpc-message`）中。\n\n与 REST 相比：gRPC 性能更好、有强类型约束、原生支持流式调用，但浏览器不能直接调用（需要 gRPC-Web 或网关转换），调试也不如 JSON 直观。常见做法是内部服务之间用 gRPC，对外用 HTTP JSON（可以用 grpc-gateway 自动转换）。"
+    },
+    {
+      "id": "net-12",
+      "code": "NET-12",
+      "cat": "net",
+      "group": "RPC",
+      "level": 2,
+      "hot": false,
+      "title": "protobuf 是如何编码的？修改字段时如何保证兼容？",
+      "answer": "编码：每个字段编码为 `tag + 值`，其中 tag = `(字段编号 << 3) | wire type`。\n\n-   整数使用 **varint**：每个字节用 7 位表示数据，最高位表示后面是否还有字节，小数字只需要 1 个字节；\n-   负数用 `int32` 会占用 10 个字节，应使用 `sint32` / `sint64`（zigzag 编码）；\n-   字符串、bytes 和嵌套消息使用长度前缀；\n-   字段名不会出现在编码结果中，只有编号，所以体积很小。\n\n兼容规则：\n\n-   **不要修改已有字段的编号或类型**；\n-   删除字段后，用 `reserved` 保留其编号和名称，防止后续被误用；\n-   新增字段是安全的，旧程序会忽略未知字段；\n-   proto3 中基本类型的字段默认无法区分\"没有设置\"和\"零值\"，需要区分时使用 `optional` 关键字或包装类型；\n-   枚举的第一个值必须是 0，通常定义为 `XXX_UNSPECIFIED`。"
+    },
+    {
+      "id": "net-13",
+      "code": "NET-13",
+      "cat": "net",
+      "group": "RPC",
+      "level": 2,
+      "hot": false,
+      "title": "gRPC 中如何处理超时、错误、元数据和拦截器？",
+      "answer": "```go\n// 客户端：设置超时，截止时间会通过 grpc-timeout 头自动传递给服务端\nctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)\ndefer cancel()\nctx = metadata.AppendToOutgoingContext(ctx, \"x-tenant-id\", tenantID)\nresp, err := client.GetUser(ctx, &pb.GetUserRequest{Id: id})\nif err != nil {\n    switch status.Code(err) {\n    case codes.NotFound:\n        return nil, ErrUserNotFound\n    case codes.DeadlineExceeded, codes.Unavailable:\n        // 可以考虑重试\n    }\n    return nil, err\n}\n\n// 服务端：返回标准的错误码\nreturn nil, status.Errorf(codes.InvalidArgument, \"invalid id: %d\", req.Id)\n```\n\n**拦截器**相当于中间件，分为一元拦截器和流拦截器，常用于日志、鉴权、指标、链路追踪、panic 恢复和限流：\n\n```go\nfunc RecoveryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo,\n    handler grpc.UnaryHandler) (resp any, err error) {\n    defer func() {\n        if r := recover(); r != nil {\n            slog.ErrorContext(ctx, \"panic\", \"method\", info.FullMethod, \"err\", r)\n            err = status.Error(codes.Internal, \"internal error\")\n        }\n    }()\n    return handler(ctx, req)\n}\n\nsrv := grpc.NewServer(grpc.ChainUnaryInterceptor(RecoveryInterceptor, AuthInterceptor))\n```\n\n注意：gRPC 服务端 handler 中的 panic **不会**被框架自动恢复，会导致进程崩溃，必须添加恢复拦截器。"
+    },
+    {
+      "id": "net-14",
+      "code": "NET-14",
+      "cat": "net",
+      "group": "RPC",
+      "level": 2,
+      "hot": true,
+      "title": "为什么 gRPC 在 Kubernetes 中容易出现负载不均衡？怎么解决？",
+      "answer": "原因：gRPC 基于 HTTP/2 **长连接**，一个客户端通常只与每个后端建立一个连接，所有请求都通过这个连接复用。Kubernetes 的 ClusterIP Service 是 **L4 负载均衡**，只在**建立连接时**选择一次后端。结果是：\n\n-   客户端实例少、服务端实例多时，部分服务端完全没有流量；\n-   服务端扩容后，新实例收不到流量，因为已有连接不会迁移。\n\n解决：\n\n1.  **客户端负载均衡**：使用 Headless Service，通过 DNS 解析出所有 Pod IP，配置 `round_robin` 负载均衡策略：\n\n```go\nconn, err := grpc.NewClient(\"dns:///user-svc.default.svc.cluster.local:9090\",\n    grpc.WithDefaultServiceConfig(`{\"loadBalancingConfig\":[{\"round_robin\":{}}]}`),\n    grpc.WithTransportCredentials(insecure.NewCredentials()))\n```\n\n2.  **服务网格 / L7 代理**：Istio（Envoy）在请求级别做负载均衡；\n3.  服务端设置 `keepalive.ServerParameters{MaxConnectionAge: 5 * time.Minute}`，定期让客户端重建连接，使流量重新分布；\n4.  使用注册中心（etcd、Nacos）和自定义的 resolver。"
+    },
+    {
+      "id": "net-15",
+      "code": "NET-15",
+      "cat": "net",
+      "group": "RPC",
+      "level": 2,
+      "hot": false,
+      "title": "服务间调用的重试应该注意什么？",
+      "answer": "-   **只重试幂等操作**，或者带有幂等键的请求；\n-   只重试**可重试的错误**：超时、连接失败、`Unavailable`、HTTP 503。参数错误、权限错误这类重试多少次都不会成功；\n-   **指数退避 + 随机抖动**：避免所有客户端在同一时刻集中重试；\n-   **限制重试次数和重试比例**（重试预算）：比如重试请求不能超过正常请求的 10%，防止下游出现故障时被重试流量彻底压垮（**重试风暴**）；\n-   **只在一层重试**：如果 A→B→C 每层都重试 3 次，C 最多会收到 27 倍的请求；\n-   重试要**遵守总的截止时间**，剩余时间不够时就不再重试；\n-   对尾延迟敏感的读请求，可以使用**对冲请求**：第一个请求超过 p95 延迟后还没有返回，就再发一个请求，采用先返回的结果。gRPC 原生支持重试和对冲策略的配置。"
+    },
+    {
+      "id": "net-16",
+      "code": "NET-16",
+      "cat": "net",
+      "group": "RPC",
+      "level": 3,
+      "hot": false,
+      "title": "如果让你设计一个 RPC 框架，需要考虑哪些模块？",
+      "answer": "1.  **接口定义与代码生成**：IDL（protobuf、Thrift），生成客户端存根和服务端骨架；\n2.  **序列化**：protobuf、JSON，可插拔；\n3.  **传输层**：基于 TCP 自定义协议或 HTTP/2，消息分帧，连接复用和连接池，请求 ID 与响应的对应（多路复用）；\n4.  **服务注册与发现**：服务端启动时注册，客户端监听实例变化；\n5.  **负载均衡**：轮询、加权、一致性哈希、P2C；\n6.  **服务治理**：超时、重试、熔断、限流、降级；\n7.  **拦截器 / 中间件**：日志、鉴权、指标、链路追踪；\n8.  **优雅启停**：先注销再停止，处理完已有请求；\n9.  **可观测性**：调用指标、日志、分布式追踪。\n\n可以参考的 Go 框架：gRPC-Go、Kitex（字节跳动）、go-zero、Kratos。"
+    },
+    {
+      "id": "net-17",
+      "code": "NET-17",
+      "cat": "net",
+      "group": "长连接",
+      "level": 2,
+      "hot": false,
+      "title": "如何用 Go 实现 WebSocket 服务？心跳和大量连接如何管理？",
+      "answer": "WebSocket 通过 HTTP 升级握手（客户端发送 `Upgrade: websocket` 和 `Sec-WebSocket-Key`，服务端返回 101），之后变为基于帧的全双工通信。Go 中常用的库是 gorilla/websocket 和 coder/websocket。\n\n典型连接模型：每个连接一个读 goroutine 和一个写 goroutine，写 goroutine 从发送 channel 中取消息：\n\n```go\nconst (\n    pongWait   = 60 * time.Second\n    pingPeriod = pongWait * 9 / 10\n)\n\nfunc (c *Client) writeLoop() {\n    ticker := time.NewTicker(pingPeriod)\n    defer func() { ticker.Stop(); c.conn.Close() }()\n    for {\n        select {\n        case msg, ok := <-c.send:\n            if !ok {\n                return\n            }\n            c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))\n            if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {\n                return\n            }\n        case <-ticker.C:\n            if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {\n                return\n            }\n        }\n    }\n}\n\nfunc (c *Client) readLoop() {\n    defer c.hub.unregister(c)\n    c.conn.SetReadDeadline(time.Now().Add(pongWait))\n    c.conn.SetPongHandler(func(string) error {\n        return c.conn.SetReadDeadline(time.Now().Add(pongWait)) // 收到 pong 后延长期限\n    })\n    for {\n        _, msg, err := c.conn.ReadMessage()\n        if err != nil {\n            return\n        }\n        c.hub.handle(c, msg)\n    }\n}\n```\n\n要点：\n\n-   gorilla/websocket 要求**同一时间最多一个 goroutine 写、一个 goroutine 读**，所以所有写操作都通过 send channel 交给写 goroutine；\n-   **慢客户端**：发送 channel 满时，不能阻塞广播，应该断开该连接或丢弃消息；\n-   **水平扩展**：连接分布在多个网关节点上，在 Redis 中维护\"用户 → 网关节点\"的路由表，跨节点的消息通过 MQ 或 Redis Pub/Sub 转发到目标节点；\n-   网关节点只负责维持连接，业务逻辑放在后端服务中，这样网关可以长期稳定运行，不用频繁发布。"
+    },
+    {
+      "id": "net-18",
+      "code": "NET-18",
+      "cat": "net",
+      "group": "长连接",
+      "level": 3,
+      "hot": false,
+      "title": "如何设计一个支撑百万连接的长连接网关？",
+      "answer": "**架构分层**：\n\n-   接入层：LVS / 云负载均衡器（L4），把连接分散到多个网关节点；\n-   网关层：只负责连接管理、鉴权、心跳、消息收发，保持无业务逻辑；\n-   路由层：Redis 中保存用户 ID 与网关节点、连接 ID 的映射；\n-   业务层：通过 MQ 或 RPC 与网关交互，下行推送时根据路由表找到对应的节点。\n\n**单机优化**：\n\n-   每个连接的 goroutine 数和缓冲区是内存的主要消耗，可以按需分配缓冲区、使用对象池；\n-   使用**时间轮**统一管理心跳超时，而不是每个连接创建一个定时器；\n-   极端情况下使用基于 epoll 的网络库（gnet、cloudwego/netpoll）减少 goroutine 数量；\n-   内核参数：`fs.file-max`、`nofile` 限制、`net.core.somaxconn`、TCP 读写缓冲区大小、`net.ipv4.tcp_mem`。\n\n**稳定性**：\n\n-   网关发布时连接会断开，需要分批灰度发布，客户端使用指数退避加随机抖动重连，避免**重连风暴**；\n-   消息可靠投递：消息带递增序号，客户端确认（ACK），断线重连后按序号补拉离线消息。"
+    },
+    {
+      "id": "net-19",
+      "code": "NET-19",
+      "cat": "net",
+      "group": "MQ",
+      "level": 2,
+      "hot": false,
+      "title": "Kafka、RabbitMQ、RocketMQ、NATS 应该如何选型？",
+      "answer": "|  | Kafka | RabbitMQ | RocketMQ | NATS (JetStream) |\n| --- | --- | --- | --- | --- |\n| 模型 | 分区日志，按偏移量消费 | AMQP，交换机路由 + 队列 | 主题 + 队列 | 主题，轻量 |\n| 吞吐量 | 极高（百万级/秒） | 中等（万级/秒） | 高 | 高 |\n| 消息回溯 | 支持（按时间或偏移量重新消费） | 不支持（消费后删除） | 支持 | 支持 |\n| 延迟消息 | 不支持原生延迟 | 插件或死信队列 | 支持 | 支持 |\n| 事务消息 | 支持事务（主要用于流处理） | 有限 | 支持（半消息 + 回查） | 不支持 |\n| 适用场景 | 日志、埋点、流式计算、事件总线 | 复杂路由、任务队列 | 电商业务消息、事务消息 | 云原生、低延迟、轻量部署 |\n\n选型思路：大数据量和事件流选择 Kafka；需要灵活路由和单条消息确认的任务队列选择 RabbitMQ；需要事务消息和延迟消息的业务场景选择 RocketMQ；追求部署简单的 Go 技术栈可以考虑 NATS。\n\nGo 中常用的 Kafka 客户端：segmentio/kafka-go、IBM/sarama、twmb/franz-go。"
+    },
+    {
+      "id": "net-20",
+      "code": "NET-20",
+      "cat": "net",
+      "group": "MQ",
+      "level": 2,
+      "hot": true,
+      "title": "Kafka 如何保证消息不丢失、不重复消费，以及消息的顺序？",
+      "answer": "**不丢失**：\n\n-   生产者：`acks=all`（所有同步副本都写入成功才返回），开启重试，检查发送的返回结果，不能\"发出去就不管\"；\n-   Broker：`replication.factor=3`、`min.insync.replicas=2`、`unclean.leader.election.enable=false`（不允许落后的副本成为 leader）；\n-   消费者：**处理完成后再提交偏移量**（关闭自动提交，或者确认自动提交的时机是在处理之后）。\n\n**不重复**：Kafka 默认是**至少一次**语义，重复不可避免（消费者在提交偏移量前崩溃，重新平衡后会再次消费），所以**消费端必须幂等**：\n\n-   使用消息中的业务唯一 ID，通过数据库唯一索引或 Redis `SETNX` 去重；\n-   使用 upsert 或带状态条件的更新；\n-   生产者开启 `enable.idempotence=true`，可以避免因为生产者重试产生的重复消息，但无法避免消费端的重复。\n\n**顺序**：Kafka 只保证**单个分区内**有序：\n\n-   需要保持顺序的消息使用**相同的 key**（如订单 ID），保证进入同一个分区；\n-   消费者内部如果需要并发处理，按 key 哈希分发到多个 worker 的 channel，保证同一个 key 由同一个 worker 串行处理；\n-   重试时不要把失败的消息直接放到队尾，否则会破坏顺序。"
+    },
+    {
+      "id": "net-21",
+      "code": "NET-21",
+      "cat": "net",
+      "group": "MQ",
+      "level": 2,
+      "hot": true,
+      "title": "消息大量积压了，应该怎么处理？",
+      "answer": "1.  **先止血、找原因**：查看消费者的日志和错误，常见原因是消费者报错后一直重试同一条消息（毒消息）、下游数据库变慢、消费者发布后出现 bug，或者流量突然增加；\n2.  **修复问题**：毒消息转移到**死信队列**，跳过后继续消费；修复下游或回滚有问题的版本；\n3.  **扩大消费能力**：\n    -   增加消费者实例，但数量**不能超过分区数**，超过的消费者会空闲；\n    -   消费者内部使用多个 goroutine 并发处理（需要注意顺序问题），使用批量处理（批量写入数据库）；\n    -   分区数不够时，可以临时编写一个只转发的程序，把积压的消息快速转发到一个分区更多的新主题，再用大量消费者处理新主题；\n4.  **事后**：针对消费延迟（consumer lag）设置告警，进行容量评估，并为非核心消息设计降级策略（比如过期的消息直接丢弃）。"
+    },
+    {
+      "id": "arch-01",
+      "code": "ARCH-01",
+      "cat": "arch",
+      "group": "基础",
+      "level": 1,
+      "hot": false,
+      "title": "单体和微服务各有什么优缺点？服务应该如何拆分？",
+      "answer": "**单体**：开发、部署、调试简单，本地调用没有网络开销，事务容易保证。问题是代码库越来越大，团队协作冲突多，一个模块出问题会影响全局，无法按模块独立扩容。\n\n**微服务**：独立开发、部署和扩容，故障隔离，技术选型灵活。代价是：\n\n-   网络调用带来延迟和不可靠；\n-   分布式事务、数据一致性问题；\n-   运维、监控、链路追踪的复杂度大幅上升；\n-   接口版本和契约管理。\n\n拆分原则：\n\n-   按**业务领域**（DDD 中的限界上下文）拆分，而不是按技术层拆分；\n-   高内聚、低耦合：一个需求尽量只改一个服务；\n-   每个服务**独占自己的数据库**，其他服务只能通过接口访问；\n-   拆分粒度与团队规模相匹配（康威定律）；\n-   不要过早拆分：先做好模块化的单体，等边界清晰、确有需要时再拆。"
+    },
+    {
+      "id": "arch-02",
+      "code": "ARCH-02",
+      "cat": "arch",
+      "group": "基础",
+      "level": 1,
+      "hot": true,
+      "title": "什么是 CAP 定理和 BASE 理论？常见组件分别是 CP 还是 AP？",
+      "answer": "**CAP**：一致性（C）、可用性（A）、分区容错性（P）。网络分区在分布式系统中不可避免，所以实际上是在**发生分区时选择 C 还是 A**：\n\n-   **CP**：保证一致，部分节点可能拒绝服务。例如 etcd、ZooKeeper（基于多数派，少数派一侧不可用）；\n-   **AP**：保证可用，可能读到旧数据。例如 Eureka、Cassandra、Nacos 的临时实例模式。\n\n没有分区时，系统可以同时满足 C 和 A；实际的取舍还包括延迟（PACELC 理论）。\n\n**BASE**：基本可用（Basically Available）、软状态（Soft state）、最终一致（Eventually consistent），是大多数互联网业务对 CAP 中 A 的工程实践：牺牲强一致，通过异步、补偿、对账实现最终一致。"
+    },
+    {
+      "id": "arch-03",
+      "code": "ARCH-03",
+      "cat": "arch",
+      "group": "基础",
+      "level": 1,
+      "hot": false,
+      "title": "服务注册与发现是如何实现的？",
+      "answer": "**核心流程**：\n\n1.  服务实例启动后，把自己的地址注册到注册中心，并通过**心跳或租约**保持存活；\n2.  实例下线或心跳超时后，注册中心把它移除；\n3.  调用方从注册中心获取实例列表，并**监听变化**，在本地缓存并做负载均衡。\n\n**两种模式**：\n\n-   客户端发现：调用方直接查询注册中心，自己选择实例（gRPC resolver、go-zero、Kratos）；\n-   服务端发现：调用方请求负载均衡器，由负载均衡器选择实例（Kubernetes Service、Nginx）。\n\n**使用 etcd 实现**：\n\n-   注册：创建一个租约（如 10 秒），把 `/services/user/10.0.0.1:9090` 写入并绑定租约，然后定期续约（KeepAlive）。实例崩溃后租约过期，key 自动删除；\n-   发现：按前缀读取所有实例，并通过 Watch 监听新增和删除。\n\n在 Kubernetes 中，可以直接使用 Service + DNS，大部分情况下不需要额外的注册中心。"
+    },
+    {
+      "id": "arch-04",
+      "code": "ARCH-04",
+      "cat": "arch",
+      "group": "基础",
+      "level": 1,
+      "hot": false,
+      "title": "常见的负载均衡算法有哪些？",
+      "answer": "-   **轮询 / 加权轮询**：Nginx 使用\"平滑加权轮询\"，避免权重高的实例在短时间内集中接收大量请求；\n-   **随机 / 加权随机**；\n-   **最少连接数**：适合请求处理时间差异大的场景；\n-   **一致性哈希**：相同的 key 总是落到同一个实例，适合需要本地缓存或会话保持的场景；\n-   **P2C（Power of Two Choices）**：随机选出两个实例，选择负载更低的一个（根据延迟的 EWMA、在途请求数等指标计算）。实现简单，效果接近全局最优，go-zero 和 Kratos 的默认负载均衡就是基于 P2C 的。\n\n负载均衡还需要配合**健康检查**和**故障剔除**：连续失败的实例暂时摘除，过一段时间再尝试恢复。"
+    },
+    {
+      "id": "arch-05",
+      "code": "ARCH-05",
+      "cat": "arch",
+      "group": "治理",
+      "level": 2,
+      "hot": true,
+      "title": "限流、熔断和降级有什么区别？熔断器是怎么工作的？",
+      "answer": "-   **限流**：保护**自己**，控制进入系统的流量，超出能力的请求直接拒绝；\n-   **熔断**：保护**调用方自己和下游**，下游故障时快速失败，不再继续调用，避免线程或 goroutine 被慢请求耗尽，给下游恢复的时间；\n-   **降级**：在资源不足或下游故障时，**主动关闭非核心功能**或返回兜底数据（默认值、缓存数据、静态推荐列表），保证核心功能可用。\n\n熔断器的状态机：\n\n1.  **关闭**：正常调用，统计滑动窗口内的错误率。请求数超过最小值且错误率超过阈值时，切换到打开状态；\n2.  **打开**：直接返回错误（或执行降级逻辑），不调用下游。经过冷却时间后进入半开状态；\n3.  **半开**：放行少量探测请求，成功则恢复为关闭状态，失败则重新打开。\n\nGo 中的实现：sony/gobreaker；go-zero 和 Kratos 使用 Google SRE 提出的**自适应熔断**，根据请求总数和成功数计算拒绝概率，不需要设置固定的阈值，表现更平滑。"
+    },
+    {
+      "id": "arch-06",
+      "code": "ARCH-06",
+      "cat": "arch",
+      "group": "治理",
+      "level": 2,
+      "hot": true,
+      "title": "分布式事务有哪些解决方案？各自适合什么场景？",
+      "answer": "1.  **2PC / XA**：协调者先让所有参与者执行并锁定资源（prepare），全部成功后再统一提交。强一致，但资源锁定时间长、性能差，协调者故障时会阻塞，互联网业务很少使用；\n2.  **TCC**（Try-Confirm-Cancel）：业务层面实现两阶段，Try 预留资源（冻结余额），Confirm 确认，Cancel 释放。性能好，但对业务侵入大，还需要处理**空回滚**（Try 没执行就收到 Cancel）、**悬挂**（Cancel 之后才收到 Try）和**幂等**问题；\n3.  **Saga**：把长事务拆成一系列本地事务，每一步都有对应的补偿操作，失败时反向执行补偿。适合长流程业务（如机票 + 酒店预订），但没有隔离性，中间状态对外可见；\n4.  **本地消息表（Outbox 模式）**：在**同一个本地事务**中写业务数据和一条待发送的消息记录，由后台任务（或者订阅 binlog）把消息投递到 MQ，下游消费时保证幂等，失败了就重试。实现简单可靠，是**最常用**的方案；\n5.  **事务消息**（RocketMQ）：先发送半消息，执行本地事务后提交或回滚，Broker 会回查事务状态；\n6.  **最大努力通知 + 对账**：适合跨公司的场景，比如支付结果通知。\n\n选型：能避免分布式事务就避免（调整服务边界）；大多数场景用 Outbox + 幂等消费实现最终一致；资金类的强一致场景考虑 TCC。Go 生态中有 dtm-labs/dtm 框架，支持 Saga、TCC、XA 和二阶段消息。"
+    },
+    {
+      "id": "arch-07",
+      "code": "ARCH-07",
+      "cat": "arch",
+      "group": "治理",
+      "level": 2,
+      "hot": true,
+      "title": "雪花算法的原理是什么？时钟回拨怎么处理？有哪些分布式 ID 的方案？",
+      "answer": "**雪花算法**（64 位）：1 位符号位 + **41 位毫秒时间戳**（可以使用约 69 年）+ **10 位机器 ID**（1024 台机器）+ **12 位序列号**（每毫秒 4096 个）。\n\n优点：趋势递增（对 B+ 树索引友好），本地生成，性能高。\n\n**时钟回拨**的处理：\n\n-   回拨幅度很小（如几毫秒）：等待时钟追上；\n-   回拨幅度较大：拒绝生成并告警，或者切换到备用的机器 ID 位；\n-   使用 NTP 时采用渐进式调整（slew 模式），避免时钟跳变。\n\n**机器 ID 的分配**：通过 etcd、ZooKeeper 或数据库在启动时自动分配，在 Kubernetes 中不能简单使用 Pod 序号，否则可能会重复。\n\n**其他方案**：\n\n-   数据库号段模式（美团 Leaf-segment）：每次从数据库取一段 ID（比如 1000 个）在内存中分配，使用双缓冲预加载；\n-   Redis INCR：简单，但依赖 Redis 的可用性和持久化；\n-   **UUIDv7**（RFC 9562）：前 48 位是毫秒时间戳，有序、无需协调，适合不想维护 ID 服务的场景，缺点是占 128 位；\n-   对外暴露的 ID 要考虑防遍历，可以使用不连续的 ID 或进行混淆。"
+    },
+    {
+      "id": "arch-08",
+      "code": "ARCH-08",
+      "cat": "arch",
+      "group": "治理",
+      "level": 2,
+      "hot": true,
+      "title": "如何设计一个高可用的系统？",
+      "answer": "可以从以下几个方面入手：\n\n1.  **冗余与无单点**：服务多实例部署，跨可用区；数据库主从 + 自动切换；中间件集群化；\n2.  **故障隔离**：核心与非核心服务分开部署；资源隔离（不同的连接池、goroutine 池，即舱壁模式）；\n3.  **过载保护**：超时、重试预算、限流、熔断、降级、排队削峰；\n4.  **快速恢复**：健康检查自动剔除故障实例；自动扩缩容；\n5.  **变更管控**：大部分故障都是由变更引起的，所以要灰度发布、能快速回滚、有变更审批和变更窗口；\n6.  **可观测性**：完善的指标、日志、链路追踪，基于 SLO 设置告警，能在几分钟内发现和定位问题；\n7.  **容灾**：数据备份和恢复演练、多活或异地容灾；\n8.  **演练**：混沌工程，主动注入故障（杀实例、网络延迟、依赖不可用），验证系统的容错能力。\n\n量化的可用性目标：99.9% 每年约允许 8.8 小时不可用，99.99% 每年约允许 52.6 分钟不可用。"
+    },
+    {
+      "id": "arch-09",
+      "code": "ARCH-09",
+      "cat": "arch",
+      "group": "治理",
+      "level": 2,
+      "hot": false,
+      "title": "如何设计多级缓存？本地缓存如何保证一致性？",
+      "answer": "**典型结构**：本地缓存（进程内）→ Redis → 数据库。\n\n-   本地缓存访问只需要纳秒级，适合**热点数据、读多写少、能容忍短暂不一致**的数据（配置、商品基本信息、权限）；\n-   Go 中常用的本地缓存库：ristretto、otter（高命中率），bigcache、freecache（把数据存储在大块 \\[\\]byte 中，对 GC 友好）。\n\n**一致性**：\n\n-   本地缓存设置**很短的过期时间**（秒级），作为兜底；\n-   数据变更时通过 Redis Pub/Sub 或 MQ **广播失效消息**，所有实例删除对应的本地缓存；\n-   广播可能丢失，因此仍然依赖过期时间兜底。\n\n**注意事项**：\n\n-   限制本地缓存的容量，避免内存过大导致 OOM 或 GC 压力；\n-   缓存的对象是共享的，**不能被调用方修改**，必要时返回副本；\n-   服务刚启动时本地缓存是空的，可以预热，避免冷启动时流量全部打到 Redis。"
+    },
+    {
+      "id": "arch-10",
+      "code": "ARCH-10",
+      "cat": "arch",
+      "group": "治理",
+      "level": 2,
+      "hot": false,
+      "title": "可观测性包括哪些内容？Go 服务应该暴露哪些指标？",
+      "answer": "可观测性的三大支柱：\n\n-   **指标**（Metrics）：Prometheus + Grafana，用于告警和趋势分析；\n-   **日志**（Logs）：结构化日志，集中采集到 ELK 或 Loki；\n-   **链路追踪**（Traces）：OpenTelemetry + Jaeger / Tempo，定位跨服务的耗时问题。\n\n三者通过 trace ID 相互关联。近年来**持续性能剖析**（continuous profiling）也被视为第四个支柱。\n\nGo 服务应该暴露的指标：\n\n-   **RED 指标**（面向请求）：请求速率（Rate）、错误数（Errors）、耗时分布（Duration，使用直方图计算 p50/p95/p99）；\n-   **下游依赖**：每个依赖的调用次数、错误率、耗时，数据库连接池（`db.Stats()`），HTTP Transport 的连接数；\n-   **运行时**：goroutine 数量、堆内存、GC 暂停时间和频率、GOMAXPROCS、线程数（prometheus/client\\_golang 的 Go collector 已经包含）；\n-   **业务指标**：下单数、支付成功率等。\n\n告警策略：基于 **SLO 的错误预算消耗速度**告警，比基于固定阈值的告警更可靠、噪音更少。"
+    },
+    {
+      "id": "arch-11",
+      "code": "ARCH-11",
+      "cat": "arch",
+      "group": "治理",
+      "level": 3,
+      "hot": false,
+      "title": "Raft 共识算法的核心流程是什么？",
+      "answer": "Raft 把共识问题分解为三部分：\n\n1.  **领导者选举**：\n    -   节点有三种角色：Follower、Candidate、Leader；\n    -   Follower 在**随机化的选举超时**内没有收到 Leader 的心跳，就会转为 Candidate，任期（term）加一并请求投票；\n    -   获得**多数票**的节点成为 Leader；\n    -   投票时会检查候选者的日志是否至少和自己一样新，保证新 Leader 拥有所有已提交的日志；\n2.  **日志复制**：客户端的写请求只发给 Leader，Leader 追加日志后通过 AppendEntries 复制到 Follower，**多数节点**写入成功后提交并应用到状态机；\n3.  **安全性**：同一个任期内最多一个 Leader；已提交的日志不会被覆盖。\n\n实践要点：\n\n-   集群节点数为奇数（3 或 5），3 个节点允许 1 个故障，5 个节点允许 2 个故障；\n-   写性能受限于 Leader，节点越多写入越慢；\n-   etcd、Consul、TiKV 都基于 Raft。etcd 读请求默认是线性一致的，需要经过 Leader 确认。"
+    },
+    {
+      "id": "arch-12",
+      "code": "ARCH-12",
+      "cat": "arch",
+      "group": "治理",
+      "level": 3,
+      "hot": false,
+      "title": "一致性哈希的原理是什么？虚拟节点有什么作用？",
+      "answer": "**普通取模哈希**的问题：`hash(key) % N`，节点数 N 变化时，几乎所有 key 的映射都会改变，导致缓存大面积失效。\n\n**一致性哈希**：\n\n-   把哈希空间组织成一个环（0 ~ 2^32-1），节点按哈希值分布在环上；\n-   key 顺时针找到的第一个节点就是它所属的节点；\n-   增加或删除节点时，只影响相邻的一段数据，大约 1/N。\n\n**虚拟节点**：节点较少时，在环上分布不均匀，导致负载倾斜。每个物理节点映射为多个（如 100～200 个）虚拟节点，使分布更均匀；也可以按机器配置分配不同数量的虚拟节点，实现加权。\n\n```go\ntype Ring struct {\n    hashes []uint32          // 排好序的虚拟节点哈希\n    owner  map[uint32]string // 虚拟节点 -> 物理节点\n}\n\nfunc (r *Ring) Get(key string) string {\n    h := crc32.ChecksumIEEE([]byte(key))\n    i := sort.Search(len(r.hashes), func(i int) bool { return r.hashes[i] >= h })\n    if i == len(r.hashes) {\n        i = 0 // 回到环的起点\n    }\n    return r.owner[r.hashes[i]]\n}\n```\n\n应用场景：缓存分片、有状态服务的路由、基于用户的负载均衡。其他方案还有 Jump Consistent Hash、Rendezvous Hash（最高随机权重）。"
+    },
+    {
+      "id": "arch-13",
+      "code": "ARCH-13",
+      "cat": "arch",
+      "group": "设计题",
+      "level": 3,
+      "hot": true,
+      "title": "如何设计一个秒杀系统？",
+      "answer": "先明确需求：商品数量（比如 1000 件）、预计 QPS（比如 100 万）、是否限购、支付超时时间。\n\n核心思路是**层层过滤，让绝大多数请求在到达数据库之前就被拦截**。\n\n1.  **前端**：页面静态化并放到 CDN；活动开始前按钮置灰；点击后加入验证码或答题，把瞬时请求分散开；\n2.  **网关**：限流、黑名单、按用户限频，拦截机器人；\n3.  **库存预扣（Redis）**：活动前把库存加载到 Redis，使用 Lua 脚本**原子地**检查并扣减库存，同时用 Set 记录已购买的用户，实现一人一单。库存扣完后，直接返回\"已售罄\"，后续请求不再访问 Redis；\n4.  **异步下单**：扣减成功的请求发送到 MQ，返回\"排队中\"，客户端轮询结果；消费者创建订单，削峰填谷；\n5.  **数据库兜底**：`UPDATE stock SET num = num - 1 WHERE sku_id = ? AND num > 0`，配合订单表上 `(user_id, activity_id)` 的唯一索引，**确保不超卖、不重复下单**；\n6.  **超时取消**：通过延迟队列，订单在规定时间内未支付就自动取消并归还库存；\n7.  **隔离**：秒杀服务独立部署，使用独立的 Redis 和数据库，不影响正常业务。\n\n需要补充说明的风险：Redis 与数据库之间的库存一致性通过对账任务保证；热点库存还可以拆分成多个分段，分散在不同的 key 上；本地内存中维护一个\"已售罄\"标记，进一步减少对 Redis 的访问。"
+    },
+    {
+      "id": "arch-14",
+      "code": "ARCH-14",
+      "cat": "arch",
+      "group": "设计题",
+      "level": 3,
+      "hot": true,
+      "title": "如何设计一个短链接系统？",
+      "answer": "需求：长链接转短链接，访问短链接时跳转到长链接。读多写少，比如每天新增 1 亿条，读写比 100:1。\n\n**短码生成**：\n\n-   **自增 ID + Base62 编码**（推荐）：使用分布式 ID 生成器或号段模式，Base62 编码后，7 位字符可以表示 62^7 ≈ 3.5 万亿个短码。连续的 ID 容易被遍历，可以先用可逆的混淆算法打乱 ID 再编码；\n-   **哈希**（MurmurHash）取前几位：可能冲突，需要检查数据库，冲突时加盐重新计算。\n\n**存储**：短码 → 长链接、创建时间、过期时间。KV 结构非常简单，可以使用分库分表的 MySQL，或者直接使用 KV 存储。是否需要对同一个长链接去重，取决于业务需求（去重需要额外建立长链接的哈希索引）。\n\n**跳转**：\n\n-   **301 永久重定向**：浏览器会缓存，减轻服务器压力，但无法统计每次访问；\n-   **302 临时重定向**：每次都会访问服务器，便于统计点击量。大多数短链接服务使用 302。\n\n**性能**：读取路径使用多级缓存（本地缓存 + Redis），热门短链接全部命中缓存；点击统计通过 MQ 异步写入。\n\n**安全**：检测恶意链接；对创建接口限流，防止滥用。"
+    },
+    {
+      "id": "arch-15",
+      "code": "ARCH-15",
+      "cat": "arch",
+      "group": "设计题",
+      "level": 3,
+      "hot": false,
+      "title": "如何设计一个 Feed 流（朋友圈、关注动态）系统？",
+      "answer": "**推模式（写扩散）**：用户发布内容时，写入每一个粉丝的收件箱（timeline）。\n\n-   优点：读取非常快，直接读自己的收件箱；\n-   缺点：大 V 有上千万粉丝时，一次发布要写入上千万次，写入压力大，并且存储冗余。\n\n**拉模式（读扩散）**：用户发布时只写自己的发件箱。读取时，拉取所有关注者的发件箱，再合并排序。\n\n-   优点：写入简单；\n-   缺点：关注了大量用户时，读取开销很大。\n\n**推拉结合**（实际方案）：\n\n-   普通用户发布时推送给粉丝；\n-   大 V 发布时只写发件箱，粉丝读取时**额外拉取**所关注的大 V 的发件箱，再与自己的收件箱合并；\n-   也可以只推送给活跃粉丝，不活跃的粉丝在上线时再拉取。\n\n**存储与分页**：\n\n-   收件箱可以用 Redis ZSet（以时间戳为 score），只保留最近的 N 条，更早的内容从数据库中读取；\n-   分页使用**游标**（上一页最后一条的时间戳或 ID），不能使用 offset，因为新内容不断插入会导致翻页时重复或遗漏；\n-   删除内容时，可以在读取时过滤，而不是逐个删除所有收件箱中的记录。"
+    },
+    {
+      "id": "arch-16",
+      "code": "ARCH-16",
+      "cat": "arch",
+      "group": "设计题",
+      "level": 3,
+      "hot": true,
+      "title": "如何实现延迟任务（比如订单 30 分钟未支付自动取消）？",
+      "answer": "1.  **Redis ZSet**：任务 ID 为 member，执行时间为 score。后台协程定期用 `ZRANGEBYSCORE` 取出到期的任务，并用 Lua 脚本**原子地**取出并删除（防止多个实例重复处理）。简单高效，但需要考虑 Redis 的持久化和单个 key 过大的问题；\n2.  **消息队列的延迟消息**：RocketMQ 原生支持延迟消息；RabbitMQ 可以通过 TTL + 死信队列，或者延迟插件实现；Kafka 没有原生支持，需要自己实现多个延迟级别的主题；\n3.  **时间轮**：内存中的分层时间轮，适合大量短时任务（如连接超时检测），但进程重启后任务会丢失，需要配合持久化；\n4.  **数据库定时扫描**：`WHERE status = 'UNPAID' AND expire_at < NOW()`，在 `expire_at` 上建立索引并分批处理。最简单可靠，适合作为其他方案的兜底；\n5.  **现成框架**：Go 生态中的 hibiken/asynq（基于 Redis，支持延迟任务、重试和定时任务）。\n\n无论哪种方案，都要保证：\n\n-   任务至少执行一次，执行逻辑**幂等**（取消订单时检查状态：`WHERE status = 'UNPAID'`）；\n-   失败重试和告警；\n-   多实例部署时任务不会被重复执行。"
+    },
+    {
+      "id": "arch-17",
+      "code": "ARCH-17",
+      "cat": "arch",
+      "group": "设计题",
+      "level": 3,
+      "hot": false,
+      "title": "如何设计订单和支付系统，保证金额与状态正确？",
+      "answer": "-   **订单状态机**：待支付 → 已支付 → 已发货 → 已完成，以及取消和退款等分支。所有状态变更都使用**带原状态条件的更新**，防止并发时状态回退或重复流转：\n\n```sql\nUPDATE orders SET status = 'PAID' WHERE order_no = ? AND status = 'UNPAID';\n```\n\n-   **金额**：使用**整数**（单位为分）或 decimal 类型，绝对不要使用浮点数；\n-   **支付回调**：验证签名、校验金额与订单是否一致、根据交易流水号做幂等处理；收到回调后快速返回成功，业务逻辑异步执行；\n-   **主动查询**：回调可能丢失，对于长时间处于\"支付中\"状态的订单，需要主动调用支付平台的查询接口；\n-   **对账**：每天下载支付平台的对账单，与本地订单逐笔核对，处理长款（平台有、本地没有）和短款的情况；\n-   **事件通知**：支付成功后通过 Outbox 模式发送消息，通知库存、积分、物流等下游系统；\n-   **审计**：资金相关的操作全部记录流水日志，只追加、不修改。"
+    },
+    {
+      "id": "arch-18",
+      "code": "ARCH-18",
+      "cat": "arch",
+      "group": "设计题",
+      "level": 3,
+      "hot": false,
+      "title": "如何进行容量评估和压测？",
+      "answer": "**容量评估**：\n\n1.  估算峰值 QPS：日活 × 人均请求数 / 86400 × 峰值系数（通常为 3～10 倍），大促活动按历史数据估算；\n2.  压测单实例的容量：在 CPU 利用率达到 60%～70%、p99 延迟和错误率满足 SLO 时的 QPS；\n3.  实例数 = 峰值 QPS / 单实例容量 × 冗余系数（考虑一个可用区故障时剩余实例也能承担全部流量）；\n4.  依赖评估：数据库连接数、Redis 的 QPS、MQ 的吞吐量，以及下游服务的容量，木桶效应决定整体容量。\n\n**压测**：\n\n-   工具：wrk、vegeta（Go 编写）、k6、ghz（gRPC 压测）；\n-   阶梯式增加压力，记录拐点：吞吐量不再增长、延迟急剧上升的点；\n-   压测过程中同时采集 pprof，找出瓶颈；\n-   **全链路压测**：在生产环境中使用带标记的压测流量，通过影子表或影子库隔离压测数据，最真实地反映系统容量；\n-   注意压测数据要接近真实分布，否则缓存命中率会偏高，结果过于乐观。"
+    },
+    {
+      "id": "arch-19",
+      "code": "ARCH-19",
+      "cat": "arch",
+      "group": "设计题",
+      "level": 3,
+      "hot": false,
+      "title": "遇到流量突增（大促、热点事件）怎么应对？",
+      "answer": "**事前**：\n\n-   容量评估和全链路压测，提前扩容（自动扩缩容存在延迟，无法应对瞬间的流量）；\n-   制定降级预案和开关，并进行演练；\n-   缓存预热，核心链路梳理，非核心功能的调用提前关闭。\n\n**事中**：\n\n-   网关和服务两级限流，超出部分快速失败或排队；\n-   按预案执行降级：关闭推荐、评论等非核心功能，返回静态兜底数据；\n-   使用 MQ 进行削峰填谷，把同步处理变为异步处理；\n-   监控大盘实时观察，出现异常立即执行预案。\n\n**事后**：复盘容量预估与实际的偏差，优化瓶颈。"
+    },
+    {
+      "id": "arch-20",
+      "code": "ARCH-20",
+      "cat": "arch",
+      "group": "设计题",
+      "level": 3,
+      "hot": false,
+      "title": "什么是异地多活？实现时有哪些难点？",
+      "answer": "**容灾的不同级别**：同城双活（两个机房延迟 1～2ms，可以做到数据库同步复制）→ 异地冷备 → 异地多活（多个地域同时承接流量）。\n\n**异地多活的核心难点是数据**：跨地域延迟有几十毫秒，无法做同步复制，各地域之间的数据只能异步同步，可能出现冲突。\n\n常见方案是**单元化**：\n\n-   按用户 ID 等维度把用户划分到不同的单元（地域），一个用户的所有读写都在其所属的单元内完成，避免跨地域写入冲突；\n-   单元之间异步双向同步数据（如通过 binlog 同步工具），用于故障时切换；\n-   全局数据（如商品信息、配置）在中心单元写入，再同步到各单元只读；\n-   故障时，把故障单元的用户路由切换到其他单元，需要处理切换期间尚未同步的数据。\n\n代价：架构改造量很大、成本高，只有对可用性要求极高的大型业务才需要。"
+    },
+    {
+      "id": "perf-01",
+      "code": "PERF-01",
+      "cat": "perf",
+      "group": "Linux",
+      "level": 1,
+      "hot": true,
+      "title": "线上机器变慢了，登录上去最先做什么？",
+      "answer": "先用**一分钟**快速建立全局视图，判断瓶颈在 CPU、内存、磁盘还是网络（参考 Brendan Gregg 的 60 秒分析法）：\n\n```bash\nuptime                  # 负载趋势：1/5/15 分钟平均负载，是在上升还是下降\ndmesg -T | tail         # 内核错误：OOM Killer、TCP 丢包、磁盘错误\nvmstat 1                # r（运行队列）、b（阻塞）、si/so（swap）、us/sy/wa/st\nmpstat -P ALL 1         # 每个 CPU 核的使用率，是否单核被打满\npidstat 1               # 哪个进程在消耗 CPU\niostat -xz 1            # 磁盘：r/s、w/s、await、aqu-sz、%util\nfree -m                 # 内存：重点看 available\nsar -n DEV 1            # 网卡吞吐量是否接近带宽上限\nsar -n TCP,ETCP 1       # 每秒新建连接数、重传数\ntop                     # 最后综合确认\n```\n\n思路：**先全局，后局部；先系统，后进程；先现象，后原因**。确定资源瓶颈和对应的进程后，再用专门的工具（pprof、perf、strace、tcpdump）深入分析。\n\n同时要确认两件事：问题是**从什么时候开始的**，那个时间点**有没有变更**（发布、配置修改、流量变化）。很多时候直接回滚比现场排查更快止损。"
+    },
+    {
+      "id": "perf-02",
+      "code": "PERF-02",
+      "cat": "perf",
+      "group": "Linux",
+      "level": 1,
+      "hot": true,
+      "title": "load average 代表什么？为什么会出现负载很高但 CPU 使用率很低？",
+      "answer": "load average 是一段时间内处于可运行状态（R）和不可中断睡眠状态（D）的**平均进程数**，分别统计 1 分钟、5 分钟和 15 分钟。Linux 把 D 状态也算在内，这是与其他 Unix 系统不同的地方。\n\n判断标准：与 CPU 核数比较，负载持续超过核数说明存在排队。\n\n**负载高但 CPU 不高**，通常是大量进程处于 **D 状态**，也就是在等待 IO：\n\n```bash\nps -eo state,pid,cmd | awk '$1 ~ /D/'   # 找出 D 状态的进程\niostat -xz 1                             # 磁盘是否饱和，await 是否很高\ncat /proc/<pid>/stack                    # 查看进程阻塞在内核的哪个位置\n```\n\n常见原因：磁盘 IO 饱和、NFS 等网络存储卡住、大量进程在等待同一个内核锁。"
+    },
+    {
+      "id": "perf-03",
+      "code": "PERF-03",
+      "cat": "perf",
+      "group": "Linux",
+      "level": 1,
+      "hot": true,
+      "title": "top 中 CPU 的 us、sy、wa、si、st 分别代表什么？各自偏高说明什么？",
+      "answer": "-   **us**（用户态）：业务代码在计算。偏高时，使用 pprof 或 perf 找出热点函数；\n-   **sy**（内核态）：系统调用、上下文切换、内存管理。偏高可能是频繁的小块读写、大量的锁竞争或线程切换、频繁的缺页中断；\n-   **ni**：调整过优先级（nice）的进程的用户态时间；\n-   **wa**（iowait）：CPU 空闲，并且有未完成的 IO 请求。偏高说明磁盘可能是瓶颈，但它只是一个参考信号，需要结合 iostat 判断；\n-   **hi / si**（硬中断 / 软中断）：si 偏高通常是**网络包处理**造成的，比如小包很多、高 PPS 的场景。需要检查 `/proc/softirqs`，以及中断是否集中在某一个 CPU 核上；\n-   **st**（steal）：虚拟机的 CPU 时间被宿主机上的其他虚拟机占用了。偏高说明宿主机资源紧张（存在\"吵闹的邻居\"），只能迁移或者升级配置，应用层面无法优化。"
+    },
+    {
+      "id": "perf-04",
+      "code": "PERF-04",
+      "cat": "perf",
+      "group": "Linux",
+      "level": 1,
+      "hot": false,
+      "title": "如何找到最消耗 CPU 的进程和线程？",
+      "answer": "```bash\ntop -c                       # 按 P 排序，找到进程\ntop -H -p <pid>              # 查看进程内各线程的 CPU 使用率\npidstat -t -p <pid> 1        # 同上，按秒输出，便于观察变化\npidstat -w -p <pid> 1        # 自愿 / 非自愿上下文切换次数\n```\n\n对于 Java，可以把线程 ID 转换为十六进制，然后在 jstack 的输出中查找。但 **Go 不能这样做**：goroutine 会在不同的线程之间迁移，线程 ID 无法对应到具体的 goroutine。Go 程序应该直接抓取 CPU profile（`/debug/pprof/profile`），或者使用 `perf top -p <pid>` 查看热点函数。"
+    },
+    {
+      "id": "perf-05",
+      "code": "PERF-05",
+      "cat": "perf",
+      "group": "Linux",
+      "level": 1,
+      "hot": false,
+      "title": "如何判断内存是否紧张？free 中的 free、available、buff/cache 有什么区别？",
+      "answer": "```text\n              total   used    free   shared  buff/cache  available\nMem:          31Gi    12Gi    1.2Gi  0.3Gi   18Gi        18Gi\n```\n\n-   **free**：完全未被使用的内存，Linux 会尽量利用空闲内存做缓存，所以这个值小很正常；\n-   **buff/cache**：页缓存和块缓存，大部分在内存不足时可以被回收；\n-   **available**：估算的**还能分配给新程序的内存**，包含可回收的缓存部分，**这是判断内存是否紧张的主要依据**。\n\n内存紧张的信号：\n\n-   `vmstat` 中 si/so（换入换出）持续不为 0；\n-   dmesg 中出现 OOM Killer 的记录；\n-   `sar -B` 中 pgscan、pgsteal 很高（内核在频繁回收页面）。\n\n**容器中**要看 cgroup 的统计（cgroup v2）：`memory.current`、`memory.max`、`memory.stat`、`memory.events`（其中的 oom\\_kill 计数）。注意页缓存也计入容器的内存使用量，Kubernetes 用 **working set**（使用量减去不活跃的文件缓存）来判断是否接近限制。"
+    },
+    {
+      "id": "perf-06",
+      "code": "PERF-06",
+      "cat": "perf",
+      "group": "Linux",
+      "level": 1,
+      "hot": false,
+      "title": "iostat 的输出中哪些字段最关键？",
+      "answer": "```bash\niostat -xz 1\n```\n\n-   `r/s`、`w/s`：每秒读写次数（IOPS）；\n-   `rkB/s`、`wkB/s`：每秒读写数据量（吞吐量）；\n-   `r_await`、`w_await`：IO 请求的平均耗时（毫秒），**包含排队时间**。SSD 通常应该小于 1ms，机械硬盘通常为 5～10ms，持续很高说明磁盘处理不过来；\n-   `aqu-sz`：平均队列长度，大于 1 说明出现了排队；\n-   `%util`：设备忙碌时间的百分比。对于**机械硬盘**，接近 100% 说明已经饱和；但对于 **SSD/NVMe 这类支持并行处理的设备**，100% 不一定代表饱和，需要结合 await 判断。\n\n找到具体是哪个进程在读写磁盘：`pidstat -d 1` 或者 `iotop -o`。\n\nGo 服务中常见的 IO 问题：同步写入大量日志、本地缓存文件频繁刷盘、临时文件写入过多（如大文件上传）。"
+    },
+    {
+      "id": "perf-07",
+      "code": "PERF-07",
+      "cat": "perf",
+      "group": "Linux",
+      "level": 1,
+      "hot": false,
+      "title": "网络方面应该检查哪些指标？用什么工具？",
+      "answer": "```bash\nsar -n DEV 1                  # 网卡收发吞吐量、包数量，是否接近带宽上限\nsar -n TCP,ETCP 1             # active/s 主动建连，passive/s 被动建连，retrans/s 重传\nss -s                         # 各种状态的连接总数\nss -tan | awk '{print $1}' | sort | uniq -c   # 按状态统计连接数\nss -tnp state established '( dport = :3306 )' # 到 MySQL 的连接\nnstat -az | grep -i -E 'retrans|drop|overflow' # 重传、丢包、队列溢出计数\nip -s link                    # 网卡层面的错误和丢包\nping / mtr <host>             # 延迟和链路丢包\n```\n\n重点关注：\n\n-   重传率（TCP 重传数 / 发送的段数）超过 1% 就需要关注；\n-   大量 TIME\\_WAIT 或 CLOSE\\_WAIT；\n-   监听队列溢出；\n-   内核日志中的 `nf_conntrack: table full`。"
+    },
+    {
+      "id": "perf-08",
+      "code": "PERF-08",
+      "cat": "perf",
+      "group": "Go",
+      "level": 2,
+      "hot": true,
+      "title": "Go 服务如何接入 pprof？生产环境需要注意什么？",
+      "answer": "```go\nimport (\n    \"net/http\"\n    _ \"net/http/pprof\" // 在 init 中把 /debug/pprof/* 注册到 http.DefaultServeMux\n)\n\nfunc main() {\n    go func() {\n        // 单独监听一个只在内网可访问的端口，不要和业务端口共用\n        log.Println(http.ListenAndServe(\"127.0.0.1:6060\", nil))\n    }()\n    // 业务服务使用自己的 mux，避免把 pprof 暴露到公网\n}\n```\n\n常用的 profile：\n\n| 地址 | 内容 |\n| --- | --- |\n| `/debug/pprof/profile?seconds=30` | CPU 采样 |\n| `/debug/pprof/heap` | 堆内存：在用（inuse）和累计分配（alloc） |\n| `/debug/pprof/allocs` | 内存分配采样，默认展示累计分配 |\n| `/debug/pprof/goroutine?debug=1` | 所有 goroutine 的调用栈（按调用栈聚合） |\n| `/debug/pprof/block`、`/mutex` | 阻塞和锁竞争，需要先开启采样 |\n| `/debug/pprof/trace?seconds=5` | 执行追踪，使用 `go tool trace` 分析 |\n\n```go\nruntime.SetMutexProfileFraction(100) // 大约采样 1/100 的锁竞争事件\nruntime.SetBlockProfileRate(int(time.Millisecond)) // 只记录阻塞超过 1ms 的事件\n```\n\n分析命令：\n\n```bash\ngo tool pprof -http=:8080 http://10.0.0.5:6060/debug/pprof/profile?seconds=30\n```\n\nWeb 界面中可以查看 Top、火焰图、调用图和源码。在 Kubernetes 中可以先用 `kubectl port-forward` 转发端口。\n\n注意：pprof 会暴露代码结构，而且抓取 profile 本身也有开销，**一定不能暴露到公网**，最好加上认证。"
+    },
+    {
+      "id": "perf-09",
+      "code": "PERF-09",
+      "cat": "perf",
+      "group": "Go",
+      "level": 2,
+      "hot": true,
+      "title": "Go 服务 CPU 使用率飙高，排查流程是什么？",
+      "answer": "1.  **确认现象**：是哪个实例、从什么时候开始、是否和发布或流量变化同时发生；\n2.  **抓取 CPU profile**：在 CPU 高的时候抓取 30 秒；\n3.  **分析**：\n    -   `top` 中 flat（函数自身耗时）高的函数是直接的热点，cum（包含子调用）高的函数是热点所在的调用链；\n    -   在火焰图中找\"最宽的平顶\"；\n    -   `list 函数名` 查看具体是哪几行代码。\n4.  **判断是否是 GC 造成的**：如果 `runtime.gcBgMarkWorker`、`runtime.mallocgc`、`runtime.scanobject` 占比很高，说明根本原因是内存分配过多，下一步应该看 `allocs` profile；\n5.  **常见原因**：\n    -   死循环、空转的 `for { select { default: } }`；\n    -   在热点路径上重复编译正则表达式（`regexp.MustCompile` 应该放在包级变量中）；\n    -   大量的 JSON 序列化，或者反射；\n    -   锁竞争导致的自旋；\n    -   日志过多，尤其是 debug 级别的日志在生产环境中打开；\n    -   TLS 握手过多（连接没有复用）；\n    -   数据量增长导致算法复杂度问题暴露，比如在 slice 中线性查找。\n6.  **修复并验证**：编写基准测试，比较优化前后的结果，发布后观察监控指标。\n\n如果 CPU 飙高只是**偶发的、持续时间很短**，人工来不及抓取：使用持续性能剖析（Pyroscope、Parca），或者使用 mosn/holmes 这类工具，在 CPU 超过阈值时自动抓取 profile。"
+    },
+    {
+      "id": "perf-10",
+      "code": "PERF-10",
+      "cat": "perf",
+      "group": "Go",
+      "level": 2,
+      "hot": true,
+      "title": "Go 服务的内存持续上涨，如何定位？",
+      "answer": "**第一步：判断是不是 Go 堆的问题**。比较 RSS 与运行时指标：\n\n-   `HeapInuse` 也在上涨 → Go 堆中的对象在增长；\n-   goroutine 数量在上涨 → goroutine 泄漏（每个 goroutine 都有栈，并引用其他对象）；\n-   RSS 上涨但 Go 堆没有变化 → cgo 分配的内存、内存没有归还操作系统，或者大量线程。\n\n**第二步：对比两个时间点的 heap profile**：\n\n```bash\ncurl -s http://host:6060/debug/pprof/heap > heap1.pb.gz\n# 等待 10~30 分钟，让内存继续上涨\ncurl -s http://host:6060/debug/pprof/heap > heap2.pb.gz\ngo tool pprof -http=:8080 -base heap1.pb.gz heap2.pb.gz   # 只显示增长的部分\n```\n\n-   `inuse_space`（默认）：当前**仍然存活**的对象占用的内存，用于排查泄漏；\n-   `alloc_space`：累计分配的内存，用于排查分配过多导致的 GC 压力。\n\n**常见的内存泄漏模式**：\n\n-   全局的 map 或缓存只增不减（没有过期或容量限制）；\n-   goroutine 泄漏；\n-   从大 slice 或大字符串中截取一小段长期保存，导致整个底层数组无法释放（应该使用 `strings.Clone` 或 `bytes.Clone`）；\n-   `time.Ticker` 没有调用 Stop（Go 1.23 之前）；\n-   HTTP 响应的 Body 没有关闭；\n-   无限增长的 channel 缓冲或队列。"
+    },
+    {
+      "id": "perf-11",
+      "code": "PERF-11",
+      "cat": "perf",
+      "group": "Go",
+      "level": 2,
+      "hot": true,
+      "title": "如何排查 goroutine 泄漏？",
+      "answer": "1.  **发现**：监控 goroutine 数量（`go_goroutines` 指标），如果在流量平稳的情况下持续上涨，基本可以确定存在泄漏；\n2.  **定位**：\n\n```bash\n# 按调用栈聚合，前面的数字是处于该调用栈的 goroutine 数量\ncurl -s 'http://host:6060/debug/pprof/goroutine?debug=1' | head -50\n# 每个 goroutine 的完整调用栈和阻塞时长\ncurl -s 'http://host:6060/debug/pprof/goroutine?debug=2' | grep -A 10 'minutes'\n```\n\n在输出中找出**数量最多**的那一组调用栈，比如 1 万个 goroutine 都阻塞在 `chan send` 上，并且阻塞时间都长达几十分钟，然后查看对应的代码行。\n\n3.  **常见原因**：\n    -   向没有接收者的 channel 发送（超时返回后，结果 channel 没有人读取）；\n    -   从永远不会关闭的 channel 接收；\n    -   没有响应 ctx 取消的后台循环；\n    -   HTTP 连接没有关闭（大量 `persistConn.readLoop`、`writeLoop` 的 goroutine）；\n    -   等待永远不会释放的锁。\n4.  **预防**：在单元测试中使用 `go.uber.org/goleak`，在测试结束时检查是否有遗留的 goroutine。"
+    },
+    {
+      "id": "perf-12",
+      "code": "PERF-12",
+      "cat": "perf",
+      "group": "Go",
+      "level": 2,
+      "hot": true,
+      "title": "接口延迟很高，但 CPU 使用率很低，可能是什么原因？怎么排查？",
+      "answer": "CPU 不高说明请求的大部分时间**不是在计算，而是在等待**（off-CPU）。需要找出它在等待什么：\n\n1.  **下游依赖变慢**：通过链路追踪查看各个 span 的耗时，看是数据库、Redis 还是其他服务慢；\n2.  **连接池等待**：\n    -   数据库：`db.Stats()` 中的 `WaitCount`、`WaitDuration` 在增长，说明连接池不够用；\n    -   HTTP：`MaxConnsPerHost` 限制导致请求排队；\n3.  **锁竞争**：开启 mutex profile 和 block profile，查看哪把锁的等待时间最长；\n4.  **GC 影响**：GC 辅助标记拖慢了请求，在 `go tool trace` 中可以看到；\n5.  **CPU 被限流**：容器的 CPU 配额用完了，进程在每个周期中被暂停。这时宿主机的 CPU 使用率看起来不高，但 cgroup 的 `nr_throttled` 计数在增长；\n6.  **其他**：DNS 解析慢、TCP 重传、同步写日志时磁盘慢、goroutine 调度延迟（就绪的 goroutine 太多）。\n\n排查工具：\n\n-   `goroutine` profile：看大量 goroutine 阻塞在什么地方；\n-   `go tool trace`：精确查看某个请求在执行过程中被阻塞的原因和时长；\n-   **fgprof**（第三方工具）：同时采集 on-CPU 和 off-CPU 时间，生成一个完整的火焰图。"
+    },
+    {
+      "id": "perf-13",
+      "code": "PERF-13",
+      "cat": "perf",
+      "group": "Go",
+      "level": 2,
+      "hot": false,
+      "title": "go tool trace 能做什么？什么时候用它而不是 pprof？",
+      "answer": "pprof 是**统计采样**，告诉你\"时间总体上花在了哪里\"；trace 是**事件记录**，告诉你\"每个 goroutine 在每个时刻在做什么\"。\n\ntrace 能看到：\n\n-   每个 P 的执行时间线，goroutine 的创建、阻塞、唤醒；\n-   GC 的各个阶段、STW 的时长、辅助标记；\n-   系统调用、网络阻塞、同步原语阻塞；\n-   自定义的任务和区域（`trace.NewTask`、`trace.WithRegion`），可以标记单个请求的处理过程。\n\n适用场景：\n\n-   延迟问题：某个请求为什么慢，是在等待调度、等待锁，还是被 GC 打断；\n-   并行度问题：明明有 8 个核，为什么只用了 2 个；\n-   GC 对延迟的影响。\n\n```bash\ncurl -o trace.out 'http://host:6060/debug/pprof/trace?seconds=5'\ngo tool trace trace.out\n```\n\nGo 1.21 起 trace 的开销降到了约 1%～2%；Go 1.25 新增了 `runtime/trace.FlightRecorder`，可以在内存中持续保留最近几秒的 trace，在检测到异常（比如某个请求超过 1 秒）时再写出，非常适合抓取偶发问题。"
+    },
+    {
+      "id": "perf-14",
+      "code": "PERF-14",
+      "cat": "perf",
+      "group": "Go",
+      "level": 2,
+      "hot": false,
+      "title": "如何定位 GC 引起的延迟毛刺？",
+      "answer": "1.  **确认相关性**：p99 延迟的毛刺是否与 GC 的时间点吻合；\n2.  **观察 GC 行为**：\n\n```bash\nGODEBUG=gctrace=1 ./app   # 每次 GC 输出一行：频率、STW 时间、标记耗时、堆大小\n```\n\n也可以通过 `runtime/metrics` 把 `/gc/pauses:seconds`（STW 暂停时间分布）、`/sched/latencies:seconds`（调度延迟分布）、GC 的 CPU 占比导出到监控系统；\n\n3.  **找到原因**：\n    -   STW 通常很短（亚毫秒级），影响更大的往往是**辅助标记**和后台标记 worker 占用了 25% 的 CPU；\n    -   在 trace 中查看请求处理期间是否出现了 \"MARK ASSIST\"；\n4.  **优化**：\n    -   减少内存分配（这是根本措施）；\n    -   适当调大 GOGC，降低 GC 频率；\n    -   设置合理的 GOMEMLIMIT；\n    -   减少堆中的指针数量，降低标记的工作量；\n    -   确认 GOMAXPROCS 设置正确，避免容器的 CPU 限流放大 GC 的影响。"
+    },
+    {
+      "id": "perf-15",
+      "code": "PERF-15",
+      "cat": "perf",
+      "group": "Go",
+      "level": 2,
+      "hot": false,
+      "title": "如何编写和使用基准测试来验证优化效果？",
+      "answer": "```go\nfunc BenchmarkEncode(b *testing.B) {\n    data := makeTestData()\n    b.ReportAllocs()\n    for b.Loop() { // Go 1.24+：自动处理计时，并防止编译器把被测代码优化掉\n        _, _ = Encode(data)\n    }\n}\n```\n\n```bash\ngo test -bench=Encode -benchmem -count=10 > old.txt\n# 修改代码后\ngo test -bench=Encode -benchmem -count=10 > new.txt\nbenchstat old.txt new.txt     # 统计显著性检验，输出变化百分比和 p 值\ngo test -bench=Encode -cpuprofile cpu.out -memprofile mem.out   # 对基准测试进行剖析\n```\n\n注意事项：\n\n-   运行多次（`-count`），用 benchstat 判断差异是否显著，不要只看一次的结果；\n-   重点关注 `allocs/op`，减少分配往往比减少 CPU 指令收益更大；\n-   测试数据要接近真实场景；\n-   在安静的机器上运行，避免受到其他进程的干扰；\n-   Go 1.24 之前的写法是 `for i := 0; i < b.N; i++`，需要注意把结果赋值给包级变量，防止被编译器优化掉。"
+    },
+    {
+      "id": "perf-16",
+      "code": "PERF-16",
+      "cat": "perf",
+      "group": "Go",
+      "level": 2,
+      "hot": false,
+      "title": "什么是持续性能剖析？为什么线上需要它？",
+      "answer": "传统做法是出问题时手动抓取 profile，但很多问题**持续时间很短**或者**无法复现**，等登录到机器上时问题已经消失了。\n\n持续性能剖析是以很低的频率（比如每 10 秒采样一次）持续采集所有实例的 CPU、内存、goroutine、锁等 profile，集中存储，可以按时间、实例、版本进行查询和对比。开销通常在 1%～2% 以内。\n\n工具：Grafana Pyroscope、Parca（基于 eBPF，不需要修改代码）、各大云厂商的 Profiler 服务。\n\n价值：\n\n-   回溯任意历史时刻的火焰图，排查偶发问题；\n-   比较不同版本之间的性能差异，及时发现性能退化；\n-   量化\"哪些函数在整个集群中消耗了最多的 CPU\"，指导优化方向。\n\n补充方案：mosn/holmes 在 CPU、内存、goroutine 数量超过阈值或突然增长时，自动保存 profile，适合捕捉\"突发\"类问题。"
+    },
+    {
+      "id": "perf-17",
+      "code": "PERF-17",
+      "cat": "perf",
+      "group": "Go",
+      "level": 3,
+      "hot": false,
+      "title": "Go 进程卡死、无响应，连 pprof 都访问不了，怎么抓取现场？",
+      "answer": "1.  **发送 SIGQUIT 获取所有 goroutine 的调用栈**：\n\n```bash\nkill -QUIT <pid>   # Go 运行时会把所有 goroutine 的调用栈打印到 stderr，然后退出\n```\n\n注意这会让**进程退出**，所以先把这个实例从负载均衡中摘除，确保日志（stderr）能够被保存下来。\n\n2.  **不终止进程，生成 core dump**：\n\n```bash\ngcore <pid>                     # 生成 core 文件，进程继续运行（短暂暂停）\ndlv core ./app core.<pid>       # 使用 delve 分析：goroutines、goroutine <id> bt\n```\n\n也可以在启动时设置 `GOTRACEBACK=crash`，程序崩溃时会生成 core dump（需要 `ulimit -c unlimited`）。\n\n3.  **`dlv attach <pid>`**：可以交互式调试，但会**暂停整个进程**，只适合已经被摘除流量的实例。\n\npprof 无法访问的常见原因：pprof 和业务共享同一个 HTTP 服务，而所有 goroutine 都被卡住了；或者 GC 的 STW 无法完成。所以 pprof 最好使用**独立的端口和独立的 Server**。"
+    },
+    {
+      "id": "perf-18",
+      "code": "PERF-18",
+      "cat": "perf",
+      "group": "综合",
+      "level": 2,
+      "hot": true,
+      "title": "服务出现 OOM，如何排查？",
+      "answer": "1.  **确认是 OOM**：\n    -   `dmesg -T | grep -i -E 'killed process|out of memory'`；\n    -   Kubernetes 中，`kubectl describe pod` 显示 `OOMKilled`，退出码为 **137**（128 + SIGKILL 的 9）；\n    -   区分是容器达到了 cgroup 的内存限制，还是整台机器内存不足；\n2.  **确认是 Go 堆还是其他内存**：查看 OOM 之前的监控，Go 堆、goroutine 数量、RSS 是如何变化的；\n3.  **找到原因**：\n    -   **缓慢增长**：内存泄漏，按照泄漏的方法，对比两次 heap profile；\n    -   **突然暴涨**：通常是某个请求一次性加载了大量数据，比如没有分页的查询加载了几百万行、读取了超大的请求体或文件、大量的并发请求同时分配大缓冲区。这种情况下来不及手动抓取 profile，可以使用 holmes 在内存超过阈值时自动保存 heap profile；\n4.  **防护措施**：\n    -   设置 `GOMEMLIMIT` 为容器限制的 80%～90%，让 GC 在接近上限时更加积极；\n    -   限制请求体大小、查询返回的行数和并发数；\n    -   大数据量的处理改为**流式处理**（分批查询、逐行处理、流式编码）。\n\n注意：GOMEMLIMIT 是软限制，存活对象真的超过限制时仍然会 OOM，它只能减少\"垃圾还没回收就被 OOM\"的情况。"
+    },
+    {
+      "id": "perf-19",
+      "code": "PERF-19",
+      "cat": "perf",
+      "group": "综合",
+      "level": 2,
+      "hot": false,
+      "title": "出现 too many open files 错误，怎么排查？",
+      "answer": "```bash\ncat /proc/<pid>/limits | grep 'open files'  # 进程的 fd 上限\nls /proc/<pid>/fd | wc -l                    # 当前打开的 fd 数量\nls -l /proc/<pid>/fd | awk '{print $NF}' | sed 's/:.*//' | sort | uniq -c   # 按类型统计（socket、文件、pipe）\nlsof -p <pid> | awk '{print $5}' | sort | uniq -c\nss -tanp | grep <pid> | awk '{print $1}' | sort | uniq -c   # 连接状态的分布\n```\n\n判断：\n\n-   fd 数量持续增长，并且大部分是 socket → **连接泄漏**：HTTP 响应的 Body 没有关闭、连接没有关闭，或者每次请求都新建了 Client；结合连接状态（大量 CLOSE\\_WAIT 就是自己没有关闭连接）；\n-   大部分是普通文件 → 打开文件后没有关闭，或者在循环中使用 defer 关闭，导致函数返回前一直不释放；\n-   fd 数量与正常连接数匹配，只是上限太低 → 调大限制（systemd 中使用 `LimitNOFILE`，容器中检查运行时的配置）。\n\nGo 1.19 起，导入 os 包的程序在启动时会自动把 `RLIMIT_NOFILE` 的软限制提高到硬限制。"
+    },
+    {
+      "id": "perf-20",
+      "code": "PERF-20",
+      "cat": "perf",
+      "group": "综合",
+      "level": 2,
+      "hot": false,
+      "title": "strace 和 perf 分别在什么情况下使用？",
+      "answer": "**strace**：跟踪进程的系统调用。\n\n```bash\nstrace -c -f -p <pid>            # 统计各系统调用的次数和耗时（按 Ctrl+C 结束）\nstrace -f -T -e trace=network -p <pid>   # 只看网络相关的调用，显示每个调用的耗时\n```\n\n适用：程序卡住时查看它在等待什么系统调用、频繁的小块读写、权限问题、配置文件路径问题。\n\n注意：strace 基于 ptrace，**对性能影响非常大**（可能让程序变慢数十倍），在生产环境中只能短时间使用。\n\n**perf**：基于硬件性能计数器和采样，开销低。\n\n```bash\nperf top -p <pid>                              # 实时查看热点函数，包括内核函数\nperf record -F 99 -g -p <pid> -- sleep 30      # 采样 30 秒\nperf report                                    # 或者使用 FlameGraph 脚本生成火焰图\n```\n\n适用：需要同时看到**内核态**耗时（比如 sy 很高的时候），或者分析 cgo、非 Go 程序。Go 编译的二进制文件默认包含帧指针，perf 的调用栈可以正常展开。"
+    },
+    {
+      "id": "perf-21",
+      "code": "PERF-21",
+      "cat": "perf",
+      "group": "综合",
+      "level": 2,
+      "hot": false,
+      "title": "大量 CLOSE\\_WAIT 的问题如何排查？",
+      "answer": "CLOSE\\_WAIT 表示**对方已经关闭了连接，而本方没有调用 Close**，几乎一定是程序的问题。\n\n```bash\nss -tanp state close-wait | head      # 找到所属进程，以及对端的地址和端口\nss -tan state close-wait | awk '{print $4}' | sort | uniq -c | sort -rn | head   # 按对端地址聚合\n```\n\n根据对端地址判断是哪一类连接：\n\n-   对端是下游的 HTTP 服务 → 作为客户端，**没有关闭响应的 Body**，或者在某些错误分支中忘记了关闭；\n-   对端是客户端 → 作为服务端，处理连接的 goroutine 阻塞在其他地方，没有执行到 Close。这时抓取 goroutine profile，查看大量 goroutine 阻塞的位置；\n-   对端是数据库或 Redis → 连接池的实现或配置有问题。\n\nCLOSE\\_WAIT 不会自动消失（没有超时时间），会持续占用 fd，最终导致 too many open files。"
+    },
+    {
+      "id": "perf-22",
+      "code": "PERF-22",
+      "cat": "perf",
+      "group": "综合",
+      "level": 2,
+      "hot": false,
+      "title": "接口变慢，怀疑是慢 SQL，如何确认和定位？",
+      "answer": "1.  **链路追踪**：查看慢请求的 trace，确认时间是花在数据库 span 上。同时注意区分：**SQL 的执行时间**和**等待获取连接的时间**是两回事；\n2.  **连接池指标**：`db.Stats()` 中的 `WaitCount` 和 `WaitDuration` 持续增长，说明是连接池不够或者连接被长时间占用（慢查询、长事务、连接泄漏），而不一定是某条 SQL 本身慢；\n3.  **数据库侧**：\n    -   慢查询日志（`long_query_time`），用 pt-query-digest 汇总；\n    -   `SHOW PROCESSLIST` 查看当前正在执行的语句，是否有很多处于等待锁的状态；\n    -   锁等待：`sys.innodb_lock_waits`（MySQL 8.0 中对应 performance\\_schema 的 `data_lock_waits`）；\n    -   长事务：`information_schema.innodb_trx`，查看 `trx_started` 很早的事务；\n4.  **分析具体的 SQL**：EXPLAIN、检查索引、检查数据量的变化；\n5.  **数据库机器本身**：CPU、IO、连接数、主从延迟。\n\n在 Go 中，可以给数据库驱动加上 OpenTelemetry 的插桩（如 otelsql），把每条 SQL 的耗时和语句自动记录到链路追踪中。"
+    },
+    {
+      "id": "perf-23",
+      "code": "PERF-23",
+      "cat": "perf",
+      "group": "综合",
+      "level": 2,
+      "hot": false,
+      "title": "线上偶发 502 和 504，如何排查？",
+      "answer": "先弄清楚两者的含义：\n\n-   **502 Bad Gateway**：网关从上游收到了无效的响应，或者连接被上游**重置或关闭**；\n-   **504 Gateway Timeout**：网关等待上游响应**超时**。\n\n**偶发 502 的经典原因**：**keep-alive 超时时间不匹配**。负载均衡器（如 Nginx、云 LB）复用与后端的空闲连接，但后端 Go 服务的 `IdleTimeout` 比负载均衡器的空闲超时更短，后端先关闭了连接，此时负载均衡器正好在这个连接上发送请求，就会收到 RST，返回 502。\n\n解决方法：**后端的空闲超时要大于负载均衡器的空闲超时**（比如 LB 是 60 秒，后端设置为 75～90 秒）。\n\n其他原因：\n\n-   后端发布或重启期间没有优雅关闭，连接被强制断开；\n-   后端进程崩溃或 OOM；\n-   响应头过大，超出了网关的缓冲区限制。\n\n**504 的排查**：\n\n-   后端处理时间超过了网关的超时设置：查看慢请求的链路追踪；\n-   后端的全连接队列溢出，或者进程卡住，无法接受新的连接；\n-   网关和后端之间的网络问题。\n\n排查时要**同时查看网关和后端的日志**，根据时间和请求 ID 进行关联，确认请求是否到达了后端、后端的处理结果是什么。"
+    },
+    {
+      "id": "perf-24",
+      "code": "PERF-24",
+      "cat": "perf",
+      "group": "综合",
+      "level": 2,
+      "hot": false,
+      "title": "上下文切换次数过高，如何排查？",
+      "answer": "```bash\nvmstat 1                 # cs 列：系统每秒的上下文切换次数；in 列：中断次数\npidstat -w 1             # 每个进程的 cswch/s（自愿切换）和 nvcswch/s（非自愿切换）\npidstat -wt -p <pid> 1   # 细化到线程\n```\n\n-   **自愿切换**多：进程在等待资源，比如 IO、锁、sleep。通常与锁竞争或者频繁的小块 IO 有关；\n-   **非自愿切换**多：进程的时间片用完了被强制调度，说明 CPU 资源紧张，正在运行的线程数远多于 CPU 核数。\n\n对 Go 程序而言：\n\n-   线程数远多于 GOMAXPROCS（阻塞的系统调用、cgo）会增加切换；\n-   容器中 GOMAXPROCS 大于 CPU 配额，也会导致频繁的切换和限流；\n-   goroutine 之间的切换发生在用户态，不会被计入这里的上下文切换次数。"
+    },
+    {
+      "id": "perf-25",
+      "code": "PERF-25",
+      "cat": "perf",
+      "group": "综合",
+      "level": 3,
+      "hot": true,
+      "title": "线上 p99 延迟飙升，你会如何系统化地排查？",
+      "answer": "按以下步骤系统化排查：\n\n**1\\. 确定影响范围**\n\n-   是所有接口还是部分接口？所有实例还是个别实例？某个机房还是全部？\n-   从什么时候开始？那个时间点是否有发布、配置变更、流量变化、依赖方的变更？\n\n个别实例异常，通常是机器本身的问题（邻居干扰、磁盘故障）；全部实例都异常，通常是变更、流量或者公共依赖的问题。\n\n**2\\. 先止损**\n\n如果与变更相关，立即回滚；单个实例异常，先摘除流量；流量突增则限流或扩容。**先恢复服务，再分析根本原因**。\n\n**3\\. 自上而下定位（RED 方法）**\n\n查看服务及其每个依赖的请求速率、错误率、延迟。通过链路追踪找到慢请求，看时间花在哪个 span 上，从而确定是本服务的问题还是下游的问题。\n\n**4\\. 自下而上检查资源（USE 方法）**\n\n对每种资源检查**使用率、饱和度和错误**：\n\n-   CPU：使用率、运行队列、限流次数；\n-   内存：可用内存、swap、OOM；\n-   磁盘：await、队列长度；\n-   网络：带宽、重传、丢包、连接队列。\n\n**5\\. 深入到进程内部**\n\nCPU profile、goroutine profile、mutex/block profile、trace、GC 日志。\n\n**6\\. 验证与复盘**\n\n修复后确认指标恢复；复盘时补充监控和告警，避免同样的问题再次发生。"
+    },
+    {
+      "id": "perf-26",
+      "code": "PERF-26",
+      "cat": "perf",
+      "group": "综合",
+      "level": 3,
+      "hot": true,
+      "title": "容器中的 CPU 限流（throttling）是怎么回事？如何发现和解决？",
+      "answer": "Kubernetes 的 CPU limit 是通过 CFS 带宽控制实现的：每个周期（默认 100ms）内，容器最多只能使用 `quota` 的 CPU 时间。比如 limit 为 2 核，就是每 100ms 内最多使用 200ms 的 CPU 时间。\n\n**问题**：一个 GOMAXPROCS=32 的 Go 程序，在一个周期开始时 32 个线程同时运行，**大约 6ms 就用完了 200ms 的配额**，剩下约 94ms 所有线程都被暂停。请求的延迟会突然增加几十毫秒，而平均 CPU 使用率看起来并不高。\n\n**发现**：\n\n```bash\ncat /sys/fs/cgroup/cpu.stat    # cgroup v2：nr_throttled、throttled_usec\n# Prometheus 指标\n# container_cpu_cfs_throttled_periods_total / container_cpu_cfs_periods_total\n```\n\n限流周期的比例持续超过百分之几，就需要处理。\n\n**解决**：\n\n-   让 GOMAXPROCS 与 CPU 配额匹配：Go 1.25 起会自动根据 cgroup 的限制设置；更早的版本使用 automaxprocs；\n-   适当提高 limit，或者只设置 request、不设置 CPU limit（这需要集群的整体策略支持）；\n-   减少突发性的 CPU 消耗（比如 GC 的并发标记会在短时间内使用大量 CPU）。"
+    },
+    {
+      "id": "perf-27",
+      "code": "PERF-27",
+      "cat": "perf",
+      "group": "综合",
+      "level": 3,
+      "hot": false,
+      "title": "如何定位网络丢包和重传问题？",
+      "answer": "**1\\. 确认丢包和重传**\n\n```bash\nnstat -az | grep -E 'TcpRetransSegs|TcpExtTCPLostRetransmit|TcpExtListenOverflows|TcpExtListenDrops'\nnetstat -s | grep -i -E 'retrans|drop|overflow|prune'\n```\n\n**2\\. 按层次检查**\n\n-   **网卡层**：`ip -s link` 中的 errors、dropped；`ethtool -S eth0 | grep -i -E 'drop|miss|err'`，如果 rx ring buffer 溢出，可以用 `ethtool -G` 调大；\n-   **软中断**：`/proc/softirqs` 中 NET\\_RX 是否集中在某一个 CPU 上（需要开启 RSS/RPS 分散处理），`mpstat` 中某个核的 %soft 很高；\n-   **内核**：dmesg 中出现 `nf_conntrack: table full, dropping packet`，说明连接跟踪表满了，需要调大 `nf_conntrack_max` 或者对不需要跟踪的流量关闭跟踪；\n-   **TCP 层**：监听队列溢出、TCP 内存不足；\n-   **链路**：使用 `mtr` 查看路径中哪一跳开始出现丢包。\n\n**3\\. 抓包分析**\n\n```bash\ntcpdump -i eth0 -nn -s 0 host 10.0.0.8 and port 3306 -w cap.pcap -c 100000\n```\n\n用 Wireshark 打开，使用 `tcp.analysis.retransmission`、`tcp.analysis.zero_window` 等过滤条件，查看重传、零窗口（接收方处理不过来）、RST 等异常。"
+    },
+    {
+      "id": "perf-28",
+      "code": "PERF-28",
+      "cat": "perf",
+      "group": "综合",
+      "level": 3,
+      "hot": false,
+      "title": "eBPF 工具在性能排查中能做什么？",
+      "answer": "eBPF 可以在内核中安全地运行自定义程序，开销很低，**适合在生产环境中直接使用**。常用的 bcc 工具集：\n\n| 工具 | 用途 |\n| --- | --- |\n| `execsnoop` | 跟踪新创建的进程，发现频繁启动的短命进程 |\n| `opensnoop` | 跟踪文件的打开操作 |\n| `biolatency` | 磁盘 IO 延迟的分布直方图 |\n| `runqlat` | CPU 运行队列延迟：线程等待被调度的时间 |\n| `offcputime` | 线程不在 CPU 上的时间和原因（off-CPU 分析） |\n| `tcpretrans` | 实时打印 TCP 重传，包括地址和状态 |\n| `tcplife` | 记录 TCP 连接的生命周期和传输数据量 |\n| `profile` | CPU 采样，可以生成火焰图 |\n\n也可以使用 bpftrace 编写一行脚本进行快速分析：\n\n```bash\nbpftrace -e 'tracepoint:syscalls:sys_enter_openat { @[comm] = count(); }'\n```\n\n在 Go 程序上使用 uprobe 时需要注意：**不要使用 uretprobe**，goroutine 的栈会被移动，uretprobe 修改返回地址可能导致程序崩溃。"
+    },
+    {
+      "id": "code-01",
+      "code": "CODE-01",
+      "cat": "code",
+      "group": "找 bug",
+      "level": 1,
+      "hot": true,
+      "title": "下面这段带超时的查询代码有什么问题？",
+      "answer": "```go\nfunc Query(ctx context.Context) (string, error) {\n    ch := make(chan string)\n    go func() {\n        ch <- slowCall()\n    }()\n    select {\n    case r := <-ch:\n        return r, nil\n    case <-time.After(time.Second):\n        return \"\", errors.New(\"timeout\")\n    }\n}\n```\n\n**goroutine 泄漏**：超时返回后，没有任何人再从 `ch` 接收，执行 `slowCall` 的 goroutine 会永远阻塞在发送语句上。高并发下每次超时泄漏一个 goroutine，最终导致内存耗尽。\n\n修复：\n\n```go\nfunc Query(ctx context.Context) (string, error) {\n    ctx, cancel := context.WithTimeout(ctx, time.Second)\n    defer cancel()\n\n    ch := make(chan string, 1) // 缓冲为 1，即使没人接收，发送也不会阻塞\n    go func() {\n        ch <- slowCall(ctx) // 把 ctx 传下去，让下游也能及时停止\n    }()\n    select {\n    case r := <-ch:\n        return r, nil\n    case <-ctx.Done():\n        return \"\", ctx.Err()\n    }\n}\n```\n\n另外，原代码没有使用传入的 ctx，上游取消时也不会停止。"
+    },
+    {
+      "id": "code-02",
+      "code": "CODE-02",
+      "cat": "code",
+      "group": "找 bug",
+      "level": 1,
+      "hot": false,
+      "title": "下面这个并发计数器有什么问题？",
+      "answer": "```go\ntype Counter struct {\n    mu sync.Mutex\n    n  map[string]int\n}\n\nfunc (c Counter) Inc(key string) {\n    c.mu.Lock()\n    defer c.mu.Unlock()\n    c.n[key]++\n}\n```\n\n**值接收者导致锁被拷贝**：每次调用 `Inc` 时，`c` 是一个副本，加锁的是副本中的 Mutex，各个 goroutine 之间根本没有互斥。而 map 是引用类型，副本中的 map 指向同一个底层哈希表，所以会出现**并发写 map**，直接导致程序崩溃（fatal error，无法 recover）。\n\n修复：改为指针接收者 `func (c *Counter) Inc(key string)`。\n\n`go vet` 的 copylocks 检查可以发现这类问题，应该在 CI 中开启。此外，`n` 在使用前需要初始化，最好提供一个构造函数。"
+    },
+    {
+      "id": "code-03",
+      "code": "CODE-03",
+      "cat": "code",
+      "group": "找 bug",
+      "level": 1,
+      "hot": false,
+      "title": "下面批量处理文件的代码有什么问题？",
+      "answer": "```go\nfunc ProcessFiles(paths []string) error {\n    for _, p := range paths {\n        f, err := os.Open(p)\n        if err != nil {\n            return err\n        }\n        defer f.Close()\n        if err := process(f); err != nil {\n            return err\n        }\n    }\n    return nil\n}\n```\n\n**循环中使用 defer**：defer 在**函数返回时**才执行，而不是每次循环结束时。处理上万个文件时，所有文件都会一直保持打开状态，最终触发 `too many open files`。\n\n修复：把每次循环的内容提取成一个单独的函数，或者使用闭包：\n\n```go\nfor _, p := range paths {\n    if err := func() error {\n        f, err := os.Open(p)\n        if err != nil {\n            return err\n        }\n        defer f.Close()\n        return process(f)\n    }(); err != nil {\n        return err\n    }\n}\n```"
+    },
+    {
+      "id": "code-04",
+      "code": "CODE-04",
+      "cat": "code",
+      "group": "找 bug",
+      "level": 1,
+      "hot": false,
+      "title": "下面并发抓取 URL 的代码有哪些问题？",
+      "answer": "```go\nfunc FetchAll(urls []string) []string {\n    var (\n        wg      sync.WaitGroup\n        results []string\n    )\n    for _, u := range urls {\n        go func() {\n            wg.Add(1)\n            defer wg.Done()\n            body, _ := fetch(u)\n            results = append(results, body)\n        }()\n    }\n    wg.Wait()\n    return results\n}\n```\n\n这段代码有三个问题：\n\n1.  **`wg.Add(1)` 写在 goroutine 内部**：主 goroutine 可能在任何 goroutine 执行 Add 之前就执行到 `Wait()`，此时计数为 0，直接返回；\n2.  **并发 append 存在数据竞争**：多个 goroutine 同时修改 `results`，会丢失数据，甚至出现异常；\n3.  **错误被忽略**，而且无法控制并发数量，一次性传入上万个 URL 会同时发起上万个请求。\n\n修复：\n\n```go\nfunc FetchAll(ctx context.Context, urls []string) ([]string, error) {\n    results := make([]string, len(urls)) // 预分配，每个 goroutine 写自己的下标\n    g, ctx := errgroup.WithContext(ctx)\n    g.SetLimit(16)\n    for i, u := range urls {\n        g.Go(func() error {\n            body, err := fetch(ctx, u)\n            if err != nil {\n                return fmt.Errorf(\"fetch %s: %w\", u, err)\n            }\n            results[i] = body\n            return nil\n        })\n    }\n    if err := g.Wait(); err != nil {\n        return nil, err\n    }\n    return results, nil\n}\n```"
+    },
+    {
+      "id": "code-05",
+      "code": "CODE-05",
+      "cat": "code",
+      "group": "并发",
+      "level": 1,
+      "hot": true,
+      "title": "用两个 goroutine 交替打印 1 到 10 的奇数和偶数",
+      "answer": "```go\nfunc main() {\n    odd, even := make(chan struct{}), make(chan struct{})\n    var wg sync.WaitGroup\n    wg.Add(2)\n\n    go func() {\n        defer wg.Done()\n        for i := 1; i <= 10; i += 2 {\n            <-odd // 等待轮到自己\n            fmt.Println(i)\n            even <- struct{}{} // 交给偶数协程\n        }\n    }()\n\n    go func() {\n        defer wg.Done()\n        for i := 2; i <= 10; i += 2 {\n            <-even\n            fmt.Println(i)\n            if i < 10 { // 最后一次不再通知，否则会因为没有接收者而永久阻塞\n                odd <- struct{}{}\n            }\n        }\n    }()\n\n    odd <- struct{}{} // 从奇数开始\n    wg.Wait()\n}\n```\n\n**扩展：N 个 goroutine 按顺序循环打印 A、B、C**，每个 goroutine 等待自己的 channel，打印后通知下一个：\n\n```go\nfunc PrintInOrder(names []string, rounds int) {\n    chs := make([]chan struct{}, len(names))\n    for i := range chs {\n        chs[i] = make(chan struct{}, 1)\n    }\n    var wg sync.WaitGroup\n    for i, name := range names {\n        wg.Add(1)\n        go func() {\n            defer wg.Done()\n            for range rounds {\n                <-chs[i]\n                fmt.Print(name)\n                chs[(i+1)%len(chs)] <- struct{}{} // 缓冲为 1，最后一次通知也不会阻塞\n            }\n        }()\n    }\n    chs[0] <- struct{}{}\n    wg.Wait()\n}\n```\n\n注意最后一轮的通知：没有接收者时会永久阻塞。解决办法是使用缓冲为 1 的 channel，或者像第一个例子那样跳过最后一次通知。"
+    },
+    {
+      "id": "code-06",
+      "code": "CODE-06",
+      "cat": "code",
+      "group": "并发",
+      "level": 1,
+      "hot": true,
+      "title": "实现一个 worker 池，支持提交任务、限制并发数、优雅关闭",
+      "answer": "```go\ntype Pool struct {\n    tasks chan func()\n    wg    sync.WaitGroup\n    once  sync.Once\n}\n\nfunc NewPool(workers, queueSize int) *Pool {\n    p := &Pool{tasks: make(chan func(), queueSize)}\n    p.wg.Add(workers)\n    for range workers {\n        go p.worker()\n    }\n    return p\n}\n\nfunc (p *Pool) worker() {\n    defer p.wg.Done()\n    for task := range p.tasks { // channel 关闭且任务取完后退出\n        p.run(task)\n    }\n}\n\nfunc (p *Pool) run(task func()) {\n    defer func() {\n        if r := recover(); r != nil { // 单个任务 panic 不能让 worker 退出，更不能让进程崩溃\n            slog.Error(\"task panic\", \"err\", r, \"stack\", string(debug.Stack()))\n        }\n    }()\n    task()\n}\n\n// Submit 在队列满时阻塞，直到有空位或者 ctx 被取消\nfunc (p *Pool) Submit(ctx context.Context, task func()) error {\n    select {\n    case p.tasks <- task:\n        return nil\n    case <-ctx.Done():\n        return ctx.Err()\n    }\n}\n\n// Close 停止接收新任务，并等待已经提交的任务全部执行完毕\nfunc (p *Pool) Close() {\n    p.once.Do(func() { close(p.tasks) })\n    p.wg.Wait()\n}\n```\n\n设计取舍：\n\n-   队列满时是阻塞、直接拒绝，还是丢弃最旧的任务？这里选择阻塞，并通过 ctx 控制等待时间；\n-   `Close` 之后再调用 `Submit` 会向已关闭的 channel 发送数据而 panic。生产环境中需要加一个关闭标志，用 RWMutex 保护 Submit 和 Close；\n-   任务需要返回结果时，可以让任务本身写入结果 channel，或者直接使用 `errgroup.SetLimit`。"
+    },
+    {
+      "id": "code-07",
+      "code": "CODE-07",
+      "cat": "code",
+      "group": "并发",
+      "level": 2,
+      "hot": true,
+      "title": "实现并发请求多个下游，任意一个失败就取消其他请求，并设置总超时",
+      "answer": "```go\nfunc FetchAll(ctx context.Context, urls []string) ([][]byte, error) {\n    ctx, cancel := context.WithTimeout(ctx, 3*time.Second)\n    defer cancel()\n\n    g, ctx := errgroup.WithContext(ctx) // 任意一个任务返回错误，ctx 就会被取消\n    g.SetLimit(10)\n    results := make([][]byte, len(urls))\n\n    for i, u := range urls {\n        g.Go(func() error {\n            req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)\n            if err != nil {\n                return err\n            }\n            resp, err := httpClient.Do(req)\n            if err != nil {\n                return err // ctx 被取消时，其他正在进行的请求也会立即返回\n            }\n            defer resp.Body.Close()\n            if resp.StatusCode != http.StatusOK {\n                return fmt.Errorf(\"%s: status %d\", u, resp.StatusCode)\n            }\n            results[i], err = io.ReadAll(io.LimitReader(resp.Body, 10<<20))\n            return err\n        })\n    }\n    if err := g.Wait(); err != nil {\n        return nil, err\n    }\n    return results, nil\n}\n```\n\n**变体：只需要最快返回的一个结果**（比如向多个副本发起请求）：\n\n```go\nfunc First(ctx context.Context, replicas []string) ([]byte, error) {\n    ctx, cancel := context.WithCancel(ctx)\n    defer cancel() // 拿到第一个结果后，取消其他请求\n\n    type result struct {\n        data []byte\n        err  error\n    }\n    ch := make(chan result, len(replicas)) // 缓冲足够大，任何 goroutine 都不会阻塞\n    for _, r := range replicas {\n        go func() {\n            data, err := fetch(ctx, r)\n            ch <- result{data, err}\n        }()\n    }\n    var errs []error\n    for range replicas {\n        res := <-ch\n        if res.err == nil {\n            return res.data, nil\n        }\n        errs = append(errs, res.err)\n    }\n    return nil, errors.Join(errs...)\n}\n```"
+    },
+    {
+      "id": "code-08",
+      "code": "CODE-08",
+      "cat": "code",
+      "group": "并发",
+      "level": 2,
+      "hot": true,
+      "title": "实现一个令牌桶限流器",
+      "answer": "```go\ntype TokenBucket struct {\n    mu       sync.Mutex\n    rate     float64 // 每秒生成的令牌数\n    capacity float64 // 桶的容量，也就是允许的最大突发量\n    tokens   float64\n    last     time.Time\n}\n\nfunc NewTokenBucket(rate float64, capacity int) *TokenBucket {\n    return &TokenBucket{\n        rate:     rate,\n        capacity: float64(capacity),\n        tokens:   float64(capacity), // 初始时桶是满的\n        last:     time.Now(),\n    }\n}\n\nfunc (b *TokenBucket) Allow() bool {\n    b.mu.Lock()\n    defer b.mu.Unlock()\n\n    now := time.Now()\n    // 按经过的时间补充令牌，不需要额外的定时器协程\n    b.tokens = min(b.capacity, b.tokens+now.Sub(b.last).Seconds()*b.rate)\n    b.last = now\n\n    if b.tokens >= 1 {\n        b.tokens--\n        return true\n    }\n    return false\n}\n```\n\n要点：\n\n-   **惰性计算**：每次请求时根据时间差补充令牌，比起用定时器协程每隔一段时间放入令牌更加精确，也更节省资源；\n-   生产环境直接使用 `golang.org/x/time/rate`，它还支持 `Wait(ctx)` 阻塞等待和 `Reserve` 预约；\n-   分布式限流：把同样的逻辑写成 Lua 脚本在 Redis 中执行，使用 Redis 的服务器时间（`TIME` 命令），避免不同机器之间的时钟差异。"
+    },
+    {
+      "id": "code-09",
+      "code": "CODE-09",
+      "cat": "code",
+      "group": "并发",
+      "level": 2,
+      "hot": false,
+      "title": "实现一个滑动窗口限流器（单机版和 Redis 版）",
+      "answer": "**单机版**：采用\"滑动窗口计数器\"，用上一个窗口的计数乘以重叠比例，近似计算滑动窗口内的请求数，只需要两个计数器：\n\n```go\ntype SlidingWindow struct {\n    mu        sync.Mutex\n    limit     int\n    window    time.Duration\n    curStart  time.Time\n    cur, prev int\n}\n\nfunc NewSlidingWindow(limit int, window time.Duration) *SlidingWindow {\n    return &SlidingWindow{limit: limit, window: window}\n}\n\nfunc (s *SlidingWindow) Allow() bool {\n    s.mu.Lock()\n    defer s.mu.Unlock()\n\n    now := time.Now()\n    if elapsed := now.Sub(s.curStart); elapsed >= s.window {\n        if elapsed >= 2*s.window {\n            s.prev = 0 // 中间空了至少一个完整的窗口\n        } else {\n            s.prev = s.cur\n        }\n        s.cur = 0\n        s.curStart = now.Truncate(s.window)\n    }\n\n    // 上一个窗口与当前滑动窗口的重叠比例\n    weight := 1 - float64(now.Sub(s.curStart))/float64(s.window)\n    if float64(s.prev)*weight+float64(s.cur) >= float64(s.limit) {\n        return false\n    }\n    s.cur++\n    return true\n}\n```\n\n**Redis 版**：使用 ZSET 记录每个请求的时间戳（滑动日志），精确但每个请求占用一个元素，适合限制较小的场景：\n\n```lua\n-- KEYS[1] 限流 key；ARGV: 当前毫秒时间, 窗口毫秒数, 限制次数, 唯一请求 ID\nredis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1] - ARGV[2])\nif redis.call('ZCARD', KEYS[1]) < tonumber(ARGV[3]) then\n    redis.call('ZADD', KEYS[1], ARGV[1], ARGV[4])\n    redis.call('PEXPIRE', KEYS[1], ARGV[2])\n    return 1\nend\nreturn 0\n```"
+    },
+    {
+      "id": "code-10",
+      "code": "CODE-10",
+      "cat": "code",
+      "group": "并发",
+      "level": 2,
+      "hot": false,
+      "title": "实现一个简化版的 singleflight",
+      "answer": "```go\ntype call struct {\n    wg  sync.WaitGroup\n    val any\n    err error\n}\n\ntype Group struct {\n    mu sync.Mutex\n    m  map[string]*call\n}\n\nfunc (g *Group) Do(key string, fn func() (any, error)) (any, error) {\n    g.mu.Lock()\n    if g.m == nil {\n        g.m = make(map[string]*call)\n    }\n    if c, ok := g.m[key]; ok { // 已经有相同的请求在执行，等待它的结果\n        g.mu.Unlock()\n        c.wg.Wait()\n        return c.val, c.err\n    }\n    c := new(call)\n    c.wg.Add(1)\n    g.m[key] = c\n    g.mu.Unlock()\n\n    defer func() { // 即使 fn panic，也要唤醒等待者并清理 key\n        c.wg.Done()\n        g.mu.Lock()\n        delete(g.m, key)\n        g.mu.Unlock()\n    }()\n    c.val, c.err = fn()\n    return c.val, c.err\n}\n```\n\n要点：\n\n-   先删除 key 还是先唤醒等待者都可以，但两者都必须执行，所以放在 defer 中；\n-   如果 fn panic，等待者会得到零值和 nil 错误，官方实现会把 panic 传递给所有等待者，这里作为简化版可以说明这一点；\n-   官方实现还提供了 `DoChan`（可以配合 select 实现超时）和 `Forget`。"
+    },
+    {
+      "id": "code-11",
+      "code": "CODE-11",
+      "cat": "code",
+      "group": "并发",
+      "level": 2,
+      "hot": false,
+      "title": "实现一个简单的发布订阅（Pub/Sub）",
+      "answer": "```go\ntype Broker[T any] struct {\n    mu   sync.RWMutex\n    subs map[string]map[chan T]struct{}\n}\n\nfunc NewBroker[T any]() *Broker[T] {\n    return &Broker[T]{subs: make(map[string]map[chan T]struct{})}\n}\n\nfunc (b *Broker[T]) Subscribe(topic string, buf int) (<-chan T, func()) {\n    ch := make(chan T, buf)\n    b.mu.Lock()\n    if b.subs[topic] == nil {\n        b.subs[topic] = make(map[chan T]struct{})\n    }\n    b.subs[topic][ch] = struct{}{}\n    b.mu.Unlock()\n\n    unsubscribe := func() {\n        b.mu.Lock()\n        defer b.mu.Unlock()\n        if _, ok := b.subs[topic][ch]; ok { // 保证重复调用也安全\n            delete(b.subs[topic], ch)\n            close(ch)\n        }\n    }\n    return ch, unsubscribe\n}\n\nfunc (b *Broker[T]) Publish(topic string, msg T) {\n    b.mu.RLock() // 持有读锁期间不会有 channel 被关闭，因此发送是安全的\n    defer b.mu.RUnlock()\n    for ch := range b.subs[topic] {\n        select {\n        case ch <- msg:\n        default: // 慢订阅者的缓冲区满了，丢弃消息，不能阻塞发布者\n        }\n    }\n}\n```\n\n讨论点：慢消费者的处理策略（丢弃、断开、阻塞）、是否需要保证消息不丢失（那就需要持久化和确认机制，也就是真正的消息队列）。"
+    },
+    {
+      "id": "code-12",
+      "code": "CODE-12",
+      "cat": "code",
+      "group": "并发",
+      "level": 2,
+      "hot": true,
+      "title": "实现多生产者、多消费者模型，收到退出信号时优雅停止",
+      "answer": "```go\nfunc main() {\n    ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)\n    defer stop()\n\n    jobs := make(chan Job, 100)\n    var producers, consumers sync.WaitGroup\n\n    for p := range 3 {\n        producers.Add(1)\n        go func() {\n            defer producers.Done()\n            for {\n                job, err := fetchJob(ctx, p)\n                if err != nil {\n                    return // ctx 被取消，或者没有更多任务\n                }\n                select {\n                case jobs <- job:\n                case <-ctx.Done():\n                    return\n                }\n            }\n        }()\n    }\n\n    // 所有生产者退出后，由协调者负责关闭 channel，保证只关闭一次\n    go func() {\n        producers.Wait()\n        close(jobs)\n    }()\n\n    for range 4 {\n        consumers.Add(1)\n        go func() {\n            defer consumers.Done()\n            for job := range jobs { // 收到退出信号后，仍然把已经入队的任务处理完\n                handle(job)\n            }\n        }()\n    }\n\n    consumers.Wait()\n    slog.Info(\"all jobs drained, exit\")\n}\n```\n\n关键点：\n\n-   只有发送方（通过协调者）关闭 channel，消费者使用 `range` 自然退出；\n-   退出信号只通知生产者停止生产，已经在队列中的任务继续处理完成，不会丢失；\n-   如果需要限制退出的总时间，可以给消费者的等待加上超时。"
+    },
+    {
+      "id": "code-13",
+      "code": "CODE-13",
+      "cat": "code",
+      "group": "并发",
+      "level": 2,
+      "hot": false,
+      "title": "实现 fan-in：把多个 channel 的数据合并到一个 channel",
+      "answer": "```go\nfunc Merge[T any](ctx context.Context, inputs ...<-chan T) <-chan T {\n    out := make(chan T)\n    var wg sync.WaitGroup\n    wg.Add(len(inputs))\n    for _, in := range inputs {\n        go func() {\n            defer wg.Done()\n            for v := range in {\n                select {\n                case out <- v:\n                case <-ctx.Done(): // 下游不再接收时及时退出，避免泄漏\n                    return\n                }\n            }\n        }()\n    }\n    go func() {\n        wg.Wait()\n        close(out) // 所有输入都处理完毕后再关闭输出\n    }()\n    return out\n}\n```\n\n配套的 fan-out 就是多个 worker 从同一个 channel 中读取数据。fan-out 加上 fan-in 就组成了一个并行处理的流水线（pipeline）。注意如果 ctx 被取消，上游的输入 channel 可能还有数据未被读取，所以上游的生产者也必须监听同一个 ctx。"
+    },
+    {
+      "id": "code-14",
+      "code": "CODE-14",
+      "cat": "code",
+      "group": "数据结构",
+      "level": 2,
+      "hot": true,
+      "title": "实现一个并发安全的 LRU 缓存",
+      "answer": "```go\ntype entry[K comparable, V any] struct {\n    key K\n    val V\n}\n\ntype LRU[K comparable, V any] struct {\n    mu    sync.Mutex\n    cap   int\n    ll    *list.List // 链表头部是最近访问的元素\n    items map[K]*list.Element\n}\n\nfunc NewLRU[K comparable, V any](capacity int) *LRU[K, V] {\n    return &LRU[K, V]{cap: capacity, ll: list.New(), items: make(map[K]*list.Element)}\n}\n\nfunc (c *LRU[K, V]) Get(key K) (V, bool) {\n    c.mu.Lock() // 注意 Get 也会修改链表顺序，所以不能使用读锁\n    defer c.mu.Unlock()\n    if e, ok := c.items[key]; ok {\n        c.ll.MoveToFront(e)\n        return e.Value.(*entry[K, V]).val, true\n    }\n    var zero V\n    return zero, false\n}\n\nfunc (c *LRU[K, V]) Put(key K, val V) {\n    c.mu.Lock()\n    defer c.mu.Unlock()\n    if e, ok := c.items[key]; ok {\n        e.Value.(*entry[K, V]).val = val\n        c.ll.MoveToFront(e)\n        return\n    }\n    c.items[key] = c.ll.PushFront(&entry[K, V]{key, val})\n    if c.ll.Len() > c.cap {\n        oldest := c.ll.Back()\n        c.ll.Remove(oldest)\n        delete(c.items, oldest.Value.(*entry[K, V]).key)\n    }\n}\n```\n\n延伸问题：\n\n-   **为什么是哈希表 + 双向链表**：哈希表提供 O(1) 查找，双向链表提供 O(1) 的移动和删除；\n-   **高并发下一把锁成为瓶颈**：按 key 哈希分成多个分片，每个分片一把锁、一个独立的 LRU；\n-   **扫描污染**：一次性的批量访问会把热点数据挤出去，可以采用 LRU-K、2Q，或者 W-TinyLFU（ristretto、otter 的实现方式）。"
+    },
+    {
+      "id": "code-15",
+      "code": "CODE-15",
+      "cat": "code",
+      "group": "数据结构",
+      "level": 2,
+      "hot": false,
+      "title": "实现一个支持过期时间的并发安全本地缓存",
+      "answer": "```go\ntype item[V any] struct {\n    val      V\n    expireAt time.Time\n}\n\ntype TTLCache[K comparable, V any] struct {\n    mu   sync.RWMutex\n    data map[K]item[V]\n    stop chan struct{}\n    once sync.Once\n}\n\nfunc NewTTLCache[K comparable, V any](cleanEvery time.Duration) *TTLCache[K, V] {\n    c := &TTLCache[K, V]{data: make(map[K]item[V]), stop: make(chan struct{})}\n    go c.janitor(cleanEvery)\n    return c\n}\n\nfunc (c *TTLCache[K, V]) Set(key K, val V, ttl time.Duration) {\n    c.mu.Lock()\n    c.data[key] = item[V]{val, time.Now().Add(ttl)}\n    c.mu.Unlock()\n}\n\nfunc (c *TTLCache[K, V]) Get(key K) (V, bool) {\n    c.mu.RLock()\n    it, ok := c.data[key]\n    c.mu.RUnlock()\n    if !ok || time.Now().After(it.expireAt) { // 惰性过期：读取时检查\n        var zero V\n        return zero, false\n    }\n    return it.val, true\n}\n\nfunc (c *TTLCache[K, V]) janitor(every time.Duration) { // 定期清理：防止过期数据一直占用内存\n    t := time.NewTicker(every)\n    defer t.Stop()\n    for {\n        select {\n        case <-t.C:\n            now := time.Now()\n            c.mu.Lock()\n            for k, it := range c.data {\n                if now.After(it.expireAt) {\n                    delete(c.data, k)\n                }\n            }\n            c.mu.Unlock()\n        case <-c.stop:\n            return\n        }\n    }\n}\n\nfunc (c *TTLCache[K, V]) Close() { c.once.Do(func() { close(c.stop) }) }\n```\n\n注意事项：\n\n-   必须提供 `Close`，否则清理协程会泄漏；\n-   数据量很大时，全量扫描会长时间持有锁，可以分片，或者像 Redis 一样每次只抽样一部分；\n-   没有容量上限时，缓存可能无限增长，生产环境需要同时有容量限制和淘汰策略；\n-   Go 的 map 删除元素后不会缩容，大量删除后需要定期重建 map 来释放内存。"
+    },
+    {
+      "id": "code-16",
+      "code": "CODE-16",
+      "cat": "code",
+      "group": "工程",
+      "level": 2,
+      "hot": false,
+      "title": "实现带指数退避和随机抖动的重试函数",
+      "answer": "```go\n// Retry 最多执行 attempts 次 fn，失败后按指数退避等待，并支持 ctx 取消\nfunc Retry(ctx context.Context, attempts int, base, maxDelay time.Duration,\n    fn func(context.Context) error) error {\n    var err error\n    backoff := base\n    for i := range attempts {\n        if err = fn(ctx); err == nil {\n            return nil\n        }\n        if !isRetryable(err) || i == attempts-1 {\n            break\n        }\n        // Equal Jitter：等待 [backoff/2, backoff] 之间的随机时长\n        sleep := backoff/2 + rand.N(backoff/2+1) // math/rand/v2\n        timer := time.NewTimer(sleep)\n        select {\n        case <-ctx.Done():\n            timer.Stop()\n            return errors.Join(err, ctx.Err())\n        case <-timer.C:\n        }\n        backoff = min(backoff*2, maxDelay)\n    }\n    return err\n}\n\nfunc isRetryable(err error) bool {\n    var ne net.Error\n    if errors.As(err, &ne) && ne.Timeout() {\n        return true\n    }\n    return errors.Is(err, ErrUnavailable) // 业务定义的可重试错误\n}\n```\n\n要点：\n\n-   为什么需要**随机抖动**：多个客户端同时失败后，如果按照相同的间隔重试，会在同一时刻再次涌向服务端；\n-   等待时使用 `select` 同时监听 ctx，**不能使用 `time.Sleep`**，否则无法及时响应取消；\n-   只重试可重试的错误，并且被重试的操作需要是幂等的。"
+    },
+    {
+      "id": "code-17",
+      "code": "CODE-17",
+      "cat": "code",
+      "group": "工程",
+      "level": 2,
+      "hot": false,
+      "title": "写一个 HTTP 中间件：记录请求日志、耗时、状态码，并恢复 panic",
+      "answer": "```go\ntype statusRecorder struct {\n    http.ResponseWriter\n    status int\n}\n\nfunc (r *statusRecorder) WriteHeader(code int) {\n    r.status = code\n    r.ResponseWriter.WriteHeader(code)\n}\n\n// Unwrap 让 http.ResponseController 能找到底层的 Flusher、Hijacker 等能力\nfunc (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }\n\nfunc AccessLog(logger *slog.Logger) func(http.Handler) http.Handler {\n    return func(next http.Handler) http.Handler {\n        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n            start := time.Now()\n            rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}\n\n            defer func() {\n                if v := recover(); v != nil {\n                    if v == http.ErrAbortHandler { // 这是 net/http 中约定的主动中止，需要继续向上抛出\n                        panic(v)\n                    }\n                    logger.ErrorContext(r.Context(), \"panic recovered\",\n                        \"err\", v, \"stack\", string(debug.Stack()))\n                    rec.status = http.StatusInternalServerError\n                    http.Error(w, \"internal server error\", http.StatusInternalServerError)\n                }\n                logger.InfoContext(r.Context(), \"access\",\n                    \"method\", r.Method,\n                    \"path\", r.URL.Path,\n                    \"status\", rec.status,\n                    \"cost_ms\", time.Since(start).Milliseconds(),\n                )\n            }()\n\n            next.ServeHTTP(rec, r)\n        })\n    }\n}\n```\n\n延伸问题：\n\n-   为什么要包装 ResponseWriter？因为标准接口无法读取已经写入的状态码；\n-   包装后会\"隐藏\" `http.Flusher` 等接口，导致 SSE 等功能失效，所以要实现 `Unwrap`；\n-   如果在 panic 之前已经写入了响应头，就无法再修改状态码了；\n-   日志中可以继续加入 trace ID、客户端 IP、响应大小。"
+    },
+    {
+      "id": "code-18",
+      "code": "CODE-18",
+      "cat": "code",
+      "group": "工程",
+      "level": 3,
+      "hot": false,
+      "title": "实现一个简化版的熔断器",
+      "answer": "```go\ntype State int\n\nconst (\n    Closed State = iota\n    Open\n    HalfOpen\n)\n\nvar ErrOpen = errors.New(\"circuit breaker is open\")\n\ntype Breaker struct {\n    mu        sync.Mutex\n    state     State\n    failures  int           // 连续失败次数\n    threshold int           // 连续失败多少次后熔断\n    coolDown  time.Duration // 熔断后多久进入半开状态\n    openedAt  time.Time\n    probing   bool          // 半开状态下是否已经有探测请求在执行\n}\n\nfunc (b *Breaker) Do(fn func() error) error {\n    if !b.allow() {\n        return ErrOpen\n    }\n    err := fn()\n    b.record(err)\n    return err\n}\n\nfunc (b *Breaker) allow() bool {\n    b.mu.Lock()\n    defer b.mu.Unlock()\n    switch b.state {\n    case Open:\n        if time.Since(b.openedAt) < b.coolDown {\n            return false\n        }\n        b.state, b.probing = HalfOpen, true // 冷却结束，放行一个探测请求\n        return true\n    case HalfOpen:\n        if b.probing {\n            return false // 同一时间只允许一个探测请求\n        }\n        b.probing = true\n        return true\n    default:\n        return true\n    }\n}\n\nfunc (b *Breaker) record(err error) {\n    b.mu.Lock()\n    defer b.mu.Unlock()\n    switch {\n    case b.state == HalfOpen && err == nil:\n        b.state, b.failures, b.probing = Closed, 0, false\n    case b.state == HalfOpen:\n        b.state, b.openedAt, b.probing = Open, time.Now(), false\n    case err == nil:\n        b.failures = 0\n    default:\n        b.failures++\n        if b.failures >= b.threshold {\n            b.state, b.openedAt = Open, time.Now()\n        }\n    }\n}\n```\n\n与生产实现相比的简化之处：\n\n-   生产环境通常基于**滑动窗口中的错误率**，并要求达到最小请求数后才判断，而不是连续失败次数；\n-   应该区分错误类型，比如参数错误不应该计入失败；\n-   半开状态下可以允许多个探测请求，按成功比例决定是否恢复；\n-   成熟的实现：sony/gobreaker，以及 go-zero、Kratos 中的 Google SRE 自适应熔断。"
+    }
+  ]
+}

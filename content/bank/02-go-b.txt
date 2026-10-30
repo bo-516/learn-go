@@ -1,0 +1,2191 @@
+Go 语言基础（GO-11 ~ GO-29）的编程小任务。
+
+=== go-11-1
+title: 用指针接收者修改状态
+--- desc
+下面的 `Counter.Inc` 用的是值接收者，修改的是副本，所以计数永远是 0。
+
+1. 把 `Inc` 改成指针接收者；
+2. 改完后 `Counter` 值类型不再实现 `Incrementer`（`*Counter` 才实现），编译器会提示 `NewIncrementer` 出错，把它改成返回 `&Counter{}`。
+--- solution
+package main
+
+type Incrementer interface {
+	Inc()
+	Value() int
+}
+
+type Counter struct{ n int }
+
+func (c *Counter) Inc()      { c.n++ }
+func (c Counter) Value() int { return c.n }
+
+func NewIncrementer() Incrementer { return &Counter{} }
+--- starter
+package main
+
+type Incrementer interface {
+	Inc()
+	Value() int
+}
+
+type Counter struct{ n int }
+
+func (c Counter) Inc()       { c.n++ } // BUG: 值接收者修改的是副本
+func (c Counter) Value() int { return c.n }
+
+func NewIncrementer() Incrementer { return Counter{} }
+--- test
+package main
+
+import "testing"
+
+func TestIncrementer(t *testing.T) {
+	inc := NewIncrementer()
+	for i := 0; i < 3; i++ {
+		inc.Inc()
+	}
+	if got := inc.Value(); got != 3 {
+		t.Fatalf("Inc 三次后 Value() = %d，期望 3", got)
+	}
+}
+
+func TestAddressableValue(t *testing.T) {
+	var c Counter
+	c.Inc() // 可寻址的变量调用指针方法时，编译器自动取地址 (&c).Inc()
+	c.Inc()
+	if c.Value() != 2 {
+		t.Fatalf("Value() = %d，期望 2", c.Value())
+	}
+}
+--- explain
+方法集规则：`T` 的方法集只有值接收者方法，`*T` 包含全部方法。所以 `Inc` 改成指针接收者后，只有 `*Counter` 能赋给 `Incrementer`。
+
+而对一个**可寻址**的变量 `c` 调用 `c.Inc()` 是合法的，编译器会改写成 `(&c).Inc()`；但 map 元素、函数返回值这类不可寻址的值就不行。
+
+=== go-12-1
+title: 修复闭包捕获同一个变量
+--- desc
+`MakeMultipliers(n)` 应该返回 n 个函数，第 i 个函数计算 `x * i`。
+
+起始代码把循环变量声明在了循环**外面**，所有闭包捕获的是同一个 `i`，循环结束后它等于 n。即使在 Go 1.22 之后这种写法也有问题——1.22 的新语义只针对在 `for` 语句里声明的变量。
+--- solution
+package main
+
+func MakeMultipliers(n int) []func(int) int {
+	var fs []func(int) int
+	for i := 0; i < n; i++ {
+		fs = append(fs, func(x int) int { return x * i })
+	}
+	return fs
+}
+--- starter
+package main
+
+func MakeMultipliers(n int) []func(int) int {
+	var fs []func(int) int
+	var i int
+	for i = 0; i < n; i++ {
+		fs = append(fs, func(x int) int { return x * i })
+	}
+	return fs
+}
+--- test
+package main
+
+import "testing"
+
+func TestMakeMultipliers(t *testing.T) {
+	fs := MakeMultipliers(4)
+	if len(fs) != 4 {
+		t.Fatalf("应返回 4 个函数，实际 %d 个", len(fs))
+	}
+	for i, f := range fs {
+		if got := f(10); got != 10*i {
+			t.Errorf("fs[%d](10) = %d，期望 %d", i, got, 10*i)
+		}
+	}
+}
+--- explain
+在 `for i := 0; ...` 里声明变量，Go 1.22+ 每次迭代都会创建新的 `i`。如果必须在循环外声明，就在循环体里拷贝一份：`i := i`。
+
+=== go-12-2
+title: 写一个 range 迭代器
+--- desc
+Go 1.23 起 `range` 可以遍历函数迭代器。实现 `Countdown(n)`，返回一个 `iter.Seq[int]`，依次产出 `n, n-1, …, 1`。
+
+注意：调用方 `break` 时 `yield` 会返回 `false`，迭代器必须立即停止，否则运行时会 panic。
+--- solution
+package main
+
+import "iter"
+
+func Countdown(n int) iter.Seq[int] {
+	return func(yield func(int) bool) {
+		// @solution
+		for i := n; i > 0; i-- {
+			if !yield(i) {
+				return
+			}
+		}
+		// @starter
+		// // TODO
+		// @end
+	}
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestCountdown(t *testing.T) {
+	var got []int
+	for v := range Countdown(4) {
+		got = append(got, v)
+	}
+	if !slices.Equal(got, []int{4, 3, 2, 1}) {
+		t.Fatalf("Countdown(4) 产出 %v，期望 [4 3 2 1]", got)
+	}
+}
+
+func TestCountdownBreak(t *testing.T) {
+	var got []int
+	for v := range Countdown(10) {
+		if v < 8 {
+			break
+		}
+		got = append(got, v)
+	}
+	if !slices.Equal(got, []int{10, 9, 8}) {
+		t.Fatalf("break 前产出 %v，期望 [10 9 8]", got)
+	}
+}
+
+func TestCountdownCollect(t *testing.T) {
+	if got := slices.Collect(Countdown(3)); !slices.Equal(got, []int{3, 2, 1}) {
+		t.Fatalf("slices.Collect(Countdown(3)) = %v", got)
+	}
+}
+
+=== go-13-1
+title: 泛型去重与结构体做 map key
+--- desc
+- `Dedup[T comparable](s []T) []T`：去掉重复元素，保留第一次出现的顺序，不修改入参；
+- `CountPoints(ps []Point) map[Point]int`：统计每个坐标出现的次数。结构体的字段都可比较，所以它可以直接做 map 的 key。
+--- solution
+package main
+
+type Point struct{ X, Y int }
+
+func Dedup[T comparable](s []T) []T {
+	// @solution
+	seen := make(map[T]struct{}, len(s))
+	out := make([]T, 0, len(s))
+	for _, v := range s {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+	// @starter
+	// return nil // TODO
+	// @end
+}
+
+func CountPoints(ps []Point) map[Point]int {
+	// @solution
+	m := make(map[Point]int)
+	for _, p := range ps {
+		m[p]++
+	}
+	return m
+	// @starter
+	// return nil // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestDedup(t *testing.T) {
+	if got := Dedup([]int{3, 1, 3, 2, 1}); !slices.Equal(got, []int{3, 1, 2}) {
+		t.Errorf("Dedup ints = %v，期望 [3 1 2]", got)
+	}
+	if got := Dedup([]string{"go", "rust", "go"}); !slices.Equal(got, []string{"go", "rust"}) {
+		t.Errorf("Dedup strings = %v", got)
+	}
+	if got := Dedup([][2]int{{1, 2}, {1, 2}, {2, 1}}); len(got) != 2 {
+		t.Errorf("数组也可比较，Dedup 结果应有 2 个元素，实际 %v", got)
+	}
+	in := []int{1, 1}
+	Dedup(in)
+	if !slices.Equal(in, []int{1, 1}) {
+		t.Error("不应修改入参")
+	}
+}
+
+func TestCountPoints(t *testing.T) {
+	m := CountPoints([]Point{{1, 2}, {0, 0}, {1, 2}})
+	if m[Point{1, 2}] != 2 || m[Point{0, 0}] != 1 || len(m) != 2 {
+		t.Fatalf("CountPoints = %v", m)
+	}
+}
+
+=== go-13-2
+title: 接口 key 的运行时 panic
+--- desc
+`map[any]int` 用 `[]int` 做 key 能编译通过，但运行时会 panic：`hash of unhashable type []int`。
+
+实现 `TryInsert(m, k, v)`：尝试执行 `m[k] = v`，如果 key 不可哈希，捕获 panic 并返回错误，而不是让程序崩溃。
+--- solution
+package main
+
+import "fmt"
+
+func TryInsert(m map[any]int, k any, v int) (err error) {
+	// @solution
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("invalid key: %v", r)
+		}
+	}()
+	// @starter
+	// // TODO: 捕获不可哈希 key 引起的 panic
+	// @end
+	m[k] = v
+	return nil
+}
+--- test
+package main
+
+import "testing"
+
+func TestTryInsert(t *testing.T) {
+	m := map[any]int{}
+	ok := []any{"a", 1, [2]int{1, 2}, struct{ A string }{"x"}, (*int)(nil)}
+	for _, k := range ok {
+		if err := TryInsert(m, k, 1); err != nil {
+			t.Errorf("TryInsert(%#v) 不应出错：%v", k, err)
+		}
+	}
+	bad := []any{[]int{1}, map[string]int{}, func() {}, struct{ S []int }{}}
+	for _, k := range bad {
+		if err := TryInsert(m, k, 1); err == nil {
+			t.Errorf("TryInsert(%T) 应返回错误", k)
+		}
+	}
+	if len(m) != len(ok) {
+		t.Fatalf("map 中应有 %d 个元素，实际 %d", len(ok), len(m))
+	}
+}
+
+=== go-14-1
+title: 用 struct{} 实现泛型集合
+--- desc
+基于 `map[T]struct{}` 实现一个集合类型 `Set[T]`：
+
+- `NewSet(items...)`、`Add`、`Has`、`Remove`、`Len`；
+- `Intersect(other)`：返回两个集合的交集（新集合）。
+
+`struct{}` 的大小是 0，作为 map 的 value 不占额外内存。
+--- solution
+package main
+
+type Set[T comparable] map[T]struct{}
+
+func NewSet[T comparable](items ...T) Set[T] {
+	s := make(Set[T], len(items))
+	for _, v := range items {
+		s.Add(v)
+	}
+	return s
+}
+
+func (s Set[T]) Add(v T) {
+	// @solution
+	s[v] = struct{}{}
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (s Set[T]) Has(v T) bool {
+	// @solution
+	_, ok := s[v]
+	return ok
+	// @starter
+	// return false // TODO
+	// @end
+}
+
+func (s Set[T]) Remove(v T) {
+	// @solution
+	delete(s, v)
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (s Set[T]) Len() int { return len(s) }
+
+func (s Set[T]) Intersect(other Set[T]) Set[T] {
+	// @solution
+	small, big := s, other
+	if len(small) > len(big) {
+		small, big = big, small
+	}
+	out := make(Set[T])
+	for v := range small {
+		if big.Has(v) {
+			out.Add(v)
+		}
+	}
+	return out
+	// @starter
+	// return nil // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"testing"
+	"unsafe"
+)
+
+func TestSetBasic(t *testing.T) {
+	s := NewSet("a", "b", "a")
+	if s.Len() != 2 || !s.Has("a") || !s.Has("b") || s.Has("c") {
+		t.Fatalf("NewSet(a, b, a) = %v", s)
+	}
+	s.Remove("a")
+	if s.Has("a") || s.Len() != 1 {
+		t.Fatal("Remove 后不应再包含 a")
+	}
+}
+
+func TestIntersect(t *testing.T) {
+	a := NewSet(1, 2, 3, 4)
+	b := NewSet(3, 4, 5)
+	c := a.Intersect(b)
+	if c.Len() != 2 || !c.Has(3) || !c.Has(4) {
+		t.Fatalf("交集 = %v，期望 {3, 4}", c)
+	}
+	if a.Len() != 4 || b.Len() != 3 {
+		t.Fatal("Intersect 不应修改原集合")
+	}
+}
+
+func TestEmptyStructSize(t *testing.T) {
+	if unsafe.Sizeof(struct{}{}) != 0 {
+		t.Fatal("struct{} 应该不占内存")
+	}
+}
+
+=== go-14-2
+title: 用 chan struct{} 广播信号
+race: true
+--- desc
+实现一个只能打开一次的闸门 `Gate`：
+
+- `Wait()` 返回一个 `<-chan struct{}`，闸门打开后所有等待者同时被唤醒；
+- `Open()` 打开闸门，可以被多次、并发调用，但不能 panic（重复 close channel 会 panic）。
+
+提示：`close` 一个 channel 会唤醒所有接收者；用 `sync.Once` 保证只关闭一次。
+--- solution
+package main
+
+import "sync"
+
+type Gate struct {
+	ch   chan struct{}
+	once sync.Once
+}
+
+func NewGate() *Gate { return &Gate{ch: make(chan struct{})} }
+
+func (g *Gate) Wait() <-chan struct{} { return g.ch }
+
+func (g *Gate) Open() {
+	// @solution
+	g.once.Do(func() { close(g.ch) })
+	// @starter
+	// // TODO: 关闭 channel，且只能关闭一次
+	// @end
+}
+--- test
+package main
+
+import (
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestGateBroadcast(t *testing.T) {
+	g := NewGate()
+	var wg sync.WaitGroup
+	released := make(chan int, 10)
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-g.Wait()
+			released <- i
+		}()
+	}
+	select {
+	case <-released:
+		t.Fatal("闸门打开之前不应有人通过")
+	case <-time.After(20 * time.Millisecond):
+	}
+	var opens sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		opens.Add(1)
+		go func() { defer opens.Done(); g.Open() }()
+	}
+	opens.Wait()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Open 之后所有等待者都应被唤醒")
+	}
+}
+
+=== go-15-1
+title: 嵌入接口，只重写一个方法
+--- desc
+`LoggedStore` 嵌入了 `Store` 接口，`Get` 会被自动「提升」，可以直接使用。请为它**只重写** `Set` 方法：先往 `Logs` 里追加 `"set <key>"`，再调用内层 `Store` 的 `Set`。
+
+这就是 Go 用组合代替继承的方式：外层类型复用内层的方法，只覆盖需要改变的部分。
+--- solution
+package main
+
+type Store interface {
+	Get(key string) (string, bool)
+	Set(key, value string)
+}
+
+type MemStore struct{ m map[string]string }
+
+func NewMemStore() *MemStore { return &MemStore{m: map[string]string{}} }
+
+func (s *MemStore) Get(key string) (string, bool) { v, ok := s.m[key]; return v, ok }
+func (s *MemStore) Set(key, value string)          { s.m[key] = value }
+
+type LoggedStore struct {
+	Store
+	Logs []string
+}
+
+// @solution
+func (l *LoggedStore) Set(key, value string) {
+	l.Logs = append(l.Logs, "set "+key)
+	l.Store.Set(key, value)
+}
+
+// @starter
+// // TODO: 为 *LoggedStore 定义 Set 方法
+// @end
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestLoggedStore(t *testing.T) {
+	ls := &LoggedStore{Store: NewMemStore()}
+	var s Store = ls
+	s.Set("a", "1")
+	s.Set("b", "2")
+	if v, ok := s.Get("a"); !ok || v != "1" {
+		t.Fatalf("Get(a) = %q, %v，期望 1, true", v, ok)
+	}
+	if !slices.Equal(ls.Logs, []string{"set a", "set b"}) {
+		t.Fatalf("Logs = %v，期望 [set a set b]", ls.Logs)
+	}
+}
+--- explain
+`l.Store.Set(...)` 显式调用内层对象的方法。注意这不是「重写」意义上的多态：如果 `MemStore` 内部的其他方法调用了 `Set`，调用的仍是 `MemStore.Set`，不会绕回 `LoggedStore.Set`。
+
+=== go-16-1
+title: 用 %w 保留错误链
+--- desc
+实现两层调用，让上层能用 `errors.Is` / `errors.As` 判断底层错误：
+
+- `FindUser(id)`：用户不存在时返回 `fmt.Errorf("find user %d: %w", id, ErrNotFound)`；
+- `LoadProfile(id)`：`FindUser` 出错时包装成 `&QueryError{Query: "load profile", Err: err}`；
+- 给 `*QueryError` 实现 `Unwrap() error`，否则错误链在这一层就断了。
+
+最终错误信息应该是 `load profile: find user 3: not found`。
+--- solution
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+var ErrNotFound = errors.New("not found")
+
+var users = map[int]string{1: "alice", 2: "bob"}
+
+type QueryError struct {
+	Query string
+	Err   error
+}
+
+func (e *QueryError) Error() string { return e.Query + ": " + e.Err.Error() }
+
+// @solution
+func (e *QueryError) Unwrap() error { return e.Err }
+
+// @starter
+// // TODO: 实现 Unwrap
+// @end
+
+func FindUser(id int) (string, error) {
+	name, ok := users[id]
+	if !ok {
+		// @solution
+		return "", fmt.Errorf("find user %d: %w", id, ErrNotFound)
+		// @starter
+		// return "", fmt.Errorf("find user %d: %v", id, ErrNotFound) // TODO: %v 会丢掉错误链
+		// @end
+	}
+	return name, nil
+}
+
+func LoadProfile(id int) (string, error) {
+	name, err := FindUser(id)
+	if err != nil {
+		return "", &QueryError{Query: "load profile", Err: err}
+	}
+	return "profile:" + name, nil
+}
+--- test
+package main
+
+import (
+	"errors"
+	"testing"
+)
+
+func TestLoadProfileOK(t *testing.T) {
+	p, err := LoadProfile(1)
+	if err != nil || p != "profile:alice" {
+		t.Fatalf("LoadProfile(1) = %q, %v", p, err)
+	}
+}
+
+func TestErrorChain(t *testing.T) {
+	_, err := LoadProfile(3)
+	if err == nil {
+		t.Fatal("用户不存在时应返回错误")
+	}
+	if err.Error() != "load profile: find user 3: not found" {
+		t.Errorf("错误信息 = %q", err.Error())
+	}
+	if !errors.Is(err, ErrNotFound) {
+		t.Error("errors.Is(err, ErrNotFound) 应为 true：检查 %w 和 Unwrap")
+	}
+	var qe *QueryError
+	if !errors.As(err, &qe) || qe.Query != "load profile" {
+		t.Error("errors.As 应能取出 *QueryError")
+	}
+}
+
+=== go-16-2
+title: 用 errors.Is / errors.As 给错误分类
+--- desc
+实现 `Classify(err)`，按以下规则返回分类（timeout 优先）：
+
+| 条件 | 返回 |
+| --- | --- |
+| `err == nil` | `"ok"` |
+| 错误链上有 `ErrTimeout` 或 `context.DeadlineExceeded` | `"timeout"` |
+| 错误链上有 `*HTTPError`，Code 为 4xx | `"client"` |
+| 错误链上有 `*HTTPError`，Code 为 5xx | `"server"` |
+| 其他 | `"unknown"` |
+
+测试里会出现 `fmt.Errorf` 多层包装、`errors.Join`、一个 `fmt.Errorf` 里多个 `%w` 的情况。
+--- solution
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+)
+
+var ErrTimeout = errors.New("timeout")
+
+type HTTPError struct{ Code int }
+
+func (e *HTTPError) Error() string { return fmt.Sprintf("http %d", e.Code) }
+
+func Classify(err error) string {
+	// @solution
+	if err == nil {
+		return "ok"
+	}
+	if errors.Is(err, ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var he *HTTPError
+	if errors.As(err, &he) {
+		switch {
+		case he.Code >= 400 && he.Code < 500:
+			return "client"
+		case he.Code >= 500:
+			return "server"
+		}
+	}
+	return "unknown"
+	// @starter
+	// return "unknown" // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+)
+
+func TestClassify(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"nil", nil, "ok"},
+		{"timeout", ErrTimeout, "timeout"},
+		{"wrapped timeout", fmt.Errorf("call api: %w", ErrTimeout), "timeout"},
+		{"deadline", fmt.Errorf("db: %w", context.DeadlineExceeded), "timeout"},
+		{"404", &HTTPError{404}, "client"},
+		{"wrapped 503", fmt.Errorf("a: %w", fmt.Errorf("b: %w", &HTTPError{503})), "server"},
+		{"join", errors.Join(errors.New("x"), &HTTPError{400}), "client"},
+		{"timeout wins", errors.Join(&HTTPError{500}, ErrTimeout), "timeout"},
+		{"multi %w", fmt.Errorf("%w; %w", errors.New("x"), &HTTPError{502}), "server"},
+		{"plain", errors.New("boom"), "unknown"},
+		{"3xx", &HTTPError{302}, "unknown"},
+	}
+	for _, c := range cases {
+		if got := Classify(c.err); got != c.want {
+			t.Errorf("%s: Classify = %q，期望 %q", c.name, got, c.want)
+		}
+	}
+}
+
+=== go-17-1
+title: 预测包初始化顺序
+--- desc
+阅读代码，预测包级变量初始化和 `init` 函数的执行顺序。`record` 每被调用一次就把名字追加到 `trace`。
+
+在 `Expected()` 里返回你预测的 `trace` 内容，测试会和真实结果比较。
+
+提示：包级变量按声明顺序初始化，但**依赖优先**——一个变量依赖的其他变量会先被初始化。
+--- solution
+package main
+
+var trace []string
+
+func record(name string, v int) int {
+	trace = append(trace, name)
+	return v
+}
+
+var a = record("a", b+c)
+var b = record("b", c*2)
+var c = record("c", 1)
+var d = record("d", 4)
+
+func init() { trace = append(trace, "init1") }
+func init() { trace = append(trace, "init2") }
+
+func Expected() []string {
+	// @solution
+	return []string{"c", "b", "a", "d", "init1", "init2"}
+	// @starter
+	// return nil // TODO: 写出你预测的顺序，例如 []string{"a", "b", ...}
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestInitOrder(t *testing.T) {
+	if !slices.Equal(trace, Expected()) {
+		t.Fatalf("实际顺序 %v，你的预测 %v", trace, Expected())
+	}
+	if a != 3 || b != 2 || c != 1 || d != 4 {
+		t.Fatalf("a=%d b=%d c=%d d=%d", a, b, c, d)
+	}
+}
+--- explain
+初始化时反复挑选「声明顺序最靠前、且依赖都已初始化」的变量：`a` 依赖 `b`、`c` 不能先初始化，`b` 依赖 `c` 也不行，于是先初始化 `c`，再 `b`、`a`，最后 `d`。`trace` 没有初始化表达式，一开始就是零值。所有包级变量初始化完成后，再按出现顺序执行 `init`。
+
+=== go-18-1
+title: 用 type switch 描述任意值
+--- desc
+实现 `Describe(v any) string`：
+
+| v 的类型 | 返回 |
+| --- | --- |
+| nil | `nil` |
+| `int` | `int:42` |
+| `string` | `string:hi` |
+| 实现了 `error` | `error:<Error()>` |
+| 实现了 `fmt.Stringer` | `stringer:<String()>` |
+| `[]int` | `ints:<长度>` |
+| 其他 | `other:<%T 的结果>` |
+
+一个类型同时实现了 `error` 和 `Stringer` 时按 `error` 处理——`case` 的顺序很重要。
+--- solution
+package main
+
+import "fmt"
+
+type Celsius float64
+
+func (c Celsius) String() string { return fmt.Sprintf("%.1f°C", float64(c)) }
+
+func Describe(v any) string {
+	// @solution
+	switch x := v.(type) {
+	case nil:
+		return "nil"
+	case int:
+		return fmt.Sprintf("int:%d", x)
+	case string:
+		return "string:" + x
+	case error:
+		return "error:" + x.Error()
+	case fmt.Stringer:
+		return "stringer:" + x.String()
+	case []int:
+		return fmt.Sprintf("ints:%d", len(x))
+	default:
+		return fmt.Sprintf("other:%T", x)
+	}
+	// @starter
+	// return "" // TODO: switch x := v.(type) { ... }
+	// @end
+}
+--- test
+package main
+
+import (
+	"errors"
+	"testing"
+)
+
+type both struct{}
+
+func (both) Error() string  { return "both-err" }
+func (both) String() string { return "both-str" }
+
+func TestDescribe(t *testing.T) {
+	cases := []struct {
+		v    any
+		want string
+	}{
+		{nil, "nil"},
+		{42, "int:42"},
+		{"hi", "string:hi"},
+		{errors.New("disk full"), "error:disk full"},
+		{Celsius(21.5), "stringer:21.5°C"},
+		{both{}, "error:both-err"},
+		{[]int{1, 2, 3}, "ints:3"},
+		{int64(7), "other:int64"},
+		{struct{}{}, "other:struct {}"},
+	}
+	for _, c := range cases {
+		if got := Describe(c.v); got != c.want {
+			t.Errorf("Describe(%#v) = %q，期望 %q", c.v, got, c.want)
+		}
+	}
+}
+--- explain
+type switch 从上到下匹配第一个满足的 case。`case error` 放在 `case fmt.Stringer` 前面，同时实现两者的类型就会命中 `error`。`int64` 不会匹配 `case int`——类型断言要求类型完全一致。
+
+=== go-19-1
+title: 泛型 Map / Filter / Reduce
+--- desc
+实现三个泛型函数：
+
+- `Map[T, U any](s []T, f func(T) U) []U`
+- `Filter[T any](s []T, keep func(T) bool) []T`
+- `Reduce[T, A any](s []T, init A, f func(A, T) A) A`
+
+都不能修改入参。
+--- solution
+package main
+
+func Map[T, U any](s []T, f func(T) U) []U {
+	// @solution
+	out := make([]U, len(s))
+	for i, v := range s {
+		out[i] = f(v)
+	}
+	return out
+	// @starter
+	// return nil // TODO
+	// @end
+}
+
+func Filter[T any](s []T, keep func(T) bool) []T {
+	// @solution
+	var out []T
+	for _, v := range s {
+		if keep(v) {
+			out = append(out, v)
+		}
+	}
+	return out
+	// @starter
+	// return nil // TODO
+	// @end
+}
+
+func Reduce[T, A any](s []T, init A, f func(A, T) A) A {
+	// @solution
+	acc := init
+	for _, v := range s {
+		acc = f(acc, v)
+	}
+	return acc
+	// @starter
+	// return init // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"strconv"
+	"testing"
+)
+
+func TestMap(t *testing.T) {
+	got := Map([]int{1, 2, 3}, strconv.Itoa)
+	if !slices.Equal(got, []string{"1", "2", "3"}) {
+		t.Fatalf("Map = %v", got)
+	}
+}
+
+func TestFilter(t *testing.T) {
+	got := Filter([]int{1, 2, 3, 4, 5, 6}, func(n int) bool { return n%2 == 0 })
+	if !slices.Equal(got, []int{2, 4, 6}) {
+		t.Fatalf("Filter = %v", got)
+	}
+}
+
+func TestReduce(t *testing.T) {
+	sum := Reduce([]int{1, 2, 3, 4}, 0, func(a, n int) int { return a + n })
+	if sum != 10 {
+		t.Fatalf("Reduce sum = %d", sum)
+	}
+	words := Reduce([]string{"go", "is", "fun"}, "", func(a, s string) string { return a + s })
+	if words != "goisfun" {
+		t.Fatalf("Reduce concat = %q", words)
+	}
+	lens := Reduce([]string{"ab", "c"}, map[string]int{}, func(m map[string]int, s string) map[string]int {
+		m[s] = len(s)
+		return m
+	})
+	if lens["ab"] != 2 || lens["c"] != 1 {
+		t.Fatalf("Reduce to map = %v", lens)
+	}
+}
+
+=== go-19-2
+title: 用 ~ 约束支持自定义数值类型
+starter: build-error
+--- desc
+定义约束 `Number`，让 `Sum` 和 `Max` 同时支持 `int`、`int64`、`float64`，**以及底层类型是它们的自定义类型**（比如 `type Celsius float64`）。
+
+- `Sum[T Number](xs []T) T`
+- `Max[T Number](xs []T) (T, bool)`：空切片返回零值和 `false`。
+
+起始代码**编译不通过**，先运行一次看看编译器的提示。约束里写 `~float64` 表示「底层类型为 float64 的所有类型」。
+--- solution
+package main
+
+type Number interface {
+	// @solution
+	~int | ~int64 | ~float64
+	// @starter
+	// int | int64 | float64 // TODO: Celsius 不满足这个约束
+	// @end
+}
+
+type Celsius float64
+
+func Sum[T Number](xs []T) T {
+	var s T
+	for _, x := range xs {
+		s += x
+	}
+	return s
+}
+
+func Max[T Number](xs []T) (T, bool) {
+	// @solution
+	if len(xs) == 0 {
+		var zero T
+		return zero, false
+	}
+	m := xs[0]
+	for _, x := range xs[1:] {
+		if x > m {
+			m = x
+		}
+	}
+	return m, true
+	// @starter
+	// var zero T
+	// return zero, false // TODO
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestSumMax(t *testing.T) {
+	if Sum([]int{1, 2, 3}) != 6 {
+		t.Error("Sum ints")
+	}
+	if Sum([]float64{0.5, 0.25}) != 0.75 {
+		t.Error("Sum floats")
+	}
+	if m, ok := Max([]int64{3, 9, -1}); !ok || m != 9 {
+		t.Errorf("Max = %d, %v", m, ok)
+	}
+	if _, ok := Max([]int{}); ok {
+		t.Error("空切片 Max 应返回 false")
+	}
+}
+
+func TestCustomType(t *testing.T) {
+	temps := []Celsius{21.5, 23, 19}
+	if got := Sum(temps); got != 63.5 {
+		t.Errorf("Sum(temps) = %v", got)
+	}
+	if m, ok := Max(temps); !ok || m != 23 {
+		t.Errorf("Max(temps) = %v, %v", m, ok)
+	}
+}
+
+=== go-19-3
+title: 泛型栈
+--- desc
+实现一个泛型栈 `Stack[T]`，零值可用：
+
+- `Push(v T)`
+- `Pop() (T, bool)`：空栈返回零值和 `false`
+- `Peek() (T, bool)`
+- `Len() int`
+--- solution
+package main
+
+type Stack[T any] struct {
+	items []T
+}
+
+func (s *Stack[T]) Push(v T) {
+	// @solution
+	s.items = append(s.items, v)
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (s *Stack[T]) Pop() (T, bool) {
+	// @solution
+	var zero T
+	if len(s.items) == 0 {
+		return zero, false
+	}
+	v := s.items[len(s.items)-1]
+	s.items[len(s.items)-1] = zero // 避免引用残留，帮助 GC
+	s.items = s.items[:len(s.items)-1]
+	return v, true
+	// @starter
+	// var zero T
+	// return zero, false // TODO
+	// @end
+}
+
+func (s *Stack[T]) Peek() (T, bool) {
+	// @solution
+	if len(s.items) == 0 {
+		var zero T
+		return zero, false
+	}
+	return s.items[len(s.items)-1], true
+	// @starter
+	// var zero T
+	// return zero, false // TODO
+	// @end
+}
+
+func (s *Stack[T]) Len() int { return len(s.items) }
+--- test
+package main
+
+import "testing"
+
+func TestStack(t *testing.T) {
+	var s Stack[string]
+	if _, ok := s.Pop(); ok {
+		t.Fatal("空栈 Pop 应返回 false")
+	}
+	s.Push("a")
+	s.Push("b")
+	if v, ok := s.Peek(); !ok || v != "b" {
+		t.Fatalf("Peek = %q, %v", v, ok)
+	}
+	if v, _ := s.Pop(); v != "b" {
+		t.Fatalf("Pop = %q，期望 b", v)
+	}
+	if v, _ := s.Pop(); v != "a" {
+		t.Fatalf("Pop = %q，期望 a", v)
+	}
+	if s.Len() != 0 {
+		t.Fatal("Len 应为 0")
+	}
+}
+
+func TestStackOfStructs(t *testing.T) {
+	type pt struct{ x, y int }
+	var s Stack[pt]
+	s.Push(pt{1, 2})
+	if v, ok := s.Pop(); !ok || v != (pt{1, 2}) {
+		t.Fatalf("Pop = %v", v)
+	}
+}
+
+=== go-20-1
+title: 实现一个会扩容的哈希表
+--- desc
+用「拉链法」实现一个字符串到 int 的哈希表，体会 map 底层的桶和扩容：
+
+- 初始 8 个桶，用给定的 `hash` 函数（FNV-1a）对桶数取模定位；
+- `Put` 新增或更新、`Get`、`Delete`、`Len`；
+- **负载因子**（元素数 / 桶数）超过 6.5 时，桶数翻倍，并把所有元素重新分布到新桶里。
+
+所以插入第 52 个元素后仍是 8 个桶（52/8 = 6.5），插入第 53 个时扩容到 16 个桶。
+--- solution
+package main
+
+type entry struct {
+	key   string
+	value int
+	next  *entry
+}
+
+type HashMap struct {
+	buckets []*entry
+	count   int
+}
+
+func NewHashMap() *HashMap { return &HashMap{buckets: make([]*entry, 8)} }
+
+func hash(key string) uint32 {
+	h := uint32(2166136261)
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return h
+}
+
+func (m *HashMap) BucketCount() int { return len(m.buckets) }
+
+func (m *HashMap) index(key string, n int) int { return int(hash(key) % uint32(n)) }
+
+func (m *HashMap) Put(key string, value int) {
+	// @solution
+	i := m.index(key, len(m.buckets))
+	for e := m.buckets[i]; e != nil; e = e.next {
+		if e.key == key {
+			e.value = value
+			return
+		}
+	}
+	m.buckets[i] = &entry{key: key, value: value, next: m.buckets[i]}
+	m.count++
+	if float64(m.count)/float64(len(m.buckets)) > 6.5 {
+		m.grow()
+	}
+	// @starter
+	// // TODO: 定位桶 → 已存在则更新 → 否则头插新节点 → 检查负载因子
+	// @end
+}
+
+// @solution
+func (m *HashMap) grow() {
+	nb := make([]*entry, len(m.buckets)*2)
+	for _, head := range m.buckets {
+		for e := head; e != nil; {
+			next := e.next
+			i := m.index(e.key, len(nb))
+			e.next = nb[i]
+			nb[i] = e
+			e = next
+		}
+	}
+	m.buckets = nb
+}
+
+// @end
+
+func (m *HashMap) Get(key string) (int, bool) {
+	// @solution
+	for e := m.buckets[m.index(key, len(m.buckets))]; e != nil; e = e.next {
+		if e.key == key {
+			return e.value, true
+		}
+	}
+	return 0, false
+	// @starter
+	// return 0, false // TODO
+	// @end
+}
+
+func (m *HashMap) Delete(key string) bool {
+	// @solution
+	i := m.index(key, len(m.buckets))
+	for p := &m.buckets[i]; *p != nil; p = &(*p).next {
+		if (*p).key == key {
+			*p = (*p).next
+			m.count--
+			return true
+		}
+	}
+	return false
+	// @starter
+	// return false // TODO
+	// @end
+}
+
+func (m *HashMap) Len() int { return m.count }
+--- test
+package main
+
+import (
+	"fmt"
+	"testing"
+)
+
+func TestPutGet(t *testing.T) {
+	m := NewHashMap()
+	m.Put("a", 1)
+	m.Put("b", 2)
+	m.Put("a", 10)
+	if v, ok := m.Get("a"); !ok || v != 10 {
+		t.Fatalf("Get(a) = %d, %v，期望 10, true", v, ok)
+	}
+	if m.Len() != 2 {
+		t.Fatalf("更新已有 key 不应增加 Len，实际 %d", m.Len())
+	}
+	if _, ok := m.Get("zzz"); ok {
+		t.Fatal("不存在的 key 应返回 false")
+	}
+}
+
+func TestGrow(t *testing.T) {
+	m := NewHashMap()
+	for i := 0; i < 52; i++ {
+		m.Put(fmt.Sprint("k", i), i)
+	}
+	if m.BucketCount() != 8 {
+		t.Fatalf("52 个元素时应仍为 8 个桶，实际 %d", m.BucketCount())
+	}
+	m.Put("k52", 52)
+	if m.BucketCount() != 16 {
+		t.Fatalf("第 53 个元素应触发扩容到 16 个桶，实际 %d", m.BucketCount())
+	}
+	for i := 53; i < 2000; i++ {
+		m.Put(fmt.Sprint("k", i), i)
+	}
+	for i := 0; i < 2000; i++ {
+		if v, ok := m.Get(fmt.Sprint("k", i)); !ok || v != i {
+			t.Fatalf("扩容后 Get(k%d) = %d, %v", i, v, ok)
+		}
+	}
+	if m.BucketCount() != 512 {
+		t.Fatalf("2000 个元素应有 512 个桶，实际 %d", m.BucketCount())
+	}
+}
+
+func TestDelete(t *testing.T) {
+	m := NewHashMap()
+	for i := 0; i < 100; i++ {
+		m.Put(fmt.Sprint(i), i)
+	}
+	if !m.Delete("42") || m.Delete("42") {
+		t.Fatal("第一次 Delete 返回 true，第二次返回 false")
+	}
+	if _, ok := m.Get("42"); ok || m.Len() != 99 {
+		t.Fatalf("删除后仍能查到，或 Len = %d", m.Len())
+	}
+}
+--- explain
+`Delete` 用了「指向指针的指针」：`p` 指向「当前节点的引用」（桶头或上一个节点的 `next` 字段），删除时直接 `*p = (*p).next`，不用区分是不是头节点。
+
+真实的 Go map 在 1.24 前是每桶 8 个槽位的 bucket 数组 + 渐进式扩容，1.24 起是 Swiss Table，但「负载因子触发翻倍、重新分布」的思路是一样的。
+
+=== go-21-1
+title: 调整字段顺序减少内存占用
+--- desc
+`Bad` 在 64 位平台上占 32 字节：每个字段都要按自身大小对齐，`bool` 后面跟 `int64` 会产生 7 字节的填充。
+
+把 `Good` 的字段**重新排序**（字段名和类型不能变），让它只占 16 字节。
+--- solution
+package main
+
+type Bad struct {
+	A bool
+	B int64
+	C bool
+	D int32
+	E bool
+}
+
+type Good struct {
+	// @solution
+	B int64
+	D int32
+	A bool
+	C bool
+	E bool
+	// @starter
+	// // TODO: 调整字段顺序
+	// A bool
+	// B int64
+	// C bool
+	// D int32
+	// E bool
+	// @end
+}
+--- test
+package main
+
+import (
+	"reflect"
+	"testing"
+	"unsafe"
+)
+
+func TestSizes(t *testing.T) {
+	if s := unsafe.Sizeof(Bad{}); s != 32 {
+		t.Fatalf("Bad 应为 32 字节，实际 %d", s)
+	}
+	if s := unsafe.Sizeof(Good{}); s != 16 {
+		t.Fatalf("Good 应为 16 字节，实际 %d", s)
+	}
+}
+
+func TestSameFields(t *testing.T) {
+	bt, gt := reflect.TypeOf(Bad{}), reflect.TypeOf(Good{})
+	if bt.NumField() != gt.NumField() {
+		t.Fatal("字段数量不同")
+	}
+	for i := 0; i < bt.NumField(); i++ {
+		f := bt.Field(i)
+		g, ok := gt.FieldByName(f.Name)
+		if !ok || g.Type != f.Type {
+			t.Fatalf("Good 缺少字段 %s %s", f.Name, f.Type)
+		}
+	}
+}
+--- explain
+按字段大小**降序**排列：`int64`(8) + `int32`(4) + 3 个 `bool`(3) = 15 字节，补齐到 8 的倍数就是 16。对数量巨大的结构体（缓存条目、事件）这能省下一半内存。
+
+=== go-22-1
+title: 用 reflect 读取 struct tag
+--- desc
+实现 `JSONFields(v any) []string`，按字段顺序返回结构体导出字段对应的 JSON 名：
+
+- 有 `json` tag 时取逗号前面的部分；tag 是 `-` 的字段跳过；没有 tag 用字段名；
+- 未导出字段跳过；
+- `v` 可以是结构体或结构体指针，其他类型返回 nil。
+--- solution
+package main
+
+import (
+	"reflect"
+	"strings"
+)
+
+func JSONFields(v any) []string {
+	// @solution
+	t := reflect.TypeOf(v)
+	if t == nil {
+		return nil
+	}
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return nil
+	}
+	var names []string
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		name := f.Name
+		if tag, ok := f.Tag.Lookup("json"); ok {
+			tagName, _, _ := strings.Cut(tag, ",")
+			if tagName == "-" {
+				continue
+			}
+			if tagName != "" {
+				name = tagName
+			}
+		}
+		names = append(names, name)
+	}
+	return names
+	// @starter
+	// return nil // TODO: reflect.TypeOf → 遍历字段 → 读取 Tag.Get("json")
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+type User struct {
+	ID       int    `json:"id"`
+	Name     string `json:"name,omitempty"`
+	Password string `json:"-"`
+	Email    string
+	age      int
+	Score    int `json:",omitempty"`
+}
+
+func TestJSONFields(t *testing.T) {
+	want := []string{"id", "name", "Email", "Score"}
+	if got := JSONFields(User{}); !slices.Equal(got, want) {
+		t.Errorf("JSONFields(User{}) = %v，期望 %v", got, want)
+	}
+	if got := JSONFields(&User{}); !slices.Equal(got, want) {
+		t.Errorf("JSONFields(&User{}) = %v，期望 %v", got, want)
+	}
+	if got := JSONFields(42); got != nil {
+		t.Errorf("非结构体应返回 nil，实际 %v", got)
+	}
+	if got := JSONFields(nil); got != nil {
+		t.Errorf("nil 应返回 nil，实际 %v", got)
+	}
+}
+
+=== go-22-2
+title: 用 reflect 设置字段
+--- desc
+实现 `SetField(obj any, name string, value any) error`，把结构体字段 `name` 设置为 `value`。以下情况返回错误：
+
+- `obj` 不是结构体指针（传值进来的反射对象不可设置）；
+- 字段不存在；
+- 字段未导出（`CanSet()` 为 false）；
+- `value` 的类型不能赋值给字段类型。
+--- solution
+package main
+
+import (
+	"errors"
+	"fmt"
+	"reflect"
+)
+
+func SetField(obj any, name string, value any) error {
+	// @solution
+	v := reflect.ValueOf(obj)
+	if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct {
+		return errors.New("obj 必须是非 nil 的结构体指针")
+	}
+	f := v.Elem().FieldByName(name)
+	if !f.IsValid() {
+		return fmt.Errorf("字段 %s 不存在", name)
+	}
+	if !f.CanSet() {
+		return fmt.Errorf("字段 %s 不可设置", name)
+	}
+	val := reflect.ValueOf(value)
+	if !val.IsValid() || !val.Type().AssignableTo(f.Type()) {
+		return fmt.Errorf("类型不匹配：%T 不能赋值给 %s", value, f.Type())
+	}
+	f.Set(val)
+	return nil
+	// @starter
+	// return errors.New("TODO")
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+type Config struct {
+	Host  string
+	Port  int
+	Tags  []string
+	debug bool
+}
+
+func TestSetFieldOK(t *testing.T) {
+	c := &Config{}
+	if err := SetField(c, "Port", 8080); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetField(c, "Host", "localhost"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetField(c, "Tags", []string{"a"}); err != nil {
+		t.Fatal(err)
+	}
+	if c.Port != 8080 || c.Host != "localhost" || len(c.Tags) != 1 {
+		t.Fatalf("设置后 c = %+v", *c)
+	}
+}
+
+func TestSetFieldErrors(t *testing.T) {
+	c := &Config{}
+	if SetField(*c, "Port", 1) == nil {
+		t.Error("传结构体值应返回错误")
+	}
+	if SetField(c, "Missing", 1) == nil {
+		t.Error("字段不存在应返回错误")
+	}
+	if SetField(c, "debug", true) == nil {
+		t.Error("未导出字段应返回错误")
+	}
+	if SetField(c, "Port", "80") == nil {
+		t.Error("类型不匹配应返回错误")
+	}
+	if SetField(c, "Port", nil) == nil {
+		t.Error("nil 值应返回错误")
+	}
+	if SetField((*Config)(nil), "Port", 1) == nil {
+		t.Error("nil 指针应返回错误")
+	}
+}
+
+=== go-23-1
+title: unsafe.Pointer 与指针运算
+--- desc
+用 `unsafe` 实现：
+
+- `Float64Bits(f)`：把 float64 的内存按 uint64 解读（等价于 `math.Float64bits`），用 `*(*uint64)(unsafe.Pointer(&f))`；
+- `AgePtr(u *User) *int`：用 `unsafe.Add` 和 `unsafe.Offsetof` 从结构体起始地址算出 `Age` 字段的地址。
+
+注意整个指针运算要在一个表达式里完成，不要把中间结果存成 `uintptr`。
+--- solution
+package main
+
+import "unsafe"
+
+type User struct {
+	Name  string
+	Age   int
+	Score float64
+}
+
+func Float64Bits(f float64) uint64 {
+	// @solution
+	return *(*uint64)(unsafe.Pointer(&f))
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+
+func AgePtr(u *User) *int {
+	// @solution
+	return (*int)(unsafe.Add(unsafe.Pointer(u), unsafe.Offsetof(u.Age)))
+	// @starter
+	// return nil // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"math"
+	"testing"
+)
+
+func TestFloat64Bits(t *testing.T) {
+	for _, f := range []float64{0, 1, -2.5, math.Pi, math.Inf(1)} {
+		if got, want := Float64Bits(f), math.Float64bits(f); got != want {
+			t.Errorf("Float64Bits(%v) = %#x，期望 %#x", f, got, want)
+		}
+	}
+}
+
+func TestAgePtr(t *testing.T) {
+	u := &User{Name: "go", Age: 13}
+	p := AgePtr(u)
+	if p != &u.Age {
+		t.Fatal("AgePtr 返回的地址不是 &u.Age")
+	}
+	*p = 14
+	if u.Age != 14 {
+		t.Fatal("通过指针修改失败")
+	}
+}
+
+=== go-24-1
+title: 用 strings.Builder 拼接
+--- desc
+实现 `Join(parts []string, sep string) string`（不要调用 `strings.Join`）。
+
+要求整个函数**最多一次**堆分配：先算出结果的总长度，`Grow` 一次，再写入。用 `+=` 循环拼接，每一轮都会分配新字符串，过不了分配次数的检查。
+--- solution
+package main
+
+import "strings"
+
+func Join(parts []string, sep string) string {
+	// @solution
+	if len(parts) == 0 {
+		return ""
+	}
+	n := len(sep) * (len(parts) - 1)
+	for _, p := range parts {
+		n += len(p)
+	}
+	var b strings.Builder
+	b.Grow(n)
+	b.WriteString(parts[0])
+	for _, p := range parts[1:] {
+		b.WriteString(sep)
+		b.WriteString(p)
+	}
+	return b.String()
+	// @starter
+	// s := ""
+	// for i, p := range parts {
+	// 	if i > 0 {
+	// 		s += sep
+	// 	}
+	// 	s += p
+	// }
+	// return s // TODO: 每次 += 都会分配
+	// @end
+}
+--- test
+package main
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestJoin(t *testing.T) {
+	cases := []struct {
+		parts []string
+		sep   string
+	}{
+		{nil, ","},
+		{[]string{"a"}, ","},
+		{[]string{"a", "b", "c"}, ", "},
+		{[]string{"", "x", ""}, "-"},
+	}
+	for _, c := range cases {
+		if got, want := Join(c.parts, c.sep), strings.Join(c.parts, c.sep); got != want {
+			t.Errorf("Join(%q, %q) = %q，期望 %q", c.parts, c.sep, got, want)
+		}
+	}
+}
+
+var sink string
+
+func TestJoinAllocs(t *testing.T) {
+	parts := strings.Fields(strings.Repeat("word ", 50))
+	allocs := testing.AllocsPerRun(50, func() { sink = Join(parts, ",") })
+	if allocs > 1 {
+		t.Fatalf("Join 发生了 %.0f 次分配，期望最多 1 次", allocs)
+	}
+}
+
+=== go-24-2
+title: 热路径上用 strconv.Append 代替 fmt
+--- desc
+实现 `AppendKV(dst []byte, key string, val int) []byte`，把 `key=val` 追加到 `dst` 末尾并返回，例如 `AppendKV(nil, "port", 8080)` 得到 `port=8080`。
+
+要求：调用方给的 `dst` 容量足够时**零分配**。`fmt.Sprintf` 有装箱和反射，过不了检查；用 `append` 和 `strconv.AppendInt`。
+--- solution
+package main
+
+import (
+	// @starter
+	// "fmt"
+	// @end
+	"strconv"
+)
+
+func AppendKV(dst []byte, key string, val int) []byte {
+	// @solution
+	dst = append(dst, key...)
+	dst = append(dst, '=')
+	return strconv.AppendInt(dst, int64(val), 10)
+	// @starter
+	// return append(dst, fmt.Sprintf("%s=%d", key, val)...) // TODO: 去掉 fmt
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestAppendKV(t *testing.T) {
+	if got := string(AppendKV(nil, "port", 8080)); got != "port=8080" {
+		t.Fatalf("got %q", got)
+	}
+	buf := []byte("a=1 ")
+	if got := string(AppendKV(buf, "b", -2)); got != "a=1 b=-2" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestAppendKVAllocs(t *testing.T) {
+	buf := make([]byte, 0, 64)
+	allocs := testing.AllocsPerRun(100, func() {
+		buf = AppendKV(buf[:0], "latency_ms", 12345)
+	})
+	if allocs != 0 {
+		t.Fatalf("AppendKV 发生了 %.0f 次分配，期望 0 次", allocs)
+	}
+}
+
+=== go-25-1
+title: 用 struct tag 控制 JSON 输出
+--- desc
+给 `User` 加上合适的 tag，并完善 `MarshalUser`，满足：
+
+1. `ID` 以**字符串**形式输出（JS 的 Number 无法精确表示超过 2⁵³ 的整数）；
+2. `Email` 为空时省略这个字段；
+3. `Password` 永远不输出；
+4. `Tags` 为 nil 时输出 `[]` 而不是 `null`。
+
+期望输出示例：`{"id":"9007199254740993","name":"alice","tags":[]}`
+--- solution
+package main
+
+import "encoding/json"
+
+type User struct {
+	// @solution
+	ID       int64    `json:"id,string"`
+	Name     string   `json:"name"`
+	Email    string   `json:"email,omitempty"`
+	Password string   `json:"-"`
+	Tags     []string `json:"tags"`
+	// @starter
+	// ID       int64
+	// Name     string
+	// Email    string
+	// Password string
+	// Tags     []string
+	// @end
+}
+
+func MarshalUser(u User) ([]byte, error) {
+	// @solution
+	if u.Tags == nil {
+		u.Tags = []string{}
+	}
+	// @end
+	return json.Marshal(u)
+}
+--- test
+package main
+
+import "testing"
+
+func TestMarshalUser(t *testing.T) {
+	cases := []struct {
+		u    User
+		want string
+	}{
+		{User{ID: 9007199254740993, Name: "alice", Password: "secret"}, `{"id":"9007199254740993","name":"alice","tags":[]}`},
+		{User{ID: 1, Name: "bob", Email: "b@x.com", Tags: []string{"vip"}}, `{"id":"1","name":"bob","email":"b@x.com","tags":["vip"]}`},
+	}
+	for _, c := range cases {
+		got, err := MarshalUser(c.u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != c.want {
+			t.Errorf("MarshalUser = %s\n          期望 %s", got, c.want)
+		}
+	}
+}
+
+=== go-25-2
+title: 解析大整数不丢精度
+--- desc
+`ParseID(data)` 解析形如 `{"id": 9007199254740993, "payload": {...}}` 的 JSON，返回 `id`。payload 结构不固定，所以整体解析到 `map[string]any`。
+
+问题：解析到 `any` 时数字默认变成 `float64`，2⁵³ 以上的整数会丢失精度。用 `json.Decoder` 的 `UseNumber()` 让数字保留为 `json.Number`。缺少 id 或 JSON 非法时返回错误。
+--- solution
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+)
+
+func ParseID(data []byte) (int64, error) {
+	var m map[string]any
+	// @solution
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&m); err != nil {
+		return 0, err
+	}
+	n, ok := m["id"].(json.Number)
+	if !ok {
+		return 0, errors.New("missing id")
+	}
+	return n.Int64()
+	// @starter
+	// if err := json.Unmarshal(data, &m); err != nil {
+	// 	return 0, err
+	// }
+	// f, ok := m["id"].(float64) // TODO: float64 只有 53 位尾数
+	// if !ok {
+	// 	return 0, errors.New("missing id")
+	// }
+	// return int64(f), nil
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestParseID(t *testing.T) {
+	id, err := ParseID([]byte(`{"id": 9007199254740993, "payload": {"x": [1, 2]}}`))
+	if err != nil || id != 9007199254740993 {
+		t.Fatalf("ParseID = %d, %v，期望 9007199254740993", id, err)
+	}
+	if id, _ := ParseID([]byte(`{"id": 42}`)); id != 42 {
+		t.Fatalf("ParseID = %d，期望 42", id)
+	}
+}
+
+func TestParseIDErrors(t *testing.T) {
+	if _, err := ParseID([]byte(`{"name": "x"}`)); err == nil {
+		t.Error("缺少 id 应返回错误")
+	}
+	if _, err := ParseID([]byte(`{bad json}`)); err == nil {
+		t.Error("非法 JSON 应返回错误")
+	}
+}
+
+=== go-25-3
+title: 严格解析配置，拒绝未知字段
+--- desc
+配置文件里把 `debug` 拼成了 `debgu`，`json.Unmarshal` 默认会静默忽略它，排查起来很痛苦。
+
+实现 `DecodeStrict(data) (Config, error)`：遇到未知字段时返回错误。提示：`json.Decoder` 的 `DisallowUnknownFields()`。
+--- solution
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+)
+
+type Config struct {
+	Port  int  `json:"port"`
+	Debug bool `json:"debug"`
+}
+
+func DecodeStrict(data []byte) (Config, error) {
+	var c Config
+	// @solution
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	err := dec.Decode(&c)
+	return c, err
+	// @starter
+	// err := json.Unmarshal(data, &c) // TODO: 会忽略未知字段
+	// return c, err
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestDecodeStrict(t *testing.T) {
+	c, err := DecodeStrict([]byte(`{"port": 8080, "debug": true}`))
+	if err != nil || c.Port != 8080 || !c.Debug {
+		t.Fatalf("DecodeStrict = %+v, %v", c, err)
+	}
+	if _, err := DecodeStrict([]byte(`{"port": 8080, "debgu": true}`)); err == nil {
+		t.Fatal("未知字段 debgu 应返回错误")
+	}
+}
+
+=== go-26-1
+title: 用私有类型做 context key
+--- desc
+实现在 context 里存取请求 ID：
+
+- `WithRequestID(ctx, id) context.Context`
+- `RequestID(ctx) (string, bool)`
+
+起始代码用字符串 `"requestID"` 做 key，别的包同样用这个字符串时就会互相覆盖。改成**非导出的自定义类型**做 key，例如 `type ctxKey struct{}`。
+--- solution
+package main
+
+import "context"
+
+// @solution
+type ctxKey struct{}
+
+// @end
+
+func WithRequestID(ctx context.Context, id string) context.Context {
+	// @solution
+	return context.WithValue(ctx, ctxKey{}, id)
+	// @starter
+	// return context.WithValue(ctx, "requestID", id) // TODO: 字符串 key 会和其他包冲突
+	// @end
+}
+
+func RequestID(ctx context.Context) (string, bool) {
+	// @solution
+	id, ok := ctx.Value(ctxKey{}).(string)
+	// @starter
+	// id, ok := ctx.Value("requestID").(string)
+	// @end
+	return id, ok
+}
+--- test
+package main
+
+import (
+	"context"
+	"testing"
+)
+
+func TestRequestID(t *testing.T) {
+	ctx := WithRequestID(context.Background(), "req-1")
+	if id, ok := RequestID(ctx); !ok || id != "req-1" {
+		t.Fatalf("RequestID = %q, %v", id, ok)
+	}
+	if _, ok := RequestID(context.Background()); ok {
+		t.Fatal("没有设置时应返回 false")
+	}
+}
+
+func TestNoCollision(t *testing.T) {
+	ctx := WithRequestID(context.Background(), "req-1")
+	// 模拟别的包也用字符串 "requestID" 存了值
+	ctx = context.WithValue(ctx, "requestID", "evil")
+	if id, _ := RequestID(ctx); id != "req-1" {
+		t.Fatalf("RequestID = %q，被其他包的同名 key 覆盖了", id)
+	}
+}
+
+=== go-27-1
+title: 消除接口装箱引起的分配
+--- desc
+下面的 `SumAll` 把累加结果放在 `any` 类型的变量里，每次赋值都要把 int **装箱**成接口——值需要放到堆上，于是每轮循环都会分配。
+
+改写它，做到零堆分配。可以用 `go build -gcflags=-m` 观察逃逸分析的输出。
+--- solution
+package main
+
+func SumAll(nums []int) int {
+	total := 0
+	for _, n := range nums {
+		total += n
+	}
+	return total
+}
+--- starter
+package main
+
+func SumAll(nums []int) int {
+	var total any = 0
+	for _, n := range nums {
+		total = total.(int) + n // 赋值给 any 会装箱
+	}
+	return total.(int)
+}
+--- test
+package main
+
+import "testing"
+
+func nums() []int {
+	s := make([]int, 1000)
+	for i := range s {
+		s[i] = 1000 + i
+	}
+	return s
+}
+
+func TestSumAll(t *testing.T) {
+	if got := SumAll(nums()); got != 1499500 {
+		t.Fatalf("SumAll = %d，期望 1499500", got)
+	}
+	if SumAll(nil) != 0 {
+		t.Fatal("空切片应返回 0")
+	}
+}
+
+var sink int
+
+func TestSumAllAllocs(t *testing.T) {
+	s := nums()
+	if a := testing.AllocsPerRun(20, func() { sink = SumAll(s) }); a != 0 {
+		t.Fatalf("SumAll 发生了 %.0f 次分配，期望 0 次", a)
+	}
+}
+--- explain
+0~255 的小整数装箱时 Go 会复用一张静态表，不会分配；更大的值就要在堆上分配一个 8 字节对象。热点路径上要避免 `[]any`、`map[string]any` 这类写法。
+
+=== go-27-2
+title: 返回值而不是指针
+--- desc
+`NewVec` 返回局部变量的指针，变量逃逸到堆上，`Total` 每次循环都会分配（起始代码加了 `//go:noinline` 模拟一个没法内联的函数，否则编译器可能通过内联把逃逸消掉）。
+
+把 `NewVec` 改成**按值返回** `Vec`，并相应修改 `Total`，做到零分配。
+--- solution
+package main
+
+type Vec struct{ X, Y, Z float64 }
+
+//go:noinline
+func NewVec(x, y, z float64) Vec {
+	return Vec{x, y, z}
+}
+
+func (v Vec) Add(o Vec) Vec { return Vec{v.X + o.X, v.Y + o.Y, v.Z + o.Z} }
+
+func Total(n int) Vec {
+	var sum Vec
+	for i := range n {
+		f := float64(i)
+		sum = sum.Add(NewVec(f, 2*f, 3*f))
+	}
+	return sum
+}
+--- starter
+package main
+
+type Vec struct{ X, Y, Z float64 }
+
+//go:noinline
+func NewVec(x, y, z float64) *Vec {
+	return &Vec{x, y, z} // 返回局部变量的指针 → 逃逸到堆上
+}
+
+func (v Vec) Add(o Vec) Vec { return Vec{v.X + o.X, v.Y + o.Y, v.Z + o.Z} }
+
+func Total(n int) Vec {
+	var sum Vec
+	for i := range n {
+		f := float64(i)
+		sum = sum.Add(*NewVec(f, 2*f, 3*f))
+	}
+	return sum
+}
+--- test
+package main
+
+import "testing"
+
+func TestTotal(t *testing.T) {
+	if got := Total(4); got != (Vec{6, 12, 18}) {
+		t.Fatalf("Total(4) = %v，期望 {6 12 18}", got)
+	}
+}
+
+var sink Vec
+
+func TestTotalAllocs(t *testing.T) {
+	if a := testing.AllocsPerRun(20, func() { sink = Total(100) }); a != 0 {
+		t.Fatalf("Total(100) 发生了 %.0f 次分配，期望 0 次", a)
+	}
+}
+
+=== go-28-1
+title: 内联与逃逸分析
+--- desc
+`MostCommon(data)` 统计每个字节出现的次数，返回出现最多的字节值（次数相同取较小的值）。
+
+起始代码通过一个**禁止内联**的函数 `newCounts()` 拿到计数数组的指针。编译器看不到函数内部，只能保守地把数组分配到堆上，于是每次调用都有一次分配。
+
+改写成零分配：直接在函数里声明 `var counts [256]int`（或者去掉 `//go:noinline`，让内联后的逃逸分析发现指针没有逃逸）。
+--- solution
+package main
+
+func MostCommon(data []byte) byte {
+	var counts [256]int
+	for _, b := range data {
+		counts[b]++
+	}
+	best := 0
+	for i := 1; i < 256; i++ {
+		if counts[i] > counts[best] {
+			best = i
+		}
+	}
+	return byte(best)
+}
+--- starter
+package main
+
+//go:noinline
+func newCounts() *[256]int { return new([256]int) }
+
+func MostCommon(data []byte) byte {
+	counts := newCounts() // 禁止内联的函数返回指针，只能在堆上分配
+	for _, b := range data {
+		counts[b]++
+	}
+	best := 0
+	for i := 1; i < 256; i++ {
+		if counts[i] > counts[best] {
+			best = i
+		}
+	}
+	return byte(best)
+}
+--- test
+package main
+
+import "testing"
+
+func TestMostCommon(t *testing.T) {
+	if got := MostCommon([]byte("hello world")); got != 'l' {
+		t.Fatalf("MostCommon = %q，期望 'l'", got)
+	}
+	if got := MostCommon([]byte("ba")); got != 'a' {
+		t.Fatalf("次数相同应取较小的值，got %q", got)
+	}
+}
+
+var sink byte
+
+func TestMostCommonAllocs(t *testing.T) {
+	data := []byte("the quick brown fox jumps over the lazy dog")
+	if a := testing.AllocsPerRun(50, func() { sink = MostCommon(data) }); a != 0 {
+		t.Fatalf("MostCommon 发生了 %.0f 次分配，期望 0 次", a)
+	}
+}
+--- explain
+用 `go build -gcflags=-m` 可以看到：起始代码会打印 `new([256]int) escapes to heap`；改成局部数组后没有逃逸。这说明内联的价值不只是省掉调用开销，更重要的是让逃逸分析看到更多上下文。
+
+=== go-29-1
+title: 批量调用，摊薄跨边界开销
+--- desc
+cgo 调用每次都有固定开销，频繁调用小函数得不偿失，常见做法是**批量化**。这里用一个接口模拟这类「每次调用都很贵」的后端。
+
+实现 `ProcessAll(b, items, batchSize)`：把 `items` 按每批最多 `batchSize` 个切分，逐批调用 `b.Call`，按原顺序拼接结果。`batchSize < 1` 时按 1 处理；`items` 为空时不调用。
+--- solution
+package main
+
+type Backend interface {
+	Call(batch []int) []int
+}
+
+func ProcessAll(b Backend, items []int, batchSize int) []int {
+	// @solution
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	out := make([]int, 0, len(items))
+	for start := 0; start < len(items); start += batchSize {
+		end := min(start+batchSize, len(items))
+		out = append(out, b.Call(items[start:end])...)
+	}
+	return out
+	// @starter
+	// var out []int
+	// for _, it := range items {
+	// 	out = append(out, b.Call([]int{it})...) // TODO: 每个元素调用一次，开销太大
+	// }
+	// return out
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+type fakeBackend struct{ calls [][]int }
+
+func (f *fakeBackend) Call(batch []int) []int {
+	f.calls = append(f.calls, slices.Clone(batch))
+	out := make([]int, len(batch))
+	for i, v := range batch {
+		out[i] = v * 2
+	}
+	return out
+}
+
+func TestProcessAll(t *testing.T) {
+	f := &fakeBackend{}
+	got := ProcessAll(f, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, 4)
+	if !slices.Equal(got, []int{2, 4, 6, 8, 10, 12, 14, 16, 18, 20}) {
+		t.Fatalf("结果 = %v", got)
+	}
+	if len(f.calls) != 3 || len(f.calls[0]) != 4 || len(f.calls[2]) != 2 {
+		t.Fatalf("应分 3 批（4、4、2），实际 %v", f.calls)
+	}
+}
+
+func TestProcessAllEdge(t *testing.T) {
+	f := &fakeBackend{}
+	if got := ProcessAll(f, nil, 4); len(got) != 0 || len(f.calls) != 0 {
+		t.Fatalf("空输入不应调用后端：got=%v calls=%d", got, len(f.calls))
+	}
+	f = &fakeBackend{}
+	ProcessAll(f, []int{1, 2}, 0)
+	if len(f.calls) != 2 {
+		t.Fatalf("batchSize=0 应按 1 处理，实际调用 %d 次", len(f.calls))
+	}
+}

@@ -1,0 +1,189 @@
+=== error-basic
+name: error 与错误处理
+group: 错误处理
+--- body
+Go 用**返回值**表示错误：`error` 是一个只有 `Error() string` 方法的内置接口，`nil` 表示成功。调用方必须显式检查。
+
+**写法**
+
+```go
+func Parse(s string) (Config, error) {
+	if s == "" {
+		return Config{}, errors.New("配置为空")
+	}
+	...
+	return cfg, nil
+}
+
+cfg, err := Parse(s)
+if err != nil {
+	return fmt.Errorf("加载配置: %w", err)
+}
+```
+
+**哨兵错误（sentinel error）**
+
+```go
+var ErrNotFound = errors.New("not found") // 包级变量，供调用方比较
+
+func (s *Store) Get(k string) (string, error) {
+	v, ok := s.m[k]
+	if !ok {
+		return "", ErrNotFound
+	}
+	return v, nil
+}
+
+if errors.Is(err, ErrNotFound) { ... }
+```
+
+**注意**
+
+- 错误信息惯例：**小写开头、不加句号**，因为它经常被拼接到其他错误后面。
+- 有错误时其他返回值一般是零值，调用方不应该使用它们。
+- 不要只 `log` 了错误又继续往上 `return`，同一个错误会被打印多次；要么处理，要么返回。
+- `errors.New` 每次调用都创建**不同**的错误值，所以哨兵错误必须定义成包级变量。
+
+=== error-wrap
+name: 错误包装 %w、errors.Is / As
+group: 错误处理
+--- body
+`fmt.Errorf("...: %w", err)` 在错误外面包一层上下文，同时保留原始错误。之后用 `errors.Is` 判断链上是否有某个错误值，用 `errors.As` 取出链上某种类型的错误。
+
+**写法**
+
+```go
+if err != nil {
+	return fmt.Errorf("查询用户 %d: %w", id, err)
+}
+
+errors.Is(err, sql.ErrNoRows)        // 链上任何一层 == sql.ErrNoRows
+var pe *fs.PathError
+if errors.As(err, &pe) {             // 链上有 *fs.PathError 就赋值给 pe
+	fmt.Println(pe.Path)
+}
+errors.Unwrap(err)                   // 剥掉一层
+errors.Join(err1, err2)              // Go 1.20+：合并多个错误
+```
+
+**例子**
+
+```go
+var ErrNotFound = errors.New("not found")
+
+func loadUser(id int) error {
+	return fmt.Errorf("load user %d: %w", id, ErrNotFound)
+}
+
+err := fmt.Errorf("handler: %w", loadUser(7))
+fmt.Println(err)                         // handler: load user 7: not found
+fmt.Println(err == ErrNotFound)          // false：已经被包装了
+fmt.Println(errors.Is(err, ErrNotFound)) // true
+```
+
+**注意**
+
+- 用 `%v` 只会把错误变成文字，**链就断了**，`errors.Is` 找不到原始错误。
+- `errors.As` 的第二个参数必须是**指向错误类型变量的指针**（`&pe`），传错会 panic。
+- 是否用 `%w` 是 API 设计选择：包装后调用方就能依赖底层错误，相当于把它变成了你的公开接口的一部分。
+
+=== error-type
+name: 自定义错误类型
+group: 错误处理
+--- body
+任何实现了 `Error() string` 的类型都是 error。需要携带额外信息（状态码、字段名、是否可重试）时，定义自己的错误类型，调用方用 `errors.As` 取出。
+
+**写法**
+
+```go
+type ValidationError struct {
+	Field string
+	Msg   string
+}
+
+func (e *ValidationError) Error() string {
+	return e.Field + ": " + e.Msg
+}
+
+// 包装了其他错误时，实现 Unwrap 让 errors.Is / As 能继续往下找
+type QueryError struct {
+	SQL string
+	Err error
+}
+
+func (e *QueryError) Error() string { return e.SQL + ": " + e.Err.Error() }
+func (e *QueryError) Unwrap() error { return e.Err }
+```
+
+**例子**
+
+```go
+func validate(age int) error {
+	if age < 0 {
+		return &ValidationError{Field: "age", Msg: "不能为负数"}
+	}
+	return nil
+}
+
+var ve *ValidationError
+if err := validate(-1); errors.As(err, &ve) {
+	fmt.Println("字段出错:", ve.Field)
+}
+```
+
+**注意：nil 接口陷阱**
+
+```go
+func check() error {
+	var p *ValidationError = nil
+	return p          // 返回的 error 不是 nil！
+}
+```
+
+接口值包含“类型 + 值”，这里类型是 `*ValidationError`、值是 nil，所以 `check() != nil` 为 true。**没有错误时直接 `return nil`**，不要返回一个值为 nil 的具体类型指针。
+
+=== panic-recover
+name: panic 与 recover
+group: 错误处理
+--- body
+`panic` 用于**不可恢复的程序错误**（越界、空指针、违反不变量），它会沿调用栈逐层执行 defer，最终让程序崩溃。在 defer 函数里调用 `recover()` 可以捕获 panic，让当前 goroutine 恢复正常。
+
+**写法**
+
+```go
+panic("不应该走到这里")
+panic(fmt.Sprintf("unknown op %q", op))
+
+defer func() {
+	if r := recover(); r != nil {
+		log.Println("recovered:", r)
+	}
+}()
+```
+
+**例子：把 panic 转成 error**
+
+```go
+func safeCall(fn func()) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r) // 通过命名返回值把错误带出去
+		}
+	}()
+	fn()
+	return nil
+}
+
+err := safeCall(func() {
+	var m map[string]int
+	m["a"] = 1 // panic
+})
+fmt.Println(err) // panic: assignment to entry in nil map
+```
+
+**注意**
+
+- `recover` **只在 defer 的函数里直接调用才有效**，在普通代码或 defer 函数调用的其他函数里调用都返回 nil。
+- recover 只能捕获**当前 goroutine** 的 panic：一个子 goroutine panic 会让整个进程崩溃，主 goroutine 的 recover 救不了，所以每个可能 panic 的 goroutine 要自己 recover。
+- 并发读写 map、栈溢出、死锁等是 fatal error，**无法 recover**。
+- 普通的业务错误用 `error` 返回，不要用 panic 做流程控制。

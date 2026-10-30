@@ -1,0 +1,777 @@
+=== fmt
+name: fmt 格式化输出
+group: 标准库
+--- body
+`fmt` 负责格式化输出和字符串拼接。`Print` 系列写到标准输出，`Sprint` 系列返回字符串，`Fprint` 系列写到任意 `io.Writer`，`Errorf` 生成错误。
+
+**常用动词**
+
+```go
+fmt.Printf("%d %s %v\n", 42, "go", []int{1}) // 42 go [1]
+%v    默认格式      %+v  结构体带字段名     %#v  Go 语法表示
+%T    类型          %q   带引号的字符串      %x   十六进制
+%5d   宽度 5        %-5s 左对齐             %05d 补零
+%.2f  保留两位小数   %p   指针地址           %%   百分号本身
+%w    （仅 Errorf）包装错误
+```
+
+**例子**
+
+```go
+type P struct{ X, Y int }
+p := P{1, 2}
+fmt.Printf("%v %+v %#v %T\n", p, p, p, p)
+// {1 2} {X:1 Y:2} main.P{X:1, Y:2} main.P
+
+s := fmt.Sprintf("%-6s|%6.2f|", "go", 3.14159) // "go    |  3.14|"
+fmt.Fprintf(os.Stderr, "error: %v\n", err)
+```
+
+**注意**
+
+- 类型实现了 `String() string` 时，`%v` / `%s` 会调用它；实现了 `Error()` 的优先用 `Error()`。
+- 动词和参数类型不匹配不会编译报错，输出会变成 `%!d(string=x)`，`go vet` 能发现大部分这类问题。
+- `fmt.Sprintf` 有反射开销，热点路径里拼接数字用 `strconv`，大量拼接用 `strings.Builder`。
+- `Println` 在参数之间加空格并换行；`Print` 只在两个都不是字符串的参数之间加空格。
+
+=== time
+name: time 时间与时长
+group: 标准库
+--- body
+`time.Time` 表示时间点，`time.Duration` 表示时长（本质是 int64 纳秒）。时长用常量相乘表示：`3 * time.Second`。
+
+**写法**
+
+```go
+now := time.Now()
+d := 1500 * time.Millisecond        // 1.5s
+time.Sleep(100 * time.Millisecond)
+elapsed := time.Since(start)        // 等于 time.Now().Sub(start)
+deadline := now.Add(5 * time.Minute)
+now.Before(deadline); now.After(t)
+t.Truncate(time.Hour)               // 向下取整到小时
+t.Unix(); t.UnixMilli()
+time.Unix(sec, 0)
+
+// 格式化用固定的参考时间 2006-01-02 15:04:05
+s := now.Format("2006-01-02 15:04:05")
+t, err := time.Parse(time.RFC3339, "2024-01-02T15:04:05Z")
+```
+
+**例子：滑动窗口限流**
+
+```go
+type Limiter struct {
+	window time.Duration
+	limit  int
+	hits   []time.Time
+}
+
+func (l *Limiter) Allow(now time.Time) bool {
+	cut := now.Add(-l.window)
+	i := 0
+	for i < len(l.hits) && !l.hits[i].After(cut) {
+		i++
+	}
+	l.hits = l.hits[i:] // 丢掉窗口外的记录
+	if len(l.hits) >= l.limit {
+		return false
+	}
+	l.hits = append(l.hits, now)
+	return true
+}
+```
+
+**注意**
+
+- **整数变量乘时长要先转换**：`n * time.Second` 在 `n` 是 `int` 变量时编译报错，写 `time.Duration(n) * time.Second`。
+- 比较时间用 `t1.Equal(t2)`，不要用 `==`（`==` 还会比较时区和单调时钟读数）。
+- 把 `now` 作为参数传入（而不是在函数里调用 `time.Now()`），测试时就能精确控制时间。
+- 格式化的布局字符串是“2006 年 1 月 2 日 15:04:05”这个固定时间，不是 `yyyy-MM-dd`。
+
+=== sort-slices
+name: 排序：sort / slices / cmp
+group: 标准库
+--- body
+Go 1.21 起推荐用泛型的 `slices` 包排序和查找，用 `cmp.Compare` 写比较函数。老代码里常见 `sort.Slice` / `sort.Ints`。
+
+**写法**
+
+```go
+slices.Sort(nums)                       // 升序
+slices.SortFunc(people, func(a, b Person) int {
+	return cmp.Compare(a.Age, b.Age)    // 负数 a 在前，0 相等，正数 b 在前
+})
+slices.SortStableFunc(...)              // 稳定排序
+i, found := slices.BinarySearch(nums, x)
+slices.Contains(s, x); slices.Index(s, x)
+slices.Reverse(s); slices.Max(s); slices.Min(s)
+slices.Equal(a, b); slices.Clone(s)
+keys := slices.Sorted(maps.Keys(m))     // Go 1.23+
+
+sort.Ints(nums)                         // 老写法
+sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+idx := sort.Search(n, func(i int) bool { return nums[i] >= x }) // 第一个满足条件的下标
+```
+
+**例子：多关键字排序**
+
+```go
+// 按分数降序，分数相同按名字升序
+slices.SortFunc(students, func(a, b Student) int {
+	if c := cmp.Compare(b.Score, a.Score); c != 0 {
+		return c
+	}
+	return strings.Compare(a.Name, b.Name)
+})
+// Go 1.22+ 也可以写成 cmp.Or(cmp.Compare(b.Score, a.Score), strings.Compare(a.Name, b.Name))
+```
+
+**例子：合并区间**
+
+```go
+slices.SortFunc(intervals, func(a, b []int) int { return a[0] - b[0] })
+```
+
+**注意**
+
+- `slices.Sort` / `sort.Slice` **不稳定**，相等元素的相对顺序可能改变，需要稳定时用 `SortStableFunc`。
+- 比较函数用 `a - b` 在数值很大时可能溢出，`cmp.Compare` 更安全。
+- `sort.Search` 要求条件对下标是“先 false 后 true”的单调关系。
+- 排序是原地进行的，会修改传入的切片。
+
+=== heap
+name: container/heap 堆
+group: 标准库
+--- body
+`container/heap` 在任何实现了 `heap.Interface` 的类型上提供堆操作。你需要实现 5 个方法：`Len`、`Less`、`Swap`（来自 sort.Interface）和 `Push`、`Pop`。
+
+**写法：最小堆**
+
+```go
+type IntHeap []int
+
+func (h IntHeap) Len() int           { return len(h) }
+func (h IntHeap) Less(i, j int) bool { return h[i] < h[j] } // 改成 > 就是最大堆
+func (h IntHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *IntHeap) Push(x any)        { *h = append(*h, x.(int)) }
+func (h *IntHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+h := &IntHeap{5, 2, 8}
+heap.Init(h)
+heap.Push(h, 1)
+min := heap.Pop(h).(int) // 1
+top := (*h)[0]           // 只看堆顶不弹出
+```
+
+**例子：第 K 大的元素（大小为 K 的最小堆）**
+
+```go
+func findKthLargest(nums []int, k int) int {
+	h := &IntHeap{}
+	for _, n := range nums {
+		heap.Push(h, n)
+		if h.Len() > k {
+			heap.Pop(h) // 弹出最小的，堆里始终是最大的 k 个
+		}
+	}
+	return (*h)[0]
+}
+```
+
+**注意**
+
+- **调用 `heap.Push(h, x)` / `heap.Pop(h)`**，不要直接调用 `h.Push` / `h.Pop`：你写的 Push / Pop 只负责在切片末尾增删，调整堆结构的是 `heap` 包。
+- Push / Pop 必须是**指针接收者**，因为要修改切片长度。
+- 元素在堆里的位置会变，需要更新某个元素的优先级时，记录下标并调用 `heap.Fix(h, i)`。
+
+=== list
+name: container/list 双向链表
+group: 标准库
+--- body
+`container/list` 是标准库的双向链表，支持 O(1) 的头尾插入、删除任意节点、把节点移到头部。最经典的用法是和 map 一起实现 **LRU 缓存**。
+
+**写法**
+
+```go
+l := list.New()
+e := l.PushFront(1)      // 返回 *list.Element
+l.PushBack(2)
+l.MoveToFront(e)
+l.Remove(e)
+back := l.Back()         // 最后一个元素
+v := back.Value.(int)    // Value 是 any
+for e := l.Front(); e != nil; e = e.Next() { }
+```
+
+**例子：LRU 缓存**
+
+```go
+type entry struct{ key, val int }
+
+type LRUCache struct {
+	cap   int
+	ll    *list.List
+	items map[int]*list.Element
+}
+
+func (c *LRUCache) Get(key int) int {
+	if e, ok := c.items[key]; ok {
+		c.ll.MoveToFront(e)
+		return e.Value.(*entry).val
+	}
+	return -1
+}
+
+func (c *LRUCache) Put(key, val int) {
+	if e, ok := c.items[key]; ok {
+		e.Value.(*entry).val = val
+		c.ll.MoveToFront(e)
+		return
+	}
+	c.items[key] = c.ll.PushFront(&entry{key, val})
+	if c.ll.Len() > c.cap {
+		old := c.ll.Back()
+		c.ll.Remove(old)
+		delete(c.items, old.Value.(*entry).key) // 所以 entry 里要存 key
+	}
+}
+```
+
+**注意**
+
+- `Value` 是 `any`，取出时要类型断言；存指针（`*entry`）才能原地修改。
+- 遍历时删除元素要先保存 `next := e.Next()`，因为 Remove 后 `e.Next()` 返回 nil。
+- 大多数情况下切片比链表更快（缓存友好），只有需要 O(1) 删除中间节点时才用链表。
+
+=== json
+name: encoding/json
+group: 标准库
+--- body
+`json.Marshal` 把 Go 值编码成 JSON，`json.Unmarshal` 把 JSON 解码到 Go 值。字段名、是否省略由结构体标签控制。
+
+**写法**
+
+```go
+type User struct {
+	ID    int      `json:"id"`
+	Name  string   `json:"name"`
+	Email string   `json:"email,omitempty"`
+	Tags  []string `json:"tags"`
+	pass  string   // 小写字段不会被编码
+}
+
+b, err := json.Marshal(u)               // []byte
+b, err := json.MarshalIndent(u, "", "  ")
+var u User
+err := json.Unmarshal(b, &u)            // 必须传指针
+
+// 流式：直接读写 io.Reader / io.Writer
+err := json.NewDecoder(r.Body).Decode(&req)
+err := json.NewEncoder(w).Encode(resp)
+```
+
+**例子：处理未知结构**
+
+```go
+var data map[string]any
+_ = json.Unmarshal([]byte(`{"n": 1, "list": [1, 2]}`), &data)
+n := data["n"].(float64)        // 数字默认解成 float64
+list := data["list"].([]any)
+```
+
+**注意**
+
+- **只有导出字段**会被编解码。
+- 解码时 JSON 里多出来的字段默认被忽略，缺少的字段保持零值；需要严格校验用 `dec.DisallowUnknownFields()`。
+- nil 切片编码成 `null`，空切片编码成 `[]`；前端如果要求数组，记得初始化。
+- 大整数（如 int64 的 ID）解到 `any` 时会变成 float64 丢精度，用 `dec.UseNumber()` 或明确的结构体类型。
+- 自定义编码：实现 `MarshalJSON() ([]byte, error)` / `UnmarshalJSON([]byte) error`。
+
+=== io
+name: io / bufio / os
+group: 标准库
+--- body
+`io.Reader`（`Read(p []byte) (n int, err error)`）和 `io.Writer`（`Write(p []byte) (n int, err error)`）是 Go 里最重要的两个接口：文件、网络连接、HTTP body、压缩流、缓冲区都实现了它们，可以随意组合。
+
+**写法**
+
+```go
+data, err := io.ReadAll(r)             // 读到 EOF
+n, err := io.Copy(dst, src)            // 从 Reader 复制到 Writer
+r := io.LimitReader(src, 1<<20)        // 最多读 1MB
+r := io.TeeReader(src, w)              // 读的同时写一份到 w
+w := io.MultiWriter(f, os.Stdout)
+
+f, err := os.Open("a.txt")             // 只读
+f, err := os.Create("b.txt")           // 创建 / 截断
+defer f.Close()
+data, err := os.ReadFile("a.txt")      // 一次读完
+
+sc := bufio.NewScanner(f)              // 按行读
+for sc.Scan() {
+	line := sc.Text()
+}
+err = sc.Err()
+
+bw := bufio.NewWriter(f)
+defer bw.Flush()                       // 一定要 Flush
+```
+
+**例子：统计 Reader 的行数**
+
+```go
+func countLines(r io.Reader) (int, error) {
+	sc := bufio.NewScanner(r)
+	n := 0
+	for sc.Scan() {
+		n++
+	}
+	return n, sc.Err()
+}
+
+countLines(strings.NewReader("a\nb\nc")) // 3：测试时用 strings.Reader 代替文件
+```
+
+**注意**
+
+- `Read` 可能**只读到一部分**数据就返回（n < len(p)），也可能同时返回 `n > 0` 和 `io.EOF`；要读满用 `io.ReadFull`。
+- `io.EOF` 表示正常结束，不是错误，要单独判断：`if err == io.EOF { break }`。
+- `bufio.Scanner` 默认单行最长 64KB，超长会失败，可以用 `sc.Buffer` 调大。
+- `bufio.Writer` 不 `Flush` 会丢数据。
+- 函数参数尽量写成 `io.Reader` / `io.Writer` 而不是 `*os.File`，更通用也更好测试。
+
+=== http
+name: net/http 服务端与客户端
+group: 标准库
+--- body
+`net/http` 包含生产可用的 HTTP 服务器和客户端。服务端的核心是 `http.Handler` 接口：`ServeHTTP(w http.ResponseWriter, r *http.Request)`。
+
+**写法：服务端**
+
+```go
+mux := http.NewServeMux()
+mux.HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")            // Go 1.22+ 路由支持方法和路径参数
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)       // 要在 Write 之前调用
+	json.NewEncoder(w).Encode(map[string]string{"id": id})
+})
+srv := &http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+log.Fatal(srv.ListenAndServe())
+```
+
+**写法：中间件**
+
+```go
+func logging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		log.Println(r.Method, r.URL.Path, time.Since(start))
+	})
+}
+```
+
+**写法：客户端**
+
+```go
+client := &http.Client{Timeout: 3 * time.Second}
+req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+resp, err := client.Do(req)
+if err != nil {
+	return err
+}
+defer resp.Body.Close()                // 必须关闭
+body, err := io.ReadAll(resp.Body)
+```
+
+**测试**：`httptest.NewRecorder()` 记录响应，`httptest.NewServer(handler)` 启动临时服务器。
+
+**注意**
+
+- **`http.Get` 和默认 Client 没有超时**，生产代码要自己设置 `Timeout`。
+- **`resp.Body` 一定要 Close**，而且最好读完，否则连接无法复用。
+- 非 2xx 状态码**不会**返回 error，要自己检查 `resp.StatusCode`。
+- `WriteHeader` 只能调用一次，第一次 `Write` 时如果没调用过会自动写 200。
+- 每个请求在独立的 goroutine 里处理，handler 访问共享状态要加锁。
+
+=== net
+name: net 网络编程
+group: 标准库
+--- body
+`net` 包提供 TCP / UDP / Unix socket。`net.Conn` 同时实现了 `io.Reader` 和 `io.Writer`，可以直接套用 `bufio`、`io.Copy` 等工具。
+
+**写法：TCP 服务端**
+
+```go
+ln, err := net.Listen("tcp", "127.0.0.1:9000")
+if err != nil {
+	return err
+}
+defer ln.Close()
+for {
+	conn, err := ln.Accept()
+	if err != nil {
+		return err
+	}
+	go handle(conn) // 每个连接一个 goroutine
+}
+```
+
+**写法：客户端**
+
+```go
+conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+defer conn.Close()
+conn.SetDeadline(time.Now().Add(5 * time.Second)) // 读写超时
+```
+
+**例子：回显服务**
+
+```go
+func handle(c net.Conn) {
+	defer c.Close()
+	sc := bufio.NewScanner(c)
+	for sc.Scan() {
+		fmt.Fprintln(c, "echo:", sc.Text())
+	}
+}
+```
+
+**测试技巧**：`net.Pipe()` 返回一对在内存中相连的 Conn，不需要真实端口。
+
+**注意**
+
+- TCP 是**字节流**，没有消息边界：一次 Write 的数据可能被拆成多次 Read，也可能多次 Write 被合并读到。需要自己定义协议（按行、长度前缀等）。
+- Deadline 是**绝对时间**，每次读写前都要重新设置。
+- 监听 `:9000` 会暴露到所有网卡，只在本机用时写 `127.0.0.1:9000`。
+
+=== sql
+name: database/sql
+group: 标准库
+--- body
+`database/sql` 定义了通用的数据库访问接口，具体数据库通过驱动接入（如 MySQL 的 `go-sql-driver/mysql`）。`*sql.DB` 是**连接池**，不是单个连接，全局创建一个即可。
+
+**写法**
+
+```go
+db, err := sql.Open("mysql", dsn)   // 不会立即连接
+db.SetMaxOpenConns(20)
+db.SetMaxIdleConns(10)
+db.SetConnMaxLifetime(time.Hour)
+
+var name string
+err := db.QueryRowContext(ctx, "SELECT name FROM users WHERE id = ?", id).Scan(&name)
+if errors.Is(err, sql.ErrNoRows) { ... }
+
+rows, err := db.QueryContext(ctx, "SELECT id, name FROM users WHERE age > ?", 18)
+defer rows.Close()
+for rows.Next() {
+	var u User
+	if err := rows.Scan(&u.ID, &u.Name); err != nil { return err }
+}
+err = rows.Err()
+
+res, err := db.ExecContext(ctx, "UPDATE users SET name = ? WHERE id = ?", name, id)
+n, _ := res.RowsAffected()
+```
+
+**例子：事务**
+
+```go
+func transfer(ctx context.Context, db *sql.DB, from, to, amount int) (err error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+	if _, err = tx.ExecContext(ctx, "UPDATE acct SET bal = bal - ? WHERE id = ?", amount, from); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE acct SET bal = bal + ? WHERE id = ?", amount, to); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+```
+
+**注意**
+
+- **永远用占位符 `?` 传参**，不要拼接 SQL 字符串，否则会 SQL 注入。
+- `rows` 必须 `Close`，否则连接不会归还连接池；循环结束后检查 `rows.Err()`。
+- 可能为 NULL 的列用 `sql.NullString` 或指针 `*string` 接收。
+- 事务里的操作必须用 `tx`，用 `db` 会拿到另一个连接，不在事务内。
+
+=== encoding
+name: 编码与哈希：hex / base64 / binary / crypto
+group: 标准库
+--- body
+`encoding/*` 和 `hash/*`、`crypto/*` 处理字节的编码、校验和哈希。它们大多遵循同一套接口：哈希实现了 `io.Writer`，写进去再 `Sum`。
+
+**常用写法**
+
+```go
+hex.EncodeToString(b)                     // []byte → "0a1f..."
+base64.StdEncoding.EncodeToString(b)
+base64.URLEncoding.DecodeString(s)        // URL 安全的变体（JWT 用 RawURLEncoding）
+binary.BigEndian.PutUint32(buf, n)        // 整数写成大端字节
+n := binary.BigEndian.Uint32(buf[:4])
+crc := crc32.ChecksumIEEE(data)
+
+sum := sha256.Sum256(data)                // [32]byte
+h := sha256.New()
+io.Copy(h, f)                             // 流式计算大文件哈希
+digest := h.Sum(nil)
+
+mac := hmac.New(sha256.New, key)
+mac.Write(msg)
+sig := mac.Sum(nil)
+hmac.Equal(sig, expected)                 // 常数时间比较，防时序攻击
+
+f := fnv.New32a()                         // 非加密的快速哈希，适合分片 / 一致性哈希
+f.Write([]byte(key))
+idx := f.Sum32() % n
+```
+
+**例子：长度前缀的消息编码**
+
+```go
+func writeMsg(w io.Writer, msg []byte) error {
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(msg)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(msg)
+	return err
+}
+```
+
+**注意**
+
+- 签名、token 比较要用 `hmac.Equal` / `subtle.ConstantTimeCompare`，不要用 `==` 或 `bytes.Equal`。
+- 密码存储不要用 SHA256，要用 bcrypt / argon2 这类慢哈希。
+- 随机数：安全相关用 `crypto/rand`，`math/rand` 只适合模拟和测试。
+- 网络协议一般用大端（BigEndian），x86 内存里是小端。
+
+=== regexp
+name: regexp 正则表达式
+group: 标准库
+--- body
+`regexp` 使用 RE2 语法，**保证线性时间**，不会出现灾难性回溯；代价是不支持反向引用和环视（lookahead）。
+
+**写法**
+
+```go
+var reEmail = regexp.MustCompile(`^[\w.+-]+@[\w-]+\.[\w.]+$`) // 包级变量，只编译一次
+
+reEmail.MatchString(s)
+re.FindString(s)                    // 第一个匹配
+re.FindAllString(s, -1)             // 所有匹配
+m := re.FindStringSubmatch(s)       // m[0] 整体，m[1] 第一个分组
+re.ReplaceAllString(s, "$1")
+re.Split(s, -1)
+```
+
+**例子：提取日志里的字段**
+
+```go
+var reLog = regexp.MustCompile(`(\w+)=(\S+)`)
+
+func parseLog(line string) map[string]string {
+	out := map[string]string{}
+	for _, m := range reLog.FindAllStringSubmatch(line, -1) {
+		out[m[1]] = m[2]
+	}
+	return out
+}
+
+parseLog("level=info user=tom cost=12ms") // map[cost:12ms level:info user:tom]
+```
+
+**注意**
+
+- 用反引号写正则，避免反斜杠要转义两次。
+- `MustCompile` 在正则写错时 panic，适合包级常量正则；运行时输入的正则用 `Compile` 并处理错误。
+- 不要在循环或 handler 里反复编译同一个正则。
+- 简单的前缀、包含判断用 `strings` 包更快。
+
+=== slog
+name: log/slog 结构化日志
+group: 标准库
+--- body
+Go 1.21 起标准库提供 `log/slog` 结构化日志：每条日志是“消息 + 键值对”，可以输出成文本或 JSON，方便检索和分析。
+
+**写法**
+
+```go
+logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+slog.SetDefault(logger)
+
+slog.Info("user login", "user_id", 42, "ip", ip)
+slog.Error("query failed", "err", err, "sql", q)
+reqLog := logger.With("request_id", rid)   // 带上公共字段
+reqLog.Debug("cache miss", slog.String("key", k))
+```
+
+输出类似：`{"time":"...","level":"INFO","msg":"user login","user_id":42,"ip":"1.2.3.4"}`
+
+**例子：测试里捕获日志**
+
+```go
+var buf bytes.Buffer
+log := slog.New(slog.NewJSONHandler(&buf, nil))
+log.Info("hello", "n", 1)
+// buf.String() 里就是 JSON，可以断言内容
+```
+
+**注意**
+
+- 键值对必须成对出现，漏写会生成 `!BADKEY`，`go vet` 能检查。
+- 低于当前级别的日志不会输出，但**参数仍会被求值**；昂贵的计算可以先 `logger.Enabled(ctx, level)` 判断。
+- 敏感信息（密码、token）不要打进日志，可以给类型实现 `LogValue()` 做脱敏。
+
+=== runtime
+name: runtime 与调试
+group: 标准库
+--- body
+`runtime` 包可以查看和控制 Go 运行时：goroutine 数量、调度、GC、内存统计、调用栈。主要用于诊断和测试，业务代码很少需要。
+
+**常用写法**
+
+```go
+runtime.NumGoroutine()         // 当前 goroutine 数，检测泄漏
+runtime.NumCPU()
+runtime.GOMAXPROCS(0)          // 传 0 只查询不修改
+runtime.Gosched()              // 让出 CPU
+runtime.GC()                   // 强制 GC（测试用）
+
+var m runtime.MemStats
+runtime.ReadMemStats(&m)       // m.HeapAlloc, m.NumGC ...
+
+buf := make([]byte, 1<<16)
+n := runtime.Stack(buf, true)  // 所有 goroutine 的栈
+
+debug.SetGCPercent(50)         // runtime/debug
+debug.SetMemoryLimit(512 << 20)
+pprof.StartCPUProfile(f)       // runtime/pprof
+```
+
+**例子：测试 goroutine 是否泄漏**
+
+```go
+func TestNoLeak(t *testing.T) {
+	before := runtime.NumGoroutine()
+	startAndStopWorkers()
+	time.Sleep(50 * time.Millisecond) // 给 goroutine 退出的时间
+	if after := runtime.NumGoroutine(); after > before {
+		t.Fatalf("goroutine 泄漏：%d → %d", before, after)
+	}
+}
+```
+
+**注意**
+
+- 线上排查优先用 `net/http/pprof` 暴露的接口和 `go tool pprof`，而不是手工打印。
+- `GOMAXPROCS` 默认等于 CPU 核数；Go 1.25 起在容器里会自动参考 cgroup 的 CPU 限制。
+- 不要在业务代码里调用 `runtime.GC()` 来“优化内存”。
+
+=== reflect
+name: reflect 反射
+group: 标准库
+--- body
+`reflect` 在运行时检查值的类型和结构：`reflect.TypeOf(x)` 得到类型信息，`reflect.ValueOf(x)` 得到值。`encoding/json`、ORM、校验库都靠它读取字段和标签。
+
+**写法**
+
+```go
+t := reflect.TypeOf(u)          // 类型
+v := reflect.ValueOf(u)         // 值
+t.Kind()                        // reflect.Struct / Slice / Ptr ...
+for i := 0; i < t.NumField(); i++ {
+	f := t.Field(i)
+	fmt.Println(f.Name, f.Type, f.Tag.Get("json"), v.Field(i).Interface())
+}
+
+// 修改值：必须传指针，再 Elem()
+pv := reflect.ValueOf(&u).Elem()
+pv.FieldByName("Name").SetString("Jerry")
+
+reflect.DeepEqual(a, b)         // 深度比较（测试里常用）
+```
+
+**例子：按标签收集非零字段**
+
+```go
+func nonZero(x any) []string {
+	v := reflect.ValueOf(x)
+	t := v.Type()
+	var out []string
+	for i := range t.NumField() {
+		if !v.Field(i).IsZero() {
+			out = append(out, t.Field(i).Tag.Get("json"))
+		}
+	}
+	return out
+}
+```
+
+**注意**
+
+- 反射代码慢、难读，而且把编译期错误变成了运行期 panic；能用接口或泛型解决的问题不要用反射。
+- 修改值要求它“可设置”（`CanSet()`）：必须通过指针拿到，并且字段是导出的。
+- 对未导出字段调用 `.Interface()` 会 panic。
+- `reflect.DeepEqual` 认为 nil 切片和空切片**不相等**。
+
+=== unsafe
+name: unsafe 与内存布局
+group: 标准库
+--- body
+`unsafe` 包绕过 Go 的类型安全：`unsafe.Sizeof` 查看类型占用的字节数，`unsafe.Pointer` 可以在任意指针类型间转换。日常主要用它**理解内存布局和对齐**。
+
+**写法**
+
+```go
+unsafe.Sizeof(x)         // 类型大小（不包括指向的数据）
+unsafe.Alignof(x)        // 对齐要求
+unsafe.Offsetof(s.f)     // 字段偏移
+
+unsafe.Sizeof("")        // 16：字符串头 = 指针 + 长度
+unsafe.Sizeof([]int{})   // 24：切片头 = 指针 + len + cap
+unsafe.Sizeof(struct{}{}) // 0
+```
+
+**例子：字段顺序影响结构体大小**
+
+```go
+type A struct {
+	a bool  // 1 字节 + 7 字节填充
+	b int64 // 8
+	c bool  // 1 字节 + 7 字节填充
+}
+type B struct {
+	b int64 // 8
+	a bool  // 1
+	c bool  // 1 + 6 字节填充
+}
+fmt.Println(unsafe.Sizeof(A{}), unsafe.Sizeof(B{})) // 24 16（64 位平台）
+```
+
+把大字段放前面、小字段放一起可以减少填充，大量对象时能明显省内存。
+
+**注意**
+
+- `unsafe.Pointer` 的转换必须遵守文档里列出的几种合法模式，否则 GC 可能出问题，而且代码不保证跨版本、跨平台可用。
+- 零拷贝的 `string` ↔ `[]byte` 转换（`unsafe.String` / `unsafe.Slice`）要保证之后不再修改字节，否则破坏了字符串不可变的假设。
+- 普通业务代码基本不需要 unsafe；`fieldalignment` 等 lint 工具可以自动提示字段排列问题。

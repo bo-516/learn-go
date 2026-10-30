@@ -1,0 +1,441 @@
+=== go-11
+--- deep
+**原理展开**
+
+方法调用 `v.M()` 其实是一个语法糖，编译器会根据接收者类型自动调整：
+
+- `M` 是指针接收者、`v` 是**可寻址**的值（变量、切片元素、结构体字段）→ 自动改写为 `(&v).M()`；
+- `M` 是值接收者、`v` 是指针 → 自动改写为 `(*v).M()`。
+
+但把值放进接口时，接口里保存的是一个**副本**，副本不可寻址，编译器没办法帮你取地址，所以“方法集”规则只在接口赋值时体现出来。同理，map 的元素、函数返回值都不可寻址，不能直接调用指针方法：`m["a"].Inc()` 编译失败。
+
+**代码示例**
+
+```go
+type Counter struct{ n int }
+
+func (c *Counter) Inc()      { c.n++ }
+func (c Counter) Value() int { return c.n }
+
+var c Counter
+c.Inc()                        // 可以：c 可寻址
+cs := []Counter{{}, {}}
+cs[0].Inc()                    // 可以：切片元素可寻址
+m := map[string]Counter{"a": {}}
+// m["a"].Inc()                // 编译错误：map 元素不可寻址
+// Counter{}.Inc()             // 编译错误：字面量不可寻址
+
+type Incer interface{ Inc() }
+var _ Incer = &c               // 可以
+// var _ Incer = c             // 编译错误：Counter does not implement Incer
+```
+
+**常见追问**
+
+- 值接收者的方法能被指针调用吗？→ 能，`*T` 的方法集包含 `T` 的所有方法。
+- 指针接收者能处理 nil 吗？→ 能，方法内部可以判断 `if c == nil`，这在链表、树的递归方法里很常见。
+- 小结构体用值接收者更快吗？→ 通常差别很小；为了一致性，有一个方法需要指针接收者时就全部用指针。
+
+**实战建议**
+
+- 默认用指针接收者；只有很小、不可变的值类型（如 `time.Time`、`Point`）才全部用值接收者。
+- 用 `var _ Interface = (*T)(nil)` 在编译期确认类型实现了接口。
+
+=== go-12
+--- deep
+**原理展开**
+
+Go 1.22 的变化由 go.mod 里的 `go` 指令控制：模块声明 `go 1.22` 及以上，编译器就为 `for` 语句里用 `:=` 声明的变量每次迭代创建一个新的变量（语义上），这样闭包、goroutine、`&v` 拿到的都是本轮迭代自己的变量。编译器会通过逃逸分析优化：变量没有被捕获时，不会真的每轮分配，没有额外开销。
+
+注意只影响**在 for 语句中声明**的变量；循环外声明、循环里赋值的变量仍然只有一份。
+
+**代码示例**
+
+```go
+// 1.22 之前的经典 bug：所有指针都指向同一个变量
+var ptrs []*int
+for _, v := range []int{1, 2, 3} {
+	ptrs = append(ptrs, &v)
+}
+for _, p := range ptrs {
+	fmt.Print(*p, " ") // 1.22 起：1 2 3；之前：3 3 3
+}
+
+// 1.22 之后仍然有问题的写法：变量在循环外声明
+var v int
+var fs []func()
+for _, v = range []int{1, 2, 3} {
+	fs = append(fs, func() { fmt.Print(v) })
+}
+for _, f := range fs {
+	f() // 333
+}
+```
+
+**常见追问**
+
+- 旧代码里的 `v := v` 现在还需要吗？→ go.mod 升级到 1.22 后不需要了，可以删掉，`go vet` 的 copyloopvar 分析器会提示。
+- 会不会改变已有代码的行为？→ 理论上会（依赖共享变量的代码），所以由 go.mod 的版本控制，只有升级版本时才生效。
+- 三段式 for 循环的变量呢？→ 同样每次迭代都是新变量，后置语句操作的是下一轮的副本。
+
+**实战建议**
+
+- 升级 go.mod 的 go 版本时跑一遍完整的测试，留意那些（极少数）依赖旧语义的代码。
+- 用 `go vet` 和 `-race` 检查 goroutine 捕获变量的代码。
+
+=== go-13
+--- deep
+**原理展开**
+
+map 需要对 key 做两件事：计算哈希值，以及判断两个 key 是否相等。可比较的类型都有编译器生成的相等函数和哈希函数。接口类型的 key 在运行时根据**动态类型**调用对应的哈希函数，如果动态类型不可哈希（slice、map、func），就会 panic `hash of unhashable type`。
+
+浮点数作为 key 有一个坑：`NaN != NaN`，所以 `m[math.NaN()] = 1` 每次都会插入一个新的条目，而且永远查不到。
+
+**代码示例**
+
+```go
+type Key struct {
+	Region string
+	ID     int64
+}
+m := map[Key]int{}
+m[Key{"cn", 1}]++          // 结构体做 key，自然支持多字段组合
+
+type Bad struct{ Tags []string }
+// _ = map[Bad]int{}       // 编译错误：invalid map key type Bad
+
+var a, b any = []int{1}, []int{1}
+// fmt.Println(a == b)     // 运行时 panic：comparing uncomparable type []int
+
+f := math.NaN()
+fm := map[float64]int{}
+fm[f], fm[f] = 1, 2
+fmt.Println(len(fm))       // 2
+```
+
+**常见追问**
+
+- 指针做 key 比较的是什么？→ 地址，不是指向的内容。
+- 怎么用切片的内容做 key？→ 转成字符串（`fmt.Sprint` 或者自己拼接）或者数组（长度固定时，Go 1.20 起切片可以直接转换为数组：`[3]int(s)`）。
+- 泛型里怎么约束“可以做 key”？→ `comparable` 约束。
+
+**实战建议**
+
+- 组合 key 用结构体，比字符串拼接（`region + ":" + id`）更安全，也不需要额外分配。
+- 测试里比较复杂结构用 `github.com/google/go-cmp` 的 `cmp.Diff`，失败时能直接看到差异。
+
+=== go-14
+--- deep
+**原理展开**
+
+所有大小为 0 的变量（`struct{}`、`[0]int`）在堆上分配时都返回同一个地址 `runtime.zerobase`，因为它们不需要任何存储空间。这也意味着两个不同的空结构体变量的地址可能相等也可能不等（规范没有保证），不要依赖它们的指针比较。
+
+“最后一个字段”的问题：如果 `struct{ a int64; z struct{} }` 不加填充，`&s.z` 就会指向结构体之后的地址，也就是下一个对象的内存，GC 会误以为下一个对象被引用。所以编译器会为末尾的零大小字段补一个字节（再按对齐补齐）。
+
+**代码示例**
+
+```go
+fmt.Println(unsafe.Sizeof(struct{}{}))                // 0
+fmt.Println(unsafe.Sizeof(struct{ a int64; z struct{} }{})) // 16，不是 8
+fmt.Println(unsafe.Sizeof(struct{ z struct{}; a int64 }{})) // 8
+
+// 集合
+seen := map[string]struct{}{}
+seen["a"] = struct{}{}
+
+// 只做信号的 channel
+done := make(chan struct{})
+go func() { defer close(done); work() }()
+<-done
+
+// 实现接口但没有状态
+type nopLogger struct{}
+func (nopLogger) Log(string) {}
+```
+
+**常见追问**
+
+- `map[string]bool` 和 `map[string]struct{}` 内存差多少？→ 每个元素省 1 字节（加上对齐可能更多），百万级 key 时有意义；更重要的是语义：struct{} 不会出现“值为 false”的歧义。
+- `chan struct{}` 和 `chan bool` 用来做信号有什么区别？→ struct{} 表达“只关心事件发生，不关心值”，不会被误用来传数据。
+- `[]struct{}` 有什么用？→ 很少用，可以用来表示“只关心个数”。
+
+**实战建议**
+
+- 把零大小字段放在结构体的开头，避免末尾填充。
+- 需要“不可比较”的结构体时，可以加一个 `_ [0]func()` 字段，它不占空间，但会让结构体不能用 `==` 比较，防止误用。
+
+=== go-15
+--- deep
+**原理展开**
+
+嵌入是编译器层面的语法糖：`s.Log()` 被改写成 `s.Logger.Log()`。方法提升遵循“**深度优先、最浅的胜出**”规则：外层的同名字段或方法会遮蔽内层的；同一深度有两个同名方法时，只要不调用就不报错，调用时报 `ambiguous selector`。
+
+接口的方法集计算时也会包含提升的方法：嵌入 `T` 时，外层类型的值获得 T 的值方法；嵌入 `*T` 时，获得 T 的全部方法。
+
+**代码示例**
+
+```go
+// 用嵌入实现“装饰器”：只增强一个方法
+type countingWriter struct {
+	io.Writer
+	n int64
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	w.n += int64(n)
+	return n, err
+}
+
+// 测试 mock：嵌入接口，只实现关心的方法
+type fakeStore struct {
+	Store // 未实现的方法被调用时会因为 nil 接口而 panic，正好暴露问题
+	users map[int]string
+}
+
+func (f *fakeStore) GetUser(id int) (string, error) { return f.users[id], nil }
+```
+
+**常见追问**
+
+- 嵌入的类型能访问外层类型吗？→ 不能，内层方法的接收者只是内层对象本身，没有“父类调用子类”的多态。需要回调时要显式传入接口。
+- 嵌入指针和嵌入值有什么区别？→ 嵌入 `*T` 时外层零值里的指针是 nil，调用提升的方法会 panic，需要初始化；好处是多个外层对象可以共享同一个内层对象。
+- 嵌入会影响 JSON 编码吗？→ 会，嵌入结构体的导出字段会被“展开”到外层的 JSON 对象里。
+
+**实战建议**
+
+- 优先使用具名字段（`log Logger`），只有确实希望外层“就是”内层的扩展时才嵌入。
+- 嵌入第三方类型会把它的所有导出方法变成你的公开 API，升级依赖时可能意外地暴露新方法。
+
+=== go-16
+--- deep
+**原理展开**
+
+`errors.Is` 和 `errors.As` 的工作方式是**遍历错误树**：先检查当前错误，然后调用 `Unwrap() error`（单链）或 `Unwrap() []error`（Go 1.20 的多错误，深度优先遍历）继续往下找。每一层还可以自定义判断：实现了 `Is(target error) bool` 方法的错误可以声明自己“等同于”某个目标，`As(target any) bool` 同理。
+
+`fmt.Errorf` 遇到 `%w` 时返回一个实现了 `Unwrap` 的 `*fmt.wrapError`；多个 `%w` 时返回实现了 `Unwrap() []error` 的 `*fmt.wrapErrors`。
+
+**代码示例**
+
+```go
+var ErrNotFound = errors.New("not found")
+
+// 自定义 Is：所有 404 的 HTTPError 都“等同于” ErrNotFound
+type HTTPError struct{ Code int }
+
+func (e *HTTPError) Error() string        { return fmt.Sprintf("http %d", e.Code) }
+func (e *HTTPError) Is(target error) bool { return target == ErrNotFound && e.Code == 404 }
+
+err := fmt.Errorf("load profile: %w", &HTTPError{Code: 404})
+fmt.Println(errors.Is(err, ErrNotFound)) // true
+
+var he *HTTPError
+if errors.As(err, &he) {
+	fmt.Println(he.Code) // 404
+}
+
+// 多个错误
+err = errors.Join(io.ErrUnexpectedEOF, context.Canceled)
+fmt.Println(errors.Is(err, context.Canceled)) // true
+```
+
+**常见追问**
+
+- 什么时候用 `%w`、什么时候用 `%v`？→ 希望调用方能判断底层错误时用 `%w`；底层错误是实现细节、不想让调用方依赖时用 `%v`（例如不想暴露你使用的是哪个数据库驱动）。
+- 哨兵错误和自定义错误类型怎么选？→ 只需要判断“是不是这种错误”用哨兵；需要携带额外信息（字段、错误码）用类型。
+- 错误应该包含堆栈吗？→ 标准库不带堆栈；需要时在边界处记录日志并带上堆栈，或者使用第三方库。
+
+**实战建议**
+
+- 错误信息逐层添加上下文，最终形成 `handler: load profile 3: query user: connection refused` 这样一眼就能定位的链。
+- 在服务边界（HTTP handler、RPC 方法）统一把内部错误映射成对外的错误码，并记录一次完整的日志。
+
+=== go-17
+--- deep
+**原理展开**
+
+包级变量的初始化顺序由编译器分析**依赖关系**决定：它会不断找出“没有依赖未初始化变量”的、声明位置最靠前的变量来初始化。依赖关系是通过分析初始化表达式里引用的变量和函数（包括函数体内引用的包级变量）得到的。存在循环依赖会编译报错 `initialization cycle`。
+
+同一个包里多个文件：`go` 命令按文件名排序后传给编译器，变量和 init 都按这个顺序。不同包之间按导入关系深度优先，每个包只初始化一次，`main` 包最后。整个初始化过程在单个 goroutine 中执行，init 里启动的 goroutine 会和后续的初始化并发运行。
+
+**代码示例**
+
+```go
+// 注册模式：数据库驱动、图片解码器、pprof 都用这种方式
+package mysql
+
+func init() {
+	sql.Register("mysql", &MySQLDriver{})
+}
+
+// 使用方只需要导入，不直接使用包里的任何名字
+import _ "github.com/go-sql-driver/mysql"
+
+// 更好的替代：显式初始化，错误可以返回
+func main() {
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatal(err)
+	}
+	db, err := sql.Open("mysql", cfg.DSN)
+	// ...
+}
+```
+
+**常见追问**
+
+- init 可以被手动调用吗？→ 不能，`init` 不能被引用。
+- 测试的时候 init 会执行吗？→ 会，测试二进制同样会初始化所有导入的包，所以 init 里连数据库会让单元测试也去连数据库。
+- 包级变量的初始化表达式能调用函数吗？→ 可以，比如 `var re = regexp.MustCompile(...)`，这是很常见的写法。
+
+**实战建议**
+
+- init 只做“不会失败、不依赖外部环境”的事：注册、计算查找表。
+- 想知道初始化花了多少时间：`GODEBUG=inittrace=1` 会打印每个包初始化的耗时和分配。
+
+=== go-18
+--- deep
+**原理展开**
+
+`itab` 的生成：把具体类型赋给接口时，运行时需要一个 (接口类型, 动态类型) 对应的 itab。编译期能确定的情况下编译器直接生成静态的 itab；运行时的类型断言到接口（`x.(io.Reader)`）则需要查一个全局哈希表缓存，第一次查找时会计算方法匹配并缓存。
+
+**装箱**：接口的 data 字段是一个指针。把一个非指针类型的值放进接口，需要一块内存来存放这个值：
+
+- 值不逃逸时可以放在栈上；
+- 0～255 的小整数、单字节的字符串、零值等有静态数据可以复用，不分配；
+- 其他情况需要堆分配。
+
+**代码示例**
+
+```go
+func BenchmarkBox(b *testing.B) {
+	var sink any
+	for i := 0; i < b.N; i++ {
+		sink = i + 1000 // 每次都要在堆上分配一个 int
+	}
+	_ = sink
+}
+
+// 动态派发 vs 静态调用
+type Shape interface{ Area() float64 }
+type Rect struct{ W, H float64 }
+
+func (r Rect) Area() float64 { return r.W * r.H }
+
+func totalIface(ss []Shape) (t float64) { // 每次间接调用，不能内联
+	for _, s := range ss {
+		t += s.Area()
+	}
+	return
+}
+
+func totalRect(rs []Rect) (t float64) { // 可以内联
+	for _, r := range rs {
+		t += r.Area()
+	}
+	return
+}
+```
+
+**常见追问**
+
+- 类型 switch 的开销呢？→ 编译器会生成按类型哈希的比较，case 多时也很快。
+- PGO（按 profile 优化）对接口调用有什么帮助？→ Go 1.21 起，PGO 可以对热点的接口调用做“去虚拟化”：如果 profile 显示某个调用点几乎总是同一个具体类型，编译器会生成“先判断类型、直接调用”的快速路径。
+- 为什么 `fmt.Println(x)` 会让 x 逃逸？→ 参数是 `...any`，需要装箱，而且 fmt 内部可能保存引用。
+
+**实战建议**
+
+- 热点路径上避免 `any`：用泛型或具体类型；日志库用强类型的字段（`slog.Int("n", n)`）而不是 `...any`。
+- 用 `go build -gcflags=-m` 查看哪些值逃逸了。
+
+=== go-19
+--- deep
+**原理展开**
+
+Go 泛型的实现是“**GC Shape Stenciling + 字典**”：
+
+- 编译器按类型参数的 **GC 形状**（底层类型的大小、对齐和指针布局）生成代码。`int` 和 `int64` 形状不同，各自一份；所有指针类型形状相同，共享一份；
+- 共享代码的不同实例通过一个隐藏的**字典**参数获得具体的类型信息（用于类型断言、调用方法、分配内存等）。
+
+这是在“完全单态化”（C++ 模板，代码膨胀、编译慢）和“完全装箱”（Java 擦除，运行时开销）之间的折中。代价是：类型参数是指针或接口时，方法调用需要通过字典间接进行，可能比直接用接口还慢一点。
+
+**代码示例**
+
+```go
+// 适合泛型：容器和算法
+func Map[T, U any](s []T, f func(T) U) []U {
+	out := make([]U, len(s))
+	for i, v := range s {
+		out[i] = f(v)
+	}
+	return out
+}
+
+type Cache[K comparable, V any] struct {
+	mu sync.Mutex
+	m  map[K]V
+}
+
+// 适合接口：不同的行为
+type Notifier interface{ Notify(ctx context.Context, msg string) error }
+type EmailNotifier struct{ /* ... */ }
+type SMSNotifier struct{ /* ... */ }
+```
+
+**常见追问**
+
+- 方法可以有类型参数吗？→ 不可以，只能使用类型上声明的类型参数，所以写不出 `s.Map[U](f)`。
+- 可以对类型参数做类型断言吗？→ 不能直接 `v.(int)`，要先转成 any：`any(v).(int)`。
+- 泛型函数可以作为值传递吗？→ 必须先实例化（显式或通过上下文推导）：`f := Map[int, string]`。
+
+**实战建议**
+
+- 标准库已经覆盖了大部分常用场景：`slices`、`maps`、`cmp`、`sync.OnceValue`、`atomic.Pointer[T]`，优先使用。
+- 先写具体类型的版本，等到真的出现第二、第三个重复的实现时，再提取成泛型。
+
+=== go-20
+--- deep
+**原理展开**
+
+**Swiss Table 的查找过程**（Go 1.24+）：
+
+1. 计算 key 的 64 位哈希，高 57 位（H1）决定从哪个 group 开始探测，低 7 位（H2）作为指纹；
+2. 每个 group 有 8 个槽位和 8 字节的控制字，每个字节存一个槽位的状态（空、已删除）或者 H2 指纹；
+3. 用 SIMD 或者位运算技巧一次性比较 8 个控制字节，找出 H2 匹配的槽位，再逐个比较 key；
+4. 没找到并且这个 group 里有空槽，说明 key 不存在；否则按二次探测去下一个 group。
+
+大 map 被拆成多个最多 1024 个槽位的子表，由一个“目录”按哈希的高位索引，扩容时只把一个子表翻倍或者分裂，避免一次性搬迁整个 map 带来的延迟尖刺。
+
+**代码示例**
+
+```go
+// 删除元素不会释放 map 的内存：大 map 清空后要重建
+m := make(map[int][128]byte)
+for i := 0; i < 1_000_000; i++ {
+	m[i] = [128]byte{}
+}
+for k := range m {
+	delete(m, k)
+}
+runtime.GC()
+// 此时 m 仍然占着几百 MB 的桶内存
+m = make(map[int][128]byte) // 让旧 map 被回收
+
+// 预分配：已知大小时避免多次扩容
+idx := make(map[string]int, len(users))
+for i, u := range users {
+	idx[u.Name] = i
+}
+```
+
+**常见追问**
+
+- 为什么 value 很大时建议存指针？→ map 的桶里直接存放 key 和 value，value 很大（超过 128 字节）时运行时会改为存指针；自己存指针可以减少扩容时的复制量，但会增加 GC 扫描的负担，需要权衡。
+- `clear(m)` 和重新 make 有什么区别？→ `clear` 删除所有元素但保留已分配的内存，适合马上要重新填充的场景。
+- map 的 key 是怎么哈希的？→ 运行时为每种 key 类型选择哈希函数，支持 AES 指令的 CPU 上使用基于 AES 的快速哈希，并且每个 map 有随机种子，防止哈希碰撞攻击。
+
+**实战建议**
+
+- 已知元素数量时用 `make(map[K]V, n)` 预分配。
+- 长期存在、元素数量波动很大的 map（比如连接表）定期重建，避免内存只增不减。
+- 不要依赖 map 的内部实现细节（遍历顺序、迭代中插入的可见性），它在不同版本中会变化。

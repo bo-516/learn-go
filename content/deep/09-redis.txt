@@ -1,0 +1,449 @@
+=== db-22
+--- deep
+**原理展开**
+
+**SDS**（简单动态字符串）：Redis 的字符串不是 C 字符串，而是带长度和剩余容量的结构，获取长度 O(1)、二进制安全（可以包含 `\0`）、追加时预分配空间减少重新分配。小于 44 字节的字符串用 **embstr** 编码，和对象头分配在一块连续内存里；整数直接用 **int** 编码。
+
+**listpack**：一块连续的内存，元素依次排列，每个元素记录自己的长度。元素少时，遍历一块连续内存比哈希表、跳表更快、更省内存。它替代了 ziplist，解决了 ziplist 的“连锁更新”问题（ziplist 的每个元素记录前一个元素的长度，修改一个元素可能导致后面所有元素都要重新编码）。
+
+**跳表**：多层的有序链表，每个节点随机地出现在若干层（Redis 中每升一层的概率是 1/4，最多 32 层），查找从最高层开始，平均 O(log n)。ZSet 同时有一个哈希表（成员 → 分数），按成员查分数 O(1)。
+
+**代码示例**
+
+```go
+// go-redis：用合适的数据结构
+rdb.HSet(ctx, "user:42", "name", "tom", "age", 18)        // 对象字段
+rdb.HIncrBy(ctx, "user:42", "visits", 1)                  // 单独修改一个字段
+
+rdb.ZAdd(ctx, "rank:2026-10", redis.Z{Score: 980, Member: "tom"})
+top, _ := rdb.ZRevRangeWithScores(ctx, "rank:2026-10", 0, 9).Result()
+
+rdb.SetBit(ctx, "sign:42:202610", 27, 1)                  // 10 月 28 日签到（第 27 位）
+days, _ := rdb.BitCount(ctx, "sign:42:202610", nil).Result()
+
+rdb.PFAdd(ctx, "uv:2026-10-28", "u1", "u2", "u1")
+uv, _ := rdb.PFCount(ctx, "uv:2026-10-28").Result()       // ≈ 2
+```
+
+**常见追问**
+
+- 怎么查看一个 key 的编码？→ `OBJECT ENCODING key`。
+- 编码转换的阈值是多少？→ 如 `hash-max-listpack-entries 128`、`hash-max-listpack-value 64`，超过任一个就转为哈希表，且不会转回来。
+- 为什么 HyperLogLog 只需要 12KB？→ 它不存储元素，只用 16384 个 6 位的寄存器记录哈希值的统计特征，以约 0.81% 的误差换取固定的内存。
+
+**实战建议**
+
+- 选择数据结构时同时考虑访问模式和内存：对象用 Hash 而不是多个 String 可以节省大量 key 的元数据开销。
+- 避免单个集合无限增长（时间线、消息列表要定期截断，如 `LTRIM`）。
+
+=== db-23
+--- deep
+**原理展开**
+
+三个问题的本质不同：
+
+- **穿透**：请求的数据在数据源中**不存在**，缓存永远不会命中——解决方向是“让不存在的结果也能被缓存或被拦截”；
+- **击穿**：单个热点 key 失效的**瞬间**并发回源——解决方向是“同一时刻只让一个请求回源”；
+- **雪崩**：大量 key **同时**失效或缓存整体不可用——解决方向是“错开失效时间 + 缓存高可用 + 保护数据库”。
+
+**逻辑过期**的思路：缓存的 value 里带上“逻辑过期时间”，Redis 的 key 本身不过期。读到已经逻辑过期的数据时，先返回旧数据，同时（加锁保证只有一个）异步回源刷新。用户永远不会因为缓存过期而等待数据库，代价是短时间内可能读到旧数据。
+
+**代码示例**
+
+```go
+type cached[T any] struct {
+	Value    T         `json:"v"`
+	ExpireAt time.Time `json:"e"`
+}
+
+func getWithLogicalExpire[T any](ctx context.Context, key string, load func(context.Context) (T, error)) (T, error) {
+	var c cached[T]
+	if raw, err := rdb.Get(ctx, key).Bytes(); err == nil && json.Unmarshal(raw, &c) == nil {
+		if time.Now().After(c.ExpireAt) {
+			// 已逻辑过期：后台刷新（singleflight 保证只有一个刷新任务），先返回旧值
+			go sf.Do(key, func() (any, error) {
+				return nil, refresh(context.WithoutCancel(ctx), key, load)
+			})
+		}
+		return c.Value, nil
+	}
+	v, err, _ := sf.Do(key, func() (any, error) { // 缓存没有：同步加载
+		return nil, refresh(ctx, key, load)
+	})
+	_ = v
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	return getWithLogicalExpire(ctx, key, load)
+}
+```
+
+（`refresh` 负责加载数据并写入带逻辑过期时间的缓存。）
+
+**常见追问**
+
+- 布隆过滤器怎么处理数据的新增？→ 新增数据时同时加入过滤器；删除数据无法从标准布隆过滤器中移除，需要定期重建。
+- 空值缓存会不会被大量随机 key 撑爆？→ 会，所以要设置较短的过期时间，并配合参数校验和限流。
+- 缓存预热怎么做？→ 服务启动或发布前，根据访问日志或业务规则，提前把热点数据加载到缓存。
+
+**实战建议**
+
+- 把“读缓存 → singleflight 回源 → 写缓存（带随机过期时间）→ 空值缓存”封装成统一的组件，业务代码不要各自实现。
+- 监控缓存命中率和数据库 QPS，命中率突降是这三类问题的早期信号。
+
+=== db-24
+--- deep
+**原理展开**
+
+Redis 的事件循环（ae）：用 epoll 等待所有连接的可读、可写事件；有事件时依次处理：读取请求 → 解析协议 → 执行命令 → 把回复写进输出缓冲区；同时处理时间事件（定期任务 serverCron：过期删除、统计、rehash 等）。所有命令在这一个线程里顺序执行，所以每条命令天然是原子的。
+
+单线程的瓶颈通常不在 CPU 计算，而在**网络 IO**（读写 socket、协议解析）。Redis 6.0 的 IO 多线程把“读请求、解析”和“写回复”分给多个线程并行处理，主线程只负责执行命令，在高并发小请求的场景下吞吐量可以提升一倍左右。
+
+**代码示例**
+
+```bash
+# 找出慢命令
+redis-cli SLOWLOG GET 10
+redis-cli CONFIG SET slowlog-log-slower-than 10000   # 10ms
+
+# 延迟监控
+redis-cli --latency -h host
+redis-cli LATENCY DOCTOR
+```
+
+```go
+// 用 SCAN 代替 KEYS 遍历
+var cursor uint64
+for {
+	keys, next, err := rdb.Scan(ctx, cursor, "session:*", 1000).Result()
+	if err != nil {
+		return err
+	}
+	for _, k := range keys {
+		_ = k // 处理
+	}
+	if next == 0 {
+		break
+	}
+	cursor = next
+}
+```
+
+**常见追问**
+
+- 单线程怎么利用多核？→ 一台机器部署多个 Redis 实例，或者使用 Cluster 分片。
+- `DEL` 一个大 key 为什么会卡？→ 释放大量内存需要时间；Redis 4.0 起可以用 `UNLINK` 在后台线程中释放。
+- Redis 的性能上限大约是多少？→ 单实例简单命令约 10 万级 QPS，使用 pipeline 可以更高；实际受网络和命令复杂度影响很大。
+
+**实战建议**
+
+- 生产环境禁用或重命名 `KEYS`、`FLUSHALL`、`FLUSHDB`、`CONFIG` 等危险命令。
+- 时间复杂度为 O(N) 的命令（`HGETALL`、`SMEMBERS`、`LRANGE 0 -1`）在大集合上要改成分批的 SCAN 系列。
+
+=== db-25
+--- deep
+**原理展开**
+
+为什么缓存和数据库很难强一致：它们是两个独立的系统，没有共同的事务；网络调用可能失败、超时、乱序；并发的读写请求之间存在各种交错。所以讨论一致性时要先明确目标：**多久之内一致**（最终一致的时间窗口）、**不一致的后果是什么**。
+
+**订阅 binlog 删除缓存**的优势：
+
+1. 只要数据库提交成功，binlog 里就一定有这条变更，不会因为应用在“更新数据库”和“删除缓存”之间崩溃而遗漏；
+2. 删除操作可以通过消息队列重试，直到成功；
+3. 业务代码只需要写数据库，缓存的维护集中在一个组件里。
+
+**代码示例**
+
+```go
+// 订阅 binlog（通过 Canal / Debezium 转发到 Kafka）后删除缓存
+func consumeChanges(ctx context.Context, r *kafka.Reader) error {
+	for {
+		m, err := r.FetchMessage(ctx)
+		if err != nil {
+			return err
+		}
+		var ev struct {
+			Table string `json:"table"`
+			ID    int64  `json:"id"`
+		}
+		if err := json.Unmarshal(m.Value, &ev); err == nil && ev.Table == "products" {
+			if err := rdb.Del(ctx, fmt.Sprintf("product:%d", ev.ID)).Err(); err != nil {
+				continue // 不提交位点，稍后重试
+			}
+		}
+		_ = r.CommitMessages(ctx, m)
+	}
+}
+```
+
+**常见追问**
+
+- 为什么不用“先删缓存，再更新数据库，再删一次缓存”？→ 也是一种方案（延迟双删的变体），但第一次删除意义不大，关键是更新数据库之后的删除。
+- 缓存更新失败怎么办？→ 重试；兜底是过期时间，最坏情况下在过期后恢复一致。
+- 读多写多的数据适合缓存吗？→ 不太适合，频繁失效会让命中率很低，还增加了一致性问题。
+
+**实战建议**
+
+- 每个缓存都写清楚“允许不一致的最长时间”，据此设置过期时间。
+- 关键数据（余额、库存的最终扣减）不读缓存。
+
+=== db-26
+--- deep
+**原理展开**
+
+**fork 和写时复制**：`bgsave` 调用 fork 创建子进程，子进程和父进程共享同一份物理内存页，子进程把内存数据写到 RDB 文件。父进程继续处理写请求，被修改的页会被复制一份（写时复制）。两个问题：
+
+1. fork 本身要复制父进程的**页表**，内存 20GB 的实例页表约 40MB，复制可能要几百毫秒，期间主线程被阻塞；
+2. 写入频繁时，大量的页被复制，最坏情况下内存使用接近翻倍。开启透明大页（THP）会让问题更严重（每次复制 2MB 的页），所以 Redis 建议关闭 THP。
+
+**AOF 重写**同样通过 fork 进行：子进程根据当前的内存数据生成新的 AOF 文件，重写期间的新命令同时写入旧 AOF 和重写缓冲区，最后追加到新文件。Redis 7.0 起改为 Multi-Part AOF（基础文件 + 增量文件 + 清单文件），不再需要重写缓冲区。
+
+**代码示例**
+
+```bash
+redis-cli INFO persistence
+# rdb_last_bgsave_status:ok
+# aof_enabled:1
+# latest_fork_usec:4321          ← 最近一次 fork 的耗时（微秒）
+
+redis-cli CONFIG GET appendfsync      # everysec
+redis-cli CONFIG GET aof-use-rdb-preamble   # yes，混合持久化
+```
+
+**常见追问**
+
+- 数据恢复时 RDB 和 AOF 优先用哪个？→ 开启了 AOF 时优先加载 AOF（数据更完整）。
+- `appendfsync everysec` 真的最多丢 1 秒吗？→ 通常是；但如果磁盘很慢，fsync 跟不上，后台刷盘阻塞超过 2 秒时主线程会等待，此时可能丢失更多或者出现延迟。
+- 主从复制和持久化有什么关系？→ 全量同步时主节点会生成一次 RDB 发给从节点，所以即使关闭了持久化，复制时也会 fork。
+
+**实战建议**
+
+- 给 Redis 预留内存余量（不超过物理内存的 60%～70%），关闭透明大页。
+- 大内存实例的持久化放在从节点上执行，主节点只负责服务。
+
+=== db-27
+--- deep
+**原理展开**
+
+一个“正确的”分布式锁需要满足：**互斥**（同一时刻只有一个持有者）、**不死锁**（持有者崩溃后锁能被释放）、**只能被持有者释放**。Redis 单实例的 `SET NX PX` + Lua 释放满足这三点，但有一个根本问题：锁的过期是基于时间的，而持有者**无法确定自己是否仍然持有锁**——GC 停顿、网络延迟、时钟漂移都可能让它在锁已经过期后继续执行临界区。
+
+**fencing token** 从存储层面解决这个问题：每次获取锁时得到一个单调递增的令牌号，写入存储时带上令牌号，存储拒绝比已见过的最大令牌更小的写入。这样即使两个客户端都以为自己持有锁，旧的那个的写入也会被拒绝。etcd 的 revision、ZooKeeper 的 zxid 都可以用作 fencing token。
+
+**代码示例**
+
+```go
+// redsync：带自动续期的分布式锁
+pool := goredis.NewPool(rdb)
+rs := redsync.New(pool)
+mutex := rs.NewMutex("lock:order:123", redsync.WithExpiry(10*time.Second))
+if err := mutex.LockContext(ctx); err != nil {
+	return err
+}
+defer mutex.UnlockContext(ctx)
+
+// 看门狗：业务执行期间定期续期
+stop := make(chan struct{})
+go func() {
+	t := time.NewTicker(3 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			if ok, err := mutex.ExtendContext(ctx); !ok || err != nil {
+				return // 续期失败，锁可能已经丢失
+			}
+		case <-stop:
+			return
+		}
+	}
+}()
+defer close(stop)
+```
+
+**常见追问**
+
+- Redlock 的争议是什么？→ Martin Kleppmann 指出它依赖“各节点时钟大致同步、进程暂停时间有界”等假设，无法提供正确性保证；antirez 认为在实际系统中这些假设是合理的。结论是：需要正确性时使用基于共识的系统 + fencing。
+- 锁的过期时间设多长？→ 大于临界区的正常执行时间（例如 P99 的数倍），配合续期机制。
+- 可重入锁怎么实现？→ 用 Hash 存“持有者 → 重入次数”，用 Lua 脚本保证原子性（Redisson 的做法）。
+
+**实战建议**
+
+- 先问自己是否真的需要分布式锁：很多场景用数据库的唯一约束、乐观锁、条件更新就能解决，而且更可靠。
+- 锁失效的后果严重时，在存储层加 fencing token 或版本号校验。
+
+=== db-28
+--- deep
+**原理展开**
+
+大 key 和热 key 的危害都源于 Redis 的单线程模型和分片模型：
+
+- 大 key：一次操作需要处理大量数据，**占用主线程的时间长**，期间所有其他请求都在等待；在集群中，一个大 key 只能在一个分片上，造成内存和流量的倾斜；
+- 热 key：请求集中在一个 key 上，也就集中在**一个分片的一个线程上**，即使集群有 100 个分片，这个 key 的吞吐上限也只是单个实例的能力。
+
+`--hotkeys` 依赖 LFU 淘汰策略记录的访问频率（每个 key 有一个对数计数器），所以只有在 `maxmemory-policy` 是 LFU 类时才能使用。
+
+**代码示例**
+
+```go
+// 热 key 的本地缓存：短过期 + 只缓存已识别的热点
+var hot = expirable.NewLRU[string, []byte](1000, nil, 2*time.Second)
+
+func get(ctx context.Context, key string) ([]byte, error) {
+	if v, ok := hot.Get(key); ok {
+		return v, nil
+	}
+	v, err := rdb.Get(ctx, key).Bytes()
+	if err == nil && isHot(key) { // isHot：由客户端统计或配置中心下发
+		hot.Add(key, v)
+	}
+	return v, err
+}
+
+// 大 Hash 分批删除
+func deleteBigHash(ctx context.Context, key string) error {
+	var cursor uint64
+	for {
+		fields, next, err := rdb.HScan(ctx, key, cursor, "", 500).Result()
+		if err != nil {
+			return err
+		}
+		for i := 0; i < len(fields); i += 2 { // 结果是 field、value 交替出现
+			rdb.HDel(ctx, key, fields[i])
+		}
+		if next == 0 {
+			return rdb.Unlink(ctx, key).Err()
+		}
+		cursor = next
+	}
+}
+```
+
+**常见追问**
+
+- `--bigkeys` 会影响线上吗？→ 它用 SCAN 遍历，对性能影响小，但仍建议在从节点或低峰期执行。
+- 热 key 复制多份后怎么更新？→ 写入时更新所有副本（或者删除所有副本），副本数不宜过多。
+- 怎么预防大 key？→ 设计时控制集合的大小（按时间或者 ID 分桶），代码评审时检查无限增长的集合。
+
+**实战建议**
+
+- 定期扫描大 key，纳入巡检报告。
+- 大促前根据业务预判热点（爆款商品、热门活动），提前做本地缓存和多副本。
+
+=== db-29
+--- deep
+**原理展开**
+
+**定期删除**的具体做法（`activeExpireCycle`）：每次随机抽取 20 个带过期时间的 key，删除其中已过期的；如果过期的比例超过 25%，就继续抽样，直到比例降下来或者达到时间上限（默认不超过 CPU 时间的 25%）。所以大量 key 同时过期时，这个循环会占用更多时间，可能造成延迟抖动。
+
+**近似 LRU**：每个对象有 24 位的 `lru` 字段记录最后访问时间（分钟级精度）。淘汰时随机采样 `maxmemory-samples` 个 key，放进一个大小为 16 的“淘汰池”中，淘汰池按空闲时间排序，每次淘汰其中最久未访问的。采样数越大越接近真正的 LRU，CPU 开销也越大。
+
+**LFU**：同样的 24 位字段，高 16 位记录最后衰减时间，低 8 位是一个对数计数器（访问越多，计数增加的概率越低），并且会随时间衰减，所以能反映“最近的访问频率”。
+
+**代码示例**
+
+```bash
+redis-cli INFO stats | grep -E 'expired_keys|evicted_keys'
+# expired_keys: 过期删除的数量
+# evicted_keys: 被淘汰的数量（持续增长说明内存不够）
+
+redis-cli INFO memory | grep -E 'used_memory_human|maxmemory_human|maxmemory_policy'
+redis-cli OBJECT FREQ some:key   # LFU 策略下查看访问频率
+```
+
+**常见追问**
+
+- 从节点上的过期 key 怎么处理？→ 从节点不主动删除过期 key，等主节点删除后同步 DEL 命令；但从节点读取时会判断是否过期，过期则返回不存在（3.2 起）。
+- `noeviction` 适合什么场景？→ Redis 作为存储（而不是缓存）时，宁可写入失败也不能丢数据。
+- LRU 和 LFU 怎么选？→ 访问模式相对稳定、有明显热点的用 LFU；偶发的批量扫描会污染 LRU（大量只访问一次的 key 挤掉热点数据），LFU 对此更稳健。
+
+**实战建议**
+
+- 缓存场景一定要设置 `maxmemory` 和淘汰策略，监控 `evicted_keys`。
+- 过期时间加随机值，避免大量 key 在同一时刻过期造成删除尖峰。
+
+=== db-30
+--- deep
+**原理展开**
+
+**Cluster 的故障转移**：每个节点定期向其他节点发送 PING，超时未收到回复就标记为“疑似下线”（PFAIL）；通过 gossip 传播，超过半数的主节点认为它疑似下线时，标记为“已下线”（FAIL）。该主节点的从节点发起选举，获得多数主节点投票的从节点升为新的主节点，接管原来的槽。
+
+**槽迁移**：把槽从节点 A 迁移到 B 时，A 上该槽标记为 MIGRATING、B 上标记为 IMPORTING，逐个迁移 key。迁移期间客户端访问 A 时，key 已经迁走的会收到 `ASK` 重定向（一次性的，不更新客户端的槽映射）；迁移完成后访问 A 会收到 `MOVED`（永久的，客户端更新映射）。
+
+**代码示例**
+
+```go
+// go-redis 的集群客户端会自动处理 MOVED / ASK 重定向
+rdb := redis.NewClusterClient(&redis.ClusterOptions{
+	Addrs:          []string{"10.0.0.1:7000", "10.0.0.2:7000", "10.0.0.3:7000"},
+	ReadOnly:       true,  // 允许读从节点
+	RouteByLatency: true,  // 读请求路由到延迟最低的节点
+})
+
+// 多 key 操作：用哈希标签保证在同一个槽
+uid := 1001
+pipe := rdb.TxPipeline()
+pipe.HSet(ctx, fmt.Sprintf("{user:%d}:profile", uid), "name", "tom")
+pipe.SAdd(ctx, fmt.Sprintf("{user:%d}:tags", uid), "vip")
+_, err := pipe.Exec(ctx)
+```
+
+**常见追问**
+
+- 为什么是 16384 个槽？→ 节点间的心跳消息里要携带槽的位图，16384 位 = 2KB，在大小和粒度之间平衡；集群规模通常不会超过 1000 个主节点。
+- 哨兵本身怎么高可用？→ 部署至少 3 个哨兵，故障判断和选举需要多数哨兵同意。
+- 集群中能用 `SELECT` 切换数据库吗？→ 不能，Cluster 只支持 0 号库。
+
+**实战建议**
+
+- 数据量和写入量单机能扛住时用主从 + 哨兵，运维更简单；需要水平扩展时用 Cluster。
+- 哈希标签不要滥用，否则数据集中在少数槽上，失去分片的意义。
+
+=== db-31
+--- deep
+**原理展开**
+
+三者的定位不同：
+
+- **Pipeline** 是**客户端**的优化：把 N 条命令合并成一次网络往返，服务端仍然逐条执行，中间可能穿插其他客户端的命令；
+- **MULTI/EXEC** 保证**隔离**（执行期间不插入其他命令），但不保证原子性中的“全部成功或全部失败”：语法错误会导致整个事务不执行，运行时错误（比如对字符串执行 INCR）只影响那一条命令；
+- **WATCH** 提供乐观锁：EXEC 时如果被监视的 key 被修改过，整个事务不执行，客户端需要重试；
+- **Lua 脚本**在服务端原子执行，并且可以读取中间结果、做条件判断，是三者中最灵活的。Redis 7.0 新增的 **Function** 可以把脚本作为库持久化地加载到服务端。
+
+**代码示例**
+
+```go
+// Pipeline：批量写入，减少往返
+pipe := rdb.Pipeline()
+for _, u := range users {
+	pipe.Set(ctx, "user:"+u.ID, u.JSON, time.Hour)
+}
+_, err := pipe.Exec(ctx)
+
+// WATCH 乐观锁：余额足够才扣减（也可以用 Lua 实现）
+err = rdb.Watch(ctx, func(tx *redis.Tx) error {
+	bal, err := tx.Get(ctx, "balance:42").Int64()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return err
+	}
+	if bal < 100 {
+		return errors.New("insufficient")
+	}
+	_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		p.DecrBy(ctx, "balance:42", 100)
+		return nil
+	})
+	return err // 被修改过时返回 redis.TxFailedErr，调用方重试
+}, "balance:42")
+```
+
+**常见追问**
+
+- Lua 脚本里可以访问其他 key 吗？→ 应该只访问通过 KEYS 传入的 key，否则在 Cluster 中无法正确路由。
+- 脚本执行太久会怎样？→ 超过 `busy-reply-threshold`（默认 5 秒）后，其他命令会收到 BUSY 错误，只能用 `SCRIPT KILL`（脚本没有写操作时）或者 `SHUTDOWN NOSAVE` 终止。
+- Pipeline 一次放多少条命令合适？→ 几百到几千条，太多会占用大量的客户端和服务端内存（回复要全部缓存）。
+
+**实战建议**
+
+- 需要原子性的“读-判断-写”逻辑一律用 Lua 脚本；只是批量操作用 Pipeline。
+- 脚本保持简短，避免在脚本中遍历大集合。

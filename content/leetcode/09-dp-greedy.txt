@@ -1,0 +1,1060 @@
+=== lc-53
+no: 53
+title: 最大子数组和
+slug: maximum-subarray
+difficulty: 中等
+category: 动态规划
+topics: 数组, 动态规划, 分治
+go: 内置 min/max, 多重赋值
+--- desc
+给定整数数组 `nums`，找出和最大的**连续**子数组（至少包含一个元素），返回其最大和。
+
+**示例**：`[-2,1,-3,4,-1,2,1,-5,4]` → `6`（`[4,-1,2,1]`）；`[5,4,-1,7,8]` → `23`；`[-3,-1,-2]` → `-1`。
+--- solution
+package main
+
+func maxSubArray(nums []int) int {
+	// @solution
+	best, cur := nums[0], 0 // cur：以当前元素结尾的最大子数组和
+	for _, v := range nums {
+		cur = max(cur+v, v) // 接在前面的子数组后面，或者从自己重新开始
+		best = max(best, cur)
+	}
+	return best
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestMaxSubArray(t *testing.T) {
+	cases := []struct {
+		nums []int
+		want int
+	}{
+		{[]int{-2, 1, -3, 4, -1, 2, 1, -5, 4}, 6},
+		{[]int{1}, 1},
+		{[]int{5, 4, -1, 7, 8}, 23},
+		{[]int{-3, -1, -2}, -1},
+		{[]int{-1}, -1},
+		{[]int{1, -1, 1, -1, 1}, 1},
+	}
+	for _, c := range cases {
+		if got := maxSubArray(c.nums); got != c.want {
+			t.Errorf("maxSubArray(%v) = %d，期望 %d", c.nums, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+动态规划（Kadane 算法）。定义 `cur` 为**以当前元素结尾**的最大子数组和。对于新元素 v，只有两种选择：接在前一个子数组后面（`cur + v`），或者从自己重新开始（`v`）。取较大者。所有 `cur` 里的最大值就是答案。
+
+直观理解：如果前面累积的和 `cur` 是负数，它只会拖累后面，不如丢掉重新开始。
+
+**代码讲解**
+
+1. `best, cur := nums[0], 0`：`best` 用第一个元素初始化，保证全是负数时也能返回正确的最大值（而不是 0）。
+2. `cur = max(cur+v, v)`：状态转移方程。
+3. `best = max(best, cur)`：记录全局最优。
+
+**易错点**
+
+- `best` 初始化为 0：全负数组 `[-3, -1, -2]` 会错误地返回 0（题目要求至少包含一个元素）。
+- 定义“以当前元素结尾”是关键，这样子数组一定是连续的。
+
+**复杂度**
+
+时间 O(n)，空间 O(1)。
+
+**延伸**
+
+动态规划的一般步骤：**定义状态 → 写转移方程 → 确定初始值 → 确定答案在哪**。这道题的状态只依赖前一个，所以只用一个变量，不需要数组。
+
+=== lc-198
+no: 198
+title: 打家劫舍
+slug: house-robber
+difficulty: 中等
+category: 动态规划
+topics: 数组, 动态规划
+go: 多重赋值, 内置 min/max
+--- desc
+一排房屋，`nums[i]` 是第 i 间房屋的现金。**相邻**的两间房屋不能在同一晚都被偷，求一晚能偷到的最高金额。
+
+**示例**：`[1,2,3,1]` → `4`（偷 1 号和 3 号）；`[2,7,9,3,1]` → `12`（2 + 9 + 1）。
+--- solution
+package main
+
+func rob(nums []int) int {
+	// @solution
+	prev, cur := 0, 0 // 到前前一间、前一间为止能偷到的最多金额
+	for _, v := range nums {
+		prev, cur = cur, max(cur, prev+v) // 不偷这一间 / 偷这一间
+	}
+	return cur
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestRob(t *testing.T) {
+	cases := []struct {
+		nums []int
+		want int
+	}{
+		{[]int{1, 2, 3, 1}, 4},
+		{[]int{2, 7, 9, 3, 1}, 12},
+		{[]int{2, 1, 1, 2}, 4},
+		{[]int{5}, 5},
+		{[]int{1, 3, 1}, 3},
+		{[]int{}, 0},
+	}
+	for _, c := range cases {
+		if got := rob(c.nums); got != c.want {
+			t.Errorf("rob(%v) = %d，期望 %d", c.nums, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+设 `dp[i]` 为前 i 间房屋能偷到的最多金额。对第 i 间房屋：
+
+- 不偷：`dp[i-1]`；
+- 偷：不能偷第 i−1 间，`dp[i-2] + nums[i]`。
+
+`dp[i] = max(dp[i-1], dp[i-2] + nums[i])`。只依赖前两个值，用两个变量滚动。
+
+**代码讲解**
+
+1. `prev, cur := 0, 0`：分别是 `dp[i-2]` 和 `dp[i-1]`，一开始都是 0（没有房屋）。
+2. `prev, cur = cur, max(cur, prev+v)`：**多重赋值先计算右边**，右边用的都是旧值，一行就完成了“窗口前移 + 状态转移”，不需要临时变量。
+3. 返回 `cur`。空数组时直接返回 0。
+
+**易错点**
+
+- 拆成两行 `prev = cur; cur = max(cur, prev+v)` 是错的：第二行的 `prev` 已经被改了。
+- 贪心地“偷所有奇数位或所有偶数位”是错的，`[2, 1, 1, 2]` 的最优解是偷第 1 和第 4 间（4），而奇偶两种方案都只有 3。
+
+**复杂度**
+
+时间 O(n)，空间 O(1)。
+
+=== lc-322
+no: 322
+title: 零钱兑换
+slug: coin-change
+difficulty: 中等
+category: 动态规划
+topics: 数组, 动态规划, 广度优先搜索
+go: math 常量, 切片, 内置 min/max
+--- desc
+给定不同面额的硬币 `coins` 和总金额 `amount`，计算凑成总金额所需的**最少硬币个数**。每种硬币数量无限；无法凑成返回 -1。
+
+**示例**：`coins = [1,2,5], amount = 11` → `3`（5 + 5 + 1）；`coins = [2], amount = 3` → `-1`；`amount = 0` → `0`。
+--- solution
+package main
+
+import "math"
+
+func coinChange(coins []int, amount int) int {
+	// @solution
+	dp := make([]int, amount+1) // dp[i] = 凑出金额 i 的最少硬币数，math.MaxInt 表示凑不出
+	for i := 1; i <= amount; i++ {
+		dp[i] = math.MaxInt
+		for _, c := range coins {
+			if c <= i && dp[i-c] != math.MaxInt {
+				dp[i] = min(dp[i], dp[i-c]+1) // 最后一枚用 c
+			}
+		}
+	}
+	if dp[amount] == math.MaxInt {
+		return -1
+	}
+	return dp[amount]
+	// @starter
+	// return -1
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestCoinChange(t *testing.T) {
+	cases := []struct {
+		coins  []int
+		amount int
+		want   int
+	}{
+		{[]int{1, 2, 5}, 11, 3},
+		{[]int{2}, 3, -1},
+		{[]int{1}, 0, 0},
+		{[]int{1}, 1, 1},
+		{[]int{2, 5, 10, 1}, 27, 4},
+		{[]int{186, 419, 83, 408}, 6249, 20},
+		{[]int{3, 7}, 11, -1},
+	}
+	for _, c := range cases {
+		if got := coinChange(c.coins, c.amount); got != c.want {
+			t.Errorf("coinChange(%v, %d) = %d，期望 %d", c.coins, c.amount, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+完全背包。`dp[i]` 表示凑出金额 i 最少需要几枚硬币。凑出 i 的最后一枚硬币可以是任意面额 c（c ≤ i），那么 `dp[i] = min(dp[i-c] + 1)`。从小到大算，`dp[0] = 0`。
+
+**代码讲解**
+
+1. `dp := make([]int, amount+1)`：下标 0～amount，`dp[0]` 的零值 0 正好是初始条件。
+2. `dp[i] = math.MaxInt`：先标记为“凑不出”。
+3. `c <= i && dp[i-c] != math.MaxInt`：硬币不能比金额大，并且 `i-c` 本身要能凑出来。**不检查第二个条件的话，`math.MaxInt + 1` 会溢出成最小的负数**，min 会选中它，结果完全错误。
+4. 最后仍是 `math.MaxInt` 就返回 -1。
+
+**易错点**
+
+- 贪心（每次拿最大的硬币）不对：`coins = [1, 3, 4], amount = 6`，贪心得到 4+1+1 = 3 枚，最优是 3+3 = 2 枚。
+- 用 `amount + 1` 代替 `math.MaxInt` 作为“无穷大”也很常见：硬币数不可能超过 amount，而且加 1 不会溢出，可以省掉第二个判断。
+
+**复杂度**
+
+时间 O(amount × len(coins))，空间 O(amount)。
+
+=== lc-300
+no: 300
+title: 最长递增子序列
+slug: longest-increasing-subsequence
+difficulty: 中等
+category: 动态规划
+topics: 数组, 二分查找, 动态规划
+go: slices 包, 切片
+--- desc
+给定整数数组 `nums`，找到其中**严格递增**的最长子序列的长度。子序列不要求连续，但要保持原来的相对顺序。
+
+**示例**：`[10,9,2,5,3,7,101,18]` → `4`（如 `[2,3,7,101]`）；`[0,1,0,3,2,3]` → `4`；`[7,7,7,7]` → `1`。
+--- solution
+package main
+
+import "slices"
+
+func lengthOfLIS(nums []int) int {
+	// @solution
+	var tails []int // tails[i] = 长度为 i+1 的递增子序列中最小的结尾元素，严格递增
+	for _, v := range nums {
+		i, _ := slices.BinarySearch(tails, v) // 第一个 >= v 的位置
+		if i == len(tails) {
+			tails = append(tails, v) // v 比所有结尾都大，最长长度 +1
+		} else {
+			tails[i] = v // 用更小的 v 替换，让这个长度的结尾尽量小
+		}
+	}
+	return len(tails)
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestLengthOfLIS(t *testing.T) {
+	cases := []struct {
+		nums []int
+		want int
+	}{
+		{[]int{10, 9, 2, 5, 3, 7, 101, 18}, 4},
+		{[]int{0, 1, 0, 3, 2, 3}, 4},
+		{[]int{7, 7, 7, 7, 7, 7, 7}, 1},
+		{[]int{1}, 1},
+		{[]int{4, 10, 4, 3, 8, 9}, 3},
+		{[]int{1, 3, 6, 7, 9, 4, 10, 5, 6}, 6},
+	}
+	for _, c := range cases {
+		if got := lengthOfLIS(c.nums); got != c.want {
+			t.Errorf("lengthOfLIS(%v) = %d，期望 %d", c.nums, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+**基础 DP（O(n²)）**：`dp[i]` 表示以 `nums[i]` 结尾的最长递增子序列长度，`dp[i] = max(dp[j] + 1)`，其中 `j < i` 且 `nums[j] < nums[i]`。
+
+**贪心 + 二分（O(n log n)，代码里的写法）**：维护数组 `tails`，`tails[k]` 是“长度为 k+1 的递增子序列中最小的结尾”。结尾越小，后面越容易接上新元素。`tails` 一定是严格递增的，所以可以二分：
+
+- v 比所有结尾都大：可以接在最长的那个后面，`tails` 追加 v；
+- 否则找到第一个 ≥ v 的位置，用 v 替换它（同样长度，结尾更小了）。
+
+最后 `tails` 的长度就是答案（注意 `tails` 本身不一定是一个真实的子序列）。
+
+**代码讲解**
+
+1. `slices.BinarySearch(tails, v)` 返回 `(位置, 是否找到)`，位置就是第一个 ≥ v 的下标，用 `_` 丢掉第二个返回值。
+2. `i == len(tails)` 时追加，否则替换。
+3. 相等的元素会替换自己（找到时 i 指向相等的元素），所以 `[7,7,7]` 的长度保持为 1，保证了“严格”递增。
+
+**易错点**
+
+- 用“第一个 > v 的位置”会把相等元素接在后面，变成求“非递减”子序列。
+- 子序列不要求连续，和「最大子数组和」那种“以当前元素结尾、只看前一个”的 DP 不同，这里要看前面所有元素。
+
+**复杂度**
+
+时间 O(n log n)，空间 O(n)。基础 DP 是 O(n²)。
+
+=== lc-62
+no: 62
+title: 不同路径
+slug: unique-paths
+difficulty: 中等
+category: 动态规划
+topics: 数学, 动态规划, 组合数学
+go: 切片, 一维 DP 压缩
+--- desc
+机器人位于 m × n 网格的左上角，每次只能**向下或者向右**移动一步，要到达右下角。总共有多少条不同的路径？
+
+**示例**：`m = 3, n = 7` → `28`；`m = 3, n = 2` → `3`（右→下→下、下→下→右、下→右→下）。
+--- solution
+package main
+
+func uniquePaths(m int, n int) int {
+	// @solution
+	dp := make([]int, n) // dp[j] = 走到当前行第 j 列的路径数
+	for j := range dp {
+		dp[j] = 1 // 第一行只能一直向右
+	}
+	for i := 1; i < m; i++ {
+		for j := 1; j < n; j++ {
+			dp[j] += dp[j-1] // 旧的 dp[j] 是从上面来的，dp[j-1] 是从左边来的
+		}
+	}
+	return dp[n-1]
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestUniquePaths(t *testing.T) {
+	cases := []struct{ m, n, want int }{
+		{3, 7, 28},
+		{3, 2, 3},
+		{1, 1, 1},
+		{7, 3, 28},
+		{10, 10, 48620},
+		{1, 5, 1},
+	}
+	for _, c := range cases {
+		if got := uniquePaths(c.m, c.n); got != c.want {
+			t.Errorf("uniquePaths(%d, %d) = %d，期望 %d", c.m, c.n, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+到达格子 (i, j) 只能从上面 (i−1, j) 或左边 (i, j−1) 过来，所以 `dp[i][j] = dp[i-1][j] + dp[i][j-1]`。第一行和第一列都只有 1 条路径。
+
+每一行只依赖上一行，可以把二维表压缩成**一维数组**：更新 `dp[j]` 之前，它存的还是上一行的值（从上面来），`dp[j-1]` 已经是这一行的新值（从左边来），所以直接 `dp[j] += dp[j-1]`。
+
+**代码讲解**
+
+1. `dp := make([]int, n)`，然后 `for j := range dp { dp[j] = 1 }` 初始化第一行。
+2. 从第二行开始，`j` 从 1 开始（第一列始终是 1，不用更新）。
+3. `dp[j] += dp[j-1]`：一行完成状态转移。
+
+**易错点**
+
+- 二维写法需要 `make([][]int, m)` 再逐行 make，详见语法卡片「二维切片」。
+- 结果可能较大，但题目保证不超过 2×10⁹，int（64 位）足够。
+
+**复杂度**
+
+时间 O(m·n)，空间 O(n)。
+
+**延伸**
+
+组合数学解法：一共要走 m−1 步向下、n−1 步向右，答案是 C(m+n−2, m−1)。
+
+=== lc-1143
+no: 1143
+title: 最长公共子序列
+slug: longest-common-subsequence
+difficulty: 中等
+category: 动态规划
+topics: 字符串, 动态规划
+go: 二维切片, byte 与 rune, 内置 min/max
+--- desc
+给定两个字符串 `text1` 和 `text2`，返回它们的**最长公共子序列**的长度；不存在则返回 0。子序列是在不改变相对顺序的情况下删除某些字符（也可以不删）后得到的字符串。
+
+**示例**：`"abcde"` 和 `"ace"` → `3`（`"ace"`）；`"abc"` 和 `"def"` → `0`。
+--- solution
+package main
+
+func longestCommonSubsequence(text1 string, text2 string) int {
+	// @solution
+	m, n := len(text1), len(text2)
+	// dp[i][j] = text1 前 i 个字符和 text2 前 j 个字符的 LCS 长度；多一行一列表示空串
+	dp := make([][]int, m+1)
+	for i := range dp {
+		dp[i] = make([]int, n+1)
+	}
+	for i := 1; i <= m; i++ {
+		for j := 1; j <= n; j++ {
+			if text1[i-1] == text2[j-1] {
+				dp[i][j] = dp[i-1][j-1] + 1
+			} else {
+				dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+			}
+		}
+	}
+	return dp[m][n]
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestLongestCommonSubsequence(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"abcde", "ace", 3},
+		{"abc", "abc", 3},
+		{"abc", "def", 0},
+		{"bsbininm", "jmjkbkjkv", 1},
+		{"ezupkr", "ubmrapg", 2},
+		{"a", "a", 1},
+		{"oxcpqrsvwf", "shmtulqrypy", 2},
+	}
+	for _, c := range cases {
+		if got := longestCommonSubsequence(c.a, c.b); got != c.want {
+			t.Errorf("longestCommonSubsequence(%q, %q) = %d，期望 %d", c.a, c.b, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+经典二维 DP。`dp[i][j]` 表示 text1 的前 i 个字符和 text2 的前 j 个字符的最长公共子序列长度：
+
+- 最后一个字符相同（`text1[i-1] == text2[j-1]`）：它一定可以作为公共子序列的最后一个字符，`dp[i][j] = dp[i-1][j-1] + 1`；
+- 不同：至少有一个字符用不上，`dp[i][j] = max(dp[i-1][j], dp[i][j-1])`。
+
+**代码讲解**
+
+1. `dp := make([][]int, m+1)` 加上逐行 `make([]int, n+1)`：二维切片的标准创建方式。多出来的第 0 行、第 0 列表示空串，值都是 0，省去了边界判断。
+2. 下标偏移：`dp[i][j]` 对应的字符是 `text1[i-1]` 和 `text2[j-1]`。
+3. `text1[i-1] == text2[j-1]`：按字节比较，题目只有小写字母。
+4. 答案在 `dp[m][n]`。
+
+**易错点**
+
+- 下标偏移写错（用 `text1[i]`）会越界或者错位。
+- 子序列不要求连续；如果要求连续（最长公共子串），不相等时 `dp[i][j] = 0`，答案是整个表里的最大值。
+
+**复杂度**
+
+时间 O(m·n)，空间 O(m·n)；只保留两行可以优化到 O(n)。
+
+=== lc-55
+no: 55
+title: 跳跃游戏
+slug: jump-game
+difficulty: 中等
+category: 贪心与区间
+topics: 数组, 贪心, 动态规划
+go: 内置 min/max, range 遍历
+--- desc
+给定非负整数数组 `nums`，最初位于第一个下标。`nums[i]` 表示在位置 i 最多可以向前跳几步。判断能否到达最后一个下标。
+
+**示例**：`[2,3,1,1,4]` → `true`；`[3,2,1,0,4]` → `false`（无论怎样都会停在下标 3，它的跳跃长度是 0）。
+--- solution
+package main
+
+func canJump(nums []int) bool {
+	// @solution
+	far := 0 // 目前能到达的最远下标
+	for i, v := range nums {
+		if i > far {
+			return false // 走不到 i，后面更走不到
+		}
+		far = max(far, i+v)
+	}
+	return true
+	// @starter
+	// return false
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestCanJump(t *testing.T) {
+	cases := []struct {
+		nums []int
+		want bool
+	}{
+		{[]int{2, 3, 1, 1, 4}, true},
+		{[]int{3, 2, 1, 0, 4}, false},
+		{[]int{0}, true},
+		{[]int{2, 0, 0}, true},
+		{[]int{1, 0, 1, 0}, false},
+		{[]int{0, 1}, false},
+	}
+	for _, c := range cases {
+		if got := canJump(c.nums); got != c.want {
+			t.Errorf("canJump(%v) = %v，期望 %v", c.nums, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+贪心：从左往右遍历，维护“目前能到达的最远位置” `far`。如果当前位置 i 已经超过了 far，说明 i 根本到不了，返回 false；否则用 `i + nums[i]` 更新 far。能遍历完就说明最后一个位置也能到达。
+
+为什么不需要关心“具体怎么跳”：只要能到达位置 i，就能到达 `[0, i]` 之间的所有位置（可以少跳几步），所以只需记录能到达的最远位置。
+
+**代码讲解**
+
+1. `far := 0`：一开始在下标 0。
+2. `for i, v := range nums`：同时拿到下标和跳跃长度。
+3. `if i > far { return false }`：先判断能不能到 i。
+4. `far = max(far, i+v)`。
+
+**易错点**
+
+- 先更新 `far` 再判断，`[0, 1]` 会在 i = 1 时用 `1 + 1` 把 far 更新到 2，错误地返回 true。
+- 也可以在 `far >= len(nums)-1` 时提前返回 true。
+
+**复杂度**
+
+时间 O(n)，空间 O(1)。
+
+=== lc-56
+no: 56
+title: 合并区间
+slug: merge-intervals
+difficulty: 中等
+category: 贪心与区间
+topics: 数组, 排序
+go: slices 包, cmp 包, 二维切片
+--- desc
+给定若干区间 `intervals[i] = [start, end]`，合并所有**重叠**的区间（端点相接也算重叠），返回不重叠的区间数组，按起点升序排列。
+
+**示例**：`[[1,3],[2,6],[8,10],[15,18]]` → `[[1,6],[8,10],[15,18]]`；`[[1,4],[4,5]]` → `[[1,5]]`。
+--- solution
+package main
+
+import (
+	"cmp"
+	"slices"
+)
+
+func merge(intervals [][]int) [][]int {
+	// @solution
+	slices.SortFunc(intervals, func(a, b []int) int { return cmp.Compare(a[0], b[0]) })
+	var res [][]int
+	for _, iv := range intervals {
+		if n := len(res); n > 0 && iv[0] <= res[n-1][1] {
+			res[n-1][1] = max(res[n-1][1], iv[1]) // 和上一个区间重叠，延长它
+		} else {
+			res = append(res, []int{iv[0], iv[1]})
+		}
+	}
+	return res
+	// @starter
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"testing"
+)
+
+func TestMerge(t *testing.T) {
+	cases := []struct {
+		in   [][]int
+		want string
+	}{
+		{[][]int{{1, 3}, {2, 6}, {8, 10}, {15, 18}}, "[[1 6] [8 10] [15 18]]"},
+		{[][]int{{1, 4}, {4, 5}}, "[[1 5]]"},
+		{[][]int{{1, 4}, {0, 4}}, "[[0 4]]"},
+		{[][]int{{1, 4}, {2, 3}}, "[[1 4]]"},
+		{[][]int{{1, 4}}, "[[1 4]]"},
+		{[][]int{{4, 7}, {1, 4}}, "[[1 7]]"},
+		{[][]int{{2, 3}, {4, 5}, {6, 7}, {8, 9}, {1, 10}}, "[[1 10]]"},
+	}
+	for _, c := range cases {
+		in := fmt.Sprint(c.in)
+		if got := fmt.Sprint(merge(c.in)); got != c.want {
+			t.Errorf("merge(%s) = %s，期望 %s", in, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+先按起点排序，这样能重叠的区间一定相邻。然后依次扫描：如果当前区间的起点 ≤ 结果中最后一个区间的终点，就和它合并（终点取较大值）；否则当前区间单独成为结果中的新区间。
+
+**代码讲解**
+
+1. `slices.SortFunc(intervals, func(a, b []int) int {...})`：比较函数返回负数、0、正数。`cmp.Compare` 比直接写 `a[0] - b[0]` 更安全（不会溢出），也更通用。
+2. `if n := len(res); n > 0 && ...`：if 的初始化语句里取长度，后面多次用到 `n`。
+3. 合并时 `max(res[n-1][1], iv[1])`：被包含的区间（如 `[1,4]` 和 `[2,3]`）终点更小，不能直接用 `iv[1]` 覆盖。
+4. `res = append(res, []int{iv[0], iv[1]})`：**新建一个切片**而不是直接 append `iv`，否则合并时修改 `res[n-1][1]` 会改到调用方传进来的区间。
+
+**易错点**
+
+- 不排序直接合并，`[[4,7],[1,4]]` 会得到错误结果。
+- 合并时漏掉 `max`。
+
+**复杂度**
+
+时间 O(n log n)（排序），空间 O(log n)（排序）+ 结果。
+
+=== lc-763
+no: 763
+title: 划分字母区间
+slug: partition-labels
+difficulty: 中等
+category: 贪心与区间
+topics: 字符串, 贪心, 哈希表
+go: 数组值类型, byte 与 rune, 内置 min/max
+--- desc
+把字符串 `s`（只含小写字母）划分为尽可能多的片段，使**同一个字母最多出现在一个片段中**。按顺序返回每个片段的长度。
+
+**示例**：`"ababcbacadefegdehijhklij"` → `[9,7,8]`（`"ababcbaca"`、`"defegde"`、`"hijhklij"`）。
+--- solution
+package main
+
+func partitionLabels(s string) []int {
+	// @solution
+	var last [26]int // 每个字母最后一次出现的位置
+	for i := 0; i < len(s); i++ {
+		last[s[i]-'a'] = i
+	}
+	var res []int
+	start, end := 0, 0
+	for i := 0; i < len(s); i++ {
+		end = max(end, last[s[i]-'a']) // 当前片段至少要延伸到这里
+		if i == end {                  // 片段里所有字母的最后位置都不超过 i，可以切一刀
+			res = append(res, end-start+1)
+			start = i + 1
+		}
+	}
+	return res
+	// @starter
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestPartitionLabels(t *testing.T) {
+	cases := []struct {
+		s    string
+		want []int
+	}{
+		{"ababcbacadefegdehijhklij", []int{9, 7, 8}},
+		{"eccbbbbdec", []int{10}},
+		{"a", []int{1}},
+		{"abc", []int{1, 1, 1}},
+		{"abca", []int{4}},
+		{"abacdc", []int{3, 3}},
+	}
+	for _, c := range cases {
+		if got := partitionLabels(c.s); !slices.Equal(got, c.want) {
+			t.Errorf("partitionLabels(%q) = %v，期望 %v", c.s, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+一个片段一旦包含了某个字母，就必须延伸到这个字母**最后一次出现**的位置。先记录每个字母的最后位置；再从左往右扫描，不断用当前字母的最后位置扩展片段的终点 `end`。当扫描位置 i 恰好等于 `end`，说明片段里的字母都不会再出现了，切一刀。
+
+**代码讲解**
+
+1. `var last [26]int`：固定 26 个字母，用数组记录最后出现位置；第一遍循环直接覆盖，最后留下的就是最后一次的位置。
+2. `start, end := 0, 0`：当前片段的起点和（至少要到的）终点。
+3. `end = max(end, last[s[i]-'a'])`：片段终点只会变大。
+4. `i == end` 时记录长度 `end - start + 1`，下一个片段从 `i + 1` 开始。
+
+**易错点**
+
+- 只看片段第一个字母的最后位置是不够的：`"abcab"` 里 a 最后出现在下标 3，但片段中间的 b 最后出现在下标 4，片段必须延伸到 4。
+
+**复杂度**
+
+时间 O(n)，空间 O(1)。
+
+=== lc-215
+no: 215
+title: 数组中的第 K 个最大元素
+slug: kth-largest-element-in-an-array
+difficulty: 中等
+category: 堆与 Top K
+topics: 数组, 分治, 快速选择, 堆
+go: math/rand/v2, switch, 多重赋值
+--- desc
+给定整数数组 `nums` 和整数 `k`，返回数组中**第 k 个最大**的元素（排序后的第 k 大，不是第 k 个不同的元素）。要求平均时间复杂度 O(n)。
+
+**示例**：`[3,2,1,5,6,4], k = 2` → `5`；`[3,2,3,1,2,4,5,5,6], k = 4` → `4`。
+--- solution
+package main
+
+import "math/rand/v2"
+
+func findKthLargest(nums []int, k int) int {
+	// @solution
+	target := len(nums) - k // 第 k 大 = 升序排列后下标为 n-k 的元素
+	lo, hi := 0, len(nums)-1
+	for {
+		pivot := nums[lo+rand.IntN(hi-lo+1)] // 随机选基准，避免被特殊输入卡成 O(n²)
+		// 三路划分：[lo, lt) < pivot，[lt, gt] == pivot，(gt, hi] > pivot
+		lt, i, gt := lo, lo, hi
+		for i <= gt {
+			switch {
+			case nums[i] < pivot:
+				nums[lt], nums[i] = nums[i], nums[lt]
+				lt++
+				i++
+			case nums[i] > pivot:
+				nums[i], nums[gt] = nums[gt], nums[i]
+				gt--
+			default:
+				i++
+			}
+		}
+		switch {
+		case target < lt:
+			hi = lt - 1
+		case target > gt:
+			lo = gt + 1
+		default:
+			return pivot // target 落在等于 pivot 的区间里
+		}
+	}
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestFindKthLargest(t *testing.T) {
+	cases := []struct {
+		nums []int
+		k    int
+		want int
+	}{
+		{[]int{3, 2, 1, 5, 6, 4}, 2, 5},
+		{[]int{3, 2, 3, 1, 2, 4, 5, 5, 6}, 4, 4},
+		{[]int{1}, 1, 1},
+		{[]int{2, 1}, 2, 1},
+		{[]int{7, 7, 7, 7}, 2, 7},
+		{[]int{-1, 2, 0}, 3, -1},
+	}
+	for _, c := range cases {
+		if got := findKthLargest(slices.Clone(c.nums), c.k); got != c.want {
+			t.Errorf("findKthLargest(%v, %d) = %d，期望 %d", c.nums, c.k, got, c.want)
+		}
+	}
+
+	// 大量重复元素：两路划分会退化成 O(n²)，三路划分不会
+	same := make([]int, 200000)
+	for i := range same {
+		same[i] = 1
+	}
+	same[123] = 2
+	if got := findKthLargest(same, 1); got != 2 {
+		t.Errorf("200000 个元素里第 1 大应该是 2，得到 %d", got)
+	}
+}
+--- explain
+**思路**
+
+**快速选择**（Quickselect）：和快速排序一样选一个基准 pivot，把数组划分成“小于 / 等于 / 大于 pivot”三段。第 k 大的元素在升序数组中的下标是 `n - k`，看这个下标落在哪一段：落在等于段就是 pivot，否则只需要在一侧继续划分。每次只处理一侧，平均 O(n)。
+
+**代码讲解**
+
+1. `target := len(nums) - k`：把“第 k 大”转成“升序下标”。
+2. `rand.IntN(hi-lo+1)`：Go 1.22 的 `math/rand/v2`，不需要手动设置种子。**随机基准**让最坏情况几乎不可能出现。
+3. 三路划分（荷兰国旗）和「颜色分类」是同一个写法：
+   - 小于 pivot 换到左边，`lt`、`i` 都前进；
+   - 大于 pivot 换到右边，`gt` 后退，`i` 不动（换过来的数还没看过）；
+   - 等于就跳过。
+4. 外层 `for {}` 无限循环 + 第二个 `switch` 决定往哪边缩小范围，找到就 `return`。
+
+**易错点**
+
+- 用普通的两路划分时，大量相等元素（测试里的 20 万个 1）会让每次划分都极不平衡，退化成 O(n²)。三路划分把相等的元素一次性归位。
+- 函数会修改输入切片的顺序，调用方需要的话先 `slices.Clone`。
+
+**复杂度**
+
+平均时间 O(n)，最坏 O(n²)（概率极低）；空间 O(1)。
+
+**延伸**
+
+- **堆**：维护大小为 k 的小顶堆（见「数据流中的第 K 大元素」），O(n log k)，适合数据流。
+- **排序**：`slices.Sort` 后取 `nums[n-k]`，O(n log n)，最简单。
+
+=== lc-347
+no: 347
+title: 前 K 个高频元素
+slug: top-k-frequent-elements
+difficulty: 中等
+category: 堆与 Top K
+topics: 数组, 哈希表, 桶排序, 堆
+go: map, 二维切片, 可变参数展开
+--- desc
+给定整数数组 `nums` 和整数 `k`，返回出现频率**前 k 高**的元素，顺序不限。保证答案唯一。要求时间复杂度优于 O(n log n)。
+
+**示例**：`nums = [1,1,1,2,2,3], k = 2` → `[1,2]`；`nums = [1], k = 1` → `[1]`。
+--- solution
+package main
+
+func topKFrequent(nums []int, k int) []int {
+	// @solution
+	count := map[int]int{}
+	for _, v := range nums {
+		count[v]++
+	}
+	buckets := make([][]int, len(nums)+1) // buckets[f] = 恰好出现 f 次的数
+	for v, c := range count {
+		buckets[c] = append(buckets[c], v)
+	}
+	res := make([]int, 0, k)
+	for f := len(buckets) - 1; f > 0 && len(res) < k; f-- {
+		res = append(res, buckets[f]...)
+	}
+	return res[:k]
+	// @starter
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestTopKFrequent(t *testing.T) {
+	cases := []struct {
+		nums []int
+		k    int
+		want []int
+	}{
+		{[]int{1, 1, 1, 2, 2, 3}, 2, []int{1, 2}},
+		{[]int{1}, 1, []int{1}},
+		{[]int{4, 1, -1, 2, -1, 2, 3}, 2, []int{-1, 2}},
+		{[]int{1, 2, 1, 2, 1, 2, 3, 1, 3, 2}, 2, []int{1, 2}},
+		{[]int{5, 5, 5, 6, 6, 7}, 3, []int{5, 6, 7}},
+	}
+	for _, c := range cases {
+		got := topKFrequent(c.nums, c.k)
+		slices.Sort(got)
+		if !slices.Equal(got, c.want) {
+			t.Errorf("topKFrequent(%v, %d) = %v，期望 %v", c.nums, c.k, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+先用 map 统计频率。频率最大不会超过 n，所以可以做**桶排序**：`buckets[f]` 放所有出现了 f 次的数，然后从高频率往低频率收集，凑够 k 个为止。
+
+**代码讲解**
+
+1. `count[v]++`：利用 map 零值计数。
+2. `buckets := make([][]int, len(nums)+1)`：二维切片，下标是频率（1～n），每个桶先是 nil，append 时自动分配。
+3. `for v, c := range count`：遍历 map 得到“数 → 频率”，放进对应的桶。
+4. 倒序遍历桶，`append(res, buckets[f]...)`：`...` 展开整个桶追加。
+5. `res[:k]`：最后一个桶可能放多了，截取前 k 个（题目保证答案唯一，所以不会截断到频率相同的元素之间）。
+
+**易错点**
+
+- 直接对 map 的 key 按频率排序也可以（O(n log n)），但不满足进阶要求。
+- 循环条件里的 `f > 0`：频率为 0 的桶是空的，不需要访问。
+
+**复杂度**
+
+时间 O(n)，空间 O(n)。
+
+**延伸**
+
+用大小为 k 的**小顶堆**（`container/heap`）按频率维护 Top K，时间 O(n log k)，适合数据量很大或流式数据。
+
+=== lc-208
+no: 208
+title: 实现 Trie（前缀树）
+slug: implement-trie-prefix-tree
+difficulty: 中等
+category: 栈、队列与设计
+topics: 设计, 字典树, 哈希表, 字符串
+go: 结构体与方法, 结构体与指针, 数组值类型
+--- desc
+实现前缀树 `Trie`：
+
+- `Constructor()` 初始化；
+- `Insert(word)` 插入字符串；
+- `Search(word)` 判断 word 是否**被插入过**；
+- `StartsWith(prefix)` 判断是否有已插入的字符串以 prefix 为前缀。
+
+所有字符串只包含小写字母。
+
+**示例**：插入 `"apple"` 后，`Search("apple")` → true，`Search("app")` → false，`StartsWith("app")` → true；再插入 `"app"` 后 `Search("app")` → true。
+--- solution
+package main
+
+type Trie struct {
+	// @solution
+	children [26]*Trie
+	isEnd    bool // 是否有单词在这个节点结束
+	// @starter
+	// // TODO：设计字段
+	// @end
+}
+
+func Constructor() Trie {
+	return Trie{}
+}
+
+func (t *Trie) Insert(word string) {
+	// @solution
+	node := t
+	for i := 0; i < len(word); i++ {
+		c := word[i] - 'a'
+		if node.children[c] == nil {
+			node.children[c] = &Trie{}
+		}
+		node = node.children[c]
+	}
+	node.isEnd = true
+	// @starter
+	// // TODO
+	// @end
+}
+
+// @solution
+// find 沿着 prefix 往下走，返回最后到达的节点；中途走不通返回 nil
+func (t *Trie) find(prefix string) *Trie {
+	node := t
+	for i := 0; i < len(prefix); i++ {
+		node = node.children[prefix[i]-'a']
+		if node == nil {
+			return nil
+		}
+	}
+	return node
+}
+
+// @end
+func (t *Trie) Search(word string) bool {
+	// @solution
+	n := t.find(word)
+	return n != nil && n.isEnd
+	// @starter
+	// return false
+	// @end
+}
+
+func (t *Trie) StartsWith(prefix string) bool {
+	// @solution
+	return t.find(prefix) != nil
+	// @starter
+	// return false
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestTrie(t *testing.T) {
+	tr := Constructor()
+	check := func(call string, got, want bool) {
+		t.Helper()
+		if got != want {
+			t.Errorf("%s = %v，期望 %v", call, got, want)
+		}
+	}
+	tr.Insert("apple")
+	check(`Search("apple")`, tr.Search("apple"), true)
+	check(`Search("app")`, tr.Search("app"), false)
+	check(`StartsWith("app")`, tr.StartsWith("app"), true)
+	tr.Insert("app")
+	check(`插入 "app" 后 Search("app")`, tr.Search("app"), true)
+	check(`StartsWith("b")`, tr.StartsWith("b"), false)
+	check(`Search("apples")`, tr.Search("apples"), false)
+	tr.Insert("banana")
+	check(`StartsWith("ban")`, tr.StartsWith("ban"), true)
+	check(`Search("ban")`, tr.Search("ban"), false)
+	check(`StartsWith("bananas")`, tr.StartsWith("bananas"), false)
+
+	other := Constructor()
+	check(`新 Trie 的 Search("apple")`, other.Search("apple"), false)
+}
+--- explain
+**思路**
+
+前缀树的每个节点代表一个前缀，有 26 个孩子指针（每个小写字母一个），另外用一个标记表示“有单词恰好在这里结束”。插入时沿着字符往下走，没有的节点就创建；查询时沿着字符往下走，走不通就说明不存在。
+
+**代码讲解**
+
+1. `children [26]*Trie`：**指针数组**，零值全是 nil，不需要初始化。用数组而不是 map，访问更快，结构也更直观。
+2. `Constructor()` 直接返回零值 `Trie{}`。
+3. 方法都用**指针接收者** `(t *Trie)`：`Insert` 要修改树；保持一致，`Search` 也用指针接收者。
+4. `Insert`：`c := word[i] - 'a'` 得到 0～25 的下标，没有孩子就 `&Trie{}` 新建，最后标记 `isEnd`。
+5. `find` 是未导出的辅助方法（小写开头），`Search` 和 `StartsWith` 共用它：
+   - `Search` 要求节点存在**并且** `isEnd`；
+   - `StartsWith` 只要求节点存在。
+
+**易错点**
+
+- `Search` 忘了检查 `isEnd`：插入 `"apple"` 后 `Search("app")` 会错误地返回 true。
+- 用值接收者 `(t Trie)` 时，`Insert` 修改的是 `children` 数组的副本，根节点上新建的孩子会丢失。
+
+**复杂度**
+
+插入和查询都是 O(L)，L 是字符串长度；空间 O(总字符数 × 26)。
+
+**延伸**
+
+前缀树常用于自动补全、敏感词过滤、IP 路由的最长前缀匹配。字符集很大时，`children` 可以换成 `map[rune]*Trie`。

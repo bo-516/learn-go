@@ -1,0 +1,619 @@
+=== web-23
+level: 2
+hot: false
+title: 如何用 Go 实现支持 Range 断点续传和分片下载的文件服务？
+--- answer
+HTTP **Range 请求**（RFC 9110）允许客户端只请求大文件的某一部分字节区间，是实现**大文件断点续传、多线程并发分片下载、以及音视频拖拽播放（Seek）**的基础。
+
+**1. 协议交互流程**
+
+1. **服务端声明支持**：服务端在响应头中返回 `Accept-Ranges: bytes` 以及文件的总字节数 `Content-Length` 和唯一校验标识 `ETag` / `Last-Modified`；
+2. **客户端发起区间请求**：例如请求前 1024 字节：`Range: bytes=0-1023`（注意区间是**闭区间 `[start, end]`**，包含第 1023 字节！），或者从某位置到末尾：`Range: bytes=1024-`；
+3. **配合 `If-Range` 防文件变更**：断点续传时客户端带上 `If-Range: "<ETag>"`。如果服务端发现文件在这期间已经被修改过了，直接返回 **`200 OK`** 重新下发完整文件；如果未修改，才返回部分内容；
+4. **服务端部分响应**：
+   - 状态码必须是 **`206 Partial Content`**；
+   - 响应头必须带 **`Content-Range: bytes 0-1023/1048576`**（`起-止/文件总大小`）和 `Content-Length: 1024`；
+   - 如果客户端请求的区间超出了文件总大小（如 `start >= size`），返回 **`416 Range Not Satisfiable`** 及 `Content-Range: bytes */1048576`。
+
+**2. Go 标准库的开箱即用实现：`http.ServeContent`**
+
+在 Go 中，**千万不要自己手写解析 `Range` 头并 `io.CopyN`**！标准库的 `http.ServeContent(w, r, name, modTime, content)`（要求 `content` 实现 **`io.ReadSeeker`**，如 `*os.File` 或 `*bytes.Reader`）已经内置了完整的 RFC 规范实现：自动处理单区间/多区间 `multipart/byteranges`、`If-Range`、`If-None-Match`、`Content-Type` 嗅探以及底层 Linux `sendfile` 零拷贝传输！
+--- deep
+**原理展开**
+
+深挖 `http.ServeContent` 与 Linux 内核级零拷贝（Zero-Copy `sendfile`）的协同机制：
+
+1. **为什么 `http.ServeContent` 要求传入 `io.ReadSeeker` 而不是普通的 `io.Reader`？**
+   - 首先，它需要通过 `content.Seek(0, io.SeekEnd)` 得知文件的精确总字节大小 `size`（用于生成 `Content-Range: bytes start-end/size` 和校验越界）；
+   - 其次，当收到 `Range: bytes=5000000-5999999` 时，它直接调用 `content.Seek(5000000, io.SeekStart)` 瞬间将文件偏移量定位到 5MB 处，而不需要从头空读丢弃前 5MB 数据！
+2. **Go 标准库如何自动触发 `sendfile(2)` 零拷贝？**
+   当底层的 `ResponseWriter` 是真实的 `*net.TCPConn`，且传入的 `content` 是 `*os.File`（外面被 `io.LimitReader` 包裹了区间长度）时，`io.Copy(w, io.LimitReader(file, length))` 会触发 `*net.TCPConn.ReadFrom` 方法，Go 标准库自动识别出源是 `*os.File`，直接调用 Linux 内核的 **`sendfile(out_fd, in_fd, &offset, count)`** 系统调用——文件数据直接从内核 Page Cache 通过 DMA 发送到网卡缓冲区，**全程不经过 Go 用户态内存，零内存分配、零用户态 CPU 拷贝**！
+
+**代码示例**
+
+```go
+// 生产级大文件断点续传下载 Handler：设置 ETag + 调用 http.ServeContent 自动支持 Range 与零拷贝
+func ServeDownload(w http.ResponseWriter, r *http.Request, filePath string) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil || stat.IsDir() {
+		http.Error(w, "invalid file", http.StatusBadRequest)
+		return
+	}
+	// 生成基于修改时间与文件大小的轻量级弱 ETag，配合客户端 If-Range 保证断点续传期间文件未被篡改
+	etag := fmt.Sprintf(`W/"%x-%x"`, stat.ModTime().UnixNano(), stat.Size())
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, stat.Name()))
+
+	// ServeContent 自动处理 Range、If-Range、If-Modified-Since、206 状态码及 sendfile 零拷贝
+	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
+}
+```
+
+**常见追问**
+
+- HTTP `Range: bytes=0-499` 请求的到底是 499 个字节还是 500 个字节？→ **500 个字节**！HTTP Range 的起止下标都是从 0 开始且**两端包含（inclusive）**的，所以字节长度计算公式永远是 **`length = end - start + 1`**。
+- 客户端发送后缀区间 `Range: bytes=-500` 是什么意思？→ 表示请求文件**最后 500 个字节**（即从 `size - 500` 到 `size - 1`），常用于在线查看大日志文件的尾部最新内容。
+- 如果中间件用自定义的 `ResponseWriter` 包装了 `w`，又没有实现 `Unwrap()` 或转发 `io.ReaderFrom` 接口，对大文件下载有什么性能影响？→ 会导致底层的 `*net.TCPConn.ReadFrom` 被隐藏，`sendfile` 零拷贝优化直接失效，退化为在 Go 堆上分配 32KB 缓冲区循环 `Read` + `Write`！
+
+**实战建议**
+
+- 凡是在 Go 服务中下发本地磁盘文件或内存 `[]byte` 切片，优先使用 `http.ServeContent`（传 `*os.File` 或 `bytes.NewReader(data)`），不要手写 `io.Copy`。
+- 如果大文件存储在对象存储（S3 / OSS / MinIO）上，不要由 Go 业务服务器中转下载流，而是生成带有效期的**预签名 URL（Presigned URL）**通过 `302 Found` 重定向让客户端直接从对象存储 CDN 进行 Range 分片下载。
+
+=== web-24
+level: 2
+hot: true
+title: 什么是 SSE（Server-Sent Events）？在 Go 中如何实现流式推送（如 AI 打字机效果）？和 WebSocket 怎么选？
+--- answer
+**SSE（Server-Sent Events）** 是基于标准 HTTP 协议的**服务端向客户端单向实时流式推送**技术（HTML5 标准 `EventSource` API），目前广泛应用于大模型（LLM）流式打字机输出、实时构建日志推送和行情通知。
+
+**1. SSE 的协议格式**
+
+本质上是一个保持长连接不关闭的普通 HTTP 响应，响应头固定为：
+- `Content-Type: text/event-stream`
+- `Cache-Control: no-cache`
+- `X-Accel-Buffering: no`（告诉 Nginx 网关不要缓冲响应，立即透传！）
+
+消息体是纯文本流，**每条事件以两个换行符 `\n\n` 结束**：
+```text
+id: 101
+event: token
+data: {"text": "你好"}
+
+: 这是一行以冒号开头的心跳注释，用于保活连接
+```
+
+**2. Go 中实现 SSE 的核心：状态控制器 `http.ResponseController.Flush()`**
+
+```go
+func SSEHandler(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "text/event-stream")
+    w.Header().Set("Cache-Control", "no-cache")
+    w.Header().Set("X-Accel-Buffering", "no")
+
+    rc := http.NewResponseController(w) // Go 1.20+：穿透中间件包装层找到底层 Flusher
+    for token := range generateTokens(r.Context()) {
+        fmt.Fprintf(w, "data: %s\n\n", token)
+        _ = rc.Flush() // 关键：立即将缓冲区数据刷给客户端！
+    }
+}
+```
+
+**3. SSE vs WebSocket 怎么选？**
+
+- **选 SSE**：只需要**服务端向客户端单向推送**（或客户端发一次请求后流式接收结果，如 AI 对话、状态进度条）。优势是直接走标准 HTTP/1.1 或 **HTTP/2 多路复用**，天然穿透企业防火墙与代理，浏览器 `EventSource` 原生支持断线自动重连并自动携带 `Last-Event-ID`；
+- **选 WebSocket**：需要**高频双向全双工通信**（如多人在线协同编辑、实时对战游戏、高频双向聊天室）。
+--- deep
+**原理展开**
+
+深挖生产环境中 SSE 流式推送最容易踩中的三个线上深坑：
+
+1. **`http.Server.WriteTimeout` 把正常的 SSE 长连接强行掐断！**
+   Go 的 `http.Server{WriteTimeout: 15 * time.Second}` 设置的是**从读取完请求头到整个响应彻底写完关闭的总时间上限**！如果一个大模型推理流式输出或实时进度推送需要持续 45 秒，到了第 15 秒时就会被 `WriteTimeout` 直接强制切断连接！
+   **解决方案**：使用 Go 1.20 引入的 **`http.NewResponseController(w).SetWriteDeadline(...)`**，在 SSE Handler 内部每次成功推送并 `Flush()` 一个分块前，动态将当前连接的写截止时间往后顺延（例如每次续期 10 秒）！
+2. **Nginx / 云网关缓冲吞掉打字机效果**：
+   Nginx 的 `proxy_buffering` 默认开启，它会把后端发出的小块 `data: ...\n\n` 攒满 4KB/8KB 缓冲区或者等连接关闭后才一股脑发给浏览器，导致用户看到卡顿半天突然蹦出整段话。必须在响应头加上 `X-Accel-Buffering: no`。
+3. **多行数据的转义规则**：如果推送的文本 `msg` 内部本身包含换行符 `\n`，不能直接拼在单个 `data: ` 后面（因为 `\n\n` 会被解析成事件结束边界），必须按 `\n` 拆开，每一行都加上 `data: ` 前缀，客户端收到后会自动用 `\n` 重新拼合。
+
+**代码示例**
+
+```go
+// 生产级 SSE 推送完整模板：支持多行文本格式化、每次推送动态续期 WriteDeadline、心跳保活与客户端断连感知
+func FormatSSEMessage(id, event, data string) string {
+	var sb strings.Builder
+	if id != "" {
+		sb.WriteString("id: ")
+		sb.WriteString(id)
+		sb.WriteByte('\n')
+	}
+	if event != "" {
+		sb.WriteString("event: ")
+		sb.WriteString(event)
+		sb.WriteByte('\n')
+	}
+	for _, line := range strings.Split(data, "\n") {
+		sb.WriteString("data: ")
+		sb.WriteString(line)
+		sb.WriteByte('\n')
+	}
+	sb.WriteByte('\n') // 第二个换行符标志着一条完整 SSE 事件的结束
+	return sb.String()
+}
+
+func StreamChatSSE(w http.ResponseWriter, r *http.Request, tokens <-chan string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	rc := http.NewResponseController(w)
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return // 客户端主动关闭了页面或断开连接，立即退出停止上游推理
+		case <-heartbeat.C:
+			_ = rc.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			_, _ = io.WriteString(w, ": ping\n\n")
+			_ = rc.Flush()
+		case tok, ok := <-tokens:
+			if !ok {
+				_, _ = io.WriteString(w, "event: done\ndata: [DONE]\n\n")
+				_ = rc.Flush()
+				return
+			}
+			_ = rc.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			_, _ = io.WriteString(w, FormatSSEMessage("", "message", tok))
+			_ = rc.Flush()
+		}
+	}
+}
+```
+
+**常见追问**
+
+- 为什么浏览器原生的 `new EventSource(url)` 在大模型对话接口里往往不够用，大家改用 `fetch() + ReadableStream` 解析 SSE？→ 因为浏览器原生的 `EventSource` API **只支持 `GET` 请求**，且不支持自定义请求头（如 `Authorization: Bearer ...`）和携带大 JSON 请求体（Prompt 上下文）！所以前端一般用 `POST fetch` 发送对话上下文，后端依然按 `text/event-stream` 标准格式流式返回。
+- SSE 断线重连后怎么做到不丢消息？→ 服务端每推一条消息都带上递增的 `id: <seq>\n`；当网络闪断浏览器自动重连时，会在 HTTP 请求头自动带上 **`Last-Event-ID: <seq>`**，服务端读取该 Header 后即可从断点位置补发后续消息。
+- HTTP/1.1 下同域名开启多个 SSE 标签页有什么坑？→ 浏览器对同一个域名在 HTTP/1.1 下的最大并发 TCP 连接数限制为 **6 个**！如果用户开了 6 个标签页每个都维持一条 HTTP/1.1 SSE 长连接，第 7 个标签页的所有请求就会被永久阻塞。解决办法是**在网关开启 HTTP/2**，所有标签页的 SSE 流自动多路复用到同一条 TCP 连接上。
+
+**实战建议**
+
+- 在 Go 1.20+ 中一律用 `http.NewResponseController(w)` 调用 `Flush()` 和 `SetWriteDeadline()`，比旧式的 `w.(http.Flusher)` 类型断言更安全且能穿透中间件。
+- 每隔 15～30 秒向空闲的 SSE 连接写入一行 `: ping\n\n` 注释心跳，防止中间负载均衡器因空闲超时断开连接。
+
+=== web-25
+level: 2
+hot: false
+title: OAuth 2.0 的授权码流程（含 PKCE）和 OIDC 是怎么工作的？
+--- answer
+先厘清两个极易混淆的概念：**OAuth 2.0 是授权（Authorization）框架**（解决“允许第三方应用代我访问某项资源”），而 **OIDC（OpenID Connect）是建立在 OAuth 2.0 之上的身份认证（Authentication）协议**（解决“确认当前登录的用户是谁”）。
+
+**1. 授权码模式 + PKCE（Authorization Code Flow with PKCE，现代最安全的标准流程）**
+
+```text
++----------+                               +---------------+                 +---------------+
+| 浏览器端 |                               |  业务后端服务 |                 | 认证中心(IdP) |
++----------+                               +---------------+                 +---------------+
+     | 1. 生成随机 code_verifier 与哈希后的       |                                  |
+     |    code_challenge，跳转 IdP 登录页 --------+--------------------------------->|
+     |<-- 2. 用户登录同意，302 重定向回回调地址，携带一次性短命授权码 code & state ---|
+     | 3. 将 code 提交给业务后端 ---------------->|                                  |
+     |                                            | 4. 后端走内网 HTTPS 用 code +    |
+     |                                            |    client_secret + code_verifier |
+     |                                            |    换取 Token ------------------>|
+     |                                            |<-- 5. 返回 access_token,         |
+     |                                            |       refresh_token, id_token ---|
+```
+
+- **`state` 参数的作用**：防 **CSRF 攻击**！发起跳转前生成一个密码学随机串绑定在当前浏览器会话 Cookie 中，回调时严格比对 URL 里的 `state` 与 Cookie 中的值是否一致，防止攻击者诱导受害者绑定攻击者的账号；
+- **PKCE（Proof Key for Code Exchange）的作用**：防**授权码（`code`）被拦截盗用**！客户端发起请求前生成高熵随机串 `code_verifier`，只把它的 SHA-256 Base64URL 摘要 `code_challenge = BASE64URL(SHA256(code_verifier))` 发给授权页；最后一步换取 Token 时必须交出原始的 `code_verifier`，IdP 校验哈希匹配才发 Token——哪怕中间人截获了重定向 URL 里的 `code`，没有 `code_verifier` 也换不到 Token！
+
+**2. OIDC（OpenID Connect）增加了什么？**
+
+OIDC 在请求 `scope` 中包含 `openid`，换取 Token 时除了拿到访问 API 用的 `access_token`，还会额外返回一个标准 **JWT 格式的 `id_token`**（内含签名保护的用户唯一标识 `sub`、邮箱、头像、签发者 `iss`、受众 `aud` 和过期时间 `exp`），业务后端直接用 IdP 的公钥（JWKS）本地验签解析即可确认用户身份。
+--- deep
+**原理展开**
+
+深挖 Go 后端实现 OAuth2 / OIDC 登录回调时必须严防的三个安全漏洞：
+
+1. **为什么不能用隐式模式（Implicit Flow，直接在浏览器 URL `#access_token=...` 返回 Token）？**
+   OAuth 2.1 规范已经**正式废弃了隐式模式**！因为 Token 直接暴露在浏览器地址栏、历史记录和 Referer 头中，极易被 XSS 脚本或第三方统计插件窃取。现代无论是服务端渲染 Web、单页应用（SPA）还是移动端 App，统一使用**授权码 + PKCE**。
+2. **`id_token`（JWT）验签的 5 项强制检查**：
+   拿到 `id_token` 后，除了用 IdP 的公钥（通过 `/.well-known/openid-configuration` 的 `jwks_uri` 获取并缓存）校验数字签名外，还必须校验：① **签名算法 `alg`** 是否为预期的非对称算法（严防将 `alg` 篡改为 `"none"` 或用公钥当 HMAC 密钥伪造签名！）；② **`iss`（Issuer）** 是否等于认证中心地址；③ **`aud`（Audience）** 是否包含本应用的 `client_id`（防止拿别人应用的 `id_token` 来冒充登录你的应用！）；④ **`exp`（过期时间）**；⑤ **`nonce`**（防重放）。
+
+**代码示例**
+
+```go
+// RFC 7636 标准 PKCE 生成与校验实现（Go 1.24 标准库 crypto/rand + crypto/sha256 + encoding/base64）
+func GeneratePKCEVerifier() (string, error) {
+	b := make([]byte, 32) // 256 bits 随机熵
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// 计算 S256 模式的 code_challenge = BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))（无填充 '='）
+func ComputePKCEChallengeS256(verifier string) string {
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+func VerifyPKCE(verifier, challenge string) bool {
+	if len(verifier) < 43 || len(verifier) > 128 { // RFC 7636 规定长度必须在 43~128 之间
+		return false
+	}
+	expected := ComputePKCEChallengeS256(verifier)
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(challenge)) == 1
+}
+```
+
+**常见追问**
+
+- 在 OAuth 2.0 回调中，如果不校验 `state` 参数，攻击者具体能干什么坏事？→ **账号绑定劫持（Login CSRF）**！比如攻击者先用自己的微信/GitHub 走一遍授权拿到 `code_attacker`，故意拦住最后一步不提交，而是把链接 `https://victim-app.com/oauth/callback?code=code_attacker` 发给已登录的受害者点击。如果后端不校验 `state`，受害者的账号就会被静默绑定到攻击者的微信上，此后攻击者直接用自己的微信就能登录受害者的账号！
+- `access_token` 和 `refresh_token` 的生命周期应该怎么设计？→ `access_token` 设得尽量短（如 5～15 分钟），用于无状态快速鉴权；`refresh_token` 设得较长（如 7～30 天），存储在服务端数据库/Redis 中，且采用**刷新令牌轮换（Refresh Token Rotation）**——每次用旧 `refresh_token` 换取新 Token 时立即作废旧令牌，一旦发现已作废的旧令牌被再次使用（说明发生泄漏），立即吊销该家族的全部令牌！
+- 授权码 `code` 的有效期和可使用次数是多少？→ 按规范必须在极短时间内过期（通常 1～5 分钟），且**只能使用唯一一次**；如果服务端检测到同一个 `code` 被第二次提交换取 Token，应立即吊销第一次换出的那个 `access_token`！
+
+**实战建议**
+
+- 在 Go 项目中集成 OAuth2 和 OIDC，优先使用官方维护的 `golang.org/x/oauth2`（已原生内置 `oauth2.GenerateVerifier()` 和 `oauth2.S256ChallengeOption`）配合 `coreos/go-oidc/v3`。
+- 回调地址 `redirect_uri` 在认证中心侧必须配置为**精确全路径白名单匹配**，严禁使用通配符或前缀匹配，防止开放重定向（Open Redirect）窃取 `code`。
+
+=== web-26
+level: 2
+hot: false
+title: 什么是 CSRF（跨站请求伪造）攻击？SameSite Cookie、CSRF Token 和 Fetch Metadata 是如何防御的？
+--- answer
+**CSRF（Cross-Site Request Forgery，跨站请求伪造）** 的攻击原理是：受害者在浏览器中登录了受信任网站 `bank.com`（浏览器保存了它的登录会话 Cookie）；随后受害者在未退出登录的情况下访问了恶意网站 `evil.com`，`evil.com` 页面中隐藏了一个自动提交向 `https://bank.com/transfer` 发起的表单或图片请求——**浏览器在发送跨站请求时会自动附带 `bank.com` 的 Cookie**，导致服务端误以为是用户本人的操作而执行转账！
+
+**现代纵深防御的四道防线：**
+
+**1. `SameSite` Cookie 属性（第一道基础防线）**
+
+- `SameSite=Strict`：完全禁止任何跨站请求携带该 Cookie（最安全，但从外链点击进入网站时也会处于未登录态）；
+- **`SameSite=Lax`（现代浏览器默认值）**：只允许安全的顶级导航（如用户点击 `<a href>` 链接 `GET` 跳转）携带 Cookie，禁止跨站 `POST` 表单、iframe、`fetch/XHR` 携带 Cookie；
+- **局限**：如果后端违反 REST 规范用 `GET` 请求修改状态，或者攻击来自同站子域名（如 `sub.bank.com` 被攻陷，属于同站 Same-Site！），仅靠 `SameSite=Lax` 无法防御。
+
+**2. 携带在自定义 Header 中的认证凭据或双重提交 Token（CSRF Token）**
+
+因为同源策略（SOP）禁止跨站页面读取 Cookie 或在未通过 CORS 预检时发送自定义请求头（如 `Authorization: Bearer ...` 或 `X-CSRF-Token`），服务端校验请求头中的 Token 与会话/Cookie 中的值一致即可确认请求来自本网站前端。
+
+**3. 现代浏览器 Fetch Metadata 请求头校验（Go 1.25 标准库 `http.CrossOriginProtection` 采用）**
+
+现代浏览器会自动在所有请求中附加 **不可被前端 JS 伪造** 的安全头：`Sec-Fetch-Site`（取值：`same-origin`、`same-site`、`cross-site`、`none`）和 `Origin`。服务端只需拒绝 `Sec-Fetch-Site: cross-site`（或 `Origin` 与 `Host` 不匹配）的非安全方法（`POST / PUT / DELETE`），就能实现**无需维护任何 Token 状态的无状态 CSRF 防护**！
+--- deep
+**原理展开**
+
+深挖为什么很多开发者以为“我用了 `SameSite=Lax` 或者前后端分离 JSON 接口就绝对没有 CSRF 了”是危险的误区：
+
+1. **`SameSite` 管的是“同站（Same-Site / eTLD+1）”，而同源策略管的是“同源（Same-Origin）”！**
+   假设你的主站是 `pay.company.com`，公司还有一个老旧的营销活动页或博客 `promo.company.com` 存在 XSS 漏洞。因为它们的注册根域名都是 `company.com`，在浏览器看来从 `promo.company.com` 向 `pay.company.com` 发请求属于 **Same-Site（同站）**！此时 `SameSite=Lax` 甚至 `SameSite=Strict` 的 Cookie **都会被浏览器毫无保留地自动发送出去**！
+2. **为什么简单 `Content-Type` 的 JSON 请求也能被跨站 `<form>` 伪造？**
+   HTML `<form enctype="text/plain" method="POST">` 可以不触发 CORS 预检请求（属于简单请求）直接跨站发出请求体长得像 JSON 的 POST 请求！如果后端框架不严格校验 `Content-Type: application/json`，就会直接中招。
+3. **Go 1.25 标准库新增的 `net/http.CrossOriginProtection`**：
+   基于 Filippo Valsorda 提出的现代 Fetch Metadata 防护方案，直接通过检查 `Sec-Fetch-Site`（优先）和比对 `Origin` 与 `Host` 来拦截跨源状态修改请求，彻底告别了繁琐易错的传统加密 CSRF Token。
+
+**代码示例**
+
+```go
+// 现代无状态跨源请求防护中间件（与 Go 1.25 net/http.CrossOriginProtection 核心逻辑一致）：
+// 结合 Sec-Fetch-Site 与 Origin 校验，零状态、零加密开销防御跨源 CSRF（含同站不同源子域攻击！）
+func CrossOriginProtectionMiddleware(trustedOrigins map[string]bool) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// 1. 安全只读方法（GET / HEAD / OPTIONS）放行（前提：业务绝不能用 GET 修改数据！）
+			switch r.Method {
+			case http.MethodGet, http.MethodHead, http.MethodOptions:
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// 2. 优先检查现代浏览器的 Sec-Fetch-Site 头（JS 无法篡改）
+			switch r.Header.Get("Sec-Fetch-Site") {
+			case "same-origin", "none":
+				next.ServeHTTP(w, r)
+				return
+			case "":
+				// 旧浏览器或非浏览器客户端：继续走下面的 Origin 检查
+			default:
+				// "cross-site" 或 "same-site"（不同子域）：除非在受信白名单中，否则拦截！
+				if !trustedOrigins[r.Header.Get("Origin")] {
+					http.Error(w, "cross-origin request blocked", http.StatusForbidden)
+					return
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// 3. 回退检查 Origin 头是否与当前请求的 Host 同源
+			if origin := r.Header.Get("Origin"); origin != "" {
+				if !trustedOrigins[origin] && !isSameOriginHost(origin, r.Host) {
+					http.Error(w, "origin mismatch", http.StatusForbidden)
+					return
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func isSameOriginHost(origin, host string) bool {
+	u, err := url.Parse(origin)
+	return err == nil && strings.EqualFold(u.Host, host)
+}
+```
+
+**常见追问**
+
+- 什么是“双重提交 Cookie（Double Submit Cookie）”模式，它有什么弱点？→ 服务端种一个可读的 `csrf_token=xyz` Cookie，前端 JS 读取该 Cookie 并放入请求头 `X-CSRF-Token: xyz` 发回，服务端比对请求头和 Cookie 中的值是否相等。它的弱点是：如果同域下的兄弟子域名存在漏洞，攻击者可以通过种入覆盖父域 `.company.com` 的同名 Cookie 来固定伪造该 Token（Cookie Tossing 攻击）；解决方案是用服务端密钥将当前用户的 `SessionID` 与随机串做 **HMAC 签名**绑定，或者使用 `__Host-` Cookie 前缀（强制要求 `Secure; Path=/` 且不含 `Domain` 属性，子域无法覆盖）。
+- 为什么 Cookie 名字加 **`__Host-`** 前缀（如 `__Host-session`）是现代 Web 安全的黄金标准？→ 浏览器内核强制规定：任何以 `__Host-` 开头的 Cookie 必须同时具备 `Secure`（仅 HTTPS）、`Path=/`、且**严禁设置 `Domain`** 属性——这意味着任何子域名都绝对无法覆盖或伪造主域的这个 Cookie！
+- 如果认证完全不用 Cookie，而是前端把 Token 存在内存里并通过 `Authorization: Bearer <token>` 请求头发送，还会有 CSRF 吗？→ 不会有 CSRF，因为浏览器跨站自动发请求不会携带自定义 `Authorization` 头；但需要注意严防 **XSS（跨站脚本攻击）** 盗取内存/localStorage 中的 Token。
+
+**实战建议**
+
+- 会话 Cookie 一律命名为 `__Host-sid` 并设置 `HttpOnly; Secure; SameSite=Lax; Path=/`。
+- 严格遵守 HTTP 语义：**任何 `GET / HEAD` 请求绝不能产生修改数据库状态或扣款的副作用**，配合 `Sec-Fetch-Site` / `Origin` 校验中间件实现零状态防护。
+
+=== web-27
+level: 3
+hot: false
+title: 如何实现 Go 服务的零停机发布（SO_REUSEPORT 热重启 vs Kubernetes 滚动更新）？
+--- answer
+在生产环境中，服务发布升级时要求**正在处理的在途请求不中断、新进来的请求不报 502 错误**，主要有两种架构路径：
+
+**1. 单机 / 传统主机部署：基于 Socket 继承或 `SO_REUSEPORT` 的进程级热重启**
+
+- **FD 继承模式（如 `tableflip`、Endless）**：
+  1. 老进程收到 `SIGHUP` 信号后，调用 `fork/exec` 启动新版本二进制子进程，并通过 `exec.Cmd.ExtraFiles` 将当前正在监听的 TCP Listener 文件描述符（fd）直接传给新进程；
+  2. 新子进程调用 `net.FileListener(fd)` 直接在同一个 socket 上开始 `Accept()` 新连接；
+  3. 新进程就绪后通知老进程，老进程调用 `srv.Shutdown(ctx)` 停止接收新连接，排空已有在途请求后安全退出。
+- **`SO_REUSEPORT` 模式（Linux 3.9+）**：
+  通过 `net.ListenConfig{Control: ...}` 开启内核 `SO_REUSEPORT` 套接字选项，允许新老两个独立进程**同时绑定监听同一个 `IP:Port`**，由 Linux 内核负责在两个进程的监听队列之间均衡分发新连接；待新进程启动监听后，老进程优雅关闭即可。
+
+**2. 云原生容器部署：Kubernetes 滚动更新（RollingUpdate）与生命周期协同**
+
+在 K8s 中不做容器内进程替换，而是启动新 Pod 替换旧 Pod。要真正做到**零 502 零丢包**，必须打通以下时序链条：
+1. **新 Pod 上线**：配置 **`readinessProbe`（就绪探针）**，只有当 Go 进程完成配置加载、连接池预热并真正开始监听端口后，探针才返回 200，K8s 才把流量切进来；
+2. **旧 Pod 下线（最易出 502 的时间差！）**：K8s 删除旧 Pod 时，**发送 `SIGTERM` 给容器**与**通知 Ingress / kube-proxy 摘除 Endpoint IP** 是**异步并行**发生的！因此旧 Pod 必须：**先在 `preStop` 钩子（或收到 `SIGTERM` 后）让就绪探针立即返回 503 并保持正常接收请求 `sleep 5s`**（等网关彻底摘掉自己的 IP），**然后再调用 `srv.Shutdown(ctx)`** 排空在途请求！
+--- deep
+**原理展开**
+
+深挖这两种零停机方案在操作系统内核层面的关键细节：
+
+1. **为什么单靠 `SO_REUSEPORT` 在老进程调用 `close(listen_fd)` 的瞬间仍然会丢掉极少数握手中的连接？**
+   在 Linux 内核中，开启 `SO_REUSEPORT` 的每个进程都拥有**各自独立的 SYN 半连接队列和 Accept 全连接队列**！当老进程调用 `srv.Shutdown()` 关闭自己的 `listen_fd` 时，虽然新到的 SYN 包会全部转给新进程，但**当时已经躺在这个老进程自己的全连接队列里、还没来得及被 `accept()` 取走的那几个连接，会被内核直接丢弃并回复 `RST`**！
+   （只有使用 `BPF_PROG_TYPE_SK_REUSEPORT` eBPF 程序在老进程排空前先把新连接优雅导流给新进程，或者采用 `ExtraFiles` 共享同一个内核 `listen_fd` 队列，才能在单机做到 100% 零握手丢失）。
+2. **Kubernetes 优雅下线的黄金时间公式**：
+   $$\text{preStop Sleep (5s)} + \text{srv.Shutdown 超时 (20s)} < \text{terminationGracePeriodSeconds (30s)}$$
+   如果两者之和超过了 K8s 的 `terminationGracePeriodSeconds`，kubelet 到点会直接发送不可捕获的 `SIGKILL`（`kill -9`）强杀容器，导致优雅关闭功亏一篑。
+
+**代码示例**
+
+```go
+// 1. Kubernetes 零停机双状态健康检查与两阶段优雅退出控制器
+type GracefulServer struct {
+	shuttingDown atomic.Bool
+	srv          *http.Server
+}
+
+// 就绪探针 /readyz：收到停机信号的第一时间立即返回 503，主动让 LB / Ingress 摘除自己
+func (g *GracefulServer) ReadyzHandler(w http.ResponseWriter, r *http.Request) {
+	if g.shuttingDown.Load() {
+		http.Error(w, "shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
+// 收到 SIGTERM 后的两阶段停机流程
+func (g *GracefulServer) ShutdownGracefully(drainDelay, shutdownTimeout time.Duration) error {
+	// 第一阶段：标记未就绪，但继续正常 Accept 处理新请求，等待 K8s Endpoints 广播生效
+	g.shuttingDown.Store(true)
+	time.Sleep(drainDelay)
+
+	// 第二阶段：网关流量已切走，关闭 Listener 并等待在途请求完成
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	return g.srv.Shutdown(ctx)
+}
+```
+
+**常见追问**
+
+- 在 `srv.Shutdown(ctx)` 执行期间，如果客户端和我们的 Go 服务之间维持着一条 **WebSocket** 或 **SSE 长连接**，或者正在使用 `http.Hijacker`，`srv.Shutdown(ctx)` 会自动关闭它们吗？→ **不会**！标准库文档明确指出：`Shutdown` 只会关闭空闲连接，并等待活跃的普通 HTTP 请求结束，**不会处理已被 Hijack 的连接（如 WebSocket）或永不结束的流**。必须调用 `srv.RegisterOnShutdown(func() { close(wsShutdownCh) })` 主动通知所有长连接协程发送关闭帧并退出！
+- K8s 的 `livenessProbe`（存活探针）和 `readinessProbe`（就绪探针）可以用同一个检查下游 DB/Redis 的接口吗？→ **绝对不能**！如果 `livenessProbe` 也去检查 Redis/MySQL，一旦 Redis 偶发抖动 3 秒，所有 Pod 的存活探针同时失败，K8s 就会**把你整个集群的所有 Pod 全部重启一遍**，引发灾难性的级联雪崩！原则是：**`livenessProbe` 只检查进程自身是否死锁，绝不检查任何外部依赖**；只有 `readinessProbe` 才在启动时检查必要依赖。
+- 收到 `SIGTERM` 后，`r.Context()`（即正在处理的 HTTP 请求的 Context）会立刻被取消吗？→ 默认情况下**不会**，为了让在途请求正常跑完；只有当配置了自定义的 `BaseContext` 并在收到信号时主动 cancel 它，或者 `Shutdown` 超时强行关闭时才会取消。
+
+**实战建议**
+
+- 区分 `/livez`（永远只回 200 OK）和 `/readyz`（受 `shuttingDown` 原子变量控制，收到 `SIGTERM` 立即变 503），这是消除 K8s 滚动发布偶发 502 最有效的手段。
+- 服务如果有长连接或后台异步消费者，统一注册到 `srv.RegisterOnShutdown` 或主退出协调器中。
+
+=== web-28
+level: 2
+hot: false
+title: API 网关在微服务架构中承担哪些职责？如何在 Go 中实现核心网关能力？
+--- answer
+在微服务架构中，**API 网关（API Gateway）** 是外部流量（移动端、Web、第三方合作伙伴）进入内部微服务集群的唯一守门人，负责将所有**横切关注点（Cross-Cutting Concerns）**从业务服务中剥离出来统一治理。
+
+**1. API 网关的六大核心职责**
+
+1. **动态路由与协议转换**：根据 Host、Path、Header 将请求转发到对应的后端服务，或将外部的 HTTP/JSON 请求转换为内部的 gRPC 调用；
+2. **统一认证与鉴权（AuthN & AuthZ）**：集中校验 JWT / OAuth2 Token、API 签名（AK/SK），验证通过后将解析出的 `X-User-ID`、`X-Tenant-ID` 注入内部请求头透传给后端（**注意必须先剥离客户端伪造的同名内部头！**）；
+3. **流量治理（限流、熔断、灰度分流）**：按 IP、用户、接口维度做令牌桶/滑动窗口限流；按染色 Header 或用户尾号将 5% 流量切给金丝雀（Canary）灰度实例；
+4. **安全防护**：TLS 卸载（TLS Termination）、WAF 防注入、CORS 跨域统一处理、防重放与请求体大小限制；
+5. **可观测性入口**：在入口统一生成全局唯一的 `Traceparent` / `X-Request-ID`，记录全量 Access Log 与 RED 监控指标（请求率、错误率、延迟）；
+6. **响应聚合与裁剪（BFF 层）**。
+
+**2. Go 标准库的核心实现利器：`httputil.ReverseProxy`**
+
+Go 标准库的 `net/http/httputil.ReverseProxy` 是一个极其强悍的生产级反向代理引擎（Traefik、Caddy 等知名网关底层均基于此）：通过配置 **`Rewrite` 函数**（Go 1.20+ 替代了易出安全漏洞的旧版 `Director`）、自定义 `Transport` 连接池、`ModifyResponse` 和 `ErrorHandler`，只需几十行代码即可构建高性能网关。
+--- deep
+**原理展开**
+
+深挖 Go 1.20 为什么要新增 `ReverseProxy.Rewrite` 来替代用了十年的 `ReverseProxy.Director`——**一个著名的网关安全漏洞（Header Smuggling / 伪造内部身份头）**：
+
+在网关设计中，我们经常在网关校验完 JWT 后，往请求头里塞一个 `req.Header.Set("X-Internal-User-ID", "10086")` 传给后端微服务。
+- 但如果客户端恶意发来一个请求头：
+  ```http
+  Connection: X-Internal-User-ID
+  X-Internal-User-ID: 1 (管理员 ID)
+  ```
+  根据 HTTP/1.1 规范，`Connection` 头里列出的所有 Header 名都属于 **Hop-by-Hop（逐跳头）**，反向代理在转发给下游前必须将它们全部删掉！
+- **旧版 `Director` 的致命缺陷**：`Director(req)` 是在 `ReverseProxy` **清理 Hop-by-Hop 头之前**执行的！這会导致两种安全事故：① 攻击者利用 `Connection: X-Real-IP` 让网关在 `Director` 之后把刚刚设置好的安全头给删掉了！② 开发者在 `Director` 里忘了清理客户端伪造的 `X-Forwarded-For`。
+- **Go 1.20+ `Rewrite(pr *ProxyRequest)` 的修复**：`Rewrite` 接收包含只读原始请求 `pr.In` 和已彻底清理完所有逐跳头的新出站请求 `pr.Out`，并提供安全的 `pr.SetXForwarded()` 方法！
+
+**代码示例**
+
+```go
+// 使用 Go 1.20+ httputil.ReverseProxy.Rewrite 构建安全的网关路由转发器：
+// 自动防伪造清理敏感内部 Header + 注入可信身份头 + 统一网关错误处理
+func NewGatewayProxy(target *url.URL, authUser func(*http.Request) (string, error)) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(target)
+			pr.Out.Host = pr.In.Host // 保留原始 Host 头（或按需设为 target.Host）
+			pr.SetXForwarded()       // 安全设置 X-Forwarded-For / Host / Proto
+
+			// 关键安全准则：先无条件删除客户端可能恶意伪造的所有 X-Internal-* 内部头！
+			for k := range pr.Out.Header {
+				if strings.HasPrefix(http.CanonicalHeaderKey(k), "X-Internal-") {
+					pr.Out.Header.Del(k)
+				}
+			}
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			// 区分是客户端自己主动取消了请求（499），还是后端连接失败/超时（502/504）
+			if errors.Is(err, context.Canceled) {
+				w.WriteHeader(499)
+				return
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				http.Error(w, "gateway timeout", http.StatusGatewayTimeout)
+				return
+			}
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		},
+	}
+}
+```
+
+**常见追问**
+
+- 在网关中获取客户端真实 IP 时，为什么绝对不能直接取 `strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0]`（第一个 IP）用作防刷限流？→ 因为客户端发请求时可以自己随便伪造一个 `X-Forwarded-For: 1.2.3.4`！当请求经过你们公司的边缘 LB 时，LB 会把真实客户端 IP **追加（Append）**在后面，变成 `X-Forwarded-For: 1.2.3.4, <真实客户端IP>`。如果网关傻乎乎地取最左边的第一个 IP，攻击者只需每次请求换一个随机假 IP 头，就能 100% 绕过网关的 IP 限流和黑名单！**正确做法是从右往左数，跳过受信代理层数，取第一个非受信任代理追加的 IP**！
+- `ReverseProxy` 转发 SSE 流式响应时，怎样让它立即 Flush 而不缓冲？→ 设置 `ReverseProxy{FlushInterval: -1}`（Go 1.20+ 设为 `-1` 表示每次从后端读到数据后立即无延迟 Flush 给客户端；对于 `text/event-stream` 标准库也会自动开启即时刷新）。
+- Go 网关的 `http.Transport` 参数不调优会出什么问题？→ 默认 `MaxIdleConnsPerHost` 只有 `2`，网关转发高并发流量到后端时，会造成网关与后端微服务之间每秒建立并关闭成千上万条短连接，瞬间打满端口！网关的 `Transport` 必须把 `MaxIdleConnsPerHost` 调大到几百以上。
+
+**实战建议**
+
+- 网关向内部微服务透传认证信息（如 `X-Internal-UID`）时，**第一步永远是先清空客户端传入的所有同名或同前缀 Header**，防止客户端直接绕过登录伪造管理员身份。
+- 解析 `X-Forwarded-For` 获取真实客户端 IP 时，必须采用**从右向左剔除受信代理 IP（Rightmost Non-Trusted IP）**的算法。
+
+=== web-29
+level: 2
+hot: false
+title: 高并发 Go 服务的日志规范应该怎样设计？log/slog 如何实现高性能结构化日志与采样降噪？
+--- answer
+在高并发生产系统中，不规范的日志要么在排查故障时“关键信息全没有”，要么在下游故障报错时“每秒狂打几十万条重复错误日志直接打爆磁盘 I/O 和日志中心”。
+
+**1. 生产级日志规范四要素**
+
+1. **统一结构化 JSON 格式**：禁止拼接非结构化的自由文本，统一输出包含 `time`、`level`、`msg`、`trace_id`、`service` 及业务键值对的 JSON，便于 Loki / ELK 索引检索；
+2. **严格的日志级别定义**：
+   - `ERROR`：系统发生了需要人工介入或计入错误率告警的异常（如 DB 连接失败、panic）；**客户端传参错误（400）或常规业务校验失败绝不能打 `ERROR`！**
+   - `WARN`：预期内的异常或自动恢复（如触发了重试、降级、限流拦截）；
+   - `INFO`：关键业务状态变迁（如订单支付成功、服务启动停止、采样后的 Access Log）；
+   - `DEBUG`：开发调试细节，生产默认关闭（可通过管理接口按租户或按单个染色请求动态开启）。
+3. **敏感信息自动脱敏**：手机号、身份证、密码、Token、银行卡号禁止明文落盘；
+4. **高频重复日志采样（Log Sampling）**：同一秒内完全相同的错误最多打印前 $N$ 条，后续按比例抽样。
+
+**2. Go 1.21+ 标准库 `log/slog` 的三大高性能实践**
+
+- **强类型 `slog.Attr` 零装箱分配**：使用 `slog.LogAttrs(ctx, slog.LevelInfo, "order created", slog.Int64("order_id", id), slog.String("uid", uid))`，避免了普通键值参数转换为 `any` 接口时的堆逃逸分配；
+- **实现 `slog.LogValuer` 接口统一脱敏与延迟计算**：为包含密码或高开销序列化的结构体实现 `LogValue() slog.Value` 方法；
+- **自定义包装 `slog.Handler`**：在 `Handle(ctx, record)` 中自动从 `ctx` 提取 `trace_id` 注入，并实现窗口期日志限流采样。
+--- deep
+**原理展开**
+
+深挖 `log/slog` 为什么能做到比传统反射日志库快数倍且近乎零堆分配：
+
+1. **`slog.Value` 的无装箱内联设计（类似 `reflect.Value` 的 union 技巧）**：
+   看一下标准库 `slog.Value` 的结构体定义：
+   ```go
+   type Value struct {
+       _   [0]func() // 禁止直接 == 比较
+       num uint64    // 直接存放 int64、uint64、float64、bool、time.Duration 或 string 的长度！
+       any any       // 存放类型标记或 string 的底层数据指针
+   }
+   ```
+   当你调用 `slog.Int64("id", 12345)` 时，整数 `12345` 直接存入值结构体内部的 `num uint64` 字段，**完全不发生 `int64 -> interface{}` 的堆内存装箱逃逸（Boxing Allocation）**！
+2. **`slog.LogValuer` 的两重收益**：
+   - **安全防呆**：给 `User` 或 `Config` 结构体实现 `LogValue() slog.Value`，只要任何开发同学不小心写了 `slog.Info("login", "user", user)`，都会自动输出脱敏后的字段，绝不可能把 `Password` 或 `AccessToken` 漏进日志里；
+   - **惰性求值**：如果当前日志级别是 `INFO`，而代码写了 `slog.Debug("dump", "state", expensiveState)`，`LogValue()` 方法**根本不会被调用**，省去了昂贵的格式化开销！
+
+**代码示例**
+
+```go
+// 1. 实现 slog.LogValuer 接口自动对结构体中的敏感字段脱敏
+type UserCredentials struct {
+	Username string
+	Phone    string
+	Password string
+}
+
+func (u UserCredentials) LogValue() slog.Value {
+	maskedPhone := u.Phone
+	if len(u.Phone) == 11 {
+		maskedPhone = u.Phone[:3] + "****" + u.Phone[7:]
+	}
+	return slog.GroupValue(
+		slog.String("username", u.Username),
+		slog.String("phone", maskedPhone),
+		slog.String("password", "[REDACTED]"), // 永远隐藏明文密码
+	)
+}
+
+// 2. 自定义 slog.Handler 中间件：自动从 Context 提取 TraceID + 按时间窗口对高频重复日志做限流采样
+type ContextAndSampleHandler struct {
+	next slog.Handler
+}
+
+func (h *ContextAndSampleHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	return h.next.Enabled(ctx, l)
+}
+
+func (h *ContextAndSampleHandler) Handle(ctx context.Context, r slog.Record) error {
+	if traceID, ok := ctx.Value(traceKey{}).(string); ok && traceID != "" {
+		r.AddAttrs(slog.String("trace_id", traceID))
+	}
+	return h.next.Handle(ctx, r)
+}
+
+func (h *ContextAndSampleHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &ContextAndSampleHandler{next: h.next.WithAttrs(attrs)}
+}
+
+func (h *ContextAndSampleHandler) WithGroup(name string) slog.Handler {
+	return &ContextAndSampleHandler{next: h.next.WithGroup(name)}
+}
+```
+
+**常见追问**
+
+- `slog.Info("msg", "id", id)` 和 `slog.LogAttrs(ctx, slog.LevelInfo, "msg", slog.Int("id", id))` 有什么性能区别？→ 前者接收 `...any`，传入的 `"id"` 和 `id` 会先组合成键值对，如果是基本类型可能触发接口装箱；而 `LogAttrs` 显式接收 `...slog.Attr` 值类型，Go 编译器能对其做彻底的逃逸消除，在极致性能热路径上推荐用 `LogAttrs`。
+- 如果用自定义的 `slog.Handler` 包装了底层 Handler，在调用 `WithAttrs` 时需要注意什么？→ 必须返回一个**新的外层包装 Handler 实例**（包裹住 `h.next.WithAttrs(attrs)`），不能直接返回 `h.next.WithAttrs(attrs)`，否则调用 `logger.With("module", "pay")` 生成的子 Logger 就会把你外层的 TraceID 注入和采样逻辑全部丢掉！
+- 生产环境高频日志采样（参考 `zap.NewProduction` 的采样器策略）通常怎么设定规则？→ 按 **`(日志级别 + 消息模板 msg)`** 作为哈希分桶 Key，在每 **1 秒**的时间窗口内：**前 $N$ 条（如 100 条）100% 原样输出**；同一秒内超出 100 条后的相同日志，**每 $M$ 条（如每 100 条）只输出 1 条**。这样既绝对不会漏掉任何偶发错误，又能在下游雪崩报错时将每秒 10 万条日志瞬間压降到每秒 1100 条，保护磁盘 I/O 不被打挂！
+
+**实战建议**
+
+- 全项目统一使用 `slog.InfoContext(ctx, ...)` / `slog.ErrorContext(ctx, ...)`（带 `Context` 后缀的方法），让底层 `slog.Handler` 能自动串联全链路 `trace_id`。
+- 为所有包含密钥、Token、手机号、身份证的领域模型实现 `slog.LogValuer` 接口，从类型层面根除日志泄密隐患。

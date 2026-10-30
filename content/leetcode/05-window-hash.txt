@@ -1,0 +1,1067 @@
+=== lc-3
+no: 3
+title: 无重复字符的最长子串
+slug: longest-substring-without-repeating-characters
+difficulty: 中等
+category: 双指针与滑动窗口
+topics: 哈希表, 字符串, 滑动窗口
+go: map, byte 与 rune, 内置 min/max
+--- desc
+给定字符串 `s`，找出其中**不含重复字符**的最长子串的长度。
+
+**示例**：`"abcabcbb"` → `3`（`"abc"`）；`"bbbbb"` → `1`；`"pwwkew"` → `3`（`"wke"`，注意 `"pwke"` 是子序列不是子串）。
+--- solution
+package main
+
+func lengthOfLongestSubstring(s string) int {
+	// @solution
+	last := map[byte]int{} // 字符 → 最近一次出现的下标
+	best, left := 0, 0
+	for right := 0; right < len(s); right++ {
+		c := s[right]
+		if i, ok := last[c]; ok && i >= left {
+			left = i + 1 // 窗口里已经有 c，左边界跳到它后面
+		}
+		last[c] = right
+		best = max(best, right-left+1)
+	}
+	return best
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestLengthOfLongestSubstring(t *testing.T) {
+	cases := []struct {
+		s    string
+		want int
+	}{
+		{"abcabcbb", 3},
+		{"bbbbb", 1},
+		{"pwwkew", 3},
+		{"", 0},
+		{" ", 1},
+		{"abba", 2},
+		{"dvdf", 3},
+		{"tmmzuxt", 5},
+	}
+	for _, c := range cases {
+		if got := lengthOfLongestSubstring(c.s); got != c.want {
+			t.Errorf("lengthOfLongestSubstring(%q) = %d，期望 %d", c.s, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+滑动窗口：用 `[left, right]` 表示当前无重复的子串。右边界每次前进一格；如果新字符已经在窗口里出现过，就把左边界移到它上一次出现位置的后面。窗口始终合法，过程中记录最大长度。
+
+**代码讲解**
+
+1. `last := map[byte]int{}`：记录每个字符**最近一次出现的下标**，这样左边界可以一步跳到位，不用一格一格挪。
+2. `for right := 0; right < len(s); right++`：按字节遍历（题目里是 ASCII 字符）。
+3. `if i, ok := last[c]; ok && i >= left`：comma-ok 判断出现过，并且**还要在窗口内**（`i >= left`）。
+4. `left = i + 1`：跳过重复字符。
+5. `last[c] = right`：更新最近位置。
+6. `best = max(best, right-left+1)`：窗口长度是 `right - left + 1`。
+
+**易错点**
+
+- 漏掉 `i >= left` 的判断：`"abba"` 处理到最后的 `a` 时，上一次的 `a` 在下标 0，已经不在窗口 `[2, 3]` 里了，如果仍然跳过去，left 会**往回退**到 1，得到错误的 3。
+- 字符集只有 ASCII 时，也可以用 `[128]int` 数组代替 map（存“下标 + 1”，0 表示没出现过），更快。
+
+**复杂度**
+
+时间 O(n)，空间 O(字符集大小)。
+
+=== lc-11
+no: 11
+title: 盛最多水的容器
+slug: container-with-most-water
+difficulty: 中等
+category: 双指针与滑动窗口
+topics: 数组, 双指针, 贪心
+go: 多重赋值, 内置 min/max
+--- desc
+给定长度为 n 的数组 `height`，第 i 条竖线的高度是 `height[i]`。找出两条线，使它们与 x 轴构成的容器能装最多的水，返回最大水量。
+
+水量 = 两线距离 × 较短那条线的高度。
+
+**示例**：`[1,8,6,2,5,4,8,3,7]` → `49`（下标 1 和 8：`min(8, 7) × 7`）。
+--- solution
+package main
+
+func maxArea(height []int) int {
+	// @solution
+	l, r, best := 0, len(height)-1, 0
+	for l < r {
+		best = max(best, min(height[l], height[r])*(r-l))
+		if height[l] < height[r] {
+			l++ // 短板决定水量，移动短板才有可能变大
+		} else {
+			r--
+		}
+	}
+	return best
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestMaxArea(t *testing.T) {
+	cases := []struct {
+		h    []int
+		want int
+	}{
+		{[]int{1, 8, 6, 2, 5, 4, 8, 3, 7}, 49},
+		{[]int{1, 1}, 1},
+		{[]int{4, 3, 2, 1, 4}, 16},
+		{[]int{1, 2, 1}, 2},
+		{[]int{2, 3, 4, 5, 18, 17, 6}, 17},
+	}
+	for _, c := range cases {
+		if got := maxArea(c.h); got != c.want {
+			t.Errorf("maxArea(%v) = %d，期望 %d", c.h, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+左右指针从两端开始，每次计算当前水量，然后**移动较短的那一边**。
+
+为什么可以这样贪心？设左边更短。如果移动右边，宽度变小，高度仍然受左边限制（不会超过 `height[l]`），水量只会更小。也就是说，以左边这条线为一端的所有容器里，当前这个已经是最大的了，可以放心地把左边排除掉。
+
+**代码讲解**
+
+1. `l, r, best := 0, len(height)-1, 0`：一行声明三个变量。
+2. `for l < r`：两指针相遇就结束。
+3. `min(height[l], height[r])*(r-l)`：内置 `min`/`max`（Go 1.21+），一行算出水量并更新最优值。
+4. 比较两边高度，移动短的；相等时移动哪边都可以。
+
+**易错点**
+
+- 移动较高的一边是错的，会漏掉最优解。
+- 暴力枚举所有两两组合是 O(n²)，n = 10⁵ 时会超时。
+
+**复杂度**
+
+时间 O(n)，空间 O(1)。
+
+=== lc-15
+no: 15
+title: 三数之和
+slug: 3sum
+difficulty: 中等
+category: 双指针与滑动窗口
+topics: 数组, 双指针, 排序
+go: slices 包, switch, 切片
+--- desc
+给定整数数组 `nums`，找出所有**和为 0** 且**不重复**的三元组 `[nums[i], nums[j], nums[k]]`（i、j、k 互不相同）。答案中不能包含重复的三元组，三元组和答案的顺序不限。
+
+**示例**：`[-1,0,1,2,-1,-4]` → `[[-1,-1,2],[-1,0,1]]`；`[0,1,1]` → `[]`；`[0,0,0]` → `[[0,0,0]]`。
+--- solution
+package main
+
+import "slices"
+
+func threeSum(nums []int) [][]int {
+	// @solution
+	slices.Sort(nums)
+	var res [][]int
+	n := len(nums)
+	for i := 0; i < n-2; i++ {
+		if nums[i] > 0 {
+			break // 最小的数都大于 0，后面不可能凑出 0
+		}
+		if i > 0 && nums[i] == nums[i-1] {
+			continue // 第一个数去重
+		}
+		l, r := i+1, n-1
+		for l < r {
+			switch sum := nums[i] + nums[l] + nums[r]; {
+			case sum < 0:
+				l++
+			case sum > 0:
+				r--
+			default:
+				res = append(res, []int{nums[i], nums[l], nums[r]})
+				for l < r && nums[l] == nums[l+1] {
+					l++ // 第二个数去重
+				}
+				for l < r && nums[r] == nums[r-1] {
+					r-- // 第三个数去重
+				}
+				l++
+				r--
+			}
+		}
+	}
+	return res
+	// @starter
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"slices"
+	"testing"
+)
+
+// norm 把每个三元组排序，再把所有三元组排序，方便比较
+func norm(x [][]int) string {
+	out := make([][]int, 0, len(x))
+	for _, t := range x {
+		c := slices.Clone(t)
+		slices.Sort(c)
+		out = append(out, c)
+	}
+	slices.SortFunc(out, slices.Compare[[]int])
+	return fmt.Sprint(out)
+}
+
+func TestThreeSum(t *testing.T) {
+	cases := []struct {
+		nums []int
+		want [][]int
+	}{
+		{[]int{-1, 0, 1, 2, -1, -4}, [][]int{{-1, -1, 2}, {-1, 0, 1}}},
+		{[]int{0, 1, 1}, nil},
+		{[]int{0, 0, 0}, [][]int{{0, 0, 0}}},
+		{[]int{0, 0, 0, 0}, [][]int{{0, 0, 0}}},
+		{[]int{-2, 0, 1, 1, 2}, [][]int{{-2, 0, 2}, {-2, 1, 1}}},
+		{[]int{-4, -2, -2, -2, 0, 1, 2, 2, 2, 3, 3, 4, 4, 6, 6},
+			[][]int{{-4, -2, 6}, {-4, 0, 4}, {-4, 1, 3}, {-4, 2, 2}, {-2, -2, 4}, {-2, 0, 2}}},
+	}
+	for _, c := range cases {
+		in := slices.Clone(c.nums)
+		if got := threeSum(in); norm(got) != norm(c.want) {
+			t.Errorf("threeSum(%v) = %v，期望 %v", c.nums, norm(got), norm(c.want))
+		}
+	}
+}
+--- explain
+**思路**
+
+先排序。固定第一个数 `nums[i]`，在它右边的区间里用**左右双指针**找另外两个数，使三数之和为 0：和太小就右移左指针，和太大就左移右指针。难点是**去重**：排序后相同的数相邻，跳过它们即可。
+
+**代码讲解**
+
+1. `slices.Sort(nums)`：Go 1.21 的泛型排序（老写法是 `sort.Ints`），会原地修改切片。
+2. `if nums[i] > 0 { break }`：剪枝，排序后后面的数更大，不可能再凑出 0。
+3. `if i > 0 && nums[i] == nums[i-1] { continue }`：第一个数和上一轮相同，得到的三元组也会重复，跳过。
+4. `switch sum := ...; {`：switch 也能带初始化语句，后面不写表达式就是无条件 switch。
+5. 找到答案后，`for l < r && nums[l] == nums[l+1]` 跳过相同的第二个数，第三个数同理，然后两个指针都向内移动一步。
+
+**易错点**
+
+- 去重时要和**前一个**比较（`nums[i-1]`），和后一个比较会漏掉 `[-1, -1, 2]` 这种第一、二个数相同的组合。
+- 跳过重复的循环里要保留 `l < r`，否则可能越界。
+- 用 map 去重三元组也可以，但要把三元组转成数组 `[3]int` 当 key，效率更低。
+
+**复杂度**
+
+时间 O(n²)（排序 O(n log n) + 双重循环），空间 O(log n)（排序）。
+
+=== lc-167
+no: 167
+title: 两数之和 II - 输入有序数组
+slug: two-sum-ii-input-array-is-sorted
+difficulty: 中等
+category: 双指针与滑动窗口
+topics: 数组, 双指针, 二分查找
+go: switch, 多重赋值
+--- desc
+给定一个**非递减排序**的整数数组 `numbers`，找出两个数使它们的和等于 `target`，返回它们的下标 `[index1, index2]`（**下标从 1 开始**，`index1 < index2`）。保证恰好有一个答案，要求只使用常数级额外空间。
+
+**示例**：`numbers = [2,7,11,15], target = 9` → `[1,2]`。
+--- solution
+package main
+
+func twoSum(numbers []int, target int) []int {
+	// @solution
+	l, r := 0, len(numbers)-1
+	for l < r {
+		switch s := numbers[l] + numbers[r]; {
+		case s == target:
+			return []int{l + 1, r + 1}
+		case s < target:
+			l++ // 和太小，左边换一个更大的数
+		default:
+			r-- // 和太大，右边换一个更小的数
+		}
+	}
+	return nil
+	// @starter
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestTwoSum(t *testing.T) {
+	cases := []struct {
+		nums   []int
+		target int
+		want   []int
+	}{
+		{[]int{2, 7, 11, 15}, 9, []int{1, 2}},
+		{[]int{2, 3, 4}, 6, []int{1, 3}},
+		{[]int{-1, 0}, -1, []int{1, 2}},
+		{[]int{1, 2, 3, 4, 4, 9, 56, 90}, 8, []int{4, 5}},
+		{[]int{5, 25, 75}, 100, []int{2, 3}},
+	}
+	for _, c := range cases {
+		if got := twoSum(c.nums, c.target); !slices.Equal(got, c.want) {
+			t.Errorf("twoSum(%v, %d) = %v，期望 %v", c.nums, c.target, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+数组有序时不需要哈希表：左右指针从两端开始，和太小就让左指针右移（换一个更大的数），和太大就让右指针左移。每一步都排除了一个不可能的数，所以一定能找到答案。
+
+**代码讲解**
+
+1. `l, r := 0, len(numbers)-1`：两端。
+2. `switch s := numbers[l] + numbers[r]; {`：带初始化语句的无条件 switch，`s` 只在 switch 内有效。
+3. 相等时返回 `l + 1, r + 1`，题目要求下标从 1 开始。
+4. 循环理论上一定会返回，最后的 `return nil` 只是为了满足编译器“所有路径都要有返回值”。
+
+**易错点**
+
+- 忘记下标 +1。
+- 为什么不会漏解：假设答案是 `(i, j)`。当 `l < i` 时，`numbers[l] + numbers[r] ≤ numbers[i] + numbers[j]`（r ≥ j 时才会出现和偏大的情况而移动 r），可以证明指针不会越过答案。
+
+**复杂度**
+
+时间 O(n)，空间 O(1)。
+
+**延伸**
+
+也可以对每个数二分查找 `target - numbers[i]`，O(n log n)。「两数之和」原题无序，所以用哈希表；有序时双指针更好。
+
+=== lc-209
+no: 209
+title: 长度最小的子数组
+slug: minimum-size-subarray-sum
+difficulty: 中等
+category: 双指针与滑动窗口
+topics: 数组, 滑动窗口, 前缀和
+go: math 常量, 内置 min/max
+--- desc
+给定一个**正整数**数组 `nums` 和正整数 `target`，找出总和**大于等于** `target` 的长度最小的**连续**子数组，返回它的长度；不存在则返回 0。
+
+**示例**：`target = 7, nums = [2,3,1,2,4,3]` → `2`（`[4,3]`）；`target = 11, nums = [1,1,1,1,1,1,1,1]` → `0`。
+--- solution
+package main
+
+import "math"
+
+func minSubArrayLen(target int, nums []int) int {
+	// @solution
+	best := math.MaxInt
+	sum, left := 0, 0
+	for right, v := range nums {
+		sum += v
+		for sum >= target { // 窗口满足条件：记录长度，然后尝试缩小
+			best = min(best, right-left+1)
+			sum -= nums[left]
+			left++
+		}
+	}
+	if best == math.MaxInt {
+		return 0
+	}
+	return best
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestMinSubArrayLen(t *testing.T) {
+	cases := []struct {
+		target int
+		nums   []int
+		want   int
+	}{
+		{7, []int{2, 3, 1, 2, 4, 3}, 2},
+		{4, []int{1, 4, 4}, 1},
+		{11, []int{1, 1, 1, 1, 1, 1, 1, 1}, 0},
+		{15, []int{1, 2, 3, 4, 5}, 5},
+		{11, []int{1, 2, 3, 4, 5}, 3},
+		{100, []int{}, 0},
+	}
+	for _, c := range cases {
+		if got := minSubArrayLen(c.target, c.nums); got != c.want {
+			t.Errorf("minSubArrayLen(%d, %v) = %d，期望 %d", c.target, c.nums, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+因为所有数都是正数，窗口扩大和一定变大、缩小和一定变小，所以可以用**滑动窗口**：右边界不断扩张；一旦窗口和 ≥ target，就记录长度并收缩左边界，直到不满足条件。
+
+**代码讲解**
+
+1. `best := math.MaxInt`：用“最大整数”表示还没找到答案，任何真实长度都比它小。
+2. `for right, v := range nums`：右边界每次纳入一个数。
+3. `for sum >= target`：注意是 **for 而不是 if**，可能需要连续收缩好几次。
+4. 收缩前先 `best = min(best, right-left+1)` 记录当前合法窗口，再减掉左边的数、左边界右移。
+5. 最后 `best` 还是 `math.MaxInt` 说明没有满足条件的子数组，返回 0。
+
+**易错点**
+
+- 用 `if` 只收缩一次，会得到偏大的结果（比如 `[1, 1, 1, 10]` 遇到 10 时需要连续收缩）。
+- 如果数组里有负数，“窗口和单调”的性质不成立，滑动窗口就不再适用，要用前缀和 + 单调队列。
+
+**复杂度**
+
+时间 O(n)：每个元素最多进、出窗口各一次。空间 O(1)。
+
+=== lc-438
+no: 438
+title: 找到字符串中所有字母异位词
+slug: find-all-anagrams-in-a-string
+difficulty: 中等
+category: 双指针与滑动窗口
+topics: 哈希表, 字符串, 滑动窗口
+go: 数组值类型, byte 与 rune
+--- desc
+给定两个字符串 `s` 和 `p`（只含小写字母），找到 `s` 中所有是 `p` 的**异位词**的子串，返回这些子串的起始下标（顺序不限）。异位词指字母相同、排列不同的字符串。
+
+**示例**：`s = "cbaebabacd", p = "abc"` → `[0,6]`（`"cba"` 和 `"bac"`）；`s = "abab", p = "ab"` → `[0,1,2]`。
+--- solution
+package main
+
+func findAnagrams(s string, p string) []int {
+	// @solution
+	if len(p) > len(s) {
+		return nil
+	}
+	var need, win [26]int
+	for i := 0; i < len(p); i++ {
+		need[p[i]-'a']++
+	}
+	var res []int
+	for i := 0; i < len(s); i++ {
+		win[s[i]-'a']++ // 右边进窗口
+		if i >= len(p) {
+			win[s[i-len(p)]-'a']-- // 左边出窗口，窗口长度保持 len(p)
+		}
+		if i >= len(p)-1 && win == need {
+			res = append(res, i-len(p)+1)
+		}
+	}
+	return res
+	// @starter
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"slices"
+	"testing"
+)
+
+func TestFindAnagrams(t *testing.T) {
+	cases := []struct {
+		s, p string
+		want []int
+	}{
+		{"cbaebabacd", "abc", []int{0, 6}},
+		{"abab", "ab", []int{0, 1, 2}},
+		{"a", "ab", nil},
+		{"aaaaa", "aa", []int{0, 1, 2, 3}},
+		{"baa", "aa", []int{1}},
+		{"abc", "d", nil},
+	}
+	for _, c := range cases {
+		got := findAnagrams(c.s, c.p)
+		slices.Sort(got)
+		if fmt.Sprint(got) != fmt.Sprint(c.want) {
+			t.Errorf("findAnagrams(%q, %q) = %v，期望 %v", c.s, c.p, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+**固定长度**的滑动窗口：窗口长度始终等于 `len(p)`，每次右边进一个字母、左边出一个字母，用计数数组维护窗口里每个字母的个数。窗口的计数和 `p` 的计数相同，就是一个异位词。
+
+**代码讲解**
+
+1. `var need, win [26]int`：两个计数数组，零值就是全 0。
+2. 先统计 `p` 的字母个数。
+3. 每一步：`win[s[i]-'a']++` 让新字母进窗口；当 `i >= len(p)` 时，下标 `i-len(p)` 的字母已经在窗口左边之外，减掉它。
+4. `i >= len(p)-1` 表示窗口已经填满；`win == need`：**数组可以直接用 `==` 比较**，一次比较 26 个数，代码非常简洁。
+5. 起始下标是 `i - len(p) + 1`。
+
+**易错点**
+
+- 切片不能用 `==` 比较，换成 `[]int` 这里就编译不过了；这是 Go 数组“值类型 + 可比较”的典型用法。
+- 窗口还没填满时（`i < len(p)-1`）不能判断。
+
+**复杂度**
+
+时间 O(26·n) = O(n)，空间 O(1)。
+
+**延伸**
+
+可以再维护一个变量 `diff` 记录“有多少个字母的计数不同”，每次只更新进出的两个字母，把比较降到 O(1)。
+
+=== lc-75
+no: 75
+title: 颜色分类
+slug: sort-colors
+difficulty: 中等
+category: 双指针与滑动窗口
+topics: 数组, 双指针, 排序
+go: 原地修改, switch, 多重赋值
+--- desc
+数组 `nums` 只包含 0、1、2（分别代表红、白、蓝），**原地**排序，使相同颜色相邻，并按 0、1、2 的顺序排列。不能使用库函数排序，尽量只遍历一次。
+
+**示例**：`[2,0,2,1,1,0]` → `[0,0,1,1,2,2]`。
+--- solution
+package main
+
+func sortColors(nums []int) {
+	// @solution
+	// [0, lo) 全是 0，[lo, i) 全是 1，(hi, n) 全是 2，[i, hi] 还没看
+	lo, i, hi := 0, 0, len(nums)-1
+	for i <= hi {
+		switch nums[i] {
+		case 0:
+			nums[lo], nums[i] = nums[i], nums[lo]
+			lo++
+			i++
+		case 1:
+			i++
+		case 2:
+			nums[i], nums[hi] = nums[hi], nums[i]
+			hi-- // 换过来的数还没看过，i 不动
+		}
+	}
+	// @starter
+	// // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestSortColors(t *testing.T) {
+	cases := [][]int{
+		{2, 0, 2, 1, 1, 0},
+		{2, 0, 1},
+		{0},
+		{1, 2, 0},
+		{2, 2, 1, 1, 0, 0, 1},
+		{1, 1, 1},
+	}
+	for _, in := range cases {
+		got := slices.Clone(in)
+		sortColors(got)
+		want := slices.Clone(in)
+		slices.Sort(want)
+		if !slices.Equal(got, want) {
+			t.Errorf("sortColors(%v) 后得到 %v，期望 %v", in, got, want)
+		}
+	}
+}
+--- explain
+**思路**
+
+荷兰国旗问题：用三个指针把数组分成四段——`[0, lo)` 是 0，`[lo, i)` 是 1，`[i, hi]` 是还没处理的，`(hi, n)` 是 2。`i` 从左往右扫描，遇到 0 换到前面，遇到 2 换到后面，遇到 1 不动。
+
+**代码讲解**
+
+1. 注释写明了四个区间的含义（**循环不变量**），三指针题先把它想清楚。
+2. `lo, i, hi := 0, 0, len(nums)-1`。
+3. `for i <= hi`：未处理区间 `[i, hi]` 非空时继续。
+4. `switch nums[i]` 按值匹配：
+   - `0`：和 `nums[lo]` 交换。换过来的一定是 1（或者 lo == i 时是自己），已经处理过，所以 `lo`、`i` 都前进。
+   - `1`：就在正确的区间，`i++`。
+   - `2`：和 `nums[hi]` 交换，`hi--`。**`i` 不能前进**，因为从后面换过来的数还没看过。
+5. 函数没有返回值，直接修改传入的切片。
+
+**易错点**
+
+- 遇到 2 交换后 `i++`，会漏处理换过来的 0，例如 `[2, 0]`。
+- 也可以两次遍历做计数排序：先数出 0、1、2 的个数，再依次填回去。代码更简单，但要遍历两次。
+
+**复杂度**
+
+时间 O(n)，一次遍历；空间 O(1)。
+
+=== lc-49
+no: 49
+title: 字母异位词分组
+slug: group-anagrams
+difficulty: 中等
+category: 哈希表与前缀和
+topics: 数组, 哈希表, 字符串
+go: 数组值类型, map, 切片
+--- desc
+给定字符串数组 `strs`（只含小写字母），把**字母异位词**分到同一组，返回分组结果，组的顺序和组内顺序都不限。
+
+**示例**：`["eat","tea","tan","ate","nat","bat"]` → `[["bat"],["nat","tan"],["ate","eat","tea"]]`。
+--- solution
+package main
+
+func groupAnagrams(strs []string) [][]string {
+	// @solution
+	groups := map[[26]int][]string{} // 字母计数 → 这一组的字符串
+	for _, s := range strs {
+		var key [26]int
+		for i := 0; i < len(s); i++ {
+			key[s[i]-'a']++
+		}
+		groups[key] = append(groups[key], s)
+	}
+	out := make([][]string, 0, len(groups))
+	for _, g := range groups {
+		out = append(out, g)
+	}
+	return out
+	// @starter
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"slices"
+	"strings"
+	"testing"
+)
+
+func norm(groups [][]string) string {
+	out := make([]string, 0, len(groups))
+	for _, g := range groups {
+		c := slices.Clone(g)
+		slices.Sort(c)
+		out = append(out, strings.Join(c, ","))
+	}
+	slices.Sort(out)
+	return fmt.Sprintf("%q", out)
+}
+
+func TestGroupAnagrams(t *testing.T) {
+	cases := []struct {
+		in   []string
+		want [][]string
+	}{
+		{[]string{"eat", "tea", "tan", "ate", "nat", "bat"}, [][]string{{"bat"}, {"nat", "tan"}, {"ate", "eat", "tea"}}},
+		{[]string{""}, [][]string{{""}}},
+		{[]string{"a"}, [][]string{{"a"}}},
+		{[]string{"abc", "bca", "cab", "xyz", "zyx", "q"}, [][]string{{"abc", "bca", "cab"}, {"xyz", "zyx"}, {"q"}}},
+		{[]string{"ab", "ba", "aab", "aba"}, [][]string{{"ab", "ba"}, {"aab", "aba"}}},
+	}
+	for _, c := range cases {
+		if got := groupAnagrams(c.in); norm(got) != norm(c.want) {
+			t.Errorf("groupAnagrams(%q) = %v，期望 %v", c.in, norm(got), norm(c.want))
+		}
+	}
+}
+--- explain
+**思路**
+
+异位词的“特征”相同：要么排序后的字符串相同，要么每个字母的个数相同。把特征当作 map 的 key，同一个 key 下的字符串就是一组。
+
+**代码讲解**
+
+1. `map[[26]int][]string{}`：key 是**数组** `[26]int`。数组是值类型、可以比较，所以能当 map 的 key；切片 `[]int` 不行。
+2. 对每个字符串统计字母个数，得到 `key`。`var key [26]int` 在循环体内声明，每次都是新的全 0 数组。
+3. `groups[key] = append(groups[key], s)`：key 不存在时 `groups[key]` 是 nil 切片，可以直接 append，不需要先判断。
+4. 最后把 map 的所有 value 收集到结果切片里；map 遍历顺序随机，题目也不要求顺序。
+
+**易错点**
+
+- 用排序后的字符串做 key 也很常见：`b := []byte(s); slices.Sort(b); key := string(b)`，每个字符串 O(k log k)。计数法是 O(k)。
+- 测试比较结果时要先规范化顺序，因为 map 遍历顺序每次都不一样。
+
+**复杂度**
+
+时间 O(n·k)，k 是字符串的平均长度；空间 O(n·k)。
+
+=== lc-128
+no: 128
+title: 最长连续序列
+slug: longest-consecutive-sequence
+difficulty: 中等
+category: 哈希表与前缀和
+topics: 数组, 哈希表
+go: struct{} 集合, map, for 无限循环
+--- desc
+给定未排序的整数数组 `nums`，找出数字连续的最长序列（不要求在原数组中连续）的长度。要求时间复杂度 O(n)。
+
+**示例**：`[100,4,200,1,3,2]` → `4`（`1,2,3,4`）；`[0,3,7,2,5,8,4,6,0,1]` → `9`。
+--- solution
+package main
+
+func longestConsecutive(nums []int) int {
+	// @solution
+	set := make(map[int]struct{}, len(nums))
+	for _, v := range nums {
+		set[v] = struct{}{}
+	}
+	best := 0
+	for v := range set {
+		if _, ok := set[v-1]; ok {
+			continue // v-1 存在，v 不是序列的起点
+		}
+		n := 1
+		for {
+			if _, ok := set[v+n]; !ok {
+				break
+			}
+			n++
+		}
+		best = max(best, n)
+	}
+	return best
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestLongestConsecutive(t *testing.T) {
+	cases := []struct {
+		nums []int
+		want int
+	}{
+		{[]int{100, 4, 200, 1, 3, 2}, 4},
+		{[]int{0, 3, 7, 2, 5, 8, 4, 6, 0, 1}, 9},
+		{[]int{}, 0},
+		{[]int{1, 2, 0, 1}, 3},
+		{[]int{9, 1, -3, 2, 4, 8, 3, -1, 6, -2, -4, 7}, 4},
+		{[]int{5}, 1},
+	}
+	for _, c := range cases {
+		if got := longestConsecutive(c.nums); got != c.want {
+			t.Errorf("longestConsecutive(%v) = %d，期望 %d", c.nums, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+排序可以做，但是 O(n log n)。要 O(n)：先把所有数放进集合，然后只从**序列的起点**开始往后数——如果 `v-1` 在集合里，说明 v 不是起点，跳过。这样每个数最多被“往后数”经过一次。
+
+**代码讲解**
+
+1. `make(map[int]struct{}, len(nums))`：集合，同时自动去重。
+2. `for v := range set`：遍历集合（不是原数组），重复的数只处理一次。
+3. `if _, ok := set[v-1]; ok { continue }`：不是起点就跳过，这是把复杂度从 O(n²) 降到 O(n) 的关键。
+4. 内层 `for { ... break ... }`：无限循环 + break，一直数到 `v+n` 不在集合中为止。
+5. `best = max(best, n)`。
+
+**易错点**
+
+- 不加“起点判断”时，像 `[1,2,3,...,n]` 这样的输入每个数都要往后数，变成 O(n²)。
+- 遍历原数组而不是集合，重复元素多时（如一万个 0）会重复计算。
+
+**复杂度**
+
+时间 O(n)，空间 O(n)。
+
+=== lc-560
+no: 560
+title: 和为 K 的子数组
+slug: subarray-sum-equals-k
+difficulty: 中等
+category: 哈希表与前缀和
+topics: 数组, 哈希表, 前缀和
+go: map, 复合字面量
+--- desc
+给定整数数组 `nums`（可能有负数）和整数 `k`，统计和为 `k` 的**连续子数组**的个数。
+
+**示例**：`nums = [1,1,1], k = 2` → `2`；`nums = [1,2,3], k = 3` → `2`（`[1,2]` 和 `[3]`）。
+--- solution
+package main
+
+func subarraySum(nums []int, k int) int {
+	// @solution
+	count := map[int]int{0: 1} // 前缀和 → 出现次数；空前缀的和是 0
+	sum, res := 0, 0
+	for _, v := range nums {
+		sum += v
+		res += count[sum-k] // 之前有几个前缀和等于 sum-k，就有几个以 v 结尾的子数组
+		count[sum]++
+	}
+	return res
+	// @starter
+	// return 0
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func TestSubarraySum(t *testing.T) {
+	cases := []struct {
+		nums []int
+		k    int
+		want int
+	}{
+		{[]int{1, 1, 1}, 2, 2},
+		{[]int{1, 2, 3}, 3, 2},
+		{[]int{1}, 0, 0},
+		{[]int{1, -1, 0}, 0, 3},
+		{[]int{3, 4, 7, 2, -3, 1, 4, 2}, 7, 4},
+		{[]int{-1, -1, 1}, 0, 1},
+	}
+	for _, c := range cases {
+		if got := subarraySum(c.nums, c.k); got != c.want {
+			t.Errorf("subarraySum(%v, %d) = %d，期望 %d", c.nums, c.k, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+记 `pre[i]` 为前 i 个数的和，子数组 `nums[j..i]` 的和等于 `pre[i+1] - pre[j]`。要它等于 k，就是找有多少个之前的前缀和等于 `pre - k`。一边遍历一边用 map 记录“每个前缀和出现了几次”，一次遍历就能统计完。
+
+**代码讲解**
+
+1. `count := map[int]int{0: 1}`：map 字面量初始化。前缀和为 0 出现过一次（什么都不选），这样从下标 0 开始的子数组也能被统计到。
+2. `sum += v`：当前前缀和。
+3. `res += count[sum-k]`：不存在的 key 读出来是 0，直接相加，不需要 comma-ok。
+4. `count[sum]++`：**先查后存**，避免把空子数组算进去（k = 0 时尤其重要）。
+
+**易错点**
+
+- 忘了 `{0: 1}`：`[1, 2, 3], k = 3` 会漏掉 `[1, 2]`。
+- 有负数，所以**不能用滑动窗口**（窗口和不再随长度单调变化）。
+- 先 `count[sum]++` 再查，在 k = 0 时会把“空子数组”多算一次。
+
+**复杂度**
+
+时间 O(n)，空间 O(n)。
+
+=== lc-238
+no: 238
+title: 除自身以外数组的乘积
+slug: product-of-array-except-self
+difficulty: 中等
+category: 哈希表与前缀和
+topics: 数组, 前缀和
+go: 切片, 倒序循环
+--- desc
+给定整数数组 `nums`，返回数组 `answer`，其中 `answer[i]` 等于 `nums` 中除 `nums[i]` 之外所有元素的乘积。**不能使用除法**，要求 O(n) 时间。
+
+**示例**：`[1,2,3,4]` → `[24,12,8,6]`；`[-1,1,0,-3,3]` → `[0,0,9,0,0]`。
+--- solution
+package main
+
+func productExceptSelf(nums []int) []int {
+	// @solution
+	n := len(nums)
+	out := make([]int, n)
+	out[0] = 1
+	for i := 1; i < n; i++ {
+		out[i] = out[i-1] * nums[i-1] // 此时 out[i] = 左边所有数的乘积
+	}
+	right := 1 // 右边所有数的乘积
+	for i := n - 1; i >= 0; i-- {
+		out[i] *= right
+		right *= nums[i]
+	}
+	return out
+	// @starter
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestProductExceptSelf(t *testing.T) {
+	cases := []struct{ in, want []int }{
+		{[]int{1, 2, 3, 4}, []int{24, 12, 8, 6}},
+		{[]int{-1, 1, 0, -3, 3}, []int{0, 0, 9, 0, 0}},
+		{[]int{2, 3}, []int{3, 2}},
+		{[]int{0, 0}, []int{0, 0}},
+		{[]int{5, 1, 1}, []int{1, 5, 5}},
+	}
+	for _, c := range cases {
+		if got := productExceptSelf(slices.Clone(c.in)); !slices.Equal(got, c.want) {
+			t.Errorf("productExceptSelf(%v) = %v，期望 %v", c.in, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+`answer[i]` = **左边所有数的乘积** × **右边所有数的乘积**。先从左到右算出每个位置的“左乘积”存进结果数组，再从右到左用一个变量累乘“右乘积”，乘进结果里。
+
+**代码讲解**
+
+1. `out := make([]int, n)`：结果长度确定，定长分配后用下标赋值。
+2. 第一遍：`out[0] = 1`（最左边的数左边没有数），`out[i] = out[i-1] * nums[i-1]`。
+3. 第二遍倒序：`for i := n - 1; i >= 0; i--`。`right` 初始为 1，先 `out[i] *= right`（乘上 i 右边的乘积），再把 `nums[i]` 乘进 `right`，供 i−1 使用。**顺序不能反**。
+4. 复用结果数组存左乘积，额外空间只有一个变量。
+
+**易错点**
+
+- 用“总乘积 ÷ nums[i]”的思路既违反题意，也处理不了 0。
+- 第二遍里先更新 `right` 再乘，会把 `nums[i]` 自己也乘进去。
+
+**复杂度**
+
+时间 O(n)，空间 O(1)（不算结果数组）。
+
+=== lc-36
+no: 36
+title: 有效的数独
+slug: valid-sudoku
+difficulty: 中等
+category: 哈希表与前缀和
+topics: 数组, 哈希表, 矩阵
+go: 二维数组, byte 与 rune, 多重赋值
+--- desc
+判断一个 9×9 的数独是否有效，只需要检查**已填入**的数字（空格用 `'.'` 表示）：
+
+1. 每一行数字 1～9 最多出现一次；
+2. 每一列数字 1～9 最多出现一次；
+3. 每个 3×3 宫内数字 1～9 最多出现一次。
+
+不需要判断数独是否有解。
+--- solution
+package main
+
+func isValidSudoku(board [][]byte) bool {
+	// @solution
+	var rows, cols, boxes [9][9]bool // [第几行/列/宫][数字 1~9 对应 0~8]
+	for i := 0; i < 9; i++ {
+		for j := 0; j < 9; j++ {
+			c := board[i][j]
+			if c == '.' {
+				continue
+			}
+			d := c - '1'
+			b := i/3*3 + j/3 // 宫的编号 0~8
+			if rows[i][d] || cols[j][d] || boxes[b][d] {
+				return false
+			}
+			rows[i][d], cols[j][d], boxes[b][d] = true, true, true
+		}
+	}
+	return true
+	// @starter
+	// return false
+	// @end
+}
+--- test
+package main
+
+import "testing"
+
+func board(rows ...string) [][]byte {
+	b := make([][]byte, len(rows))
+	for i, r := range rows {
+		b[i] = []byte(r)
+	}
+	return b
+}
+
+var valid = []string{
+	"53..7....",
+	"6..195...",
+	".98....6.",
+	"8...6...3",
+	"4..8.3..1",
+	"7...2...6",
+	".6....28.",
+	"...419..5",
+	"....8..79",
+}
+
+// with 返回把第 r 行第 c 列改成 v 之后的盘面
+func with(r, c int, v byte) [][]byte {
+	b := board(valid...)
+	b[r][c] = v
+	return b
+}
+
+func TestIsValidSudoku(t *testing.T) {
+	cases := []struct {
+		name string
+		b    [][]byte
+		want bool
+	}{
+		{"有效盘面", board(valid...), true},
+		{"第一列重复 8", with(0, 0, '8'), false},
+		{"行内重复 7", with(0, 8, '7'), false},
+		{"列内重复 1", with(0, 8, '1'), false},
+		{"宫内重复 9", with(0, 2, '9'), false},
+		{"空盘面", board(".........", ".........", ".........", ".........", ".........", ".........", ".........", ".........", "........."), true},
+	}
+	for _, c := range cases {
+		if got := isValidSudoku(c.b); got != c.want {
+			t.Errorf("%s：isValidSudoku = %v，期望 %v", c.name, got, c.want)
+		}
+	}
+}
+--- explain
+**思路**
+
+遍历一次棋盘，对每个数字同时检查它所在的行、列、宫里是否已经出现过。用三个“出现过”表记录，表的大小固定是 9×9，用**二维数组**最合适。
+
+**代码讲解**
+
+1. `var rows, cols, boxes [9][9]bool`：二维数组，零值全是 false，不需要初始化。`rows[i][d]` 表示第 i 行是否出现过数字 d+1。
+2. `d := c - '1'`：字符 `'1'`～`'9'` 转成 0～8 的下标。`c` 是 byte，结果也是 byte，可以直接当数组下标。
+3. `b := i/3*3 + j/3`：宫的编号。`i/3` 是宫所在的行（0～2），`j/3` 是宫所在的列，整数除法自动向下取整。
+4. 三个表任一已经为 true 就说明重复。
+5. `rows[i][d], cols[j][d], boxes[b][d] = true, true, true`：多重赋值一次标记三个表。
+
+**易错点**
+
+- 宫编号写成 `i/3 + j/3` 会让不同的宫撞到同一个编号。
+- 用 `map[byte]bool` 也可以，但固定大小的数组更快，也不用 make。
+
+**复杂度**
+
+时间 O(81) = O(1)，空间 O(1)。

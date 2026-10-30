@@ -1,0 +1,739 @@
+并发编程新增题目（CONC-24 ~ CONC-29）的编程任务。
+
+=== conc-24-1
+title: 用 sync.Cond 实现支持重复广播的状态栅栏
+race: true
+--- desc
+实现一个状态控制器 `Gate`：
+
+- 初始状态为**关闭（closed）**；
+- `Wait()`：如果当前处于关闭状态，阻塞等待直到门被打开；如果已经处于打开状态，立即返回；
+- `Open()`：将门设为打开状态，并**唤醒所有**正在等待的 goroutine；
+- `Close()`：将门重新设为关闭状态（后续调用 `Wait()` 的 goroutine 将再次阻塞，直到下一次 `Open()`）。
+
+与只能 `close` 一次的 channel 不同，`Gate` 可以反复 `Open` 和 `Close`。
+--- solution
+package main
+
+import "sync"
+
+type Gate struct {
+	mu   sync.Mutex
+	cond *sync.Cond
+	open bool
+}
+
+func NewGate() *Gate {
+	g := &Gate{}
+	g.cond = sync.NewCond(&g.mu)
+	return g
+}
+
+func (g *Gate) Wait() {
+	// @solution
+	g.mu.Lock()
+	for !g.open {
+		g.cond.Wait()
+	}
+	g.mu.Unlock()
+	// @starter
+	// // TODO: 加锁并在 !g.open 时循环调用 g.cond.Wait()
+	// @end
+}
+
+func (g *Gate) Open() {
+	// @solution
+	g.mu.Lock()
+	g.open = true
+	g.mu.Unlock()
+	g.cond.Broadcast()
+	// @starter
+	// // TODO: 将 open 设为 true 并广播唤醒所有等待者
+	// @end
+}
+
+func (g *Gate) Close() {
+	// @solution
+	g.mu.Lock()
+	g.open = false
+	g.mu.Unlock()
+	// @starter
+	// // TODO: 将 open 设为 false
+	// @end
+}
+--- test
+package main
+
+import (
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestGateRepeatOpenClose(t *testing.T) {
+	g := NewGate()
+	var passed atomic.Int32
+	var wg sync.WaitGroup
+
+	for range 5 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			g.Wait()
+			passed.Add(1)
+		}()
+	}
+
+	time.Sleep(15 * time.Millisecond)
+	if got := passed.Load(); got != 0 {
+		t.Fatalf("gate is closed, want 0 passed, got %d", got)
+	}
+
+	g.Open()
+	wg.Wait()
+	if got := passed.Load(); got != 5 {
+		t.Fatalf("after first Open, want 5 passed, got %d", got)
+	}
+
+	// 关闭后再次等待，验证可重复开关
+	g.Close()
+	var secondPassed atomic.Bool
+	done := make(chan struct{})
+	go func() {
+		g.Wait()
+		secondPassed.Store(true)
+		close(done)
+	}()
+
+	time.Sleep(15 * time.Millisecond)
+	if secondPassed.Load() {
+		t.Fatal("should block after Close()")
+	}
+	g.Open()
+	<-done
+}
+--- explain
+**思路**
+
+`sync.Cond` 最适合“共享布尔条件反复切换并一对多广播唤醒”的场景：`Wait()` 在持有锁的前提下用 `for !g.open` 循环检查条件并调用 `g.cond.Wait()`；`Open()` 在锁内将 `g.open` 设为 `true` 后调用 `g.cond.Broadcast()` 一次性唤醒所有挂起的协程。
+
+**代码讲解**
+
+1. `g.cond = sync.NewCond(&g.mu)`：初始化条件变量并关联互斥锁 `&g.mu`。
+2. `for !g.open { g.cond.Wait() }`：`Wait()` 会原子地释放 `g.mu` 并休眠，被唤醒返回前自动重新获取 `g.mu`；用 `for` 循环防止被唤醒时门又被另一个协程调用 `Close()` 关上了。
+3. `g.cond.Broadcast()`：唤醒等待队列中的全部 goroutine（如果用 `Signal()` 则只会唤醒 1 个，其余 4 个会一直卡住）。
+
+**易错点**
+
+- 调用 `g.cond.Wait()` 前如果没有先调用 `g.mu.Lock()`，会直接因为对未加锁的 Mutex 解锁而触发运行时 fatal panic。
+
+=== conc-25-1
+title: 实现严格 FIFO 防饥饿的带权重信号量 TryAcquire 与 Release
+race: true
+--- desc
+实现带权重信号量 `Weighted`（总配额为 `size`）：
+
+- `TryAcquire(n int64) bool`：如果当前没有正在排队等待的任务，且剩余配额 `size - cur >= n`，立即扣减配额并返回 `true`；否则返回 `false`；
+- `Acquire(ctx context.Context, n int64) error`：申请权重为 `n` 的配额。若当前无法立即满足（剩余配额不足，或队列前面已有等待者），则按严格 **FIFO（先进先出）** 顺序排队等待，直到配额满足或 `ctx` 取消；
+- `Release(n int64)`：归还 `n` 个配额，并从队头开始依次唤醒所有可以被当前剩余配额满足的等待者（遇到第一个配额不够的队头时停止，绝不让后面的小任务插队）。
+--- solution
+package main
+
+import (
+	"context"
+	"slices"
+	"sync"
+)
+
+type waiter struct {
+	n     int64
+	ready chan struct{}
+}
+
+type Weighted struct {
+	mu      sync.Mutex
+	size    int64
+	cur     int64
+	waiters []*waiter
+}
+
+func NewWeighted(size int64) *Weighted {
+	return &Weighted{size: size}
+}
+
+func (w *Weighted) TryAcquire(n int64) bool {
+	// @solution
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.size-w.cur >= n && len(w.waiters) == 0 {
+		w.cur += n
+		return true
+	}
+	return false
+	// @starter
+	// return false // TODO: 仅当剩余配额足够且无等待队列时成功
+	// @end
+}
+
+func (w *Weighted) Acquire(ctx context.Context, n int64) error {
+	// @solution
+	w.mu.Lock()
+	if w.size-w.cur >= n && len(w.waiters) == 0 {
+		w.cur += n
+		w.mu.Unlock()
+		return nil
+	}
+	if n > w.size {
+		w.mu.Unlock()
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	wt := &waiter{n: n, ready: make(chan struct{})}
+	w.waiters = append(w.waiters, wt)
+	w.mu.Unlock()
+
+	select {
+	case <-wt.ready:
+		return nil
+	case <-ctx.Done():
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		select {
+		case <-wt.ready:
+			w.cur -= n
+			w.notifyLocked()
+			return ctx.Err()
+		default:
+			wasFront := len(w.waiters) > 0 && w.waiters[0] == wt
+			w.waiters = slices.DeleteFunc(w.waiters, func(x *waiter) bool { return x == wt })
+			if wasFront && w.size > w.cur {
+				w.notifyLocked()
+			}
+			return ctx.Err()
+		}
+	}
+	// @starter
+	// return ctx.Err() // TODO: 实现 FIFO 排队等待与 ctx 取消处理
+	// @end
+}
+
+func (w *Weighted) Release(n int64) {
+	// @solution
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.cur -= n
+	w.notifyLocked()
+	// @starter
+	// // TODO: 归还配额并按 FIFO 顺序唤醒队头可满足的等待者
+	// @end
+}
+
+func (w *Weighted) notifyLocked() {
+	for len(w.waiters) > 0 {
+		head := w.waiters[0]
+		if w.size-w.cur < head.n {
+			break
+		}
+		w.cur += head.n
+		w.waiters = w.waiters[1:]
+		close(head.ready)
+	}
+}
+--- test
+package main
+
+import (
+	"context"
+	"testing"
+	"time"
+)
+
+func TestWeightedFIFOAndCancel(t *testing.T) {
+	sem := NewWeighted(10)
+	if !sem.TryAcquire(6) {
+		t.Fatal("initial TryAcquire(6) should succeed")
+	}
+
+	// 当前已用 6，剩余 4。大任务申请 8，必须排队等待
+	bigDone := make(chan error, 1)
+	ctxBig, cancelBig := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelBig()
+	go func() {
+		bigDone <- sem.Acquire(ctxBig, 8)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	// 虽然当前剩余 4 >= 2，但因为队头有申请 8 的大任务在等，TryAcquire(2) 必须返回 false 防止插队饥饿
+	if sem.TryAcquire(2) {
+		t.Fatal("TryAcquire(2) should fail when a waiter is already queued")
+	}
+
+	// 小任务申请 3，排在大任务后面
+	smallDone := make(chan error, 1)
+	go func() {
+		smallDone <- sem.Acquire(context.Background(), 3)
+	}()
+
+	// 大任务在 50ms 后因超时取消退出队列，此时队头变成申请 3 的小任务（剩余 4 >= 3），应被立即唤醒！
+	if err := <-bigDone; err == nil {
+		t.Fatal("expected big task to time out")
+	}
+	select {
+	case err := <-smallDone:
+		if err != nil {
+			t.Fatalf("small task failed: %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("small task should be woken up after front big waiter canceled")
+	}
+	sem.Release(3)
+	sem.Release(6)
+}
+--- explain
+**思路**
+
+维护已使用配额 `cur` 和等待队列 `waiters`。核心在于两点：一是任何新请求只要看到 `len(waiters) > 0` 就必须进队尾排队（哪怕剩余配额够它用），防止大任务饥饿；二是当队头的大任务因为 `ctx.Done()` 超时退出队列时，必须调用一次 `notifyLocked()`，让排在它后面、配额已经足够的小任务能被及时唤醒。
+
+**代码讲解**
+
+1. `w.size-w.cur >= n && len(w.waiters) == 0`：快路径同时检查剩余配额和等待队列是否为空。
+2. `notifyLocked()`：始终只检查队头 `w.waiters[0]`，如果剩余配额够就累加 `w.cur`、弹出队头并 `close(head.ready)`；如果队头不够就立即 `break`。
+3. `case <-ctx.Done()`：加锁后先用非阻塞 `select` 检查 `wt.ready` 是否已经被并发的 `Release` 关闭了（若已关闭则需退还刚划拨的 `n` 个配额）；否则将自己从 `w.waiters` 删除，若自己原本是队头则触发 `notifyLocked()`。
+
+**易错点**
+
+- 忘记在队头等待者因取消被移除后调用 `notifyLocked()`，会导致后面排着的小任务在配额明明充足的情况下永远阻塞（即测试中的 `smallDone` 超时）。
+
+=== conc-26-1
+title: 用 context.WithoutCancel 与 AfterFunc 管理请求后置任务与取消回调
+race: true
+--- desc
+实现两个函数：
+
+1. `DetachedWithTimeout(reqCtx context.Context, timeout time.Duration) (context.Context, context.CancelFunc)`：基于 `reqCtx` 创建一个派生的 Context，要求**保留 `reqCtx` 中的所有 `Value`**，但**不受 `reqCtx` 取消的影响**，同时具备独立的 `timeout` 超时控制；
+2. `RunWithCancelHook(ctx context.Context, work func(), onCancel func()) error`：使用 `context.AfterFunc` 注册取消回调 `onCancel`，然后执行 `work()`。如果 `work()` 执行完时 `ctx` 尚未被取消，注销该回调并返回 `nil`（确保 `onCancel` 不会被调用）；如果 `ctx` 在 `work()` 期间被取消，确保 `onCancel` 被触发并返回 `ctx.Err()`。
+--- solution
+package main
+
+import (
+	"context"
+	"time"
+)
+
+func DetachedWithTimeout(reqCtx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	// @solution
+	return context.WithTimeout(context.WithoutCancel(reqCtx), timeout)
+	// @starter
+	// return context.WithTimeout(reqCtx, timeout) // TODO: 使用 context.WithoutCancel 剥离父级取消信号
+	// @end
+}
+
+func RunWithCancelHook(ctx context.Context, work func(), onCancel func()) error {
+	// @solution
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(done)
+		onCancel()
+	})
+	work()
+	if stop() {
+		return nil
+	}
+	<-done // 等待已在异步执行的 onCancel 彻底跑完，避免数据竞争
+	return ctx.Err()
+	// @starter
+	// work() // TODO: 使用 context.AfterFunc 注册 onCancel，并在正常完成时调用 stop()
+	// return nil
+	// @end
+}
+--- test
+package main
+
+import (
+	"context"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+type ctxKey string
+
+func TestDetachedWithTimeout(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.WithValue(context.Background(), ctxKey("trace"), "tr-99"))
+	detached, cancelDetached := DetachedWithTimeout(parent, time.Second)
+	defer cancelDetached()
+
+	// 取消父 Context 后，detached 不应被取消，且仍能读到 Value
+	cancelParent()
+	if detached.Err() != nil {
+		t.Fatalf("detached context should not be canceled when parent is canceled: %v", detached.Err())
+	}
+	if got := detached.Value(ctxKey("trace")); got != "tr-99" {
+		t.Fatalf("detached context lost value: got %v, want tr-99", got)
+	}
+}
+
+func TestRunWithCancelHook(t *testing.T) {
+	// 1. 正常完成：onCancel 不应被调用
+	var canceled atomic.Int32
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	err := RunWithCancelHook(ctx1, func() {}, func() { canceled.Add(1) })
+	cancel1() // work 结束后再 cancel，因为 stop() 已注销，onCancel 不应触发
+	time.Sleep(10 * time.Millisecond)
+	if err != nil || canceled.Load() != 0 {
+		t.Fatalf("normal run: err=%v, canceled=%d", err, canceled.Load())
+	}
+
+	// 2. 执行期间取消：onCancel 必须执行且返回 ctx.Err()
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	err = RunWithCancelHook(ctx2, func() {
+		cancel2()
+	}, func() {
+		canceled.Add(1)
+	})
+	if err == nil || canceled.Load() != 1 {
+		t.Fatalf("canceled run: err=%v, canceled=%d, want err!=nil and canceled=1", err, canceled.Load())
+	}
+}
+--- explain
+**思路**
+
+1. `context.WithoutCancel(reqCtx)` 剥离父 Context 的取消链但保留所有 `Value`，外层再套 `context.WithTimeout` 赋予后台任务独立的超时上限。
+2. `stop := context.AfterFunc(ctx, fn)` 在等待期间不创建 goroutine；当 `work()` 完成时调用 `stop()`：若返回 `true`，说明 `ctx` 未取消且回调已被成功注销；若返回 `false`，说明回调已经被启动执行，等待其执行完毕后返回 `ctx.Err()`。
+
+**代码讲解**
+
+1. `context.WithTimeout(context.WithoutCancel(reqCtx), timeout)`：组合标准库的两个派生函数。
+2. `stop := context.AfterFunc(...)`：回调内部在执行完 `onCancel()` 后 `close(done)`。
+3. `if stop() { return nil }`：`stop()` 返回 `true` 代表回调从未且永远不会运行；返回 `false` 时通过 `<-done` 同步等待回调 goroutine 完成，保证函数返回后 `onCancel` 的副作用已立即可见。
+
+**易错点**
+
+- 注意 `stop()` 返回 `false` 时，只代表 `AfterFunc` 的回调协程**已经被启动**，不代表它已经执行结束；因此在需要确定性观察 `onCancel` 结果时，用 `<-done` 等待其跑完。
+
+=== conc-27-1
+title: 通过注入虚拟时钟测试带冷却时间的任务触发器
+race: true
+--- desc
+实现一个节流触发器 `Throttler`：
+
+- `NewThrottler(interval time.Duration, now func() time.Time) *Throttler`：如果传入的 `now` 为 `nil`，默认使用 `time.Now`；
+- `TryRun(fn func()) bool`：如果距离上一次成功执行的时间已经达到或超过 `interval`（或者这是第一次调用），则执行 `fn()`、更新最后执行时间并返回 `true`；否则不执行 `fn` 并返回 `false`。
+
+通过注入可控的 `now` 函数，单元测试无需调用 `time.Sleep` 即可在 0ms 内精确测试任意时长的时间窗口边界。
+--- solution
+package main
+
+import (
+	"sync"
+	"time"
+)
+
+type Throttler struct {
+	mu       sync.Mutex
+	interval time.Duration
+	now      func() time.Time
+	lastRun  time.Time
+}
+
+func NewThrottler(interval time.Duration, now func() time.Time) *Throttler {
+	if now == nil {
+		now = time.Now
+	}
+	return &Throttler{interval: interval, now: now}
+}
+
+func (th *Throttler) TryRun(fn func()) bool {
+	// @solution
+	th.mu.Lock()
+	cur := th.now()
+	if !th.lastRun.IsZero() && cur.Sub(th.lastRun) < th.interval {
+		th.mu.Unlock()
+		return false
+	}
+	th.lastRun = cur
+	th.mu.Unlock()
+	fn()
+	return true
+	// @starter
+	// fn() // TODO: 检查距离上次执行是否已满 interval
+	// return true
+	// @end
+}
+--- test
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+func TestThrottlerWithFakeClock(t *testing.T) {
+	cur := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	fakeNow := func() time.Time { return cur }
+
+	th := NewThrottler(10*time.Second, fakeNow)
+	runs := 0
+	inc := func() { runs++ }
+
+	if !th.TryRun(inc) || runs != 1 {
+		t.Fatalf("first TryRun should succeed, runs=%d", runs)
+	}
+	cur = cur.Add(9 * time.Second)
+	if th.TryRun(inc) || runs != 1 {
+		t.Fatalf("at +9s TryRun should be throttled, runs=%d", runs)
+	}
+	cur = cur.Add(1 * time.Second) // 刚好满 10s
+	if !th.TryRun(inc) || runs != 2 {
+		t.Fatalf("at +10s TryRun should succeed, runs=%d", runs)
+	}
+}
+--- explain
+**思路**
+
+把获取当前时间的操作抽象为函数字段 `now func() time.Time`，业务状态机只调用 `th.now()` 而不直接硬编码调用 `time.Now()`。这样生产环境传入 `nil` 自动走真实系统时钟，而单元测试只需拨动局部变量 `cur` 就能瞬间验证 10 秒甚至 24 小时的冷却逻辑。
+
+**代码讲解**
+
+1. `!th.lastRun.IsZero() && cur.Sub(th.lastRun) < th.interval`：第一次调用时 `lastRun` 是零值 `time.Time{}`（`IsZero() == true`），直接放行；后续调用比较时间差是否达到 `interval`。
+2. 更新 `th.lastRun = cur` 后释放互斥锁，再调用 `fn()`，减小锁粒度。
+
+**易错点**
+
+- 不要用 `lastRun.Unix() == 0` 判断是否首次执行，Go 标准写法是用 `th.lastRun.IsZero()`。
+
+=== conc-28-1
+title: 实现带空闲自动缩容的动态协程池
+race: true
+--- desc
+实现一个动态伸缩的协程池 `DynamicPool`：
+
+- 最多同时运行 `maxWorkers` 个 worker 协程；
+- 当调用 `Submit(task func())` 时，确保任务被执行；如果当前活跃 worker 数未满，按需启动新 worker；
+- 如果某个 worker 在 `idleTimeout` 时间内没有收到新任务，它应当**自动退出**以释放协程资源（可通过 `ActiveWorkers()` 查看当前存活的 worker 数量）；
+- `Close()` 等待所有已提交的任务执行完毕并让所有 worker 退出。
+--- solution
+package main
+
+import (
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type DynamicPool struct {
+	sem         chan struct{}
+	tasks       chan func()
+	idleTimeout time.Duration
+	active      atomic.Int32
+	wg          sync.WaitGroup
+	once        sync.Once
+}
+
+func NewDynamicPool(maxWorkers int, idleTimeout time.Duration) *DynamicPool {
+	return &DynamicPool{
+		sem:         make(chan struct{}, maxWorkers),
+		tasks:       make(chan func(), maxWorkers*4),
+		idleTimeout: idleTimeout,
+	}
+}
+
+func (p *DynamicPool) ActiveWorkers() int {
+	return int(p.active.Load())
+}
+
+func (p *DynamicPool) Submit(task func()) {
+	// @solution
+	p.tasks <- task
+	select {
+	case p.sem <- struct{}{}:
+		p.active.Add(1)
+		p.wg.Add(1)
+		go p.worker()
+	default:
+	}
+	// @starter
+	// task() // TODO: 将任务放入队列，并按需启动不超过 maxWorkers 的 worker
+	// @end
+}
+
+func (p *DynamicPool) worker() {
+	defer func() {
+		p.active.Add(-1)
+		<-p.sem
+		p.wg.Done()
+	}()
+	timer := time.NewTimer(p.idleTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case task, ok := <-p.tasks:
+			if !ok {
+				return
+			}
+			task()
+			timer.Reset(p.idleTimeout)
+		case <-timer.C:
+			// 空闲超时前再做一次非阻塞检查，防止队列里刚好还有遗留任务没消费完
+			select {
+			case task, ok := <-p.tasks:
+				if !ok {
+					return
+				}
+				task()
+				timer.Reset(p.idleTimeout)
+			default:
+				return
+			}
+		}
+	}
+}
+
+func (p *DynamicPool) Close() {
+	p.once.Do(func() {
+		close(p.tasks)
+	})
+	p.wg.Wait()
+}
+--- test
+package main
+
+import (
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestDynamicPoolScaleUpAndDown(t *testing.T) {
+	pool := NewDynamicPool(4, 40*time.Millisecond)
+	defer pool.Close()
+
+	var done atomic.Int32
+	for range 8 {
+		pool.Submit(func() {
+			time.Sleep(15 * time.Millisecond)
+			done.Add(1)
+		})
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	if act := pool.ActiveWorkers(); act == 0 || act > 4 {
+		t.Fatalf("active workers during burst = %d, want 1..4", act)
+	}
+
+	// 等待所有任务完成且超过 idleTimeout (40ms)，worker 应自动缩容到 0
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if done.Load() == 8 && pool.ActiveWorkers() == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected 8 tasks done and 0 active workers after idle timeout, got done=%d active=%d",
+		done.Load(), pool.ActiveWorkers())
+}
+--- explain
+**思路**
+
+用容量为 `maxWorkers` 的缓冲通道 `sem` 控制最大活跃 worker 数量。每次 `Submit` 把任务推入 `tasks` 后，用 `select { case p.sem <- struct{}{}: go p.worker() default: }` 非阻塞地按需扩容 worker；每个 worker 内部维护一个 `time.Timer`，空闲超过 `idleTimeout` 且队列为空时自动退出并归还 `<-p.sem` 槽位。
+
+**代码讲解**
+
+1. `select { case p.sem <- struct{}{}: ... default: }`：如果活跃 worker 没达到 `maxWorkers` 就启动新 worker；达到上限则走 `default` 由已在运行的 worker 消费队列。
+2. `case <-timer.C:`：触发空闲超时后，先通过内层 `select + default` 确认 `p.tasks` 确实为空再退出，防止最后一个 worker 退出时队列里还留有任务。
+
+**易错点**
+
+- worker 退出时必须先减少 `active` 并归还 `<-p.sem`，否则后续新任务到来时无法再次扩容启动新 worker。
+
+=== conc-29-1
+title: 使用双层 select 实现高低优先级通道消费
+race: true
+--- desc
+实现 `DrainByPriority(high, low <-chan int) []int`：
+
+不断从 `high` 和 `low` 两个通道读取整数并追加到结果切片中，直到**两个通道都关闭且排空**为止。
+要求：**只要 `high` 通道中当前有可读的数据，就必须优先读取并处理 `high` 通道的数据**；只有当 `high` 暂时没有可读数据（或已关闭）时，才从 `low` 读取。
+--- solution
+package main
+
+func DrainByPriority(high, low <-chan int) []int {
+	var out []int
+	// @solution
+	for high != nil || low != nil {
+		// 第一层：优先非阻塞排空 high
+		if high != nil {
+			select {
+			case v, ok := <-high:
+				if !ok {
+					high = nil
+				} else {
+					out = append(out, v)
+				}
+				continue
+			default:
+			}
+		}
+		// 第二层：high 暂无可读数据时，阻塞等待任一通道
+		select {
+		case v, ok := <-high:
+			if !ok {
+				high = nil
+			} else {
+				out = append(out, v)
+			}
+		case v, ok := <-low:
+			if !ok {
+				low = nil
+			} else {
+				out = append(out, v)
+			}
+		}
+	}
+	// @starter
+	// // TODO: 使用双层 select 优先消费 high，通道关闭时置为 nil
+	// @end
+	return out
+}
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestDrainByPriority(t *testing.T) {
+	high := make(chan int, 10)
+	low := make(chan int, 10)
+
+	// 预先在两个通道中都塞满数据，验证 high 一定先被全部取完
+	for _, v := range []int{101, 102, 103} {
+		high <- v
+	}
+	for _, v := range []int{1, 2, 3} {
+		low <- v
+	}
+	close(high)
+	close(low)
+
+	got := DrainByPriority(high, low)
+	want := []int{101, 102, 103, 1, 2, 3}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+--- explain
+**思路**
+
+单层 `select` 在多个 `case` 同时就绪时会随机选择。为了保证 `high` 优先，在每轮循环开头先写一个带 `default` 的非阻塞 `select` 专门检查 `high`：只要 `high` 里有数据就一直走第一层并 `continue`；只有当 `high` 为空走到 `default`（或 `high` 已关闭置为 `nil`）时，才进入第二层阻塞 `select` 同时等待 `high` 和 `low`。
+
+**代码讲解**
+
+1. `for high != nil || low != nil`：当某个通道被关闭（`!ok`）时，将其变量设为 `nil`，`select` 会自动忽略值为 `nil` 的通道，直到两个通道都变为 `nil` 时退出循环。
+2. 第一层 `select` 包含 `default:`，确保 `high` 暂时没数据时不会卡死，而是落入第二层等待 `low`。
+
+**易错点**
+
+- 当 `v, ok := <-high` 返回 `!ok`（通道已关闭）时，由于已关闭通道在非阻塞 `select` 中永远立即就绪，如果不把 `high = nil` 并在外层判断 `if high != nil`，第一层就会陷入死循环！

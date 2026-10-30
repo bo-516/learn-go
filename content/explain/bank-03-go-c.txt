@@ -1,0 +1,385 @@
+=== go-17-1
+--- explain
+**思路**
+
+包的初始化分两步：先初始化**所有包级变量**，再按出现顺序执行 `init` 函数。变量大体按声明顺序初始化，但如果一个变量的初始化表达式**依赖**另一个还没初始化的变量，被依赖的会先初始化。
+
+**推导过程**
+
+1. 第一个声明的是 `a`，它依赖 `b` 和 `c`，所以要先初始化它们。
+2. `b` 依赖 `c`，于是先初始化 `c` → 记录 `"c"`。
+3. 然后 `b` → 记录 `"b"`；然后 `a` → 记录 `"a"`。
+4. `c` 已经初始化过了，跳过；接着 `d` → 记录 `"d"`。
+5. 最后两个 `init` 按出现顺序执行：`"init1"`、`"init2"`。
+
+结果：`[c b a d init1 init2]`。
+
+**易错点**
+
+- `trace` 本身也是包级变量，它没有初始化表达式（零值 nil），不影响顺序。
+- 一个文件里可以有多个 `init`；同一个包的多个文件，`go` 工具会按文件名排序后交给编译器。
+- 被导入的包总是先于导入方完成初始化，每个包只初始化一次。
+- init 里不要做依赖外部环境的重活（连数据库、读配置），出错只能 panic，而且让测试变得困难。
+
+=== go-18-1
+--- explain
+**思路**
+
+类型 switch 按接口值的**动态类型**分支。case 可以是具体类型，也可以是接口类型（“只要实现了这个接口就匹配”）。分支**从上往下第一个匹配的生效**，所以同时满足多个 case 时，写在前面的优先。
+
+**代码讲解**
+
+1. `switch x := v.(type)`：每个 case 里，`x` 自动是该 case 的类型（只有一个类型时）。
+2. `case nil`：v 本身是 nil 接口时匹配。
+3. `case int` / `case string`：具体类型，`x` 分别是 int、string。
+4. `case error` 写在 `case fmt.Stringer` 前面：同时实现两者的类型按 error 处理。
+5. `case []int`：切片也能作为 case，`len(x)` 可用。
+6. `default`：`x` 和 `v` 同为 any，`%T` 打印动态类型，例如 `other:main.Celsius`……不过 `Celsius` 实现了 `String()`，会先被 Stringer 分支匹配。
+
+**易错点**
+
+- 一个 case 列了多个类型（`case int, int64:`）时，`x` 的类型是 `any`，不能直接做算术运算。
+- `fmt.Sprintf` 打印实现了 `Error()` 或 `String()` 的值时会自动调用这些方法，用 `%v` 打印时要注意不要在 `String()` 里再打印自身，造成无限递归。
+
+=== go-19-1
+--- explain
+**思路**
+
+函数式编程的三件套，用泛型写一次，任何类型都能用。关键是正确声明**类型参数**：`Map` 输入元素类型是 T、输出是 U；`Reduce` 的累加器类型 A 可以和元素类型不同。
+
+**代码讲解**
+
+1. `Map[T, U any]`：结果长度和输入相同，`make([]U, len(s))` 后按下标赋值，一次分配。
+2. `Filter[T any]`：结果长度未知，`var out []T` 后 append。都不满足时返回 nil。
+3. `Reduce[T, A any](s []T, init A, f func(A, T) A) A`：从 init 开始，依次 `acc = f(acc, v)`。
+4. 调用时类型参数通常可以自动推导：`Map(nums, strconv.Itoa)` 推导出 `T = int, U = string`。
+
+**易错点**
+
+- 不能修改入参：`Filter` 里如果复用 `s[:0]` 作为结果，会覆盖调用方的数据。
+- Go 的方法不能有自己的类型参数，所以没法写成 `s.Map(f)` 这种链式调用，只能是普通函数。
+- 标准库没有 Map / Filter（有 `slices.DeleteFunc`、`slices.IndexFunc` 等），简单场景直接写 for 循环更符合 Go 的风格。
+
+=== go-19-2
+--- explain
+**思路**
+
+`+` 和 `>` 只有在约束允许的类型上才能用。约束里写 `int | int64 | float64` 时，只有这三个**确切的类型**满足；写成 `~float64` 表示“**底层类型**是 float64 的所有类型”，自定义的 `type Celsius float64` 才能用。
+
+**代码讲解**
+
+1. `type Number interface { ~int | ~int64 | ~float64 }`：带类型集合的接口，只能用作约束。
+2. `Sum`：`var s T` 得到 T 的零值，`s += x` 合法，因为类型集合里的每个类型都支持 `+`。
+3. `Max`：空切片时 `var zero T` 返回零值和 false，这是泛型函数返回“无值”的标准写法（不能写 `return 0, false`，因为 0 不一定能赋给 T……这里其实可以，但 `var zero T` 适用于任何约束）。
+4. `for _, x := range xs[1:]` 从第二个开始比较。
+
+**易错点**
+
+- 起始代码编译不通过的原因：`Celsius does not satisfy Number (possibly missing ~ for float64 in Number)`，编译器的提示已经说明了问题。
+- 想支持所有有序类型可以直接用标准库 `cmp.Ordered`，它就是用 `~` 定义的。
+
+=== go-19-3
+--- explain
+**思路**
+
+泛型类型 `Stack[T]` 的方法里可以使用类型参数 T。零值可用：`items` 是 nil 切片，可以直接 append。空栈时需要返回“T 的零值”，写法是 `var zero T`。
+
+**代码讲解**
+
+1. `type Stack[T any] struct { items []T }`。
+2. 方法签名写成 `func (s *Stack[T]) Push(v T)`：接收者要带上类型参数；用指针接收者，因为要修改切片。
+3. `Pop`：先取栈顶，再把那个位置**清成零值** `s.items[len(s.items)-1] = zero`，最后缩短切片。
+4. `Peek` 只读不删。
+
+**易错点**
+
+- 不清零的话，被弹出的元素仍然留在底层数组里（切片只是长度变短了），如果 T 是指针或包含指针，GC 就无法回收它们，造成内存泄漏。
+- 使用时要写出类型参数：`var s Stack[int]`，泛型类型不能省略。
+
+=== go-20-1
+--- explain
+**思路**
+
+拉链法哈希表：一个桶数组，每个桶是一条链表。key 的哈希值对桶数取模决定放在哪个桶；同一个桶里的冲突元素挂在链表上。元素越来越多时链表变长、查询变慢，所以当**负载因子**（元素数 / 桶数）超过阈值时，桶数翻倍并重新分布所有元素。6.5 正是 Go map 使用的负载因子。
+
+**代码讲解**
+
+1. `entry` 是链表节点，`HashMap` 有 `buckets []*entry` 和元素计数 `count`。
+2. `hash`：FNV-1a，用 `uint32` 运算，乘法溢出会自动回绕，正是算法需要的。
+3. `Put`：先在链表里找，找到就更新；找不到就**头插**一个新节点 `&entry{..., next: m.buckets[i]}`，然后检查负载因子。
+4. `grow`：新建两倍大小的桶数组，遍历所有旧节点，**复用节点**重新头插到新桶里（先保存 `next`，因为 `e.next` 马上会被改掉）。
+5. `Delete`：用**指向指针的指针** `p := &m.buckets[i]`，删除头节点和中间节点是同一段代码（见语法卡片「指向指针的指针」）。
+
+**易错点**
+
+- `float64(m.count)/float64(len(m.buckets))`：整数除法会丢掉小数，必须先转成浮点数。
+- 扩容时用新的桶数取模，`index(e.key, len(nb))`。
+
+**延伸**
+
+真实的 Go map（1.24 起是 Swiss Table 实现）每个桶存多个 key，用哈希值的高位快速过滤，扩容是**渐进式**的（每次写操作搬一部分），避免一次扩容造成长时间停顿。
+
+=== go-21-1
+--- explain
+**思路**
+
+每个字段要按自身大小对齐（int64 要放在 8 的倍数地址上，int32 放在 4 的倍数上），编译器会在字段之间插入**填充字节**；结构体的总大小还要是最大对齐值的倍数。把大字段放前面、小字段聚在一起，填充就最少。
+
+**计算过程**
+
+`Bad`：A(1) + 填充 7 + B(8) + C(1) + 填充 3 + D(4) + E(1) + 填充 7 = 32。
+
+`Good`：B(8) + D(4) + A(1) + C(1) + E(1) + 填充 1 = 16。
+
+**易错点**
+
+- 字段顺序会影响 JSON 输出、按位置初始化的字面量等，调整前要确认没有依赖顺序的代码。
+- 只有大量创建的结构体（如百万级的缓存条目）才值得优化，普通结构体以可读性为先。
+- 可以用 `unsafe.Sizeof(Good{})` 验证大小，或者用 `fieldalignment` 工具自动检查。
+
+=== go-22-1
+--- explain
+**思路**
+
+`reflect.TypeOf(v)` 拿到类型信息，遍历结构体的每个字段，读取它的名字、是否导出、tag。指针要先 `Elem()` 拿到指向的类型。
+
+**代码讲解**
+
+1. `t := reflect.TypeOf(v)`；`v` 是 nil 接口时 t 为 nil，先判断。
+2. `t.Kind() == reflect.Pointer` 时 `t = t.Elem()`：支持传结构体指针。
+3. 不是结构体就返回 nil。
+4. `f := t.Field(i)` 得到 `reflect.StructField`；`f.IsExported()` 判断是否导出。
+5. `f.Tag.Lookup("json")`：返回 `(值, 是否存在)`，比 `Get` 多一个 ok，可以区分“没有 tag”和“tag 为空字符串”。
+6. `strings.Cut(tag, ",")` 取逗号前的名字（后面可能是 `omitempty`）；`"-"` 跳过；名字为空（如 `json:",omitempty"`）时仍用字段名。
+
+**易错点**
+
+- 嵌入字段、`json:"-,"`（字段名就叫 `-`）等边界情况，标准库 `encoding/json` 都有特殊处理，这里没有覆盖。
+- 反射比直接访问慢一到两个数量级，结果最好按类型缓存（`sync.Map` 以 `reflect.Type` 为 key）。
+
+=== go-22-2
+--- explain
+**思路**
+
+反射修改值有两个前提：值必须是**可寻址的**（通过指针拿到），字段必须是**导出的**。`reflect.ValueOf(obj)` 拿到指针，`Elem()` 得到它指向的结构体，这时的字段才是可设置的。
+
+**代码讲解**
+
+1. 第一个检查：必须是指针、不是 nil、指向的是结构体。`||` 短路保证 `IsNil()` 和 `Elem()` 只在类型正确时调用。
+2. `FieldByName(name)` 找不到时返回零值 `reflect.Value`，用 `IsValid()` 判断。
+3. `f.CanSet()`：未导出字段返回 false。
+4. `val.Type().AssignableTo(f.Type())`：检查类型能否赋值；`!val.IsValid()` 处理 `value` 是 nil 的情况。
+5. `f.Set(val)` 完成赋值。
+
+**易错点**
+
+- 传结构体的值（而不是指针）进来，拿到的是副本，`CanSet()` 永远是 false；即使能改，改的也是副本。
+- 不检查类型直接 `Set`，类型不匹配时会 panic。
+- `reflect.ValueOf(nil)` 返回无效的 Value，调用它的 `Type()` 会 panic，所以要先 `IsValid()`。
+
+=== go-23-1
+--- explain
+**思路**
+
+`unsafe.Pointer` 可以和任意指针类型互相转换，用来“把同一块内存当成另一种类型来读”；`unsafe.Add` 做指针偏移，`unsafe.Offsetof` 给出字段相对于结构体起始位置的偏移量。
+
+**代码讲解**
+
+1. `*(*uint64)(unsafe.Pointer(&f))`：取 f 的地址 → 转成通用指针 → 转成 `*uint64` → 解引用，得到同样 8 个字节按整数解读的结果。
+2. `unsafe.Offsetof(u.Age)`：编译期常量，Age 字段的偏移（`Name` 是 16 字节的字符串头，所以是 16）。
+3. `unsafe.Add(unsafe.Pointer(u), offset)`：从结构体起始地址加上偏移，再转成 `*int`。
+
+**易错点**
+
+- **不要把指针转成 `uintptr` 存起来再转回来**：`uintptr` 只是一个整数，GC 不知道它引用了对象，期间对象可能被移动（栈增长时）或回收。必须在一个表达式里完成转换和运算，或者用 `unsafe.Add`。
+- 日常代码用 `math.Float64bits`、直接写 `&u.Age` 就好，这道题是为了理解底层机制。
+
+=== go-24-1
+--- explain
+**思路**
+
+字符串不可变，每次 `s += x` 都要分配一个新字符串并复制全部内容，n 个片段的总复制量是 O(n²)。`strings.Builder` 内部是一个 `[]byte`，如果**先算出总长度并 `Grow` 一次**，后面的写入都不会再扩容，最后 `String()` 直接把这块内存当成字符串返回，不再复制。
+
+**代码讲解**
+
+1. 空切片直接返回 `""`。
+2. 总长度 = 所有片段长度之和 + 分隔符长度 × (片段数 − 1)。
+3. `var b strings.Builder`：零值可用。`b.Grow(n)` 预分配。
+4. 先写第一个片段，之后每次写“分隔符 + 片段”，避免在末尾多一个分隔符。
+5. `b.String()`：零拷贝返回（内部用了 unsafe）。
+
+**易错点**
+
+- `strings.Builder` 不能被复制后再写入（会 panic），作为参数要传指针。
+- 片段数量固定且很少时，`a + b + c` 一次性拼接只分配一次，也很高效；问题只出在**循环里** `+=`。
+- 标准库的 `strings.Join` 就是这么实现的。
+
+=== go-24-2
+--- explain
+**思路**
+
+`fmt.Sprintf` 需要把参数装进 `[]any`（装箱可能分配），还要解析格式串、使用反射，开销大。热路径上直接往 `[]byte` 里 `append`：字符串用 `append(dst, s...)`，整数用 `strconv.AppendInt`，调用方给足容量时完全不分配。
+
+**代码讲解**
+
+1. `append(dst, key...)`：`[]byte` 可以直接 append 一个字符串展开的字节，这是 `append` 的一个特例。
+2. `append(dst, '=')`：追加一个字节。
+3. `strconv.AppendInt(dst, int64(val), 10)`：把十进制数字直接写到 dst 末尾并返回新切片。
+4. 函数返回 `[]byte`，调用方接着复用：`buf = AppendKV(buf[:0], "port", 8080)`。
+
+**易错点**
+
+- 调用方必须接收返回值，和 `append` 一样。
+- `strconv` 系列还有 `AppendFloat`、`AppendQuote`、`AppendBool`；标准库的 `time.Time.AppendFormat`、`slog` 内部都大量使用这种写法。
+
+=== go-25-1
+--- explain
+**思路**
+
+`encoding/json` 的行为几乎都通过结构体 tag 控制：
+
+- `json:"id,string"`：数字编码成 JSON 字符串；
+- `omitempty`：零值时省略；
+- `json:"-"`：永远不编码；
+- nil 切片编码成 `null`，空切片 `[]string{}` 编码成 `[]`，tag 控制不了，只能在编码前处理。
+
+**代码讲解**
+
+1. `ID int64 \`json:"id,string"\``：前端 JavaScript 的 Number 只能精确表示 2⁵³ 以内的整数，大 ID 必须用字符串传输。
+2. `Email ... omitempty`、`Password ... "-"`。
+3. `MarshalUser(u User)` 参数是值拷贝，`u.Tags = []string{}` 不会修改调用方的数据。
+4. `json.Marshal(u)` 返回 `([]byte, error)`。
+
+**易错点**
+
+- 只有**导出字段**会被编码，小写字段写了 tag 也没用。
+- `omitempty` 对结构体类型（如 `time.Time`）不生效，Go 1.24 新增了 `omitzero`。
+- tag 写错格式（比如冒号后加空格 `json: "id"`）不会报编译错误，只会被忽略，`go vet` 能发现。
+
+=== go-25-2
+--- explain
+**思路**
+
+JSON 解析到 `any` 时，数字默认变成 `float64`，float64 只有 53 位尾数，超过 2⁵³ 的整数会被舍入（9007199254740993 会变成 9007199254740992）。`Decoder.UseNumber()` 让数字保持为 `json.Number`（本质是原始字符串），需要时再精确地转成 int64。
+
+**代码讲解**
+
+1. `json.NewDecoder(bytes.NewReader(data))`：Decoder 从 `io.Reader` 读取，`bytes.NewReader` 把字节切片包装成 Reader。
+2. `dec.UseNumber()` 必须在 `Decode` 之前调用。
+3. `m["id"].(json.Number)`：类型断言，缺少 id 或类型不对时 `ok` 为 false。
+4. `n.Int64()` 用 `strconv.ParseInt` 解析，返回 `(int64, error)`，可以直接作为函数的两个返回值。
+
+**易错点**
+
+- 结构不固定的部分可以用 `json.RawMessage` 延迟解析，只把确定的字段定义成结构体，通常比 `map[string]any` 更好。
+- 如果能定义结构体并把字段声明为 `int64`，数字会直接按整数解析，不会丢精度。
+
+=== go-25-3
+--- explain
+**思路**
+
+`json.Unmarshal` 默认忽略 JSON 中多出来的字段，拼错的配置项会被静默丢弃。`Decoder.DisallowUnknownFields()` 让遇到未知字段时返回错误，适合解析配置文件这类需要严格校验的输入。
+
+**代码讲解**
+
+1. `dec := json.NewDecoder(bytes.NewReader(data))`。
+2. `dec.DisallowUnknownFields()`：开启严格模式。
+3. `err := dec.Decode(&c)`：遇到 `debgu` 会返回 `json: unknown field "debgu"`。
+4. 返回 `c, err`：出错时 c 可能只被部分填充，调用方应该只在 err 为 nil 时使用它。
+
+**易错点**
+
+- `Decoder.Decode` 只读取**一个** JSON 值，后面还有内容不会报错；需要确保没有多余内容时，可以再调用一次 `dec.Decode(&struct{}{})` 检查是否返回 `io.EOF`。
+- 对外提供的 API 一般不开启严格模式，便于向前兼容（客户端多传字段不应该报错）；配置文件则应该严格。
+
+=== go-26-1
+--- explain
+**思路**
+
+`context.WithValue` 的 key 用 `==` 比较。用字符串做 key，不同的包很可能用了同一个字符串，互相覆盖。用**未导出的自定义类型**做 key，别的包根本无法构造出相同类型的值，从根本上避免了冲突。
+
+**代码讲解**
+
+1. `type ctxKey struct{}`：空结构体类型，未导出。`ctxKey{}` 的所有值都相等，而且不占内存。
+2. `context.WithValue(ctx, ctxKey{}, id)` 返回一个新的 context，原 context 不变。
+3. `ctx.Value(ctxKey{}).(string)`：`Value` 返回 `any`，用 comma-ok 类型断言取出字符串；不存在时 `Value` 返回 nil，断言的 ok 为 false。
+
+**易错点**
+
+- 只往 context 里放**请求范围的元数据**（请求 ID、用户身份、trace 信息），不要放可选参数或依赖（数据库连接、logger 配置），否则函数的依赖关系变得不可见。
+- `go vet` 会对用内置类型（如 string）做 key 发出警告。
+- `Value` 是沿着父链逐层查找的，链很长时有一定开销。
+
+=== go-27-1
+--- explain
+**思路**
+
+把 int 赋给 `any` 时，接口需要一个指针指向数据，编译器通常会在堆上分配一个 int 来存放它（**装箱**）。循环里反复装箱就是反复分配。直接用 `int` 类型的变量累加，就完全不需要分配。
+
+**代码讲解**
+
+1. `total := 0`：类型是 int，存在栈上（甚至寄存器里）。
+2. `total += n`：纯整数运算。
+
+**易错点**
+
+- Go 对 0～255 的小整数和一些常量做了优化（使用静态数据，不分配），所以小数据测试可能看不出分配。
+- 用 `go build -gcflags=-m` 可以看到 `... escapes to heap` 之类的提示，这是定位分配原因的第一步。
+- 泛型（`func Sum[T Number]`）在大多数情况下也能避免装箱，比 `any` 好得多。
+
+=== go-27-2
+--- explain
+**思路**
+
+返回局部变量的指针，变量必须在函数返回后继续存在，所以**逃逸到堆上**。像 `Vec` 这样只有 24 字节的小结构体，按值返回只是复制 3 个 float64，比堆分配加上之后的 GC 便宜得多。
+
+**代码讲解**
+
+1. `func NewVec(x, y, z float64) Vec { return Vec{x, y, z} }`：按值返回，结构体在调用方的栈上。
+2. `func (v Vec) Add(o Vec) Vec`：值接收者、按值返回，不产生任何指针。
+3. `Total` 里 `sum = sum.Add(NewVec(...))`：全部是栈上的值运算，零分配。
+4. `//go:noinline` 阻止编译器内联 `NewVec`，模拟一个“编译器看不到内部”的函数。
+
+**易错点**
+
+- 并不是“指针一定更快”：小对象传值通常更快，大对象（几百字节以上）或需要共享修改时才用指针。
+- 内联能改变逃逸分析的结果：函数被内联后，编译器可能发现指针并没有逃出调用方，于是把对象放回栈上。
+
+=== go-28-1
+--- explain
+**思路**
+
+逃逸分析是在编译期、按函数分析的。`newCounts()` 返回一个数组指针且被禁止内联，编译器看不到调用方如何使用这个指针，只能保守地把数组分配到堆上。直接在函数里声明 `var counts [256]int`，数组在栈上，零分配。
+
+**代码讲解**
+
+1. `var counts [256]int`：2KB 的数组，零值全是 0，放在栈上完全没问题。
+2. `counts[b]++`：b 是 byte，取值范围正好是 0～255，可以直接当下标，不会越界。
+3. 找最大值时从 `i := 1` 开始，只在**严格大于**时更新 `best`，所以次数相同时保留较小的字节值。
+4. `byte(best)` 转回字节。
+
+**易错点**
+
+- 用 `map[byte]int` 计数既慢又会分配，固定范围的计数用数组。
+- 栈上能放的对象大小有限制（超过一定大小的变量会被放到堆上），2KB 远在限制之内。
+- 查看内联决策：`go build -gcflags='-m -m'`。
+
+=== go-29-1
+--- explain
+**思路**
+
+每次跨边界调用（cgo、RPC、系统调用、数据库往返）都有固定开销，处理一个元素和处理一批元素的开销几乎一样。把元素按批次切分，调用次数从 n 降到 n / batchSize，固定开销被摊薄。
+
+**代码讲解**
+
+1. `batchSize < 1` 时修正为 1，防止死循环。
+2. `out := make([]int, 0, len(items))`：结果总数已知，预分配。
+3. `for start := 0; start < len(items); start += batchSize`：按步长遍历。
+4. `end := min(start+batchSize, len(items))`：最后一批可能不满。
+5. `items[start:end]`：切片表达式，不复制数据。
+6. `append(out, b.Call(...)...)`：展开结果追加。
+
+**易错点**
+
+- 传给 `Call` 的子切片和 `items` 共享底层数组，如果 `Call` 会修改输入或者保存引用，就需要先复制。
+- 批次太大也有代价：延迟变高、单次调用占用内存多。实际系统中常常同时按“数量”和“时间”两个条件触发批处理。

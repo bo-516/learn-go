@@ -1,0 +1,305 @@
+=== web-01-1
+--- explain
+**思路**
+
+`net/http` 的核心是 `http.Handler` 接口，只有一个方法 `ServeHTTP(w, r)`。服务器为每个连接启动一个 goroutine，解析请求后调用 Handler；Handler 通过 `ResponseWriter` 写响应头和响应体。
+
+**代码讲解**
+
+1. `type HelloHandler struct{}`：空结构体，只用来挂方法；`func (HelloHandler) ServeHTTP(...)` 接收者不需要名字时可以省略。
+2. `r.Method != http.MethodGet`：用标准库常量而不是字符串字面量。
+3. `w.Header().Set("Allow", ...)` 必须在写状态码**之前**；`http.Error` 会设置 Content-Type、写状态码和错误信息。
+4. `r.URL.Query().Get("name")`：解析查询参数，不存在返回空字符串。
+5. 设置 `Content-Type` 后 `fmt.Fprintf(w, ...)`：`ResponseWriter` 实现了 `io.Writer`。第一次写入时如果没调用过 `WriteHeader`，会自动写 200。
+
+**易错点**
+
+- 先写了响应体再设置响应头，响应头的修改不会生效（已经发出去了）。
+- `WriteHeader` 只能调用一次，重复调用会打印警告 `superfluous response.WriteHeader call`。
+- handler 返回后不要再使用 `w` 和 `r`（比如在后台 goroutine 里写响应）。
+
+=== web-02-1
+--- explain
+**思路**
+
+中间件的类型是 `func(http.Handler) http.Handler`：接收下一个处理者，返回一个包装了额外逻辑的新处理者。要让 `mws[0]` 在最外层，就要**从最后一个开始包装**：先用 `mws[n-1]` 包住 handler，再用 `mws[n-2]` 包住结果……最后用 `mws[0]` 包在最外面。
+
+**代码讲解**
+
+1. `type Middleware func(http.Handler) http.Handler`：给函数类型起名字，签名更清楚。
+2. `Chain(h http.Handler, mws ...Middleware)`：可变参数。
+3. `for i := len(mws) - 1; i >= 0; i--`：倒序遍历。
+4. `h = mws[i](h)`：每次用当前中间件包装已有的 handler。
+
+**执行顺序**：请求进来时从外到内（A 前 → B 前 → handler），返回时从内到外（B 后 → A 后），这就是“洋葱模型”。
+
+**易错点**
+
+- 正序包装的结果是 `mws` 的最后一个在最外层，顺序反了。日志、恢复 panic 这类中间件通常要放在最外层。
+- 社区常用的 `alice`、`chi` 的 `Use` 都是这个原理。
+
+=== web-02-2
+--- explain
+**思路**
+
+Gin 不用嵌套包装，而是把所有处理函数放在一个切片里，`Context` 用 `index` 记录执行到了哪里。`Next()` 是一个**循环**：从下一个开始，依次执行剩下的处理函数。中间件里调用 `c.Next()`，后续的函数都执行完才返回，所以 `Next()` 之后的代码就是“后置逻辑”。
+
+**代码讲解**
+
+1. `Run` 创建 Context，`index: -1`，然后调用 `Next()`，第一次自增后从 0 开始。
+2. `Next()`：`c.index++` 后进入循环，执行 `c.handlers[c.index](c)`，返回后再 `c.index++`。
+3. 中间件**没有调用** `Next` 时，它返回后外层的循环会继续执行下一个，所以框架会“自动”往下走。
+4. 中间件**调用了** `Next` 时，内层的循环把后面的函数都执行完了，`index` 已经到了末尾，外层循环随即结束，不会重复执行。
+5. `Abort()` 把 `index` 设成一个很大的值，循环条件不再满足，后续函数都不会执行；当前函数自己剩下的代码仍然会执行完。
+6. `abortIndex = math.MaxInt / 2`：常量，留出空间防止之后的 `index++` 溢出。
+
+**易错点**
+
+- 调用 `Abort()` 后当前函数仍会继续执行，所以通常写成 `c.AbortWithStatusJSON(...); return`。
+- 在 goroutine 里使用 `*gin.Context` 要先 `c.Copy()`，因为 Context 会被对象池复用。
+
+=== web-03-1
+--- explain
+**思路**
+
+Go 1.22 起标准库的 `ServeMux` 支持在模式里写**请求方法**和**路径参数**：`"GET /users/{id}"`。方法不匹配时自动返回 405（并带上 Allow 头），路径参数用 `r.PathValue("id")` 读取，`{path...}` 匹配剩余的所有路径段。很多简单服务不再需要第三方路由库。
+
+**代码讲解**
+
+1. `mux.HandleFunc("GET /users/{id}", func(w, r) {...})`：模式字符串里方法和路径之间用一个空格分隔。
+2. `r.PathValue("id")` 返回匹配到的路径段。
+3. `w.WriteHeader(http.StatusCreated)` 写 201 后再写响应体。
+4. `"GET /files/{path...}"`：通配段必须在最后，`a/b.txt` 会整个匹配到 `path`。
+
+**易错点**
+
+- `GET` 模式同时匹配 `HEAD` 请求。
+- 两个模式冲突时（都能匹配同一个请求且无法判断哪个更具体），注册时会 panic。
+- 和 Gin 的区别：Gin 用基数树（radix tree）路由，自带参数绑定、校验、中间件分组等功能；ServeMux 更简单，但胜在没有依赖。
+
+=== web-04-1
+--- explain
+**思路**
+
+`srv.Shutdown(ctx)` 会先关闭监听（不再接受新连接），然后等待所有正在处理的请求完成，最多等到 ctx 超时。`srv.Serve` 在 Shutdown 被调用后会立即返回 `http.ErrServerClosed`，这不是错误，而是正常关闭的信号。
+
+**代码讲解**
+
+1. `errCh := make(chan error, 1)` 加 goroutine 运行 `srv.Serve(ln)`：缓冲为 1，即使没人接收，goroutine 也能把结果放进去然后退出。
+2. `select` 等待两种情况：服务自己出错（比如端口问题）直接返回；`ctx.Done()` 表示收到退出信号。
+3. `context.WithTimeout(context.Background(), grace)`：Shutdown 用一个**新的** context，不能用已经取消了的 ctx，否则 Shutdown 会立即返回、不等任何请求。
+4. Shutdown 出错（超时）直接返回。
+5. 最后 `<-errCh` 读取 Serve 的返回值，`errors.Is(err, http.ErrServerClosed)` 就当作正常结束。
+
+**易错点**
+
+- 用已取消的 ctx 调用 Shutdown，等于没有优雅关闭。
+- Shutdown 不会等待被劫持（Hijack）的连接，比如 WebSocket，需要用 `srv.RegisterOnShutdown` 自己通知它们关闭。
+- 通常的触发方式：`ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)`。
+
+=== web-04-2
+--- explain
+**思路**
+
+Kubernetes 删除 Pod 时，“发送 SIGTERM”和“从 Service 的 Endpoint 中摘除”是**并行**发生的，摘除传播到所有节点的 kube-proxy 需要几秒。如果收到 SIGTERM 立刻关闭服务，这几秒内转发过来的请求就会失败。所以先让**就绪探针**失败、等一会儿让流量切走，再真正关闭。
+
+**代码讲解**
+
+1. `shuttingDown atomic.Bool`：标志位会被信号处理的 goroutine 写、被请求处理的 goroutine 读，用原子变量避免数据竞争。
+2. `/livez` 永远返回 ok：存活探针失败会导致容器被**重启**，关闭过程中不应该让它失败。
+3. `/readyz` 在关闭中返回 503：就绪探针失败只会让 Pod 不再接收新流量。
+4. `io.WriteString(w, "ok")`：直接写字符串，比 `fmt.Fprint` 更轻。
+
+**完整的关闭流程**：收到 SIGTERM → `MarkShuttingDown()` → sleep 几秒（或者用 preStop hook 的 sleep）→ `srv.Shutdown()` 等待处理中的请求 → 关闭数据库连接等资源 → 退出。整个过程要在 `terminationGracePeriodSeconds`（默认 30 秒）内完成，否则会被 SIGKILL。
+
+**易错点**
+
+- 存活探针里检查数据库等依赖：依赖故障时所有 Pod 被不断重启，雪上加霜。存活探针只检查进程自身是否卡死。
+
+=== web-05-1
+--- explain
+**思路**
+
+使用 `http.Client` 的几个关键点：
+
+1. 请求要带 context，超时和取消才能生效；
+2. **响应体必须关闭**，否则底层连接无法放回连接池复用；
+3. 4xx、5xx **不会**返回 error，要自己检查状态码；
+4. 不要无限制地读取对方的响应。
+
+**代码讲解**
+
+1. `http.NewRequestWithContext(ctx, http.MethodGet, url, nil)`：最后一个参数是请求体（`io.Reader`），GET 为 nil。
+2. `client.Do(req)` 出错时 `resp` 为 nil，不需要关闭。
+3. `defer resp.Body.Close()` 紧跟在错误检查之后。
+4. 状态码不对时，先 `io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))` 把少量剩余数据读掉：HTTP/1.1 只有在响应体被**读完并关闭**后，连接才能被复用。
+5. `json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(v)`：最多读 1MB，流式解码。
+
+**易错点**
+
+- `http.Get` / `http.DefaultClient` **没有超时**，对方不响应时会永远挂着。要么给 Client 设置 `Timeout`，要么每个请求都带有截止时间的 ctx。
+- 每次请求都新建 `http.Client`（以及新的 Transport）会导致连接无法复用，Client 应该创建一次并复用。
+- `Transport.MaxIdleConnsPerHost` 默认只有 2，高并发调用同一个服务时应该调大。
+
+=== web-06-1
+--- explain
+**思路**
+
+JWT = `base64url(header).base64url(payload).base64url(签名)`。签名是对前两段用密钥计算的 HMAC，服务端只要重新计算签名并比较，就能确认令牌没有被篡改，不需要查数据库。注意 payload 只是 base64 编码，任何人都能解码看到内容，**不能放敏感信息**。
+
+**代码讲解**
+
+1. `var enc = base64.RawURLEncoding`：URL 安全且不带填充，JWT 规范要求这种编码。
+2. `sign`：`hmac.New(sha256.New, secret)` 创建 HMAC，`Write` 写入数据，`Sum(nil)` 得到签名。
+3. `Sign`：编码 header 和 claims，拼接后计算签名，三段用 `.` 连接。
+4. `Verify` 的检查顺序：
+   - 必须正好三段；三段都能 base64 解码；
+   - header 能解析且 `alg == "HS256"`：**必须固定算法**，否则攻击者可以把 alg 改成 `none` 绕过签名校验；
+   - `hmac.Equal` 常量时间比较签名，防止时序攻击；
+   - 最后才解析 payload 并检查过期时间。
+5. 多个错误用包级的哨兵变量，调用方可以用 `errors.Is` 区分。
+
+**易错点**
+
+- 用 `bytes.Equal` 或 `==` 比较签名：比较时间和第一个不同字节的位置有关，可能被用来逐字节猜出签名。
+- 先解析 payload 再验签：在确认令牌可信之前就使用了里面的数据。
+- 生产环境用成熟的库（如 `golang-jwt/jwt`），并且显式指定允许的算法。
+
+=== web-06-2
+--- explain
+**思路**
+
+JWT 的优点是无状态，缺点是签发后无法主动失效。注销时把令牌的唯一 ID（`jti`）放进**黑名单**，验证时查一下。黑名单只需要保存到令牌本身过期为止：过期之后令牌本来就会被拒绝，条目可以删除。
+
+**代码讲解**
+
+1. `revoked map[string]time.Time`：jti → 令牌的过期时间。
+2. `Revoke` 直接记录。
+3. `IsRevoked`：`ok && r.now().Before(exp)`，已经过期的条目视为不在黑名单中。
+4. `Cleanup`：遍历 map 删除过期的条目，在 range 中删除当前元素是安全的。
+
+**易错点**
+
+- 黑名单让 JWT 又变成了“每次请求都要查存储”，失去了一部分无状态的优势。所以常见的方案是：**短期的 access token**（比如 15 分钟，不做黑名单或只做很小的黑名单）+ **长期的 refresh token**（存在服务端，可以随时撤销）。
+- 用 Redis 存黑名单时，`SET jti 1 EX <剩余秒数>`，过期自动删除，不需要 Cleanup。
+- 这个结构没有加锁，并发使用时需要 Mutex。
+
+=== web-07-1
+--- explain
+**思路**
+
+浏览器的同源策略禁止网页读取其他源的响应。CORS 让服务端通过响应头声明“允许哪些源访问”。“非简单请求”（比如带自定义头、`Content-Type: application/json` 的 POST、PUT、DELETE）在真正发送前，浏览器会先发一个 **OPTIONS 预检请求**，服务端同意后才发送真实请求。
+
+**代码讲解**
+
+1. 没有 `Origin` 头：不是跨域请求（或者不是浏览器发的），直接放行。
+2. 判断预检：`OPTIONS` 方法并且带 `Access-Control-Request-Method` 头。
+3. 不在白名单：预检返回 403；普通请求照常处理但不加 CORS 头，浏览器会拦截响应。
+4. 在白名单：回显具体的 origin（带 Cookie 时规范禁止使用 `*`），加 `Allow-Credentials`。`h.Add("Vary", "Origin")` 告诉缓存：响应内容随 Origin 变化，不同的 Origin 不能共享缓存。
+5. 预检请求：设置允许的方法、回显请求的头、`Max-Age` 让浏览器缓存预检结果 600 秒，返回 204，不调用 next。
+
+**易错点**
+
+- 把请求的 Origin 原样回显而不校验白名单：等于允许任何网站带着用户的 Cookie 调用接口，相当于关闭了同源保护。
+- CORS 只是浏览器的限制，不是服务端的安全措施，curl 等工具不受影响；接口本身仍然需要认证和 CSRF 防护。
+
+=== web-08-1
+--- explain
+**思路**
+
+幂等键：客户端为每次“操作”生成一个唯一 ID（比如下单时生成），重试时带上同一个 ID。服务端第一次看到这个键时执行操作并保存结果，之后的重复请求直接返回保存的结果。难点在于**并发的重复请求**：第二个请求到达时第一个还没执行完，它必须等待，而不是再执行一次。
+
+**代码讲解**
+
+1. `entry` 里的 `done chan struct{}` 是“执行完成”的信号，`res`、`err` 保存结果。
+2. `Do`：持锁检查 key。已存在就解锁，然后 `<-e.done` 等待第一次执行完成，返回结果和 `replayed = true`。
+3. 不存在：创建 entry 放进 map，**解锁后**执行 fn（不能持锁执行，否则所有 key 都被串行化）。
+4. fn 出错时从 map 删除，允许重试。
+5. `close(e.done)` 唤醒所有等待者。close 发生在写 `e.res`、`e.err` 之后，channel 的关闭保证了等待者能看到这些写入。
+
+**易错点**
+
+- fn 出错时，**正在等待**的并发请求仍然会拿到这个错误（它们在删除之前就拿到了 entry），这是可以接受的。
+- 生产环境的结果要存在数据库或 Redis 里，带过期时间；还要校验同一个键的请求参数是否一致，不一致应该报错。
+- 数据库唯一约束（比如订单号唯一索引）是最后一道防线。
+
+=== web-09-1
+--- explain
+**思路**
+
+漏桶：请求进入桶里（水位 +1），桶以恒定速率漏水，桶满了就拒绝。效果是把输出速率限制为恒定值，突发流量会被拒绝。实现时不需要真的定时漏水，每次请求到来时**根据经过的时间计算**漏掉了多少即可。
+
+**代码讲解**
+
+1. 构造时 `last: now()` 记录起始时间。
+2. `elapsed := now.Sub(b.last).Seconds()`：经过的秒数，float64。
+3. `b.water = max(0, b.water-elapsed*b.rate)`：漏水后水位不能为负。内置 max 对 float64 同样适用。
+4. `b.water+1 > b.capacity`：加一份水会溢出就拒绝，拒绝时不加水。
+5. 允许时 `b.water++`。
+
+**易错点**
+
+- 和令牌桶的区别：令牌桶积攒令牌，空闲一段时间后允许一次突发（最多桶容量那么多）；漏桶严格限制速率。API 限流一般用令牌桶，Go 的 `golang.org/x/time/rate` 就是令牌桶。
+- 这个结构没有加锁，并发使用需要 Mutex。
+- 用注入的 `now` 函数，测试可以精确模拟时间。
+
+=== web-09-2
+--- explain
+**思路**
+
+按用户或 IP 限流，每个 key 一个独立的限流器，放在 map 里。两个问题：并发访问 map 要加锁；key 会无限增长（每个访问过的 IP 都会留下一个条目），要定期**清理长时间不活跃的 key**。
+
+**代码讲解**
+
+1. `keys map[string]*keyState` 存指针，取出来修改的就是 map 里的那一份。
+2. `Allow`：加锁 → 取出或创建 → 更新 `lastSeen` → 调用窗口计数器。
+3. `st.w.allow(...)`：`w` 是值类型字段，通过指针 `st` 访问时可以调用它的指针方法（`&st.w` 是可寻址的）。
+4. `Cleanup`：遍历删除超过 `idle` 没访问的 key。
+5. 已有的 `window.allow`：超过窗口大小就重置计数，`w.start, w.count = now, 0` 多重赋值。
+
+**易错点**
+
+- 用一把全局锁保护所有 key，高并发下会成为瓶颈，可以按 key 哈希分片。
+- 固定窗口在窗口边界处可能放过两倍的请求（上一个窗口末尾 + 下一个窗口开头），对精度要求高时用滑动窗口或令牌桶。
+- 分布式限流要把计数放到 Redis 里（用 Lua 保证原子性）。
+
+=== web-10-1
+--- explain
+**思路**
+
+`http.Server` 的超时字段默认都是 0，表示**不限制**。一个故意每隔几秒才发送一个字节的客户端（Slowloris 攻击）就能长时间占用连接和 goroutine，大量这样的连接会耗尽服务器资源。所以对外的服务一定要设置超时。
+
+**代码讲解**
+
+直接用结构体字面量配置所有字段并返回指针：
+
+- `ReadHeaderTimeout`：读取请求头的时间，防 Slowloris 最关键的一项；
+- `ReadTimeout`：读取整个请求（包括请求体）；
+- `WriteTimeout`：从读完请求头到写完响应；
+- `IdleTimeout`：keep-alive 连接空闲多久后关闭；
+- `MaxHeaderBytes`：`1 << 20` 即 1MB。
+
+**易错点**
+
+- `WriteTimeout` 包含了 handler 的执行时间，处理慢的接口（比如导出文件）会被截断；对于流式响应，可以用 `http.ResponseController`（Go 1.20+）为单个请求调整截止时间。
+- Server 的超时只能统一设置，请求级别的超时（比如每个接口不同）要用 context，见下一题。
+- 只设置了 `ReadTimeout` 而没有设置 `IdleTimeout` 时，空闲超时会沿用 `ReadTimeout`。
+
+=== web-10-2
+--- explain
+**思路**
+
+请求级超时：中间件给请求的 context 加上截止时间，下游所有使用 `r.Context()` 的操作（数据库查询、HTTP 调用）都会在超时后被取消，handler 可以及时返回 504。
+
+**代码讲解**
+
+1. `Timeout(d)` 返回一个中间件（函数返回函数），这是带参数的中间件的常见写法。
+2. `context.WithTimeout(r.Context(), d)`：基于请求原有的 context 派生，客户端断开连接时也会取消。
+3. `defer cancel()`：请求结束时释放定时器。
+4. `r.WithContext(ctx)` 返回一个带新 context 的请求**副本**，原请求不变。
+
+**易错点**
+
+- 超时只有在下游**检查 ctx** 时才生效：handler 里的代码如果不使用 ctx（比如调用了不支持 context 的库），超时后仍然会继续运行。
+- 标准库还有 `http.TimeoutHandler(h, d, msg)`：超时后直接给客户端返回 503，但 handler 的 goroutine 仍在运行，并且它会缓冲整个响应，不适合流式输出。
+- 超时时间要比上游（网关、客户端）的超时短，否则上游已经放弃了，这边还在白白计算。

@@ -1,0 +1,1686 @@
+Web 平台开发（WEB-01 ~ WEB-11）的编程小任务。测试用 net/http/httptest 驱动真实的 net/http 代码。
+
+=== web-01-1
+title: 实现一个 http.Handler
+--- desc
+实现 `HelloHandler` 的 `ServeHTTP` 方法：
+
+- 只接受 `GET`，其他方法返回 `405`，并设置响应头 `Allow: GET`；
+- 从查询参数 `name` 读取名字，没有时默认 `world`；
+- 返回 `200`，`Content-Type: text/plain; charset=utf-8`，响应体 `hello, <name>`。
+
+任何实现了 `ServeHTTP(http.ResponseWriter, *http.Request)` 的类型都是一个 `http.Handler`。
+--- solution
+package main
+
+import (
+	"fmt"
+	"net/http"
+)
+
+type HelloHandler struct{}
+
+func (HelloHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// @solution
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		name = "world"
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprintf(w, "hello, %s", name)
+	// @starter
+	// // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func do(method, target string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	HelloHandler{}.ServeHTTP(rec, httptest.NewRequest(method, target, nil))
+	return rec
+}
+
+func TestHello(t *testing.T) {
+	rec := do("GET", "/hello?name=gopher")
+	if rec.Code != 200 || rec.Body.String() != "hello, gopher" {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		t.Fatalf("Content-Type = %q", ct)
+	}
+	if rec := do("GET", "/hello"); rec.Body.String() != "hello, world" {
+		t.Fatalf("默认名字：got %q", rec.Body.String())
+	}
+}
+
+func TestMethodNotAllowed(t *testing.T) {
+	rec := do("POST", "/hello")
+	if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != "GET" {
+		t.Fatalf("POST 应返回 405 和 Allow: GET，实际 %d %q", rec.Code, rec.Header().Get("Allow"))
+	}
+}
+
+=== web-02-1
+title: 组合标准库中间件
+--- desc
+中间件就是「接收一个 Handler、返回一个新 Handler」的函数。实现：
+
+`Chain(h, mws...)`：依次包装，保证 `mws[0]` 在**最外层**（最先执行）。测试里提供了一个会记录执行顺序的 `tag` 中间件。
+
+调用 `Chain(h, A, B)` 后，执行顺序应该是 `A 前 → B 前 → handler → B 后 → A 后`。
+--- solution
+package main
+
+import "net/http"
+
+type Middleware func(http.Handler) http.Handler
+
+func Chain(h http.Handler, mws ...Middleware) http.Handler {
+	// @solution
+	for i := len(mws) - 1; i >= 0; i-- {
+		h = mws[i](h)
+	}
+	return h
+	// @starter
+	// return h // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"testing"
+)
+
+func tag(name string, log *[]string) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			*log = append(*log, name+" before")
+			next.ServeHTTP(w, r)
+			*log = append(*log, name+" after")
+		})
+	}
+}
+
+func TestChainOrder(t *testing.T) {
+	var log []string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { log = append(log, "handler") })
+	Chain(h, tag("A", &log), tag("B", &log)).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
+	want := []string{"A before", "B before", "handler", "B after", "A after"}
+	if !slices.Equal(log, want) {
+		t.Fatalf("执行顺序 = %v\n期望 %v", log, want)
+	}
+}
+
+func TestChainEmpty(t *testing.T) {
+	called := false
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true })
+	Chain(h).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
+	if !called {
+		t.Fatal("没有中间件时应直接调用 handler")
+	}
+}
+
+=== web-02-2
+title: 实现 Gin 风格的 c.Next() 和 c.Abort()
+--- desc
+Gin 把中间件和最终处理函数放在一个切片里，`Context` 记录当前执行到的下标。实现：
+
+- `Run(handlers...)`：创建 Context，从第一个处理函数开始执行；
+- `c.Next()`：执行后续的处理函数，全部返回后才回到调用 `Next` 的地方，形成洋葱模型；
+- `c.Abort()`：后续处理函数不再执行（但当前函数会继续执行完）；
+- 中间件**不调用** `Next` 时，框架也要在它返回后自动执行下一个处理函数。
+
+提示：Gin 的 `Next` 是一个循环：`c.index++; for c.index < len(c.handlers) { c.handlers[c.index](c); c.index++ }`，`Abort` 把 index 设成一个很大的值。
+--- solution
+package main
+
+import "math"
+
+type HandlerFunc func(*Context)
+
+type Context struct {
+	handlers []HandlerFunc
+	index    int
+	Log      []string
+}
+
+const abortIndex = math.MaxInt / 2
+
+func Run(handlers ...HandlerFunc) *Context {
+	c := &Context{handlers: handlers, index: -1}
+	c.Next()
+	return c
+}
+
+func (c *Context) Next() {
+	// @solution
+	c.index++
+	for c.index < len(c.handlers) {
+		c.handlers[c.index](c)
+		c.index++
+	}
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (c *Context) Abort() {
+	// @solution
+	c.index = abortIndex
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (c *Context) IsAborted() bool { return c.index >= abortIndex }
+--- test
+package main
+
+import (
+	"slices"
+	"testing"
+)
+
+func mw(name string) HandlerFunc {
+	return func(c *Context) {
+		c.Log = append(c.Log, name+" before")
+		c.Next()
+		c.Log = append(c.Log, name+" after")
+	}
+}
+
+func handler(c *Context) { c.Log = append(c.Log, "handler") }
+
+func TestOnion(t *testing.T) {
+	c := Run(mw("A"), mw("B"), handler)
+	want := []string{"A before", "B before", "handler", "B after", "A after"}
+	if !slices.Equal(c.Log, want) {
+		t.Fatalf("Log = %v\n期望 %v", c.Log, want)
+	}
+}
+
+func TestWithoutNext(t *testing.T) {
+	plain := func(c *Context) { c.Log = append(c.Log, "plain") }
+	c := Run(plain, mw("A"), handler)
+	want := []string{"plain", "A before", "handler", "A after"}
+	if !slices.Equal(c.Log, want) {
+		t.Fatalf("Log = %v\n期望 %v（不调用 Next 的中间件返回后也要继续执行）", c.Log, want)
+	}
+}
+
+func TestAbort(t *testing.T) {
+	auth := func(c *Context) {
+		c.Log = append(c.Log, "auth failed")
+		c.Abort()
+		c.Log = append(c.Log, "after abort") // Abort 不会中断当前函数
+	}
+	c := Run(mw("A"), auth, handler)
+	want := []string{"A before", "auth failed", "after abort", "A after"}
+	if !slices.Equal(c.Log, want) || !c.IsAborted() {
+		t.Fatalf("Log = %v\n期望 %v", c.Log, want)
+	}
+}
+
+=== web-03-1
+title: Go 1.22 的 ServeMux 路由
+--- desc
+用标准库的 `http.NewServeMux()` 注册路由（Go 1.22 起支持请求方法和路径参数）：
+
+| 路由 | 响应 |
+| --- | --- |
+| `GET /users/{id}` | `200`，响应体 `user <id>` |
+| `POST /users` | `201`，响应体 `created` |
+| `GET /files/{path...}` | `200`，响应体为剩余路径，如 `a/b.txt` |
+
+方法不匹配时 ServeMux 会自动返回 405，不用自己处理。路径参数用 `r.PathValue("id")` 读取。
+--- solution
+package main
+
+import (
+	"fmt"
+	"net/http"
+)
+
+func NewMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	// @solution
+	mux.HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "user %s", r.PathValue("id"))
+	})
+	mux.HandleFunc("POST /users", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprint(w, "created")
+	})
+	mux.HandleFunc("GET /files/{path...}", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, r.PathValue("path"))
+	})
+	// @starter
+	// // TODO: 注册三个路由
+	// @end
+	return mux
+}
+--- test
+package main
+
+import (
+	"net/http/httptest"
+	"testing"
+)
+
+func call(method, path string) (int, string) {
+	rec := httptest.NewRecorder()
+	NewMux().ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+	return rec.Code, rec.Body.String()
+}
+
+func TestRoutes(t *testing.T) {
+	cases := []struct {
+		method, path string
+		code         int
+		body         string
+	}{
+		{"GET", "/users/42", 200, "user 42"},
+		{"POST", "/users", 201, "created"},
+		{"GET", "/files/a/b/c.txt", 200, "a/b/c.txt"},
+	}
+	for _, c := range cases {
+		code, body := call(c.method, c.path)
+		if code != c.code || body != c.body {
+			t.Errorf("%s %s = %d %q，期望 %d %q", c.method, c.path, code, body, c.code, c.body)
+		}
+	}
+}
+
+func TestMethodMismatch(t *testing.T) {
+	if code, _ := call("DELETE", "/users/42"); code != 405 {
+		t.Errorf("DELETE /users/42 = %d，期望 405", code)
+	}
+	if code, _ := call("GET", "/users"); code != 405 {
+		t.Errorf("GET /users = %d，期望 405", code)
+	}
+	if code, _ := call("GET", "/nothing"); code != 404 {
+		t.Errorf("GET /nothing = %d，期望 404", code)
+	}
+}
+
+=== web-04-1
+title: 优雅关闭 HTTP 服务
+--- desc
+实现 `Serve(ctx, srv, ln, grace)`：
+
+1. 在后台用 `srv.Serve(ln)` 启动服务；
+2. `ctx` 被取消（收到退出信号）时，调用 `srv.Shutdown`：停止接收新连接，**等待处理中的请求完成**，最多等 `grace`；
+3. 正常关闭时返回 nil（`Serve` 返回的 `http.ErrServerClosed` 不算错误）；服务自己出错时返回该错误。
+
+测试会启动一个真实的本地服务：请求处理到一半时取消 ctx，这个请求仍然必须成功完成。
+--- solution
+package main
+
+import (
+	"context"
+	"errors"
+	"net"
+	"net/http"
+	"time"
+)
+
+func Serve(ctx context.Context, srv *http.Server, ln net.Listener, grace time.Duration) error {
+	// @solution
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Serve(ln) }()
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		return err
+	}
+	if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+	// @starter
+	// return srv.Serve(ln) // TODO: 没有处理退出信号
+	// @end
+}
+--- test
+package main
+
+import (
+	"context"
+	"io"
+	"net"
+	"net/http"
+	"testing"
+	"time"
+)
+
+func TestGracefulShutdown(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		io.WriteString(w, "done")
+	})}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- Serve(ctx, srv, ln, 2*time.Second) }()
+
+	url := "http://" + ln.Addr().String()
+	type result struct {
+		body string
+		err  error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		resp, err := http.Get(url)
+		if err != nil {
+			resCh <- result{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		resCh <- result{string(b), err}
+	}()
+
+	time.Sleep(50 * time.Millisecond) // 请求正在处理中
+	cancel()
+
+	select {
+	case r := <-resCh:
+		if r.err != nil || r.body != "done" {
+			t.Fatalf("处理中的请求应正常完成：body=%q err=%v", r.body, r.err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("请求超时")
+	}
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("优雅关闭应返回 nil，实际 %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ctx 取消后 Serve 应该返回")
+	}
+	if _, err := http.Get(url); err == nil {
+		t.Fatal("关闭后不应再接受新连接")
+	}
+}
+
+=== web-04-2
+title: 就绪探针：关闭前先摘流量
+--- desc
+在 Kubernetes 里，Pod 收到 SIGTERM 后，Service 摘除它的 Endpoint 有延迟。常见做法：先让就绪探针失败，等几秒让流量切走，再真正关闭。
+
+实现 `Health`：
+
+- `GET /livez` 永远返回 `200 ok`（存活探针，失败会被重启）；
+- `GET /readyz` 正常时返回 `200 ok`，调用 `MarkShuttingDown()` 之后返回 `503 shutting down`；
+- `MarkShuttingDown` 可能和请求并发执行，用 `atomic.Bool`。
+--- solution
+package main
+
+import (
+	"io"
+	"net/http"
+	"sync/atomic"
+)
+
+type Health struct {
+	shuttingDown atomic.Bool
+}
+
+func (h *Health) MarkShuttingDown() {
+	// @solution
+	h.shuttingDown.Store(true)
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (h *Health) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "ok")
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		// @solution
+		if h.shuttingDown.Load() {
+			http.Error(w, "shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		// @starter
+		// // TODO
+		// @end
+		io.WriteString(w, "ok")
+	})
+	return mux
+}
+--- test
+package main
+
+import (
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+)
+
+func get(h *Health, path string) (int, string) {
+	rec := httptest.NewRecorder()
+	h.Handler().ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+	return rec.Code, strings.TrimSpace(rec.Body.String())
+}
+
+func TestProbes(t *testing.T) {
+	h := &Health{}
+	if c, b := get(h, "/readyz"); c != 200 || b != "ok" {
+		t.Fatalf("readyz = %d %q", c, b)
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); h.MarkShuttingDown() }()
+	go func() { defer wg.Done(); get(h, "/readyz") }()
+	wg.Wait()
+	if c, b := get(h, "/readyz"); c != 503 || b != "shutting down" {
+		t.Fatalf("关闭中 readyz = %d %q，期望 503", c, b)
+	}
+	if c, _ := get(h, "/livez"); c != 200 {
+		t.Fatalf("livez 应始终 200，实际 %d", c)
+	}
+}
+
+=== web-05-1
+title: 正确使用 http.Client
+--- desc
+实现 `FetchJSON(ctx, client, url, v)`，把 JSON 响应解码到 `v`：
+
+1. 用 `http.NewRequestWithContext` 创建请求，让 ctx 的超时和取消生效；
+2. **一定要关闭** `resp.Body`，否则连接无法复用、goroutine 泄漏；
+3. 状态码不是 200 时返回错误（net/http 不会因为 4xx/5xx 返回 error）；
+4. 用 `io.LimitReader` 限制最多读取 1MB，防止对方返回超大响应。
+
+测试会统计响应体的 `Close` 调用次数。
+--- solution
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+)
+
+func FetchJSON(ctx context.Context, client *http.Client, url string, v any) error {
+	// @solution
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		return fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(v)
+	// @starter
+	// resp, err := client.Get(url) // TODO: 没有用 ctx，没有关闭 Body，没有检查状态码
+	// if err != nil {
+	// 	return err
+	// }
+	// return json.NewDecoder(resp.Body).Decode(v)
+	// @end
+}
+--- test
+package main
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+type countingBody struct {
+	io.ReadCloser
+	closes *atomic.Int32
+}
+
+func (b countingBody) Close() error {
+	b.closes.Add(1)
+	return b.ReadCloser.Close()
+}
+
+type countingTransport struct{ closes atomic.Int32 }
+
+func (t *countingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := http.DefaultTransport.RoundTrip(r)
+	if err == nil {
+		resp.Body = countingBody{resp.Body, &t.closes}
+	}
+	return resp, err
+}
+
+func server() *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ok", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"name":"gopher","age":13}`)
+	})
+	mux.HandleFunc("/fail", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"boom"}`, 500)
+	})
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(2 * time.Second):
+		case <-r.Context().Done():
+		}
+	})
+	return httptest.NewServer(mux)
+}
+
+type user struct {
+	Name string `json:"name"`
+	Age  int    `json:"age"`
+}
+
+func TestFetchJSON(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	tr := &countingTransport{}
+	client := &http.Client{Transport: tr}
+
+	var u user
+	if err := FetchJSON(context.Background(), client, srv.URL+"/ok", &u); err != nil || u.Name != "gopher" {
+		t.Fatalf("u=%+v err=%v", u, err)
+	}
+	if err := FetchJSON(context.Background(), client, srv.URL+"/fail", &u); err == nil {
+		t.Fatal("500 应返回错误")
+	}
+	if n := tr.closes.Load(); n != 2 {
+		t.Fatalf("响应体 Close 了 %d 次，期望 2 次", n)
+	}
+}
+
+func TestFetchJSONTimeout(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	var u user
+	if err := FetchJSON(ctx, &http.Client{}, srv.URL+"/slow", &u); err == nil {
+		t.Fatal("超时应返回错误")
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("ctx 超时没有生效")
+	}
+}
+
+=== web-06-1
+title: 手写 JWT（HS256）签发与校验
+--- desc
+JWT 由三段组成：`base64url(header).base64url(payload).base64url(签名)`，签名是对前两段用 HMAC-SHA256 计算的。实现：
+
+- `Sign(claims, secret)`：header 固定为 `{"alg":"HS256","typ":"JWT"}`，三段都用 `base64.RawURLEncoding`；
+- `Verify(token, secret, now)`：
+  - 不是三段、base64 或 JSON 解析失败 → `ErrMalformed`；
+  - header 的 `alg` 不是 `HS256`（比如 `none`）→ `ErrMalformed`；
+  - 签名不匹配 → `ErrSignature`（用 `hmac.Equal` 做常量时间比较）；
+  - `exp`（Unix 秒）不晚于 `now` → `ErrExpired`。
+
+注意 payload 只是编码，**不是加密**，任何人都能解码看到内容。
+--- solution
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+)
+
+var (
+	ErrMalformed = errors.New("malformed token")
+	ErrSignature = errors.New("invalid signature")
+	ErrExpired   = errors.New("token expired")
+)
+
+type Claims struct {
+	Sub string `json:"sub"`
+	Exp int64  `json:"exp"`
+}
+
+type header struct {
+	Alg string `json:"alg"`
+	Typ string `json:"typ"`
+}
+
+var enc = base64.RawURLEncoding
+
+func sign(data string, secret []byte) []byte {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(data))
+	return mac.Sum(nil)
+}
+
+func Sign(c Claims, secret []byte) (string, error) {
+	// @solution
+	h, _ := json.Marshal(header{"HS256", "JWT"})
+	p, err := json.Marshal(c)
+	if err != nil {
+		return "", err
+	}
+	unsigned := enc.EncodeToString(h) + "." + enc.EncodeToString(p)
+	return unsigned + "." + enc.EncodeToString(sign(unsigned, secret)), nil
+	// @starter
+	// return "", errors.New("TODO")
+	// @end
+}
+
+func Verify(token string, secret []byte, now time.Time) (Claims, error) {
+	var c Claims
+	// @solution
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return c, ErrMalformed
+	}
+	hb, err1 := enc.DecodeString(parts[0])
+	pb, err2 := enc.DecodeString(parts[1])
+	sig, err3 := enc.DecodeString(parts[2])
+	if err1 != nil || err2 != nil || err3 != nil {
+		return c, ErrMalformed
+	}
+	var h header
+	if json.Unmarshal(hb, &h) != nil || h.Alg != "HS256" {
+		return c, ErrMalformed
+	}
+	if !hmac.Equal(sig, sign(parts[0]+"."+parts[1], secret)) {
+		return c, ErrSignature
+	}
+	if json.Unmarshal(pb, &c) != nil {
+		return Claims{}, ErrMalformed
+	}
+	if c.Exp <= now.Unix() {
+		return c, ErrExpired
+	}
+	return c, nil
+	// @starter
+	// return c, errors.New("TODO")
+	// @end
+}
+--- test
+package main
+
+import (
+	"encoding/base64"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+)
+
+var secret = []byte("s3cr3t")
+
+func TestSignKnownValue(t *testing.T) {
+	tok, err := Sign(Claims{Sub: "42", Exp: 2000000000}, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 || parts[0] != "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" {
+		t.Fatalf("header 段不对：%q", tok)
+	}
+	if p, _ := base64.RawURLEncoding.DecodeString(parts[1]); string(p) != `{"sub":"42","exp":2000000000}` {
+		t.Fatalf("payload = %s", p)
+	}
+}
+
+func TestVerify(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	tok, _ := Sign(Claims{Sub: "alice", Exp: now.Add(time.Hour).Unix()}, secret)
+	c, err := Verify(tok, secret, now)
+	if err != nil || c.Sub != "alice" {
+		t.Fatalf("Verify = %+v, %v", c, err)
+	}
+	if _, err := Verify(tok, []byte("wrong"), now); !errors.Is(err, ErrSignature) {
+		t.Errorf("错误的密钥：%v", err)
+	}
+	if _, err := Verify(tok, secret, now.Add(2*time.Hour)); !errors.Is(err, ErrExpired) {
+		t.Errorf("过期：%v", err)
+	}
+	parts := strings.Split(tok, ".")
+	forged := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"admin","exp":9999999999}`))
+	if _, err := Verify(parts[0]+"."+forged+"."+parts[2], secret, now); !errors.Is(err, ErrSignature) {
+		t.Errorf("篡改 payload：%v", err)
+	}
+	none := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	if _, err := Verify(none+"."+parts[1]+".", secret, now); !errors.Is(err, ErrMalformed) {
+		t.Errorf("alg=none：%v", err)
+	}
+	for _, bad := range []string{"", "a.b", "a.b.c.d", "!!.!!.!!"} {
+		if _, err := Verify(bad, secret, now); !errors.Is(err, ErrMalformed) {
+			t.Errorf("Verify(%q) = %v，期望 ErrMalformed", bad, err)
+		}
+	}
+}
+
+=== web-06-2
+title: 用黑名单实现 JWT 注销
+--- desc
+JWT 无法主动失效，注销时把令牌的 `jti` 放进黑名单，记录到令牌本身的过期时间为止。实现 `Revoker`：
+
+- `Revoke(jti, exp)`：加入黑名单；
+- `IsRevoked(jti)`：是否在黑名单中（令牌已经过期的条目视为不在——反正验签时会因为过期被拒绝）；
+- `Cleanup()`：删除所有已过期的条目，返回删除数量。不清理的话黑名单会无限增长（Redis 里用 key 的 TTL 自动完成）。
+--- solution
+package main
+
+import "time"
+
+type Revoker struct {
+	now     func() time.Time
+	revoked map[string]time.Time
+}
+
+func NewRevoker(now func() time.Time) *Revoker {
+	return &Revoker{now: now, revoked: map[string]time.Time{}}
+}
+
+func (r *Revoker) Revoke(jti string, exp time.Time) {
+	// @solution
+	r.revoked[jti] = exp
+	// @starter
+	// // TODO
+	// @end
+}
+
+func (r *Revoker) IsRevoked(jti string) bool {
+	// @solution
+	exp, ok := r.revoked[jti]
+	return ok && r.now().Before(exp)
+	// @starter
+	// return false // TODO
+	// @end
+}
+
+func (r *Revoker) Cleanup() int {
+	// @solution
+	n := 0
+	now := r.now()
+	for jti, exp := range r.revoked {
+		if !now.Before(exp) {
+			delete(r.revoked, jti)
+			n++
+		}
+	}
+	return n
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+func TestRevoker(t *testing.T) {
+	now := time.Unix(1000, 0)
+	r := NewRevoker(func() time.Time { return now })
+	r.Revoke("t1", now.Add(10*time.Minute))
+	r.Revoke("t2", now.Add(time.Hour))
+	if !r.IsRevoked("t1") || r.IsRevoked("t3") {
+		t.Fatal("IsRevoked 判断不对")
+	}
+	now = now.Add(15 * time.Minute)
+	if r.IsRevoked("t1") {
+		t.Fatal("令牌已过期的条目不需要再拦截")
+	}
+	if n := r.Cleanup(); n != 1 {
+		t.Fatalf("Cleanup 删除了 %d 条，期望 1 条", n)
+	}
+	if !r.IsRevoked("t2") || len(r.revoked) != 1 {
+		t.Fatal("未过期的条目应保留")
+	}
+}
+
+=== web-07-1
+title: CORS 中间件
+--- desc
+实现 `CORS(allowed, next)`：
+
+- 请求没有 `Origin` 头：直接交给 `next`；
+- `Origin` 在白名单中：
+  - 设置 `Access-Control-Allow-Origin: <origin>`（带 Cookie 时不能用 `*`）、`Access-Control-Allow-Credentials: true`、`Vary: Origin`；
+  - 如果是**预检请求**（`OPTIONS` 且带 `Access-Control-Request-Method`）：再设置 `Access-Control-Allow-Methods: GET, POST, PUT, DELETE`、`Access-Control-Allow-Headers`（回显请求里的 `Access-Control-Request-Headers`）、`Access-Control-Max-Age: 600`，返回 `204`，**不调用** `next`；
+  - 否则调用 `next`；
+- `Origin` 不在白名单：不加任何 CORS 头；预检请求返回 `403`，普通请求照常交给 `next`（浏览器会拦截响应）。
+--- solution
+package main
+
+import (
+	"net/http"
+	"slices"
+)
+
+func CORS(allowed []string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// @solution
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		preflight := r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != ""
+		if !slices.Contains(allowed, origin) {
+			if preflight {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", origin)
+		h.Set("Access-Control-Allow-Credentials", "true")
+		h.Add("Vary", "Origin")
+		if preflight {
+			h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE")
+			if reqHeaders := r.Header.Get("Access-Control-Request-Headers"); reqHeaders != "" {
+				h.Set("Access-Control-Allow-Headers", reqHeaders)
+			}
+			h.Set("Access-Control-Max-Age", "600")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+		// @starter
+		// w.Header().Set("Access-Control-Allow-Origin", "*") // TODO: 带 Cookie 时不允许 *，也没有处理预检
+		// next.ServeHTTP(w, r)
+		// @end
+	})
+}
+--- test
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+var allowed = []string{"https://app.example.com"}
+
+func serve(method string, hdr map[string]string) (*httptest.ResponseRecorder, bool) {
+	called := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true; w.Write([]byte("ok")) })
+	req := httptest.NewRequest(method, "/api", nil)
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	CORS(allowed, next).ServeHTTP(rec, req)
+	return rec, called
+}
+
+func TestSimpleRequest(t *testing.T) {
+	rec, called := serve("GET", map[string]string{"Origin": "https://app.example.com"})
+	if !called || rec.Header().Get("Access-Control-Allow-Origin") != "https://app.example.com" ||
+		rec.Header().Get("Access-Control-Allow-Credentials") != "true" || rec.Header().Get("Vary") != "Origin" {
+		t.Fatalf("called=%v headers=%v", called, rec.Header())
+	}
+}
+
+func TestPreflight(t *testing.T) {
+	rec, called := serve("OPTIONS", map[string]string{
+		"Origin":                         "https://app.example.com",
+		"Access-Control-Request-Method":  "PUT",
+		"Access-Control-Request-Headers": "Content-Type, X-Token",
+	})
+	if called {
+		t.Fatal("预检请求不应调用 next")
+	}
+	h := rec.Header()
+	if rec.Code != 204 || h.Get("Access-Control-Allow-Methods") != "GET, POST, PUT, DELETE" ||
+		h.Get("Access-Control-Allow-Headers") != "Content-Type, X-Token" || h.Get("Access-Control-Max-Age") != "600" {
+		t.Fatalf("预检响应不对：%d %v", rec.Code, h)
+	}
+}
+
+func TestDisallowedOrigin(t *testing.T) {
+	rec, called := serve("GET", map[string]string{"Origin": "https://evil.example"})
+	if !called || rec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatal("不在白名单的来源不应获得 CORS 头")
+	}
+	rec, called = serve("OPTIONS", map[string]string{"Origin": "https://evil.example", "Access-Control-Request-Method": "DELETE"})
+	if called || rec.Code != 403 {
+		t.Fatalf("不在白名单的预检应返回 403，实际 %d", rec.Code)
+	}
+	if _, called := serve("GET", nil); !called {
+		t.Fatal("没有 Origin 的请求应直接放行")
+	}
+}
+
+=== web-08-1
+title: 幂等键：重复请求返回第一次的结果
+race: true
+--- desc
+客户端为每次操作生成一个唯一的幂等键，服务端保证同一个键只执行一次。实现 `Store.Do(key, fn)`：
+
+- key 第一次出现：执行 `fn`，保存结果，返回 `(result, false, err)`；
+- **并发**的重复请求：等待第一次执行完，返回同样的结果和 `replayed = true`；
+- 之后的重复请求：直接返回保存的结果，`replayed = true`；
+- `fn` 返回错误：**不保存**（删除记录），允许客户端用同一个键重试。
+--- solution
+package main
+
+import "sync"
+
+type Result struct {
+	Status int
+	Body   string
+}
+
+type entry struct {
+	done chan struct{}
+	res  Result
+	err  error
+}
+
+type Store struct {
+	mu      sync.Mutex
+	entries map[string]*entry
+}
+
+func NewStore() *Store { return &Store{entries: map[string]*entry{}} }
+
+func (s *Store) Do(key string, fn func() (Result, error)) (Result, bool, error) {
+	// @solution
+	s.mu.Lock()
+	if e, ok := s.entries[key]; ok {
+		s.mu.Unlock()
+		<-e.done
+		return e.res, true, e.err
+	}
+	e := &entry{done: make(chan struct{})}
+	s.entries[key] = e
+	s.mu.Unlock()
+
+	e.res, e.err = fn()
+	if e.err != nil {
+		s.mu.Lock()
+		delete(s.entries, key)
+		s.mu.Unlock()
+	}
+	close(e.done)
+	return e.res, false, e.err
+	// @starter
+	// res, err := fn() // TODO: 每次都执行
+	// return res, false, err
+	// @end
+}
+--- test
+package main
+
+import (
+	"errors"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestConcurrentDuplicates(t *testing.T) {
+	s := NewStore()
+	var calls, replayed atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, rep, err := s.Do("pay:order-1", func() (Result, error) {
+				calls.Add(1)
+				time.Sleep(20 * time.Millisecond)
+				return Result{201, "paid"}, nil
+			})
+			if err != nil || res.Body != "paid" {
+				t.Errorf("res=%+v err=%v", res, err)
+			}
+			if rep {
+				replayed.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if calls.Load() != 1 || replayed.Load() != 19 {
+		t.Fatalf("fn 执行 %d 次（期望 1），重放 %d 次（期望 19）", calls.Load(), replayed.Load())
+	}
+	if _, rep, _ := s.Do("pay:order-1", func() (Result, error) { return Result{}, nil }); !rep {
+		t.Fatal("之后的重复请求应直接返回保存的结果")
+	}
+}
+
+func TestErrorNotSaved(t *testing.T) {
+	s := NewStore()
+	_, _, err := s.Do("k", func() (Result, error) { return Result{}, errors.New("db down") })
+	if err == nil {
+		t.Fatal("应返回 fn 的错误")
+	}
+	res, rep, err := s.Do("k", func() (Result, error) { return Result{200, "ok"}, nil })
+	if err != nil || rep || res.Body != "ok" {
+		t.Fatalf("失败后应允许重试：res=%+v rep=%v err=%v", res, rep, err)
+	}
+}
+
+=== web-09-1
+title: 漏桶限流
+--- desc
+漏桶以恒定速率「漏水」：每个请求往桶里加一份水，桶满了就拒绝。它能把突发流量整形为平稳的速率，但不允许合理的突发（这是和令牌桶的主要区别）。
+
+实现 `LeakyBucket.Allow()`：
+
+1. 先按距离上次计算经过的时间，漏掉 `rate × 秒数` 的水（水位不低于 0）；
+2. 水位加 1 后不超过容量 → 允许；否则拒绝（拒绝时不加水）。
+
+时间通过注入的 `now` 函数获取。
+--- solution
+package main
+
+import "time"
+
+type LeakyBucket struct {
+	capacity float64
+	rate     float64 // 每秒漏掉的水量
+	water    float64
+	last     time.Time
+	now      func() time.Time
+}
+
+func NewLeakyBucket(capacity, rate float64, now func() time.Time) *LeakyBucket {
+	return &LeakyBucket{capacity: capacity, rate: rate, last: now(), now: now}
+}
+
+func (b *LeakyBucket) Allow() bool {
+	// @solution
+	now := b.now()
+	elapsed := now.Sub(b.last).Seconds()
+	b.last = now
+	b.water = max(0, b.water-elapsed*b.rate)
+	if b.water+1 > b.capacity {
+		return false
+	}
+	b.water++
+	return true
+	// @starter
+	// return true // TODO
+	// @end
+}
+--- test
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+func TestLeakyBucket(t *testing.T) {
+	now := time.Unix(0, 0)
+	b := NewLeakyBucket(3, 2, func() time.Time { return now }) // 容量 3，每秒漏 2
+	for i := 0; i < 3; i++ {
+		if !b.Allow() {
+			t.Fatalf("第 %d 个请求应被允许", i+1)
+		}
+	}
+	if b.Allow() {
+		t.Fatal("桶满后应拒绝")
+	}
+	now = now.Add(500 * time.Millisecond) // 漏掉 1 份
+	if !b.Allow() || b.Allow() {
+		t.Fatal("0.5s 后只能再放行 1 个")
+	}
+	now = now.Add(10 * time.Second) // 漏空，水位不能为负
+	allowed := 0
+	for i := 0; i < 10; i++ {
+		if b.Allow() {
+			allowed++
+		}
+	}
+	if allowed != 3 {
+		t.Fatalf("漏空后最多放行容量个请求，实际 %d", allowed)
+	}
+}
+
+=== web-09-2
+title: 按 key 限流并清理不活跃的 key
+race: true
+--- desc
+按用户或 IP 限流时，每个 key 需要独立的限流器。代码里已经给出一个固定窗口计数器 `window`。实现 `KeyedLimiter`：
+
+- `Allow(key)`：取出（或创建）这个 key 的限流器并判断，记录最后访问时间；并发安全；
+- `Cleanup()`：删除超过 `idle` 时间没有访问的 key，返回删除数量——不清理的话，每个出现过的 IP 都会永久占用内存。
+--- solution
+package main
+
+import (
+	"sync"
+	"time"
+)
+
+// window 是一个已经实现好的固定窗口计数器：每个窗口最多 limit 个请求。
+type window struct {
+	start time.Time
+	count int
+}
+
+func (w *window) allow(now time.Time, limit int, size time.Duration) bool {
+	if now.Sub(w.start) >= size {
+		w.start, w.count = now, 0
+	}
+	if w.count >= limit {
+		return false
+	}
+	w.count++
+	return true
+}
+
+type keyState struct {
+	w        window
+	lastSeen time.Time
+}
+
+type KeyedLimiter struct {
+	mu    sync.Mutex
+	now   func() time.Time
+	limit int
+	size  time.Duration
+	idle  time.Duration
+	keys  map[string]*keyState
+}
+
+func NewKeyedLimiter(now func() time.Time, limit int, size, idle time.Duration) *KeyedLimiter {
+	return &KeyedLimiter{now: now, limit: limit, size: size, idle: idle, keys: map[string]*keyState{}}
+}
+
+func (l *KeyedLimiter) Allow(key string) bool {
+	// @solution
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	st, ok := l.keys[key]
+	if !ok {
+		st = &keyState{}
+		l.keys[key] = st
+	}
+	st.lastSeen = now
+	return st.w.allow(now, l.limit, l.size)
+	// @starter
+	// return true // TODO
+	// @end
+}
+
+func (l *KeyedLimiter) Cleanup() int {
+	// @solution
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	n := 0
+	for k, st := range l.keys {
+		if now.Sub(st.lastSeen) > l.idle {
+			delete(l.keys, k)
+			n++
+		}
+	}
+	return n
+	// @starter
+	// return 0 // TODO
+	// @end
+}
+
+func (l *KeyedLimiter) Len() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.keys)
+}
+--- test
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestPerKey(t *testing.T) {
+	now := time.Unix(0, 0)
+	var mu sync.Mutex
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	l := NewKeyedLimiter(clock, 5, time.Second, time.Minute)
+	var ok atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if l.Allow("1.2.3.4") {
+				ok.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if ok.Load() != 5 {
+		t.Fatalf("同一个 key 每秒最多 5 个，实际放行 %d 个", ok.Load())
+	}
+	if !l.Allow("5.6.7.8") {
+		t.Fatal("不同 key 互不影响")
+	}
+}
+
+func TestCleanup(t *testing.T) {
+	now := time.Unix(0, 0)
+	l := NewKeyedLimiter(func() time.Time { return now }, 5, time.Second, time.Minute)
+	for i := 0; i < 100; i++ {
+		l.Allow(fmt.Sprint("ip-", i))
+	}
+	now = now.Add(30 * time.Second)
+	l.Allow("ip-7")
+	now = now.Add(45 * time.Second)
+	if n := l.Cleanup(); n != 99 {
+		t.Fatalf("Cleanup 删除了 %d 个，期望 99 个", n)
+	}
+	if l.Len() != 1 {
+		t.Fatal("最近访问过的 key 应保留")
+	}
+}
+
+=== web-10-1
+title: 给 http.Server 设置超时
+--- desc
+`http.Server` 的超时默认全是 0（不限制），一个慢速客户端就能一直占着连接（Slowloris 攻击）。实现 `NewServer(addr, h)`，返回配置好的服务：
+
+| 字段 | 值 | 作用 |
+| --- | --- | --- |
+| `ReadHeaderTimeout` | 5s | 读取请求头 |
+| `ReadTimeout` | 15s | 读取整个请求（含 Body） |
+| `WriteTimeout` | 30s | 从读完请求头到写完响应 |
+| `IdleTimeout` | 90s | keep-alive 空闲连接 |
+| `MaxHeaderBytes` | 1MB | 请求头大小上限 |
+--- solution
+package main
+
+import (
+	"net/http"
+	"time"
+)
+
+func NewServer(addr string, h http.Handler) *http.Server {
+	// @solution
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	// @starter
+	// return &http.Server{Addr: addr, Handler: h} // TODO: 没有任何超时
+	// @end
+}
+--- test
+package main
+
+import (
+	"net/http"
+	"testing"
+	"time"
+)
+
+func TestNewServer(t *testing.T) {
+	h := http.NewServeMux()
+	s := NewServer(":8080", h)
+	if s.Addr != ":8080" || s.Handler != h {
+		t.Fatal("Addr 或 Handler 不对")
+	}
+	checks := []struct {
+		name      string
+		got, want time.Duration
+	}{
+		{"ReadHeaderTimeout", s.ReadHeaderTimeout, 5 * time.Second},
+		{"ReadTimeout", s.ReadTimeout, 15 * time.Second},
+		{"WriteTimeout", s.WriteTimeout, 30 * time.Second},
+		{"IdleTimeout", s.IdleTimeout, 90 * time.Second},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %v，期望 %v", c.name, c.got, c.want)
+		}
+	}
+	if s.MaxHeaderBytes != 1<<20 {
+		t.Errorf("MaxHeaderBytes = %d", s.MaxHeaderBytes)
+	}
+}
+
+=== web-10-2
+title: 请求级超时中间件
+--- desc
+实现中间件 `Timeout(d)`：给每个请求的 context 加上 `d` 的截止时间（`context.WithTimeout` + `r.WithContext`），并在请求结束后 `cancel`。
+
+测试里的 handler 已经写好：它调用一个会响应 ctx 的慢查询，遇到 `context.DeadlineExceeded` 返回 `504`。只要超时传进去了，慢请求就会及时返回 504，而不是一直挂着。
+--- solution
+package main
+
+import (
+	"context"
+	"net/http"
+	"time"
+)
+
+func Timeout(d time.Duration) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// @solution
+			ctx, cancel := context.WithTimeout(r.Context(), d)
+			defer cancel()
+			next.ServeHTTP(w, r.WithContext(ctx))
+			// @starter
+			// next.ServeHTTP(w, r) // TODO
+			// @end
+		})
+	}
+}
+--- test
+package main
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
+
+func slowQuery(ctx context.Context, cost time.Duration) error {
+	select {
+	case <-time.After(cost):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func handler(cost time.Duration) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := slowQuery(r.Context(), cost); errors.Is(err, context.DeadlineExceeded) {
+			http.Error(w, "timeout", http.StatusGatewayTimeout)
+			return
+		}
+		w.Write([]byte("ok"))
+	})
+}
+
+func TestTimeout(t *testing.T) {
+	mw := Timeout(30 * time.Millisecond)
+
+	rec := httptest.NewRecorder()
+	mw(handler(time.Millisecond)).ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if rec.Code != 200 {
+		t.Fatalf("快请求应返回 200，实际 %d", rec.Code)
+	}
+
+	start := time.Now()
+	rec = httptest.NewRecorder()
+	mw(handler(2*time.Second)).ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if rec.Code != http.StatusGatewayTimeout || time.Since(start) > 500*time.Millisecond {
+		t.Fatalf("慢请求应在约 30ms 后返回 504，实际 %d（耗时 %v）", rec.Code, time.Since(start))
+	}
+}
+
+=== web-11-1
+title: 统一错误响应
+--- desc
+实现统一的错误出口 `WriteError(w, err)`，响应体都是 `{"code":…,"message":"…"}`：
+
+| 错误 | HTTP 状态码 | code | message |
+| --- | --- | --- | --- |
+| 错误链上有 `*AppError` | `e.Status` | `e.Code` | `e.Message` |
+| 错误链上有 `context.DeadlineExceeded` | 504 | 50400 | `upstream timeout` |
+| 其他 | 500 | 50000 | `internal error` |
+
+最后一种情况**不能**把内部错误信息（比如 SQL 报错）暴露给用户。`AppError` 通过 `Unwrap` 保留内部原因，方便记录日志。
+--- solution
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+)
+
+type AppError struct {
+	Status  int
+	Code    int
+	Message string
+	cause   error
+}
+
+func (e *AppError) Error() string { return e.Message }
+func (e *AppError) Unwrap() error { return e.cause }
+
+func NewAppError(status, code int, msg string, cause error) *AppError {
+	return &AppError{Status: status, Code: code, Message: msg, cause: cause}
+}
+
+type body struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func WriteError(w http.ResponseWriter, err error) {
+	status, b := http.StatusInternalServerError, body{50000, "internal error"}
+	// @solution
+	var ae *AppError
+	switch {
+	case errors.As(err, &ae):
+		status, b = ae.Status, body{ae.Code, ae.Message}
+	case errors.Is(err, context.DeadlineExceeded):
+		status, b = http.StatusGatewayTimeout, body{50400, "upstream timeout"}
+	}
+	// @starter
+	// b.Message = err.Error() // TODO: 泄漏了内部错误信息，也没有区分错误类型
+	// @end
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(b)
+}
+--- test
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func write(err error) (int, string) {
+	rec := httptest.NewRecorder()
+	WriteError(rec, err)
+	return rec.Code, strings.TrimSpace(rec.Body.String())
+}
+
+func TestWriteError(t *testing.T) {
+	cases := []struct {
+		err  error
+		code int
+		body string
+	}{
+		{NewAppError(400, 40001, "手机号格式不正确", nil), 400, `{"code":40001,"message":"手机号格式不正确"}`},
+		{fmt.Errorf("create order: %w", NewAppError(409, 40901, "订单已存在", errors.New("Error 1062: Duplicate entry"))), 409, `{"code":40901,"message":"订单已存在"}`},
+		{fmt.Errorf("call stock: %w", context.DeadlineExceeded), 504, `{"code":50400,"message":"upstream timeout"}`},
+		{errors.New("dial tcp 10.0.0.5:3306: connection refused"), 500, `{"code":50000,"message":"internal error"}`},
+	}
+	for _, c := range cases {
+		code, body := write(c.err)
+		if code != c.code || body != c.body {
+			t.Errorf("WriteError(%v) = %d %s\n期望 %d %s", c.err, code, body, c.code, c.body)
+		}
+	}
+}
+
+func TestUnwrapKeepsCause(t *testing.T) {
+	cause := errors.New("duplicate key")
+	err := NewAppError(409, 40901, "conflict", cause)
+	if !errors.Is(err, cause) {
+		t.Fatal("AppError 应保留内部原因")
+	}
+}
+
+=== web-11-2
+title: 参数校验与 typed nil 陷阱
+--- desc
+实现 `Validate(req)`，按 `name`、`email`、`age` 的顺序检查，收集**所有**字段错误：
+
+- `name`：去掉首尾空白后不能为空（`required`），最多 20 个字符，按 rune 计（`too long`）；
+- `email`：必须恰好包含一个 `@`，且前后都不为空（`invalid`）；
+- `age`：0 ~ 150（`out of range`）。
+
+有错误时返回 `ValidationErrors`，它的 `Error()` 形如 `name: required; age: out of range`。
+
+**没有错误时必须返回真正的 nil**——如果直接 `return errs`（一个值为 nil 的 `ValidationErrors`），调用方拿到的 `error` 并不等于 nil（参见 GO-10）。
+--- solution
+package main
+
+import (
+	"strings"
+	"unicode/utf8"
+)
+
+type FieldError struct {
+	Field string
+	Msg   string
+}
+
+type ValidationErrors []FieldError
+
+func (v ValidationErrors) Error() string {
+	parts := make([]string, len(v))
+	for i, e := range v {
+		parts[i] = e.Field + ": " + e.Msg
+	}
+	return strings.Join(parts, "; ")
+}
+
+type CreateUserReq struct {
+	Name  string
+	Email string
+	Age   int
+}
+
+func Validate(r CreateUserReq) error {
+	var errs ValidationErrors
+	// @solution
+	name := strings.TrimSpace(r.Name)
+	switch {
+	case name == "":
+		errs = append(errs, FieldError{"name", "required"})
+	case utf8.RuneCountInString(name) > 20:
+		errs = append(errs, FieldError{"name", "too long"})
+	}
+	local, domain, ok := strings.Cut(r.Email, "@")
+	if !ok || local == "" || domain == "" || strings.Contains(domain, "@") {
+		errs = append(errs, FieldError{"email", "invalid"})
+	}
+	if r.Age < 0 || r.Age > 150 {
+		errs = append(errs, FieldError{"age", "out of range"})
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	// @starter
+	// // TODO: 校验各个字段
+	// @end
+	return errs
+}
+--- test
+package main
+
+import (
+	"errors"
+	"strings"
+	"testing"
+)
+
+func TestValid(t *testing.T) {
+	if err := Validate(CreateUserReq{Name: "张三", Email: "a@b.com", Age: 30}); err != nil {
+		t.Fatalf("合法请求应返回 nil，实际 %#v", err)
+	}
+	if err := Validate(CreateUserReq{Name: strings.Repeat("名", 20), Email: "x@y", Age: 0}); err != nil {
+		t.Fatalf("20 个汉字是合法的（按 rune 计），实际 %v", err)
+	}
+}
+
+func TestInvalid(t *testing.T) {
+	err := Validate(CreateUserReq{Name: "   ", Email: "no-at-sign", Age: 200})
+	var ve ValidationErrors
+	if !errors.As(err, &ve) || len(ve) != 3 {
+		t.Fatalf("应返回 3 个字段错误，实际 %v", err)
+	}
+	if err.Error() != "name: required; email: invalid; age: out of range" {
+		t.Fatalf("Error() = %q", err.Error())
+	}
+	cases := []struct {
+		req  CreateUserReq
+		want string
+	}{
+		{CreateUserReq{Name: strings.Repeat("a", 21), Email: "a@b", Age: 1}, "name: too long"},
+		{CreateUserReq{Name: "ok", Email: "@b.com", Age: 1}, "email: invalid"},
+		{CreateUserReq{Name: "ok", Email: "a@b@c", Age: 1}, "email: invalid"},
+		{CreateUserReq{Name: "ok", Email: "a@b", Age: -1}, "age: out of range"},
+	}
+	for _, c := range cases {
+		if err := Validate(c.req); err == nil || err.Error() != c.want {
+			t.Errorf("Validate(%+v) = %v，期望 %q", c.req, err, c.want)
+		}
+	}
+}

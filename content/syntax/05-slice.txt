@@ -1,0 +1,516 @@
+=== array
+name: 数组 [N]T
+group: 数组、切片与字符串
+--- body
+数组长度是**类型的一部分**：`[3]int` 和 `[4]int` 是不同类型。数组是值类型，赋值和传参都会复制整个数组。
+
+**写法**
+
+```go
+var a [26]int              // 26 个 0
+b := [3]string{"a", "b", "c"}
+c := [...]int{1, 2, 3}     // 长度由元素个数推导
+d := [5]int{1: 10, 3: 30}  // 指定下标初始化
+```
+
+**例子：字母计数（异位词判断）**
+
+```go
+func isAnagram(s, t string) bool {
+	var cnt [26]int
+	for i := 0; i < len(s); i++ {
+		cnt[s[i]-'a']++
+	}
+	for i := 0; i < len(t); i++ {
+		cnt[t[i]-'a']--
+	}
+	return cnt == [26]int{} // 数组可以直接用 == 比较
+}
+```
+
+**注意**
+
+- 数组能用 `==` 比较、能当 map 的 key（如 `map[[26]int][]string` 给异位词分组），切片都不行。
+- 固定大小的计数表用数组比 map 快很多，也不需要 `make`。
+- 传参会复制整个数组，大数组请传指针或切片 `a[:]`。
+
+=== slice-make
+name: make 创建切片
+group: 数组、切片与字符串
+--- body
+切片是对底层数组的一个“视图”，包含三部分：指针、长度 `len`、容量 `cap`。`make([]T, len, cap)` 创建指定长度和容量的切片，元素是零值。
+
+**写法**
+
+```go
+s := make([]int, 5)        // len=5 cap=5，[0 0 0 0 0]
+s := make([]int, 0, 10)    // len=0 cap=10，准备 append
+s := []int{1, 2, 3}        // 字面量
+var s []int                // nil 切片
+```
+
+**例子**
+
+```go
+// 已知结果长度：make 定长后按下标赋值
+squares := make([]int, len(nums))
+for i, n := range nums {
+	squares[i] = n * n
+}
+
+// 只知道上限：预分配容量，再 append
+evens := make([]int, 0, len(nums))
+for _, n := range nums {
+	if n%2 == 0 {
+		evens = append(evens, n)
+	}
+}
+```
+
+**注意**
+
+- **常见 bug**：`s := make([]int, n)` 之后又 `append`，结果前面多出 n 个 0。定长就用下标赋值，不定长用 `make([]int, 0, n)`。
+- 预分配容量能避免 append 过程中反复扩容拷贝，是简单有效的性能优化。
+- `len(nil切片) == 0`，可以直接 range、append，不需要先判空。
+
+=== slice-expr
+name: 切片表达式 s[i:j]
+group: 数组、切片与字符串
+--- body
+`s[i:j]` 取下标 `[i, j)` 的元素（左闭右开），得到的新切片和原切片**共享同一个底层数组**。字符串也能这样截取子串。
+
+**写法**
+
+```go
+s[1:3]   // 下标 1、2
+s[:3]    // 前 3 个
+s[2:]    // 从下标 2 到末尾
+s[:]     // 整个
+s[:len(s)-1] // 去掉最后一个（栈的 pop）
+s[1:]        // 去掉第一个（队列的 pop）
+```
+
+**例子：栈和队列**
+
+```go
+stack := []int{}
+stack = append(stack, 1, 2)     // push
+top := stack[len(stack)-1]      // peek
+stack = stack[:len(stack)-1]    // pop
+
+queue := []int{1, 2, 3}
+head := queue[0]
+queue = queue[1:]               // 出队
+```
+
+**注意**
+
+- **共享底层数组**：修改子切片的元素会影响原切片；对子切片 `append` 在容量足够时会覆盖原切片后面的元素。
+- 想要独立的副本：`out := append([]int(nil), s[i:j]...)` 或 `slices.Clone(s[i:j])`。
+- 从大切片里截取一小段长期保存，会让整个大数组无法被回收（内存泄漏），这时应该复制出来。
+- 越界（`j > cap(s)` 或 `i > j`）会 panic。
+
+=== slice-full
+name: 完整切片表达式 s[i:j:k]
+group: 数组、切片与字符串
+--- body
+`s[i:j:k]` 额外限制新切片的容量为 `k-i`。这样对它 `append` 时一旦超出 `j`，就会**分配新数组**，不会覆盖原切片 `j` 之后的数据。
+
+**写法**
+
+```go
+sub := s[i:j:j]   // 容量 = 长度，append 必定复制
+```
+
+**例子：安全地返回子切片**
+
+```go
+s := []int{1, 2, 3, 4, 5}
+a := s[0:2]        // len 2, cap 5
+a = append(a, 99)  // 覆盖了 s[2]！s 变成 [1 2 99 4 5]
+
+s = []int{1, 2, 3, 4, 5}
+b := s[0:2:2]      // len 2, cap 2
+b = append(b, 99)  // 容量不够，分配新数组；s 不变
+```
+
+**注意**
+
+- 适合“把内部切片的一部分交给调用方，但不希望调用方 append 影响内部数据”的场景。
+- 字符串不支持三索引切片。
+- 它只防住了 append 覆盖，修改已有元素 `b[0] = x` 仍然会影响原切片（扩容之前）。
+
+=== append
+name: append 追加元素
+group: 数组、切片与字符串
+--- body
+`append(s, 元素...)` 在切片末尾追加元素并**返回新切片**。容量不够时会分配更大的数组并复制旧数据。
+
+**写法**
+
+```go
+s = append(s, 1)
+s = append(s, 1, 2, 3)
+s = append(s, other...)            // 拼接两个切片
+s = append(s[:i], s[i+1:]...)      // 删除下标 i（会修改原底层数组）
+s = append(s[:i], append([]int{x}, s[i:]...)...) // 在 i 处插入（slices.Insert 更清晰）
+```
+
+**例子：回溯里保存路径的副本**
+
+```go
+var res [][]int
+var path []int
+var dfs func(start int)
+dfs = func(start int) {
+	res = append(res, append([]int(nil), path...)) // 必须复制！
+	for i := start; i < len(nums); i++ {
+		path = append(path, nums[i])
+		dfs(i + 1)
+		path = path[:len(path)-1]
+	}
+}
+```
+
+**注意**
+
+- **必须接收返回值**：`append(s, x)` 不赋值回去等于什么都没做（编译器会报 unused）。
+- 回溯题里直接 `res = append(res, path)` 是经典 bug：之后修改 path 会改掉已保存的结果，必须复制一份。
+- 扩容策略：小切片大约翻倍，大切片按约 1.25 倍增长；不要依赖具体数值。
+- 两个切片共享底层数组时，各自 append 可能互相覆盖，见「切片表达式」。
+
+=== copy
+name: copy 复制切片
+group: 数组、切片与字符串
+--- body
+`copy(dst, src)` 把 `src` 的元素复制到 `dst`，复制的个数是 `min(len(dst), len(src))`，返回实际复制的数量。
+
+**写法**
+
+```go
+dst := make([]int, len(src))
+copy(dst, src)
+
+n := copy(buf, "hello")   // 也能从字符串复制到 []byte
+copy(s[i:], s[i+1:])      // 原地左移，删除下标 i
+s = s[:len(s)-1]
+```
+
+**例子：轮转数组**
+
+```go
+func rotate(nums []int, k int) {
+	n := len(nums)
+	k %= n
+	tmp := make([]int, n)
+	copy(tmp, nums[n-k:])     // 后 k 个放到前面
+	copy(tmp[k:], nums[:n-k]) // 其余接在后面
+	copy(nums, tmp)
+}
+```
+
+**注意**
+
+- `dst` 的**长度**决定能复制多少：`dst := make([]int, 0, 10)` 再 `copy` 一个都不会复制（len 是 0）。
+- `src` 和 `dst` 重叠也能正确处理（和 memmove 一样）。
+- 复制整个切片更简单的写法：`slices.Clone(s)`。
+
+=== slice2d
+name: 二维切片
+group: 数组、切片与字符串
+--- body
+Go 没有内置的二维数组切片，`[][]T` 是“切片的切片”，**每一行都要单独 make**。
+
+**写法**
+
+```go
+grid := make([][]int, m)
+for i := range grid {
+	grid[i] = make([]int, n)
+}
+
+// 一次分配，行之间共享同一块内存（更省分配次数）
+flat := make([]int, m*n)
+for i := range grid {
+	grid[i] = flat[i*n : (i+1)*n]
+}
+```
+
+**例子：动态规划表**
+
+```go
+func uniquePaths(m, n int) int {
+	dp := make([][]int, m)
+	for i := range dp {
+		dp[i] = make([]int, n)
+		dp[i][0] = 1
+	}
+	for j := range n {
+		dp[0][j] = 1
+	}
+	for i := 1; i < m; i++ {
+		for j := 1; j < n; j++ {
+			dp[i][j] = dp[i-1][j] + dp[i][j-1]
+		}
+	}
+	return dp[m-1][n-1]
+}
+```
+
+**注意**
+
+- 只 `make([][]int, m)` 不初始化每行，访问 `grid[i][j]` 会 panic（每行都是 nil）。
+- 遍历时 `len(grid)` 是行数，`len(grid[0])` 是列数（先确认 grid 非空）。
+- 方向数组是网格题的常用技巧：`dirs := [][2]int{{0, 1}, {1, 0}, {0, -1}, {-1, 0}}`。
+
+=== builtin-minmax
+name: 内置 min / max（Go 1.21+）
+group: 数组、切片与字符串
+--- body
+Go 1.21 起 `min`、`max` 是内置函数，接受**一个或多个**同类型的有序值（整数、浮点、字符串）。
+
+**写法**
+
+```go
+m := min(a, b)
+m := max(a, b, c)
+best = max(best, cur)
+lo := min(x, 0) // 常量会自动转换成 x 的类型
+```
+
+**例子**
+
+```go
+func maxProfit(prices []int) int {
+	lowest, profit := prices[0], 0
+	for _, p := range prices {
+		lowest = min(lowest, p)
+		profit = max(profit, p-lowest)
+	}
+	return profit
+}
+```
+
+**注意**
+
+- 它们不接收切片：求切片最大值用 `slices.Max(s)`（空切片会 panic）。
+- 1.21 之前要自己写 `func max(a, b int) int`；在旧代码里看到这类辅助函数不要奇怪。
+- 浮点数里有 NaN 时结果是 NaN。
+
+=== rune
+name: byte 与 rune
+group: 数组、切片与字符串
+--- body
+`byte` 是 `uint8` 的别名，表示一个字节；`rune` 是 `int32` 的别名，表示一个 Unicode 码点。单引号字面量 `'a'` 的类型是 rune。
+
+**写法**
+
+```go
+var b byte = s[0]     // 取第 i 个字节
+r := 'a'              // rune，值是 97
+idx := s[i] - 'a'     // 小写字母转 0~25
+c := byte('a' + 2)    // 'c'
+unicode.IsLetter(r)
+unicode.ToLower(r)
+```
+
+**例子：判断回文（只看字母和数字）**
+
+```go
+func isPalindrome(s string) bool {
+	rs := []rune{}
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			rs = append(rs, unicode.ToLower(r))
+		}
+	}
+	for i, j := 0, len(rs)-1; i < j; i, j = i+1, j-1 {
+		if rs[i] != rs[j] {
+			return false
+		}
+	}
+	return true
+}
+```
+
+**注意**
+
+- `s[i]` 得到的是 **byte**，对中文等多字节字符会拆开；需要按字符处理时用 `range s` 或 `[]rune(s)`。
+- `'a' - 'A'` 是 32，大小写转换可以 `c - 'a' + 'A'`，但处理任意文字时用 `unicode` 包更安全。
+- `string(r)` 把一个 rune 转成字符串；`string(65)` 是 `"A"`，**不是** `"65"`。
+
+=== string-bytes
+name: 字符串与 []byte / []rune 互转
+group: 数组、切片与字符串
+--- body
+Go 的字符串是**不可变**的字节序列。要修改内容，先转成 `[]byte` 或 `[]rune`，改完再转回 `string`。每次转换都会**复制数据**。
+
+**写法**
+
+```go
+b := []byte(s)    // 按字节，适合 ASCII
+r := []rune(s)    // 按字符，适合中文等
+s2 := string(b)
+s3 := string(r)
+```
+
+**例子：反转字符串（支持中文）**
+
+```go
+func reverse(s string) string {
+	r := []rune(s)
+	for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
+		r[i], r[j] = r[j], r[i]
+	}
+	return string(r)
+}
+
+fmt.Println(reverse("Go语言")) // 言语oG
+```
+
+**注意**
+
+- `s[0] = 'x'` 编译报错：字符串不能修改。
+- 用 `[]byte` 反转中文会得到乱码，因为一个汉字是 3 个字节。
+- 热点路径里频繁 `string(b)` / `[]byte(s)` 会产生大量分配；拼接用 `strings.Builder`，比较时 `bytes.Equal` 或编译器优化过的 `string(b) == s` 不会分配。
+- 字符串常用操作见 `strings` 包；字节切片对应 `bytes` 包，函数名几乎一样。
+
+=== strings
+name: strings 包常用函数
+group: 数组、切片与字符串
+--- body
+`strings` 包提供字符串的查找、切分、替换、修剪等操作，`bytes` 包对 `[]byte` 提供同名函数，`unicode` 包判断字符类别。
+
+**常用函数**
+
+```go
+strings.Contains(s, "go")         // 是否包含
+strings.HasPrefix(s, "http://")   // 前缀 / 后缀：HasSuffix
+strings.Index(s, "x")             // 第一次出现的字节下标，没有返回 -1
+strings.Split("a,b,c", ",")       // [a b c]
+strings.Fields("  a  b ")         // 按空白切分并去掉空串：[a b]
+strings.Join([]string{"a", "b"}, "-") // a-b
+strings.TrimSpace(s)              // 去掉首尾空白；Trim / TrimPrefix / TrimSuffix
+strings.ReplaceAll(s, "a", "b")
+strings.ToLower(s)                // ToUpper
+strings.Repeat("ab", 3)           // ababab
+strings.Cut("k=v", "=")           // "k", "v", true（Go 1.18+）
+strings.EqualFold("Go", "GO")     // 忽略大小写比较
+```
+
+**例子：解析 "key=value" 列表**
+
+```go
+func parse(s string) map[string]string {
+	m := map[string]string{}
+	for _, part := range strings.Split(s, ";") {
+		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok {
+			m[k] = v
+		}
+	}
+	return m
+}
+```
+
+**注意**
+
+- `Split("", ",")` 返回 `[""]`（长度 1），不是空切片；`Fields` 对空串返回空切片。
+- `TrimLeft(s, "ab")` 删除的是**字符集合**中的字符，不是前缀；去前缀用 `TrimPrefix`。
+- 下标都是**字节**下标。
+- 循环里用 `+=` 拼接字符串是 O(n²)，用 `strings.Builder` 或 `strings.Join`。
+
+=== strings-builder
+name: strings.Builder / bytes.Buffer
+group: 数组、切片与字符串
+--- body
+`strings.Builder` 用于高效拼接字符串：内部维护一个 `[]byte`，最后 `String()` **不复制**直接得到结果。`bytes.Buffer` 类似，同时还能当 `io.Reader` 读出数据。
+
+**写法**
+
+```go
+var sb strings.Builder        // 零值可用
+sb.Grow(64)                   // 可选：预分配
+sb.WriteString("hello")
+sb.WriteByte(' ')
+sb.WriteRune('世')
+fmt.Fprintf(&sb, "%d", 42)    // Builder 实现了 io.Writer
+s := sb.String()
+```
+
+**例子：压缩字符串 aabccc → a2bc3**
+
+```go
+func compress(s string) string {
+	var sb strings.Builder
+	for i := 0; i < len(s); {
+		j := i
+		for j < len(s) && s[j] == s[i] {
+			j++
+		}
+		sb.WriteByte(s[i])
+		if j-i > 1 {
+			sb.WriteString(strconv.Itoa(j - i))
+		}
+		i = j
+	}
+	return sb.String()
+}
+```
+
+**注意**
+
+- `strings.Builder` **不能复制**（复制后再写会 panic），传参要用指针 `*strings.Builder`。
+- 它不是并发安全的。
+- 只是拼接几个固定的片段，`+` 或 `fmt.Sprintf` 就够了；循环拼接才需要 Builder。
+
+=== strconv
+name: strconv 数字与字符串互转
+group: 数组、切片与字符串
+--- body
+`strconv` 负责数字、布尔和字符串之间的转换，比 `fmt.Sprintf` / `fmt.Sscanf` 更快、错误更明确。
+
+**常用函数**
+
+```go
+n, err := strconv.Atoi("123")             // string → int
+s := strconv.Itoa(123)                    // int → string
+i, err := strconv.ParseInt("ff", 16, 64)  // 指定进制和位数
+s := strconv.FormatInt(255, 2)            // "11111111"
+f, err := strconv.ParseFloat("3.14", 64)
+b, err := strconv.ParseBool("true")
+q := strconv.Quote(`a"b`)                 // 结果是 "a\"b"：加上引号并转义
+```
+
+**例子：逆波兰表达式求值**
+
+```go
+func evalRPN(tokens []string) int {
+	var st []int
+	for _, t := range tokens {
+		if n, err := strconv.Atoi(t); err == nil {
+			st = append(st, n)
+			continue
+		}
+		a, b := st[len(st)-2], st[len(st)-1]
+		st = st[:len(st)-2]
+		switch t {
+		case "+":
+			st = append(st, a+b)
+		case "-":
+			st = append(st, a-b)
+		case "*":
+			st = append(st, a*b)
+		default:
+			st = append(st, a/b)
+		}
+	}
+	return st[0]
+}
+```
+
+**注意**
+
+- **不要用 `string(n)` 把数字转字符串**，那是按码点转字符（`string(65) == "A"`），`go vet` 也会警告。
+- 解析失败返回的错误是 `*strconv.NumError`，可以用 `errors.Is(err, strconv.ErrRange)` 判断溢出。
+- `Atoi` 接受前导 `+` / `-`，不接受空格，需要先 `TrimSpace`。

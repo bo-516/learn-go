@@ -1,0 +1,573 @@
+=== conc-01
+--- deep
+**原理展开**
+
+goroutine 便宜的原因：
+
+- **栈小且可增长**：从 2KB 开始，函数入口检查栈空间，不够时分配两倍大小的新栈并整体复制（连续栈）；GC 时如果发现栈使用率很低还会收缩；
+- **用户态切换**：切换只需要保存少量寄存器（PC、SP 等）到 G 结构体里，不需要陷入内核，也不需要切换页表；
+- **调度器知道 goroutine 在等什么**：channel、锁、网络 IO 阻塞时，goroutine 被挂起并让出线程，线程继续运行别的 goroutine。
+
+但阻塞的**系统调用**和 cgo 会占住线程，这时调度器会创建或唤醒其他线程来运行剩下的 goroutine，所以 goroutine 并不能完全避免线程开销。
+
+**代码示例**
+
+```go
+func main() {
+	var wg sync.WaitGroup
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	before := m.StackInuse
+
+	for range 100_000 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			time.Sleep(time.Second)
+		}()
+	}
+	runtime.ReadMemStats(&m)
+	fmt.Printf("goroutines=%d stack=%dMB\n",
+		runtime.NumGoroutine(), (m.StackInuse-before)>>20) // 约 200MB 左右（每个 2KB）
+	wg.Wait()
+}
+```
+
+**常见追问**
+
+- goroutine 有 ID 吗？→ 运行时内部有，但没有公开的 API 获取，这是有意的设计，防止开发者实现“goroutine 本地存储”。
+- 能强制终止另一个 goroutine 吗？→ 不能，只能通过 context、channel 通知它自己退出。
+- goroutine 越多越好吗？→ 不是，CPU 密集型任务超过 GOMAXPROCS 个并发并没有帮助；IO 密集型任务也要受下游容量限制。
+
+**实战建议**
+
+- 把 `go_goroutines` 纳入监控，持续增长就是泄漏信号。
+- 每启动一个 goroutine，都要想清楚：它什么时候结束？谁来等它结束？出错时怎么通知？
+
+=== conc-02
+--- deep
+**原理展开**
+
+channel 在运行时是一个 `hchan` 结构体：一把锁、一个环形缓冲区（`buf`、`sendx`、`recvx`、`qcount`）、两个等待队列（`sendq`、`recvq`，存放阻塞的 goroutine）。
+
+发送的流程：
+
+1. 如果 `recvq` 里有等待的接收者，**直接把数据复制到接收者的栈上**并唤醒它（不经过缓冲区）；
+2. 否则如果缓冲区没满，放进缓冲区；
+3. 否则把当前 goroutine 包装成 `sudog` 挂到 `sendq` 上，挂起。
+
+关闭 channel 时唤醒所有等待者：接收者得到零值，发送者 panic。
+
+**代码示例**
+
+```go
+// 无缓冲 channel 的同步语义：发送完成时，接收方一定已经拿到了数据
+done := make(chan struct{})
+var data int
+go func() {
+	data = 42
+	done <- struct{}{} // 发送 happens-before 对应的接收完成
+}()
+<-done
+fmt.Println(data) // 一定是 42
+
+// 缓冲为 1 的 channel 实现“最新值”通知：只保留最近一次
+latest := make(chan Config, 1)
+publish := func(c Config) {
+	select {
+	case <-latest: // 丢掉还没被消费的旧值
+	default:
+	}
+	latest <- c
+}
+```
+
+**常见追问**
+
+- `len(ch)` 和 `cap(ch)` 能用来做判断吗？→ 只能用于监控，并发下读到的值随时可能过期。
+- 关闭 channel 后还能读到缓冲里的数据吗？→ 能，读完之后才返回零值和 false。
+- 无缓冲 channel 和容量为 1 的 channel 有什么本质区别？→ 前者是同步交接（发送方知道对方已经收到），后者是异步的（发送方只知道放进了缓冲）。
+
+**实战建议**
+
+- 缓冲大小要有依据：0（同步）、1（避免泄漏、合并通知）、N（已知的批量大小或者削峰）。随手写个 100 往往掩盖了设计问题。
+- 关闭操作统一放在发送方，用 `defer close(ch)`。
+
+=== conc-03
+--- deep
+**原理展开**
+
+WaitGroup 内部用一个 64 位原子变量同时存放**计数器**（高 32 位）和**等待者数量**（低 32 位），外加一个信号量。`Add` 原子地修改计数器，计数器降为 0 时，按等待者数量释放信号量唤醒所有 `Wait` 的 goroutine。`Wait` 发现计数器不为 0，就把等待者数量加 1，然后阻塞在信号量上。
+
+把计数器和等待者数量放在同一个原子变量里，是为了在一次 CAS 中同时读写两者，避免竞态。
+
+**代码示例**
+
+```go
+// Go 1.25+：wg.Go 自动 Add/Done
+var wg sync.WaitGroup
+for _, u := range urls {
+	wg.Go(func() { fetch(u) })
+}
+wg.Wait()
+
+// 等待的同时支持超时
+func waitTimeout(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false // 注意：后台 goroutine 仍在等待，直到 wg 归零
+	}
+}
+```
+
+**常见追问**
+
+- WaitGroup 可以重复使用吗？→ 可以，但必须在上一轮的 `Wait` 返回之后才能开始新一轮的 `Add`。
+- 需要收集错误怎么办？→ 用 errgroup，或者每个 goroutine 把错误写到结果切片的对应位置。
+- WaitGroup 和 channel 等待怎么选？→ 只需要“等全部结束”用 WaitGroup；需要结果或者需要 select 用 channel。
+
+**实战建议**
+
+- 新代码优先用 `wg.Go`（Go 1.25+）或 `errgroup`，从结构上避免 Add / Done 不匹配。
+- 不要把 WaitGroup 作为参数传来传去，在同一个函数里创建、启动、等待最清楚。
+
+=== conc-04
+--- deep
+**原理展开**
+
+RWMutex 内部有一把普通 Mutex（写者之间互斥）、一个读者计数 `readerCount`、写者等待的读者数 `readerWait`，以及读者和写者各自的信号量。
+
+- `RLock`：原子地把 readerCount 加 1；如果结果是负数，说明有写者在等待或持有锁，阻塞；
+- `Lock`：先获取内部 Mutex，再把 readerCount **减去一个很大的数**（`rwmutexMaxReaders`）使它变成负数，这样之后的 RLock 都会阻塞（写优先），然后等待已有的读者全部退出。
+
+所以 RWMutex 的每次读加锁都要做原子操作，在多核高并发下，这个计数器本身会成为缓存行争用的热点。
+
+**代码示例**
+
+```go
+// 死锁：持有读锁时再次 RLock，中间插入了一个写者
+var mu sync.RWMutex
+
+func outer() {
+	mu.RLock()
+	defer mu.RUnlock()
+	// 此时另一个 goroutine 调用 mu.Lock()，它会等待当前读者，
+	// 同时阻止新的读者
+	inner() // 这里的 RLock 被阻塞 → 写者等读者、读者等写者，死锁
+}
+
+func inner() {
+	mu.RLock()
+	defer mu.RUnlock()
+}
+```
+
+**常见追问**
+
+- 读写锁能降级或升级吗？→ Go 的 RWMutex 都不支持。需要“读后写”时，释放读锁、获取写锁，然后**重新检查条件**。
+- 为什么读多写少时 RWMutex 也可能更慢？→ 临界区很短时，原子计数的开销占主导；而且所有读者都在修改同一个计数器。
+- 怎么排查锁竞争？→ 开启 mutex profile：`runtime.SetMutexProfileFraction(5)`，然后看 `/debug/pprof/mutex`。
+
+**实战建议**
+
+- 默认用 Mutex，用基准测试证明 RWMutex 更快之后再换。
+- 锁内只做内存操作，不做 IO、不调用外部回调、不往 channel 发送。
+
+=== conc-05
+--- deep
+**原理展开**
+
+`select` 的实现（`runtime.selectgo`）：
+
+1. 把所有 case 按**随机顺序**排列（pollorder），按 channel 地址排序得到加锁顺序（lockorder，避免死锁）；
+2. 锁住所有涉及的 channel，按 pollorder 检查有没有能立即完成的 case，有就执行并返回；
+3. 没有并且有 default，执行 default；
+4. 否则把当前 goroutine 挂到**所有** channel 的等待队列上，挂起；被某个 channel 唤醒后，从其他 channel 的队列中把自己移除。
+
+随机顺序保证了公平性：如果总是按书写顺序检查，第一个 case 一直就绪时，后面的 case 永远得不到执行。
+
+**代码示例**
+
+```go
+// 优先处理退出信号：随机选择意味着没有优先级，需要时先单独检查
+for {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case job := <-jobs:
+		process(job)
+	}
+}
+
+// 定时器复用：避免在循环里反复 time.After
+timer := time.NewTimer(idle)
+defer timer.Stop()
+for {
+	select {
+	case msg := <-in:
+		handle(msg)
+		timer.Reset(idle)
+	case <-timer.C:
+		return // 空闲超时
+	}
+}
+```
+
+**常见追问**
+
+- select 里的 break 能跳出外层 for 吗？→ 不能，要用带标签的 break 或者 return。
+- 同一个 channel 可以出现在多个 case 里吗？→ 可以，比如同时读写同一个 channel。
+- case 里的表达式什么时候求值？→ 进入 select 时，所有 case 的 channel 表达式和发送的值都会被求值一次（从上到下），即使最后没有选中。
+
+**实战建议**
+
+- 长期运行的 for-select 循环一定要有退出 case（`ctx.Done()`）。
+- 发现 CPU 被打满时，检查有没有带空 default 的 for-select。
+
+=== conc-06
+--- deep
+**原理展开**
+
+为什么要限制并发数：goroutine 本身很便宜，但它们访问的**资源**不是：数据库连接、下游服务的容量、文件描述符、内存。不加限制时，突发流量会让所有请求同时打到下游，下游变慢后请求堆积，内存暴涨，最终级联崩溃。
+
+几种方式的取舍：
+
+- 信号量：每个任务一个 goroutine，任务数量有限、结束后 goroutine 就退出时最简单；
+- worker 池：goroutine 数量固定，适合长期运行、任务源源不断的场景，worker 还可以持有可复用的资源；
+- errgroup.SetLimit：需要错误处理和取消时最方便。
+
+**代码示例**
+
+```go
+// 带权重的信号量：大任务占用更多名额
+sem := semaphore.NewWeighted(100) // 总共 100 个单位，比如 100MB 内存
+for _, f := range files {
+	w := max(1, f.Size>>20) // 按 MB 计算权重
+	if err := sem.Acquire(ctx, w); err != nil {
+		return err
+	}
+	go func() {
+		defer sem.Release(w)
+		process(f)
+	}()
+}
+_ = sem.Acquire(ctx, 100) // 等待所有任务完成：拿到全部名额
+```
+
+**常见追问**
+
+- 并发数设多少合适？→ CPU 密集型约等于核数；IO 密集型取决于下游的容量，用压测确定；也可以根据延迟自适应调整。
+- 信号量写在 goroutine 里面和外面有什么区别？→ 外面：控制了 goroutine 的创建速度；里面：一次性创建所有 goroutine，只是控制同时运行的数量，任务多时浪费内存。
+- worker 池里一个任务 panic 怎么办？→ 每个 worker 要 recover，否则一个任务的 panic 会让整个进程崩溃。
+
+**实战建议**
+
+- 对下游的每一种资源都设置明确的并发上限，并把等待时间纳入监控。
+- 优先使用 `errgroup`：它把“等待、错误、取消、限流”都处理好了。
+
+=== conc-07
+--- deep
+**原理展开**
+
+`sync.Once` 的结构只有一个原子的 `done` 标志和一把 Mutex。`Do` 的快速路径只是一次原子读，所以初始化完成后的调用几乎没有开销。慢速路径加锁后再检查一次 `done`，执行 f，**f 返回之后**才原子地设置 done（用 defer，所以 f panic 也会设置）。
+
+为什么不能用 CAS 实现：`if CompareAndSwap(0, 1) { f() }` 会让第二个调用者在 f 还没执行完时就看到 done == 1 并直接返回，拿到未初始化的数据。Once 的语义是“所有调用者返回时，f 都已经执行完毕”。
+
+**代码示例**
+
+```go
+// Go 1.21+：带返回值和错误的懒加载
+var loadConfig = sync.OnceValues(func() (*Config, error) {
+	data, err := os.ReadFile("config.json")
+	if err != nil {
+		return nil, err
+	}
+	var c Config
+	return &c, json.Unmarshal(data, &c)
+})
+
+func handler() {
+	cfg, err := loadConfig() // 只读一次文件；错误也会被缓存
+	if err != nil {
+		// ...
+	}
+	_ = cfg
+}
+
+// 需要“失败后可重试”时，自己用锁实现
+type lazy struct {
+	mu  sync.Mutex
+	val *Client
+}
+
+func (l *lazy) Get() (*Client, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.val != nil {
+		return l.val, nil
+	}
+	c, err := dial()
+	if err != nil {
+		return nil, err // 不缓存失败，下次重试
+	}
+	l.val = c
+	return c, nil
+}
+```
+
+**常见追问**
+
+- `sync.OnceFunc`、`OnceValue`、`OnceValues` 有什么区别？→ 分别对应“无返回值”“一个返回值”“两个返回值（通常是值和错误）”，f panic 时每次调用都会重新 panic。
+- Once 能重置吗？→ 不能；需要重置的场景说明它不是真正的“一次性”初始化，应该用锁。
+- 包级变量初始化和 Once 怎么选？→ 初始化便宜、不会失败的用包级变量；昂贵的、可能用不到的、依赖运行时配置的用 Once 懒加载。
+
+**实战建议**
+
+- 懒加载会把初始化的耗时转移到第一次请求上，对延迟敏感的服务可以在启动时预热。
+- 初始化失败时不要永久缓存错误（除非这是期望的行为），否则一次网络抖动会让服务永远不可用。
+
+=== conc-08
+--- deep
+**原理展开**
+
+goroutine 泄漏的危害不只是那 2KB 的栈：泄漏的 goroutine 引用的所有对象（闭包捕获的变量、参数、它持有的连接和缓冲区）都无法被 GC 回收；如果它持有锁或者占着连接池的连接，影响会扩散到其他请求。
+
+所有泄漏的根源都是“**没有退出路径**”。每一个可能阻塞的操作（channel 收发、锁、网络 IO、等待）都要回答：如果对方永远不来，我怎么退出？
+
+**代码示例**
+
+```go
+// 测试中检测泄漏
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
+
+// 生产者正确的退出方式：发送放进 select
+func produce(ctx context.Context, out chan<- Item) {
+	defer close(out)
+	for {
+		item, err := fetchNext(ctx)
+		if err != nil {
+			return
+		}
+		select {
+		case out <- item:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+```
+
+线上排查：
+
+```bash
+curl -s 'http://localhost:6060/debug/pprof/goroutine?debug=1' | head -50
+# 输出按调用栈分组，第一行是数量：
+# 8432 @ 0x43e8f6 0x40c3a5 ...
+#   main.(*Worker).send+0x55   /app/worker.go:88
+```
+
+**常见追问**
+
+- `time.After` 会造成泄漏吗？→ Go 1.23 之前，未触发的定时器要到期后才能被回收，在高频循环中会积累大量定时器（不是 goroutine 泄漏，而是内存）；1.23 起未引用的定时器可以被立即回收。
+- 怎么在压测中发现泄漏？→ 压测前后对比 goroutine 数量，压测结束后一段时间应该回落到基线。
+- 第三方库导致的泄漏怎么办？→ goroutine profile 里看调用栈属于哪个库，检查使用方式（是否需要 Close / Stop）。
+
+**实战建议**
+
+- 代码评审时对每一个 `go` 语句问三个问题：它什么时候结束？谁等它？它阻塞时怎么退出？
+- 给长期运行的 goroutine 设置 pprof 标签（`pprof.Do`），在 profile 里一眼就能看出是哪个模块的。
+
+=== conc-09
+--- deep
+**原理展开**
+
+`context.WithTimeout` 实际上是 `WithDeadline(parent, now + d)`：
+
+1. 如果父 context 的截止时间更早，直接创建一个普通的 cancelCtx（不需要自己的定时器）；
+2. 否则创建 timerCtx，用 `time.AfterFunc` 在截止时间到达时调用 cancel；
+3. 把自己注册到父节点：如果父节点是标准库的 cancelCtx，直接加入它的 children；如果是自定义的 context 实现，就启动一个 goroutine 监听父节点的 Done（这就是为什么不建议自己实现 Context 接口）。
+
+取消的传播是**同步**的：cancel 时加锁遍历 children 依次 cancel，所有子孙节点的 Done channel 都会被关闭。
+
+**代码示例**
+
+```go
+// 预算分配：给多个下游调用分配剩余时间
+func call(ctx context.Context) error {
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining < 50*time.Millisecond {
+			return errors.New("not enough time budget") // 时间不够，直接放弃
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	return downstream(ctx)
+}
+
+// 把截止时间传给下游服务（gRPC 会自动做）
+req.Header.Set("X-Timeout-Ms", strconv.FormatInt(time.Until(deadline).Milliseconds(), 10))
+```
+
+**常见追问**
+
+- `ctx.Err()` 返回什么？→ 还没结束返回 nil；被取消返回 `context.Canceled`；超时返回 `context.DeadlineExceeded`。
+- 客户端断开连接时服务端能知道吗？→ net/http 会取消 `r.Context()`，handler 里监听它就能及时停止。
+- 为什么下游的超时要比上游短？→ 上游已经放弃等待了，下游再继续执行就是浪费；还要为上游自己的处理留出时间。
+
+**实战建议**
+
+- 每一层都设置自己的超时：网关 > 服务 > 下游调用，逐层递减。
+- 超时错误在日志里要能区分是“自己的超时”还是“上游取消”，便于判断问题出在哪一层。
+
+=== conc-10
+--- deep
+**原理展开**
+
+`Lock` 的快速路径：`CompareAndSwapInt32(&m.state, 0, mutexLocked)`，没有竞争时只有这一条原子指令。
+
+慢速路径（`lockSlow`）：
+
+1. 如果锁被占用、处于正常模式、并且满足自旋条件，先**自旋**一会儿（执行几十次 PAUSE 指令），期望持有者很快释放；
+2. 自旋失败，把等待者计数加一，通过信号量 `runtime_SemacquireMutex` 挂起；
+3. 被唤醒后检查等待了多久，超过 1ms 就把锁切换到**饥饿模式**。
+
+`Unlock` 在正常模式下只是唤醒一个等待者，让它和新来的 goroutine 公平竞争；在饥饿模式下直接把锁的所有权**交给**队首的等待者（`handoff`）。
+
+**代码示例**
+
+```go
+// 观察锁竞争：开启 mutex profile
+func main() {
+	runtime.SetMutexProfileFraction(5) // 每 5 次竞争事件采样 1 次
+	go http.ListenAndServe("localhost:6060", nil)
+	// ...
+}
+// go tool pprof http://localhost:6060/debug/pprof/mutex
+// 看哪些位置的锁导致了最多的等待时间
+
+// 减少锁竞争：缩小临界区
+func (c *Cache) Set(k string, v []byte) {
+	encoded := compress(v) // 耗时的计算放在锁外
+	c.mu.Lock()
+	c.m[k] = encoded
+	c.mu.Unlock()
+}
+```
+
+**常见追问**
+
+- 为什么正常模式允许“插队”？→ 新来的 goroutine 正在 CPU 上运行，直接拿到锁可以避免一次上下文切换，吞吐量更高。
+- `TryLock` 什么时候用？→ 极少，官方文档也说正确使用的场景很少见；可以用于“拿不到锁就跳过这次可选的工作”。
+- Mutex 可以被另一个 goroutine 解锁吗？→ 可以（Go 的锁不绑定 goroutine），但这几乎总是 bug。
+
+**实战建议**
+
+- 锁竞争高时，先考虑分片、缩小临界区、读写分离（写时复制），而不是换成更“高级”的锁。
+- `go vet` 的 copylocks 检查一定要开启。
+
+=== conc-11
+--- deep
+**原理展开**
+
+**Go 1.24 之前**的两层结构：`read` 是一个原子指针指向的只读 map，读操作无锁；`dirty` 是加锁访问的可写 map，包含所有最新的数据。读 read 未命中时加锁查 dirty，并记一次 miss；miss 次数达到 dirty 的大小时，把 dirty 整体提升为 read。删除是“标记删除”（把 entry 的指针置为 nil / expunged）。这个设计在 key 集合稳定时非常高效，但新增 key 很频繁时，dirty 频繁重建，性能很差。
+
+**Go 1.24 起**改为 `HashTrieMap`：按哈希值的位分层的并发前缀树，读操作无锁，写操作只锁住树中的一个节点，不同 key 的修改可以并行，并且不再有提升 dirty 的开销。
+
+**代码示例**
+
+```go
+// 适合的场景：缓存只增长、读多写少
+var handlers sync.Map // string -> http.Handler
+
+func register(name string, h http.Handler) { handlers.Store(name, h) }
+
+func lookup(name string) (http.Handler, bool) {
+	v, ok := handlers.Load(name)
+	if !ok {
+		return nil, false
+	}
+	return v.(http.Handler), true
+}
+
+// Go 1.20+ 的新方法
+handlers.Swap("a", newHandler)                 // 替换并返回旧值
+handlers.CompareAndSwap("a", oldH, newH)       // 值相等才替换
+handlers.CompareAndDelete("a", oldH)
+handlers.Clear()                               // Go 1.23+
+```
+
+**常见追问**
+
+- 有没有泛型版本的 sync.Map？→ 标准库还没有；可以自己包装一层：`type Map[K comparable, V any] struct{ m sync.Map }`。
+- Range 期间修改 map 会怎样？→ 是安全的，但 Range 不保证看到并发修改，也不是一个一致的快照。
+- 怎么统计元素个数？→ 只能 Range 计数，或者自己另外维护一个原子计数器。
+
+**实战建议**
+
+- 写 benchmark 对比 `sync.Map` 和 `map + RWMutex`（以及分片 map）在你的实际读写比例下的表现。
+- 值是指针或者原子类型时，配合 `LoadOrStore` 做“只创建一次”。
+
+=== conc-12
+--- deep
+**原理展开**
+
+`sync.Pool` 的结构：每个 P 有一个 `poolLocal`，包含一个 `private`（只有这个 P 能访问，完全无锁）和一个 `shared`（无锁的双端队列，自己从头部存取，其他 P 从尾部偷）。
+
+- `Get`：private → 本地 shared 头部 → 偷其他 P 的 shared 尾部 → victim 缓存 → 调用 New；
+- `Put`：放进 private，private 已有就放进 shared 头部。
+
+GC 时，当前的池被移到 victim，原来的 victim 被丢弃。对象在没被使用的情况下最多存活两轮 GC。这样既不会无限占用内存，又避免了 GC 之后所有对象一下子消失导致的分配尖峰。
+
+**代码示例**
+
+```go
+// 用 Pool 复用大的临时切片：存指针，避免 Put 时切片头装箱分配
+var bufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 32<<10)
+		return &b
+	},
+}
+
+func process(r io.Reader) error {
+	bp := bufPool.Get().(*[]byte)
+	buf := (*bp)[:0]
+	defer func() {
+		if cap(buf) <= 1<<20 { // 太大的不放回
+			*bp = buf[:0]
+			bufPool.Put(bp)
+		}
+	}()
+	buf, err := readAll(r, buf)
+	if err != nil {
+		return err
+	}
+	return handle(buf)
+}
+```
+
+**常见追问**
+
+- 为什么存 `*[]byte` 而不是 `[]byte`？→ 切片头是三个字，放进 `any` 需要分配一个对象来存放它，每次 Put 都会产生一次分配，抵消了 Pool 的收益（`staticcheck` 的 SA6002 会提示）。
+- Pool 里的对象会被 GC 扫描吗？→ 会，它们只是普通的堆对象，Pool 不会让 GC 变快，只是减少了分配次数。
+- New 为 nil 时 Get 返回什么？→ 池为空时返回 nil，调用方要自己处理。
+
+**实战建议**
+
+- 只在 profile 证明某类对象的分配是热点时才引入 Pool，并用 benchmark 验证效果。
+- 放回之前清理敏感数据（密码、token），因为下一个使用者可能读到残留的内容。

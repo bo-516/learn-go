@@ -1,0 +1,510 @@
+=== go-30
+level: 2
+hot: true
+title: Go 1.23 的 range 迭代器（iter.Seq）是怎么工作的？slices、maps 包新增了哪些迭代器函数？
+--- answer
+Go 1.23 正式支持 **range-over-func**（对函数进行 `for range` 遍历），并在标准库新增了 `iter` 包，统一了自定义容器和流式序列的遍历方式。
+
+**1. 三种标准迭代器签名（`iter` 包）**
+
+```go
+package iter
+
+type Seq[V any]     func(yield func(V) bool)
+type Seq2[K, V any] func(yield func(K, V) bool)
+```
+
+- **推模式（Push Iterator）**：迭代器本身是一个高阶函数，接收编译器生成的 `yield` 回调函数作为参数；
+- 迭代器内部每产生一个元素，就调用一次 `yield(v)`；
+- 如果循环体正常继续，`yield` 返回 `true`；如果循环体执行了 `break`、`return` 或 `goto` 跳出循环，`yield` 会返回 `false`，此时迭代器**必须立即停止遍历并返回**，完成清理工作。
+
+```go
+// 自定义斐波那契数列无限迭代器
+func Fib() iter.Seq[int] {
+    return func(yield func(int) bool) {
+        a, b := 0, 1
+        for {
+            if !yield(a) {
+                return // 调用方 break 时立即退出
+            }
+            a, b = b, a+b
+        }
+    }
+}
+```
+
+**2. 拉模式（Pull Iterator）：`iter.Pull` / `iter.Pull2`**
+
+当需要同时交替步进两个序列（如合并或对比两个流）时，`for range` 的推模式不方便，可以用 `next, stop := iter.Pull(seq)` 把推模式转换为按需调用的 `next() (V, bool)` 拉模式，用完后必须 `defer stop()`。
+
+**3. `slices` 与 `maps` 新增的常用迭代器函数**
+
+- `slices`：`All`（返回带下标的 `Seq2[int, E]`）、`Values`（返回 `Seq[E]`）、`Backward`（倒序遍历）、`Chunk(s, n)`（按固定大小分批切片遍历）、`Collect(seq)`（把迭代器收集成新切片）、`Sorted(seq)`（收集并排序）、`AppendSeq(s, seq)`；
+- `maps`：`Keys(m)`、`Values(m)`、`All(m)`（均返回惰性迭代器，不再像以前那样一次性分配整个切片）、`Collect(seq2)`、`Insert(m, seq2)`。
+--- deep
+**原理展开**
+
+编译器是如何把 `for x := range seq` 编译成函数调用的？在编译阶段（`cmd/compile/internal/rangefunc`），编译器会将循环体改写为一个闭包 `body` 传给 `seq(body)`：
+
+- 循环体里的 `continue` 被直接改写为 `return true`；
+- 循环体里的 `break` 被改写为 `return false`；
+- 如果循环体里带有外层函数的 `return val` 或外层 `break label`，编译器会在栈上生成状态标志变量，让 `yield` 先返回 `false` 通知迭代器走完 `defer` 清理逻辑，待 `seq` 函数返回后再跳转到外层的 `return`。
+- **违反契约的运行时检测**：如果 `yield` 已经返回了 `false`（循环已结束），而编写拙劣的迭代器没有检查返回值，强行第二次调用 `yield`，编译器插入的状态检查会立即触发 `panic: runtime error: range function continued iteration after function for loop body returned false`。
+
+而 `iter.Pull(seq)` 底层则是利用运行时专门优化的**轻量级内部协程切换（Coroutine switch，`runtime.newcoro` / `coroswitch`）**实现的：它把推模式的 `seq` 挂在一个受控协程上，每次调用 `next()` 时直接做一对一的上下文切换，比普通 `go func() + chan` 的调度开销低得多。
+
+**代码示例**
+
+```go
+// 组合通用惰性管道算子：Filter + Map + slices.Collect（全程只在最终 Collect 时分配结果切片）
+func Filter[V any](seq iter.Seq[V], keep func(V) bool) iter.Seq[V] {
+	return func(yield func(V) bool) {
+		for v := range seq {
+			if keep(v) && !yield(v) {
+				return
+			}
+		}
+	}
+}
+
+func Map[In, Out any](seq iter.Seq[In], fn func(In) Out) iter.Seq[Out] {
+	return func(yield func(Out) bool) {
+		for v := range seq {
+			if !yield(fn(v)) {
+				return
+			}
+		}
+	}
+}
+
+// 实战：获取 map 中所有键并排序（Go 1.23 最地道的写法）
+func SortedMapKeys[K cmp.Ordered, V any](m map[K]V) []K {
+	return slices.Sorted(maps.Keys(m))
+}
+```
+
+**常见追问**
+
+- 如果在迭代器函数内部使用了 `defer`（比如打开了数据库游标或持有了读锁），调用方在循环里 `break` 或 `panic` 时，`defer` 能正常执行吗？→ **能**！只要迭代器遵守契约在 `!yield(v)` 时返回（或循环体 panic 沿着调用栈向上展开），迭代器函数自己的 `defer` 都会在离开循环时立即执行。
+- `maps.Keys(m)` 为什么返回 `iter.Seq[K]` 而不是像以前 `golang.org/x/exp/maps.Keys` 那样直接返回 `[]K`？→ 因为有时调用方只是想遍历或者配合 `slices.Sorted(maps.Keys(m))` 使用，返回惰性迭代器避免了中间切片的无谓堆分配；确实需要切片时套一层 `slices.Collect(maps.Keys(m))` 即可。
+- `iter.Pull` 为什么必须调用 `stop()`？→ 如果没有把序列读到结尾就提前结束，内部挂起的协程会一直停留在等待下一次 `next()` 的状态，`stop()` 会让挂起处的 `yield` 返回 `false`，从而触发迭代器的清理并释放内部协程。
+
+**实战建议**
+
+- 编写自定义 `iter.Seq` 时，永远写成 `if !yield(v) { return }`，绝不能忽略 `yield` 的布尔返回值。
+- 批量分片处理大切片时，直接用标准库 `for batch := range slices.Chunk(items, 100)`，代码极其干净且共用原底层数组零分配。
+
+=== go-31
+level: 2
+hot: false
+title: 类型定义（type T U）和类型别名（type T = U）有什么区别？Go 1.24 的泛型类型别名有什么用？
+--- answer
+在 Go 中，`type T U` 和 `type T = U` 看起来只差一个等号，但在类型系统中的语义完全不同：
+
+**1. 类型定义（Type Definition）：`type MyInt int`**
+
+- 创建了一个**全新的、独立的类型** `MyInt`，它的底层类型（underlying type）是 `int`；
+- **不能隐式混用**：`MyInt` 和 `int` 之间赋值必须显式类型转换 `MyInt(x)`；
+- **方法集归零**：`MyInt` **不会继承**原类型 `int`（或原结构体）上定义的任何方法，但可以为 `MyInt` 定义属于它自己的新方法（例如 `type Duration int64` 定义 `String()` 方法，或者为自定义切片定义方法）。
+
+**2. 类型别名（Type Alias，Go 1.9+）：`type MyInt = int`**
+
+- **没有创建新类型**，只是给已有类型起了另一个名字，`MyInt` 和 `int` 是**完全相同的同一个类型**（如同标准库里的 `type byte = uint8`、`type rune = int32`、`type any = interface{}`）；
+- **完全互通**：无需任何类型转换即可直接相互赋值；
+- **共享全部方法集**：原类型有什么方法，别名就有什么方法；如果同包内给别名加方法，实际上就是给原类型加方法。
+
+**3. Go 1.24 的泛型类型别名（Generic Type Aliases）**
+
+Go 1.18 引入泛型时暂不支持带类型参数的别名，**Go 1.24 正式補齐了泛型类型别名**：
+
+```go
+// Go 1.24+：别名也可以携带类型参数和约束
+type Set[T comparable] = map[T]struct{}
+type Pair[K comparable, V any] = struct {
+    Key K
+    Val V
+}
+```
+
+它最大的工程价值是**大型代码库的渐进式重构与包拆分**：当把一个泛型类型 `Cache[K, V]` 从旧包 `pkg/legacy` 迁移到新包 `pkg/cache` 时，可以在旧包里留下一行 `type Cache[K comparable, V any] = cache.Cache[K, V]`，让所有老调用方无缝兼容且类型完全等价。
+--- deep
+**原理展开**
+
+从类型检查器（`go/types`）和反射（`reflect`）的视角看：
+
+- 对于类型别名 `type UserID = int64`，编译期符号表直接将 `UserID` 解析指向 `int64`（或通过 `types.Alias` 记录别名链并在 `types.Unalias` 后完全等同），运行时 `reflect.TypeOf(UserID(1)) == reflect.TypeOf(int64(1))` 永远为 **`true`**；
+- 对于类型定义 `type UserID int64`，编译器在运行时生成了独立的 `abi.Type` 类型元数据描述符，`reflect.TypeOf(UserID(1)) == reflect.TypeOf(int64(1))` 为 **`false`**。正是因为类型定义拥有独立的编译期身份，才能用它实现**领域强类型防呆（Newtype Pattern）**——防止在函数传参时不小心把 `OrderID` 和 `UserID` 两个 `int64` 参数顺序传反！
+
+此外，如果你既想基于已有结构体定义一个**新类型**，又想**保留原结构体的所有方法**，应该使用**结构体嵌入（Struct Embedding）**而不是类型定义。
+
+**代码示例**
+
+```go
+// 1. 用类型定义实现编译期防呆（防止把 userID 和 orderID 传反）
+type UserID int64
+type OrderID int64
+
+func QueryOrder(u UserID, o OrderID) {}
+
+// 2. JSON 定制序列化的经典陷阱：在 MarshalJSON 中用类型定义剥离方法集，防止无限递归栈溢出！
+type SecretUser struct {
+	ID       int64  `json:"id"`
+	Password string `json:"-"`
+}
+
+func (u SecretUser) MarshalJSON() ([]byte, error) {
+	// 关键：type plain SecretUser 创建了新类型，它没有继承 MarshalJSON 方法！
+	// 如果写成 type plain = SecretUser（类型别名），json.Marshal(plain(u)) 会无限递归调用自己导致 stack overflow！
+	type plain SecretUser
+	return json.Marshal(struct {
+		plain
+		HasPassword bool `json:"has_password"`
+	}{
+		plain:       plain(u),
+		HasPassword: u.Password != "",
+	})
+}
+```
+
+**常见追问**
+
+- 在自定义 `MarshalJSON()` 或 `String()` 方法内部，想复用默认的结构体序列化逻辑，应该用 `type alias = MyStruct` 还是 `type shadow MyStruct`？→ **必须用类型定义 `type shadow MyStruct`**！因为类型定义会剥离掉 `MyStruct` 上的 `MarshalJSON()` / `String()` 方法，交给 `json.Marshal` 或 `fmt.Sprintf` 时才会走默认的字段反射逻辑；如果用 `=` 类型别名，方法还在，会立刻陷入无限递归导致栈溢出崩溃。
+- 能给非本包的类型（比如 `*http.Request` 或 `[]int`）通过类型别名 `type MySlice = []int` 添加方法吗？→ **不能**。因为 `MySlice` 就是 `[]int`，而 Go 规定只能为**当前包内定义的命名类型**绑定方法；想加方法必须用类型定义 `type MySlice []int`。
+- 泛型类型别名里的类型参数约束可以比原泛型类型更严格吗？→ 可以，别名上声明的约束必须满足原泛型类型的约束（可以相同或更具体，但不能更宽泛，否则实例化原类型时会编译报错）。
+
+**实战建议**
+
+- 在核心业务模型中，对容易混淆的同底层类型 ID（如 `TenantID`、`AccountID`、`SkuID`）使用类型定义 `type TenantID int64`，让编译器帮你拦截参数错位 bug。
+- 重构拆分包导出类型时，优先用类型别名 `type OldName = newpkg.NewName` 保持向后兼容。
+
+=== go-32
+level: 1
+hot: true
+title: 函数类型为什么也能实现接口？http.HandlerFunc 是怎么工作的？
+--- answer
+在 Go 中，**任何自定义命名类型（只要不是指针类型或接口类型本身）都可以拥有方法**——不仅结构体可以定义方法，基本类型、切片类型、甚至**函数类型（Function Type）**都可以定义方法，从而实现接口。
+
+**1. `http.Handler` 与 `http.HandlerFunc` 的源码设计**
+
+标准库 `net/http` 的核心接口只有一个方法：
+
+```go
+type Handler interface {
+    ServeHTTP(ResponseWriter, *Request)
+}
+
+// HandlerFunc 是一个底层类型为函数的命名类型
+type HandlerFunc func(ResponseWriter, *Request)
+
+// 为这个函数类型定义 ServeHTTP 方法，方法体就是直接调用函数本身 f(w, r)！
+func (f HandlerFunc) ServeHTTP(w ResponseWriter, r *Request) {
+    f(w, r)
+}
+```
+
+**2. 为什么这样设计？（函数适配器模式）**
+
+- 当处理器需要维护很多依赖状态（如数据库连接池、配置、Logger）时，我们定义一个**结构体**实现 `http.Handler` 接口；
+- 当处理器很简单、或只是一个闭包函数 `func(w http.ResponseWriter, r *http.Request)` 时，如果每次都要专门定义一个空结构体再写 `ServeHTTP` 方法就太繁琐了；
+- 有了 `http.HandlerFunc` 这个**类型适配器**，只需做一次类型转换 `http.HandlerFunc(myFunc)`，就能把一个普通函数零成本包装成满足 `http.Handler` 接口的对象！
+
+**3. 双向灵活切换**
+
+- **函数转接口**：`http.HandlerFunc(fn)`；
+- **结构体方法转函数**：Go 支持**方法值（Method Value）**，如果某个方法签名是 `func (s *Server) handleLogin(w, r)`，直接把 `s.handleLogin` 当作函数传给 `mux.HandleFunc("/login", s.handleLogin)` 即可，它会自动绑定接收者 `s`。
+--- deep
+**原理展开**
+
+函数类型实现接口是 Go 语言中贯通**面向对象（接口多态）**与**函数式编程（高阶函数与闭包）**的桥梁：
+
+1. **接口只有 1 个方法时（Single-Method Interface）**：如 `http.Handler`、`io.Reader`、`io.Writer`、`RoundTripper`。定义一个对应的函数类型（如 `HandlerFunc`、`ReaderFunc`），就能让无状态的纯函数、捕获局部变量的闭包与有状态的结构体在同一个接口下无缝互操作。
+2. **类型转换 vs 函数调用**：注意 `http.HandlerFunc(fn)` **不是函数调用**，而是把类型 `func(ResponseWriter, *Request)` 显式转换为底层类型完全相同的命名类型 `http.HandlerFunc`（编译期零成本，仅在随后赋给 `http.Handler` 接口变量时构造 `iface` 接口头）。
+3. **装饰器 / 中间件（Middleware）的优雅组合**：正因为 `http.Handler` 和 `http.HandlerFunc` 可以随时互转，Go 的中间件签名得以统一写成 `func(next http.Handler) http.Handler`，内部返回一个 `http.HandlerFunc(func(w, r) { ... next.ServeHTTP(w, r) })` 闭包，无需定义任何中间结构体。
+
+**代码示例**
+
+```go
+// 举一反三：为 http.RoundTripper（HTTP 客户端传输层接口）编写函数类型适配器，
+// 让你能像写服务端中间件一样，用几行闭包为 http.Client 加上统一 Header 注入、日志和 Mock 测试！
+type RoundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f RoundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+// 为 http.Client 添加自动携带 Bearer Token 的客户端中间件
+func WithBearerToken(base http.RoundTripper, token string) http.RoundTripper {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		// 按照 RoundTripper 契约，修改请求前必须先浅拷贝 req 和 Header，避免并发污染调用方原请求
+		cloned := req.Clone(req.Context())
+		cloned.Header.Set("Authorization", "Bearer "+token)
+		return base.RoundTrip(cloned)
+	})
+}
+```
+
+**常见追问**
+
+- 如果我有两个函数变量 `var f1, f2 http.HandlerFunc`，能用 `f1 == f2` 比较它们是否相等吗？→ **不能**！在 Go 中，函数类型（`func`）、切片（`slice`）和映射（`map`）属于**不可比较类型**（只能与 `nil` 比较）。更重要的是，如果你把一个 `http.HandlerFunc` 赋给 `var h1, h2 http.Handler` 接口变量，然后执行 `h1 == h2`，在运行时会直接触发 **`panic: runtime error: comparing uncomparable type http.HandlerFunc`**！
+- 方法值（Method Value，如 `s.handleLogin`）在底层是怎么实现的，会产生堆分配吗？→ 编译器会把 `s.handleLogin` 合成一个捕获了接收者指针 `s` 的隐式闭包结构体；如果这个闭包逃逸到了函数外部（比如注册到了全局路由表），就会在堆上分配一个包含 `{fnPtr, s}` 的闭包对象。
+- 什么时候应该定义结构体实现接口，什么时候用 `HandlerFunc` 闭包？→ 状态固定不变或只有 1～2 个简单依赖时用闭包最轻便；当依赖项多、需要暴露多个相关处理方法或需要单独对内部状态做单元测试时，用结构体更清晰。
+
+**实战建议**
+
+- 在自己设计单方法接口（如 `Validator`、`Interceptor`、`TaskRunner`）时，顺手在旁边配一个 `type ValidatorFunc func(...) error` 适配器，会让调用方写单元测试桩（Stub/Mock）和简单扩展时的体验提升十倍。
+- 切忌对动态类型可能是 `HandlerFunc` 的接口变量做 `==` 相等比较或作为 `map` 的 key。
+
+=== go-33
+level: 2
+hot: false
+title: go.mod、go.sum、go.work 以及 Go 1.24 的 tool 指令分别是做什么的？
+--- answer
+这四个机制共同构成了现代 Go 工程的可复现构建（Reproducible Builds）与多模块依赖管理体系：
+
+**1. `go.mod` 与最小版本选择（MVS）**
+
+- `module`：声明当前模块的导入路径；
+- `go 1.24.0`：声明该模块要求使用的最低 Go 语言与工具链版本（Go 1.21+ 起，如果本地 `go` 版本低于 `go.mod` 要求，`go` 命令会自动下载并切换到对应的工具链版本）；
+- `require`：依赖列表。Go 不使用复杂的 SAT 版本求解器，而是采用 **MVS（Minimal Version Selection，最小版本选择）**：在满足所有依赖模块声明的最低版本要求的前提下，永远选择**符合条件的最老（最小）版本**，无需 lock 文件就能保证构建结果 100% 确定；
+- `replace` / `exclude` / `retract`：替换依赖指向本地或 fork 仓库、排除坏版本、模块作者撤回已发布的缺陷版本。
+
+**2. `go.sum`（密码学防篡改校验，不是锁文件）**
+
+记录每个依赖模块版本源码树和 `go.mod` 文件的 **SHA-256 哈希值**（格式为 `h1:base64...`）。它的作用是确保无论从哪个代理（`GOPROXY`）或机器下载依赖，源码只要被篡改过哪怕 1 个字节，`go` 命令就会立刻拒绝构建。
+
+**3. `go.work`（多模块工作区，Go 1.18+）**
+
+当本地需要同时修改主项目和另一个被依赖的本地 SDK 模块时，无需再手改 `go.mod` 加 `replace`（容易误提交到 Git），只需在顶层目录执行 `go work init ./app ./sdk` 生成 `go.work`（不提交到 Git），编译器会自动优先使用本地工作区中的模块源码。
+
+**4. Go 1.24 新增的 `tool` 指令**
+
+以前项目依赖代码生成或 Linter 工具（如 `stringer`、`sqlc`、`mockgen`）时，只能写一个怪异的 `tools.go` 文件用 `_ "pkg/cmd/tool"` 假导入。**Go 1.24 原生支持在 `go.mod` 中声明 `tool` 指令**：
+
+```bash
+go get -tool golang.org/x/tools/cmd/stringer@latest
+go tool stringer -type= Pill   # 自动按 go.mod 锁定的版本编译、缓存并运行！
+```
+--- deep
+**原理展开**
+
+理解 Go 模块系统的几个深层工程机制：
+
+1. **为什么有了 `go.mod` 确定版本，还需要 `go.sum` 和校验和数据库（`GOSUMDB`）？**
+   `go.mod` 里的版本号只是一个 Git Tag（如 `v1.2.3`）。如果第三方作者恶意删除并重新推送了同名 Git Tag，或者企业的私有缓存代理被投毒，仅靠版本号无法发现源码变了。`go.sum` 配合全局透明日志数据库 `sum.golang.org`（基于 Merkle Tree 树结构），保证了全球所有开发者拿到的同一个版本号对应完全一致的哈希值。
+2. **语义化导入版本规则（Semantic Import Versioning）**：
+   在 Go Module 中，**如果主版本号达到 `v2` 及以上，模块名和所有 `import` 路径末尾必须显式带上 `/v2`、`/v3` 后缀**（如 `github.com/go-redis/redis/v8`）。这样设计的好处是：同一个二进制程序里可以同时共存并导入某库的 `v1` 和 `v2` 两个破坏性变更版本，不会发生符号冲突。
+3. **Go 1.24 `tool` 指令的构建缓存优化**：以前每次 `go run pkg/cmd/tool@v1.0.0` 都要重新链接可执行文件；Go 1.24 的 `go tool <name>` 会把编译好的工具二进制持久化缓存在 `GOCACHE` 中，后续执行毫秒级直接启动。
+
+**代码示例**
+
+```text
+// 典型的生产级 go.mod 文件示例（Go 1.24+）
+module example.com/order-service
+
+go 1.24.0
+
+// Go 1.24+：直接管理项目构建与代码生成工具版本，团队所有人使用的工具版本 100% 一致
+tool (
+	golang.org/x/tools/cmd/stringer
+	github.com/sqlc-dev/sqlc/cmd/sqlc
+)
+
+require (
+	golang.org/x/sync v0.10.0
+	golang.org/x/text v0.21.0 // indirect
+)
+
+// 撤回曾经发布过的有严重 bug 的版本，下游执行 go get 时会收到警告并跳过该版本
+retract v1.0.3
+```
+
+```bash
+# 私有仓库配置（不经过公共代理 GOPROXY 和公共校验库 GOSUMDB，直接走内网 Git）
+go env -w GOPRIVATE="git.mycompany.com/*,github.com/myorg/private-*"
+
+# 查看为什么某个间接依赖会被引入，以及是谁把它拉高到了当前版本
+go mod why -m golang.org/x/text
+go mod graph | grep golang.org/x/text
+```
+
+**常见追问**
+
+- `go.sum` 里为什么同一个模块版本通常有两行记录（一行有 `/go.mod` 后缀，一行没有）？→ 没有后缀的那行是该版本**完整源码压缩包**的 SHA-256 哈希；带 `/go.mod` 后缀的那行是仅仅它的 `go.mod` 文件的哈希——因为 MVS 算法在计算依赖图时，有时只需要下载某个历史版本的 `go.mod` 文件来分析传递依赖，而最终被更高版本替代后根本不需要下载它的完整源码包。
+- 库（Library）作者在自己的 `go.mod` 里写 `replace` 会在下游生效吗？→ **不会**！Go 规定 `replace` 和 `exclude` 指令**只在当前作为主模块（Main Module）构建时才生效**，一旦作为依赖被别人 `require`，里面的 `replace` 会被完全忽略。
+- CI 构建时应该用 `go build` 还是加上 `-mod=readonly`？→ Go 1.16 起，`go build` 和 `go test` 默认就是 `-mod=readonly`（如果 `go.mod` 或 `go.sum` 缺少条目会直接报错退出，而不会在 CI 里偷偷联网修改 `go.mod`）。
+
+**实战建议**
+
+- `go.mod` 和 `go.sum` **必须一起提交到 Git 仓库**；而本地联调生成的 `go.work` 和 `go.work.sum` **应当加入 `.gitignore`**。
+- 升级到 Go 1.24+ 后，删掉项目里别扭的 `tools.go` 假导入文件，统一用 `go get -tool` 和 `go tool` 管理代码生成工具。
+
+=== go-34
+level: 1
+hot: true
+title: Go 中 byte 和 rune 有什么区别？下标遍历和 for range 遍历字符串有什么差异？
+--- answer
+在 Go 中，字符串（`string`）底层是一个**只读的字节切片**（通常按 UTF-8 编码存储文本），理解 `byte` 和 `rune` 的关键在于区分**字节（Byte）**与 **Unicode 码点（Code Point）**：
+
+**1. `byte` 与 `rune` 的本质**
+
+- `byte` 是 `uint8` 的类型别名（占 **1 个字节**），代表原始的二进制字节；`len(s)` 返回的永远是**字节数**，而不是字符个数！
+- `rune` 是 `int32` 的类型别名（占 **4 个字节**），代表一个 **Unicode 码点**（如一个英文字母 `'a'`、一个汉字 `'中'` 或一个 Emoji `'🚀'`）。在 UTF-8 变长编码下，ASCII 字符占 1 字节，常用汉字占 **3 字节**，Emoji 占 **4 字节**。
+
+**2. 两种遍历方式的差异**
+
+```go
+s := "Go语言" // 字节长度 len(s) == 2 + 3 + 3 = 8
+
+// 1. 下标遍历：按字节（byte / uint8）逐个访问，共循环 8 次
+for i := 0; i < len(s); i++ {
+    b := s[i] // 类型是 byte，汉字会被劈成 3 个乱码半字节
+}
+
+// 2. for range 遍历：运行时自动按 UTF-8 解码成 rune（int32），共循环 4 次
+for i, r := range s {
+    // i 是该字符起始字节的下标（依次为 0, 1, 2, 5，注意不是连续的 0,1,2,3！）
+    // r 的类型是 rune（依次为 'G', 'o', '语', '言'）
+}
+```
+
+**3. 常见操作规范**
+
+- **统计字符（码点）个数**：使用 `utf8.RuneCountInString(s)`（复杂度 $O(N)$，但无需分配内存），**不要用** `len([]rune(s))`（会把整个字符串拷贝分配成新切片）；
+- **按字符位置截取或反转字符串**：如果包含非 ASCII 字符，不能直接按字节切片 `s[:n]`（可能从汉字中间劈开产生非法 UTF-8 乱码），需结合 `utf8.DecodeRuneInString` 或转为 `[]rune` 处理。
+--- deep
+**原理展开**
+
+深挖 `for i, r := range s` 与 UTF-8 解码的底层细节：
+
+1. **编译器对 `for range s` 的改写**：当 `s[i] < 0x80`（最高位为 0，单字节 ASCII）时，循环直接内联取 `rune(s[i])` 并将下标 `+1`，速度极快；当遇到多字节字符（`s[i] >= 0x80`）时，调用 `runtime.decoderune(s, i)` 解码出码点 `r` 和所占字节宽度 `width`（2～4 字节），下一轮下标跳到 `i + width`。
+2. **遇到非法 UTF-8 字节序列时会怎样？**
+   如果字符串里混入了损坏的二进制字节（比如截取了半个汉字 `s[:3]`），`for range` **不会 panic，也不会报错**，而是将该非法字节替换为 Unicode 替换字符 **`utf8.RuneError`（即 `'\uFFFD'`，显示为 ``）**，且只前进 **1 个字节**继续向后遍历！
+3. **编译器对 `for _, r := range []rune(s)` 的优化**：如果只是读取遍历，直接写 `for _, r := range s` 零内存分配；即使需要修改字符而转为 `[]rune(s)`，也要注意每个 `rune` 占 4 字节，大文本转换会使内存体积膨胀 1.3～4 倍。
+
+**代码示例**
+
+```go
+// 安全地按“最多 maxRunes 个字符”截断字符串，零堆内存分配（不转 []rune），绝不劈裂多字节汉字！
+func TruncateRunes(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := 0
+	for i := range s {
+		if runes == maxRunes {
+			return s[:i] // i 恰好是第 maxRunes+1 个字符的起始字节边界！
+		}
+		runes++
+	}
+	return s // 总字符数不超过 maxRunes，直接返回原字符串
+}
+
+// 如何区分字符串中是“真的包含 '' (\uFFFD) 字符”还是“包含非法的 UTF-8 损坏字节”？
+func HasInvalidUTF8(s string) bool {
+	// 标准库 utf8.ValidString 极其高效（支持按字长快速跳过 ASCII）
+	return !utf8.ValidString(s)
+}
+```
+
+**常见追问**
+
+- 在 `for i, r := range "你好"` 中，打印出来的 `i` 依次是多少？如果想拿到“第几个字符（0, 1, 2...）”的序号怎么办？→ `i` 依次是 **`0` 和 `3`**（因为 `'你'` 在 UTF-8 中占 3 个字节 `0, 1, 2`）。需要连续字符序号时，必须自己在循环外声明一个 `idx := 0` 并在每次迭代末尾 `idx++`。
+- 如果把字符串中的合法 `''`（`\uFFFD`，占 3 个字节 `0xEF 0xBF 0xBD`）和一个损坏的单字节 `0xFF` 放在一起，用 `utf8.DecodeRuneInString` 怎么区分它们？→ 两者返回的 `r` 都是 `utf8.RuneError`，但返回值中的字节宽度 `size` 不同：**损坏的非法字节返回的 `size == 1`**，而真正合法的替换字符 `''` 编码返回的 **`size == 3`**！
+- Emoji 组合字符（比如带肤色修饰符或家庭组合 `'👨‍👩‍👧‍👦'`）用 `utf8.RuneCountInString` 算出来为什么不是 1？→ 因为 Unicode 中一个视觉上的“字素簇（Grapheme Cluster）”可能由多个 `rune` 通过零宽连接符（ZWJ `\u200d`）拼接而成，严格按视觉字符切分需要使用 Unicode UAX #29 分词算法（如 `rivo/uniseg`）。
+
+**实战建议**
+
+- 截断用户昵称或摘要写入数据库 `VARCHAR` 前，先用 `for i := range s` 找到字符边界 `s[:i]`，防止把 UTF-8 多字节字符拦腰截断导致 MySQL 报 `Incorrect string value` 错误。
+- 检查字符串是否包含有效 UTF-8 一律用 `utf8.ValidString(s)`。
+
+=== go-35
+level: 2
+hot: false
+title: Go 的无类型常量（untyped constant）和 iota 是怎么工作的？有哪些高级用法和坑？
+--- answer
+Go 的常量系统有两个独特的设计：**无类型常量（Untyped Constants）的高精度计算**和**常量生成器 `iota`**。
+
+**1. 无类型常量（Untyped Constants）**
+
+在 Go 中，字面量常量（如 `42`、`3.14`、`"hello"`）以及未显式指定类型的 `const Max = 1 << 100` 默认都是**无类型常量**：
+
+- **突破硬件位数限制的高精度**：编译器内部用至少 256 位（实际上使用 `math/big`）的任意精度算术来表示和计算无类型常量。因此 `const Huge = 1 << 100` 合法，且 `const KB = Huge >> 90`（结果是 `1024`）可以在编译期精确算出而不会溢出！
+- **延迟确定类型（隐式适配）**：因为Go 不允许不同数值类型隐式转换（`int32` 和 `int64` 不能直接相加），如果常量一开始就被绑死为 `int`，那么 `var x int64 = 10 + x` 都要写强制转换。无类型常量在被赋给变量或传参时，只要不溢出目标类型范围，就能**自动隐式转换为任意兼容的目标类型**（如 `int32`、`int64`、`float64`、`time.Duration`）；只有在需要类型推导（如 `x := 10`）时，才会退化为它的**默认类型**（`int`、`rune`、`float64`、`complex128`、`string`、`bool`）。
+
+**2. `iota` 的工作规则**
+
+- `iota` 代表当前 `const (...)` 声明块中的**行索引（ConstSpec 下标，从 0 开始）**；
+- 每遇到一个新的 `const` 关键字，`iota` 重置为 `0`；在同一个 `const` 块内，每换一行声明（即使该行没有写 `iota`），`iota` 也会自动 `+1`；
+- **省略表达式继承上一行**：如果某一行只写了常量名没写 `= 表达式`，它会自动重复上一行的完整表达式（此时 `iota` 已变为当前行号）。
+
+```go
+type Perm uint8
+const (
+    Read Perm = 1 << iota // 1 << 0 = 1
+    Write                 // 1 << 1 = 2
+    Execute               // 1 << 2 = 4
+)
+```
+--- deep
+**原理展开**
+
+深入理解 `iota` 与枚举（Enum）在生产工程中的用法和常见隐患：
+
+1. **`iota` 按行计数而非按出现次数计数**：
+   如果一个 `const` 块的前两行写的是普通固定常量，第三行才开始写 `1 << iota`，那么第三行的 `iota` 已经是 **`2`**（而不是 `0`）！另外，如果同一行写了多个常量 `A, B = iota, iota + 10`，这一行里的两个 `iota` 值相同。
+2. **零值安全原则（Zero-Value Safety）**：
+   Go 的变量默认初始化为零值（`0`）。如果定义订单状态枚举时直接从 `0` 开始：`Created = iota`（值为 0），那么当上游传漏了字段、或者 JSON 反序列化一个空结构体 `{}` 时，`order.Status` 默认就是 `0`，系统会误以为这是一个“已创建（Created）”的合法订单！**最佳实践是永远把 `0` 留给 `Unknown` / `Unspecified`（或用 `_ = iota` 跳过 0）**。
+3. **持久化数据的顺序脆弱性**：如果把 `iota` 生成的整数存入了数据库或发往 RPC，一旦将来有人在枚举块中间插入了一个新常量，后面所有常量的数值都会整体偏移 `+1`，瞬间造成线上历史数据全部错乱！
+
+**代码示例**
+
+```go
+// 1. 生产级枚举定义规范：0 设为 Unknown + 编译期利用无类型常量做存储容量表达式
+type OrderStatus uint8
+
+const (
+	OrderStatusUnknown OrderStatus = iota // 0：默认零值代表未指定/非法状态，防止漏赋值误判
+	OrderStatusPending                    // 1
+	OrderStatusPaid                       // 2
+	OrderStatusShipped                    // 3
+)
+
+// 利用 iota + 10*iota 生成字节单位常量（_ 跳过 0）
+const (
+	_  = iota
+	KB = 1 << (10 * iota) // 1 << 10 = 1024 (无类型常量，可赋给 int64/uint64)
+	MB                    // 1 << 20
+	GB                    // 1 << 30
+	TB                    // 1 << 40
+)
+
+// 2. 利用数组下标越界实现“编译期静态断言（Compile-time Assertion）”
+// 如果将来有人删改了枚举却忘了同步更新名称表，编译期就会直接报错！
+var statusNames = [...]string{
+	OrderStatusUnknown: "unknown",
+	OrderStatusPending: "pending",
+	OrderStatusPaid:    "paid",
+	OrderStatusShipped: "shipped",
+}
+
+func (s OrderStatus) String() string {
+	if int(s) < len(statusNames) {
+		return statusNames[s]
+	}
+	return fmt.Sprintf("OrderStatus(%d)", s)
+}
+```
+
+**常见追问**
+
+- `const a = ^uint(0)` 和 `const b = ^0` 各是什么意思？→ `^uint(0)` 是将有类型的无符号 `0` 按位取反，得到当前架构下最大的 `uint` 值（64 位下为 `math.MaxUint64`）；而 `^0` 是对有符号无类型常量 `0` 按位取反（补码表示下 `^x == -1 - x`），结果是 `-1`（因此若写成 `var u uint = ^0` 会直接在编译期报错 `constant -1 overflows uint`）。
+- 为什么 `time.Sleep(100 * time.Millisecond)` 可以直接编译，而 `n := 100; time.Sleep(n * time.Millisecond)` 却编译报错？→ 因为字面量 `100` 是**无类型常量**，与 `time.Duration` 类型的 `time.Millisecond` 相乘时自动隐式转化为 `time.Duration`；而 `n := 100` 已经被推导为确定的 `int` 类型变量，`int` 与 `time.Duration`（类型定义 `type Duration int64`）不能隐式相乘，必须写 `time.Duration(n) * time.Millisecond`。
+- 如何自动为枚举类型生成 `String()` 方法？→ 在文件头部加上 `//go:generate go tool stringer -type=OrderStatus` 注释，执行 `go generate ./...` 即可由官方 `stringer` 工具自动生成高效的常量名映射代码。
+
+**实战建议**
+
+- 凡是需要存入数据库或通过 JSON/Protobuf 跨服务传输的枚举，**显式写出每个枚举项的固定数值（或加注释严禁在中间插入新项）**，且永远让 `0` 代表 `Unknown / Invalid`。
+- 导出给外部使用的数值常量（如缓冲区大小、掩码），尽量不显式写死 `int` 类型，保持为无类型常量，方便调用方直接用于 `int64`、`uint32` 等不同场景而不必强转。

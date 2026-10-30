@@ -1,0 +1,574 @@
+{
+  "items": [
+    {
+      "id": "short-var",
+      "name": "短变量声明 :=",
+      "group": "基础与变量",
+      "body": "`:=` 同时完成**声明 + 赋值**，类型由右边的值推导出来。它只能用在函数内部，是 Go 里最常见的声明方式。\n\n**写法**\n\n```go\nx := 10              // int\nname, age := \"Tom\", 18\nf, err := os.Open(\"a.txt\")\n```\n\n**例子**\n\n```go\na, err := strconv.Atoi(\"12\")\nb, err := strconv.Atoi(\"34\") // 合法：b 是新变量，err 只是被重新赋值\nfmt.Println(a+b, err)        // 46 \u003cnil\u003e\n```\n\n**注意**\n\n- `:=` 左边**至少要有一个新变量**，其余已存在的变量（同一作用域内）只是赋值；全是旧变量会报 `no new variables on left side of :=`。\n- 在 `if`、`for`、内层 `{}` 里用 `:=` 会创建**新的同名变量**，遮蔽（shadow）外层变量。常见 bug：\n\n```go\nvar err error\nif true {\n\t_, err := strconv.Atoi(\"x\") // 这是新的 err，外层 err 仍然是 nil\n\t_ = err\n}\n```\n\n- 包级别（函数外）不能用 `:=`，只能用 `var`。\n- 推导出的类型是“默认类型”：`x := 1` 是 `int`，`y := 1.5` 是 `float64`，`r := 'a'` 是 `rune`。"
+    },
+    {
+      "id": "var-zero",
+      "name": "var 声明与零值",
+      "group": "基础与变量",
+      "body": "`var` 声明变量时如果不赋初值，变量会被自动设为该类型的**零值**。Go 没有“未初始化”的变量，这是很多代码能写得很短的原因。\n\n**写法**\n\n```go\nvar n int            // 0\nvar s string         // \"\"\nvar ok bool          // false\nvar p *Node          // nil\nvar buf []byte       // nil 切片，len 为 0，可以直接 append\nvar m map[string]int // nil map，可以读，不能写\nvar mu sync.Mutex    // 零值就是一把可用的未加锁的锁\nvar (\n\ta = 1\n\tb string\n)\n```\n\n**各类型的零值**：数值 `0`、字符串 `\"\"`、布尔 `false`，指针 / 切片 / map / channel / 函数 / 接口都是 `nil`，结构体是“每个字段都取零值”。\n\n**例子**\n\n```go\ntype Counter struct {\n\tmu sync.Mutex\n\tn  map[string]int\n}\n\nvar c Counter            // 不需要构造函数，mu 已经可用\nc.mu.Lock()\nfmt.Println(c.n[\"x\"])    // 0：读 nil map 是安全的\nc.mu.Unlock()\n```\n\n**注意**\n\n- **向 nil map 写入会 panic**：`var m map[string]int; m[\"a\"] = 1` → `assignment to entry in nil map`，要先 `make`。\n- nil 切片和空切片 `[]int{}` 用起来几乎一样（len、range、append 都正常），但 `json.Marshal` 时前者是 `null`，后者是 `[]`。\n- 设计类型时尽量让“零值可用”，比如 `sync.Mutex`、`bytes.Buffer`、`strings.Builder` 都不需要初始化。"
+    },
+    {
+      "id": "const-iota",
+      "name": "常量与 iota",
+      "group": "基础与变量",
+      "body": "`const` 定义编译期常量；在 `const ( ... )` 块里，`iota` 从 0 开始，每行加 1，常用来定义枚举。\n\n**写法**\n\n```go\nconst Pi = 3.14159\nconst (\n\tStateIdle State = iota // 0\n\tStateRunning           // 1：省略的行会重复上一行的表达式\n\tStateDone              // 2\n)\nconst (\n\t_  = iota             // 跳过 0\n\tKB = 1 \u003c\u003c (10 * iota) // 1 \u003c\u003c 10\n\tMB                    // 1 \u003c\u003c 20\n)\n```\n\n**例子**\n\n```go\ntype Weekday int\n\nconst (\n\tSunday Weekday = iota\n\tMonday\n\tTuesday\n)\n\nfunc (d Weekday) String() string {\n\treturn [...]string{\"Sun\", \"Mon\", \"Tue\"}[d]\n}\n\nfmt.Println(Monday) // Mon：实现了 String() 后 fmt 会自动调用\n```\n\n**注意**\n\n- 无类型常量（`const N = 10`）精度很高，可以直接和 `int64`、`float64` 等运算，用到时才确定类型。\n- `iota` 是“在当前 const 块里的行号”，每个新的 `const (` 块都从 0 重新开始。\n- 只有布尔、数字、字符串可以是常量；切片、map、结构体不能 `const`。\n- 枚举通常给 0 值留一个“未知 / 未设置”的含义，避免零值被误当作有效状态。"
+    },
+    {
+      "id": "multi-assign",
+      "name": "多重赋值与交换",
+      "group": "基础与变量",
+      "body": "Go 支持一次给多个变量赋值。右边所有表达式**先全部求值**，然后再统一赋给左边，所以交换两个变量不需要临时变量。\n\n**写法**\n\n```go\na, b = b, a                  // 交换\na, b = b, a+b                // 斐波那契：用的是旧的 a 和 b\nnums[i], nums[j] = nums[j], nums[i]\n_, err = io.Copy(dst, src)   // _ 丢弃不需要的值\n```\n\n**例子**\n\n```go\n// 反转切片\nfunc reverse(s []int) {\n\tfor i, j := 0, len(s)-1; i \u003c j; i, j = i+1, j-1 {\n\t\ts[i], s[j] = s[j], s[i]\n\t}\n}\n```\n\n**注意**\n\n- `a, b = b, a+b` 和分两行写 `a = b; b = a + b` 结果不同：后者第二行用的是**新的** a。\n- 链表反转这类题经常写成 `prev, cur, cur.Next = cur, cur.Next, prev`，虽然合法，但求值顺序很容易想错，推荐拆成几行清楚的赋值。\n- `_` 是空白标识符，可以接收任意值但不能读取。"
+    },
+    {
+      "id": "type-def",
+      "name": "自定义类型 type",
+      "group": "基础与变量",
+      "body": "`type 新类型 底层类型` 基于已有类型定义一个**全新的类型**，可以给它加方法；`type A = B` 则只是起别名，两者是同一个类型。\n\n**写法**\n\n```go\ntype UserID int64                // 新类型：和 int64 不能直接混用\ntype Celsius float64\ntype HandlerFunc func(w http.ResponseWriter, r *http.Request)\ntype Set map[string]struct{}\ntype byte = uint8                // 别名（标准库里的写法）\n```\n\n**例子**\n\n```go\ntype Celsius float64\n\nfunc (c Celsius) Fahrenheit() float64 { return float64(c)*9/5 + 32 }\n\nt := Celsius(100)\nfmt.Println(t.Fahrenheit()) // 212\nvar f float64 = t           // 编译错误：不能把 Celsius 直接赋给 float64\n```\n\n**注意**\n\n- 新类型**不继承**原类型的方法：`type MyMutex sync.Mutex` 之后 `MyMutex` 没有 `Lock` 方法（想要继承方法应该用结构体嵌入）。\n- 新类型和底层类型之间可以显式转换：`int64(id)`、`UserID(42)`。\n- 用新类型区分含义（`UserID` 和 `OrderID`）可以让编译器帮你发现参数传错的问题。\n- 函数类型也能定义方法，`http.HandlerFunc` 就是这样让普通函数实现接口的。"
+    },
+    {
+      "id": "type-conv",
+      "name": "类型转换 T(x)",
+      "group": "基础与变量",
+      "body": "Go **没有隐式类型转换**，`int` 和 `int64`、`int` 和 `float64` 之间都必须显式写 `T(x)`。\n\n**写法**\n\n```go\nf := float64(n) / 2\ni := int(3.9)          // 3：浮点转整数直接截断小数\nu := uint8(300)        // 44：整数转换超出范围会按位截断\nd := time.Duration(n) * time.Millisecond\nid := UserID(42)\n```\n\n**例子**\n\n```go\n// 平均值：先转 float64 再除，否则是整数除法\nfunc avg(nums []int) float64 {\n\tsum := 0\n\tfor _, n := range nums {\n\t\tsum += n\n\t}\n\treturn float64(sum) / float64(len(nums))\n}\n```\n\n**注意**\n\n- `7 / 2` 是 `3`（整数除法）；要得到 `3.5` 需要 `float64(7) / 2`。\n- 整数和字符串互转**不能**用 `string(65)`，那会得到 `\"A\"`（按 Unicode 码点）。数字转字符串用 `strconv.Itoa`，反过来用 `strconv.Atoi`。\n- `[]byte(s)`、`string(b)` 是会复制数据的转换，见「字符串与 []byte 互转」。\n- 类型转换 `T(x)` 和类型断言 `x.(T)` 是两回事：断言只用于接口值。"
+    },
+    {
+      "id": "pointer",
+      "name": "指针 \u0026 和 *",
+      "group": "基础与变量",
+      "body": "`\u0026x` 取变量的地址，得到 `*T` 类型的指针；`*p` 通过指针读写它指向的值。Go 的指针不能做算术运算，比 C 安全很多。\n\n**写法**\n\n```go\nx := 1\np := \u0026x        // p 的类型是 *int\n*p = 2         // 通过指针修改 x\nn := new(int)  // 分配一个零值 int，返回 *int\nu := \u0026User{Name: \"Tom\"} // 最常见：直接取复合字面量的地址\nu.Name = \"Jerry\"        // 结构体指针访问字段不用写 (*u).Name\n```\n\n**例子**\n\n```go\nfunc inc(p *int) { *p++ }\n\nn := 1\ninc(\u0026n)\nfmt.Println(n) // 2：函数参数是值拷贝，想修改调用方的变量就传指针\n```\n\n**什么时候用指针**\n\n- 函数需要修改参数；\n- 结构体较大，避免拷贝；\n- 需要表达“没有值”（`nil`），比如链表、树的节点 `*ListNode`；\n- 类型里有不能复制的字段（`sync.Mutex`）。\n\n**注意**\n\n- 对 nil 指针解引用会 panic：`invalid memory address or nil pointer dereference`，访问前要判空。\n- 返回局部变量的地址是安全的，编译器会通过逃逸分析把它分配到堆上。\n- 切片、map、channel 本身已经是“引用语义”的小结构，一般不需要再取指针。"
+    },
+    {
+      "id": "ptr-ptr",
+      "name": "指向指针的指针 **T",
+      "group": "基础与变量",
+      "body": "`**T` 是“指针的指针”。当你需要**修改调用方手里的那个指针变量本身**（而不是它指向的对象）时会用到，链表的删除、插入是典型场景。\n\n**写法**\n\n```go\nvar head *ListNode\npp := \u0026head      // pp 的类型是 **ListNode\n*pp = \u0026ListNode{Val: 1} // 修改的是 head 本身\n```\n\n**例子：不需要哨兵节点的链表删除**\n\n```go\nfunc removeElements(head *ListNode, val int) *ListNode {\n\tpp := \u0026head                   // 指向“当前要检查的那个指针”\n\tfor *pp != nil {\n\t\tif (*pp).Val == val {\n\t\t\t*pp = (*pp).Next      // 直接把这个指针改成跳过当前节点\n\t\t} else {\n\t\t\tpp = \u0026(*pp).Next      // 移动到下一个节点的 Next 字段\n\t\t}\n\t}\n\treturn head\n}\n```\n\n`pp` 一开始指向 `head` 变量，之后指向某个节点的 `Next` 字段，所以删除头节点和删除中间节点是同一段代码。\n\n**注意**\n\n- `(*pp).Val` 的括号不能省：`*pp.Val` 会被解析成 `*(pp.Val)`。\n- 大多数时候用“哨兵节点（dummy head）”写法更直观；`**T` 写法更短，但读代码的人要多想一步。\n- 函数参数里出现 `**T` 通常是为了“在函数里替换调用方的指针”，在 Go 里更常见的做法是**返回新指针**。"
+    },
+    {
+      "id": "bits",
+      "name": "位运算",
+      "group": "基础与变量",
+      "body": "Go 的位运算符：`\u0026` 与、`|` 或、`^` 异或（一元时是按位取反）、`\u0026^` 按位清除、`\u003c\u003c` 左移、`\u003e\u003e` 右移。`math/bits` 提供计数、旋转等高效函数。\n\n**写法**\n\n```go\nx \u0026 1          // 判断奇偶\nx \u0026 (x - 1)    // 去掉最低位的 1\nx \u0026 -x         // 只保留最低位的 1\nx ^ y          // 相同为 0，不同为 1；a ^ a == 0\nflags |= 1 \u003c\u003c 3   // 置位\nflags \u0026^= 1 \u003c\u003c 3  // 清除（and not）\nbits.OnesCount(uint(x)) // 1 的个数\n```\n\n**例子**\n\n```go\n// 只出现一次的数字：成对的数异或后抵消\nfunc singleNumber(nums []int) int {\n\tx := 0\n\tfor _, n := range nums {\n\t\tx ^= n\n\t}\n\treturn x\n}\n\n// 2 的幂：二进制里只有一个 1\nfunc isPowerOfTwo(n int) bool { return n \u003e 0 \u0026\u0026 n\u0026(n-1) == 0 }\n```\n\n**注意**\n\n- 运算符优先级：`\u0026`、`\u003c\u003c`、`\u003e\u003e` 和 `*` 同级，**比 `==` 高**，所以 `n\u0026(n-1) == 0` 就是 `(n \u0026 (n-1)) == 0`（这点和 C 相反）。\n- 有符号数右移是算术右移（保留符号位），`-8 \u003e\u003e 1 == -4`。\n- 移位次数可以是变量，但不能是负数（运行时 panic）。\n- Go 没有 `~x` 取反写法，用 `^x`。"
+    },
+    {
+      "id": "if-init",
+      "name": "if 带初始化语句",
+      "group": "流程控制",
+      "body": "`if` 可以先执行一条简短语句，再判断条件。这里声明的变量**只在 if / else 块里有效**，常用于“调用 + 判错”和 map 查询。\n\n**写法**\n\n```go\nif err := do(); err != nil {\n\treturn err\n}\nif v, ok := m[key]; ok {\n\tuse(v)\n} else {\n\t// 这里也能用 v 和 ok\n}\n```\n\n**例子**\n\n```go\nfunc parsePort(s string) (int, error) {\n\tif n, err := strconv.Atoi(s); err != nil {\n\t\treturn 0, fmt.Errorf(\"端口不是数字: %w\", err)\n\t} else if n \u003c 1 || n \u003e 65535 {\n\t\treturn 0, fmt.Errorf(\"端口超出范围: %d\", n)\n\t} else {\n\t\treturn n, nil\n\t}\n}\n```\n\n**注意**\n\n- 条件不需要括号，但大括号必须有，且 `{` 必须和 `if` 在同一行。\n- 变量作用域很小是优点：不会污染外层，也避免后面误用。但如果后面还要用这个值，就不要放在 if 里声明。\n- Go 惯用写法是“提前返回”：错误分支 `return`，正常逻辑不缩进，少写 `else`。"
+    },
+    {
+      "id": "for-classic",
+      "name": "for 三段式循环",
+      "group": "流程控制",
+      "body": "Go 只有 `for` 一种循环关键字。三段式写法和 C 一样：初始化; 条件; 后置语句。\n\n**写法**\n\n```go\nfor i := 0; i \u003c n; i++ { }\nfor i := n - 1; i \u003e= 0; i-- { }\nfor i, j := 0, len(s)-1; i \u003c j; i, j = i+1, j-1 { } // 多个变量用多重赋值\n```\n\n**例子**\n\n```go\n// 冒泡排序的内外层循环\nfor i := 0; i \u003c len(a); i++ {\n\tfor j := 0; j \u003c len(a)-1-i; j++ {\n\t\tif a[j] \u003e a[j+1] {\n\t\t\ta[j], a[j+1] = a[j+1], a[j]\n\t\t}\n\t}\n}\n```\n\n**注意**\n\n- `i++` 是**语句**不是表达式：不能写 `x = i++`，也没有 `++i`。\n- 后置语句里不能写 `i++, j--`，要写 `i, j = i+1, j-1`。\n- **Go 1.22 起**，`for` 声明的循环变量每次迭代都是新变量，闭包和 goroutine 捕获 `i` 不再有经典的“全部拿到最后一个值”问题（模块 `go` 版本需 ≥ 1.22）。\n- 只需要遍历下标或元素时，优先用 `range`。"
+    },
+    {
+      "id": "for-while",
+      "name": "for 当作 while",
+      "group": "流程控制",
+      "body": "省略初始化和后置语句，只留条件，`for` 就是其他语言里的 `while`。\n\n**写法**\n\n```go\nfor cond { }\nfor left \u003c right { }\nfor node != nil { node = node.Next }\n```\n\n**例子**\n\n```go\n// 二分查找\nfunc search(nums []int, target int) int {\n\tlo, hi := 0, len(nums)-1\n\tfor lo \u003c= hi {\n\t\tmid := lo + (hi-lo)/2 // 防止 lo+hi 溢出的写法\n\t\tswitch {\n\t\tcase nums[mid] == target:\n\t\t\treturn mid\n\t\tcase nums[mid] \u003c target:\n\t\t\tlo = mid + 1\n\t\tdefault:\n\t\t\thi = mid - 1\n\t\t}\n\t}\n\treturn -1\n}\n```\n\n**注意**\n\n- Go 没有 `while`、`do ... while` 关键字。`do-while` 可以写成 `for { ...; if !cond { break } }`。\n- 条件里的变量要在循环体内更新，否则就是死循环。"
+    },
+    {
+      "id": "for-ever",
+      "name": "无限循环 for { }",
+      "group": "流程控制",
+      "body": "什么条件都不写的 `for { }` 是无限循环，靠 `break`、`return` 或 `select` 里的退出分支结束。常用于后台 goroutine、事件循环、重试。\n\n**写法**\n\n```go\nfor {\n\tselect {\n\tcase \u003c-ctx.Done():\n\t\treturn\n\tcase job := \u003c-jobs:\n\t\thandle(job)\n\t}\n}\n```\n\n**例子：带次数上限的重试**\n\n```go\nfunc retry(n int, fn func() error) error {\n\tvar err error\n\tfor i := 0; ; i++ {        // 条件留空也是无限循环\n\t\tif err = fn(); err == nil || i == n-1 {\n\t\t\treturn err\n\t\t}\n\t\ttime.Sleep(time.Duration(i+1) * 10 * time.Millisecond)\n\t}\n}\n```\n\n**注意**\n\n- 在 `select` 或 `switch` 里写 `break` **只会跳出 select / switch**，不会跳出外层 for。要跳出循环用 `return` 或带标签的 `break Loop`。\n- 后台循环一定要有退出条件（`ctx.Done()`、关闭的 channel），否则会导致 goroutine 泄漏。\n- 空的 `for {}` 会一直占用 CPU，等待应该用 channel 或 `select {}`（永久阻塞且不占 CPU）。"
+    },
+    {
+      "id": "switch-tag",
+      "name": "switch 值匹配",
+      "group": "流程控制",
+      "body": "`switch x { case ... }` 按值匹配。Go 的 case **默认不会贯穿**（不需要写 `break`），一个 case 可以列多个值。\n\n**写法**\n\n```go\nswitch op {\ncase \"+\":\n\treturn a + b\ncase \"-\", \"minus\":   // 多个值\n\treturn a - b\ndefault:\n\treturn 0\n}\n\nswitch c := s[i]; c { // 也可以带初始化语句\ncase '(', '[', '{':\n}\n```\n\n**例子**\n\n```go\nfunc romanValue(c byte) int {\n\tswitch c {\n\tcase 'I':\n\t\treturn 1\n\tcase 'V':\n\t\treturn 5\n\tcase 'X':\n\t\treturn 10\n\t}\n\treturn 0\n}\n```\n\n**注意**\n\n- 需要继续执行下一个 case 时显式写 `fallthrough`（很少用，且会**无条件**进入下一个 case）。\n- `case` 后面可以是变量或表达式，不要求是常量；但重复的常量 case 会编译报错。\n- 在 `switch` 里 `break` 只跳出 switch，循环里要跳出外层用标签。"
+    },
+    {
+      "id": "switch-true",
+      "name": "无条件 switch（if-else 链）",
+      "group": "流程控制",
+      "body": "`switch` 后面不写表达式，相当于 `switch true`，每个 case 是一个布尔条件，**从上往下第一个为真的分支执行**。比长长的 `if / else if` 更整齐。\n\n**写法**\n\n```go\nswitch {\ncase score \u003e= 90:\n\tgrade = \"A\"\ncase score \u003e= 60:\n\tgrade = \"B\"\ndefault:\n\tgrade = \"C\"\n}\n```\n\n**例子**\n\n```go\nfunc fizzBuzz(i int) string {\n\tswitch {\n\tcase i%15 == 0:\n\t\treturn \"FizzBuzz\"\n\tcase i%3 == 0:\n\t\treturn \"Fizz\"\n\tcase i%5 == 0:\n\t\treturn \"Buzz\"\n\tdefault:\n\t\treturn strconv.Itoa(i)\n\t}\n}\n```\n\n**注意**\n\n- 条件的顺序很重要：更具体的条件（`i%15 == 0`）要放在更宽泛的条件前面。\n- `default` 可以放在任意位置，但它总是在所有 case 都不满足时才执行；习惯上放最后。"
+    },
+    {
+      "id": "label",
+      "name": "标签 break / continue",
+      "group": "流程控制",
+      "body": "给外层循环加标签，就可以在内层直接 `break 标签` 或 `continue 标签`，一次跳出多层循环，或者从 `select` / `switch` 里跳出外层的 `for`。\n\n**写法**\n\n```go\nOuter:\n\tfor i := range grid {\n\t\tfor j := range grid[i] {\n\t\t\tif grid[i][j] == target {\n\t\t\t\tbreak Outer   // 跳出两层循环\n\t\t\t}\n\t\t\tif grid[i][j] \u003c 0 {\n\t\t\t\tcontinue Outer // 直接进入外层的下一次迭代\n\t\t\t}\n\t\t}\n\t}\n```\n\n**例子：select 里退出循环**\n\n```go\nLoop:\n\tfor {\n\t\tselect {\n\t\tcase v, ok := \u003c-ch:\n\t\t\tif !ok {\n\t\t\t\tbreak Loop // 只写 break 只会跳出 select\n\t\t\t}\n\t\t\tsum += v\n\t\tcase \u003c-timeout:\n\t\t\tbreak Loop\n\t\t}\n\t}\n```\n\n**注意**\n\n- 标签名习惯首字母大写；定义了但没用到的标签会编译报错。\n- `goto` 也能用标签，但几乎不推荐；`break / continue 标签` 是正常、清晰的写法。\n- 很多时候把内层逻辑抽成函数、用 `return` 退出，代码更好读。"
+    },
+    {
+      "id": "defer",
+      "name": "defer 延迟执行",
+      "group": "流程控制",
+      "body": "`defer` 把一个函数调用推迟到**当前函数返回前**执行，多个 defer 按**后进先出**顺序执行。主要用于释放资源：解锁、关闭文件、结束 span、`recover`。\n\n**写法**\n\n```go\nmu.Lock()\ndefer mu.Unlock()\n\nf, err := os.Open(name)\nif err != nil {\n\treturn err\n}\ndefer f.Close()\n\ndefer func() { log.Println(\"done\") }()\n```\n\n**例子**\n\n```go\nfunc demo() (n int) {\n\tdefer func() { n *= 2 }() // 可以修改命名返回值\n\tfor i := 1; i \u003c= 3; i++ {\n\t\tdefer fmt.Print(i, \" \")  // 输出 3 2 1\n\t}\n\treturn 5                  // 先把 n 设为 5，再执行 defer，最终返回 10\n}\n```\n\n**注意**\n\n- **参数在 defer 语句执行时就求值了**：`defer fmt.Println(i)` 打印的是当时的 i；想用最终值就用闭包 `defer func() { fmt.Println(i) }()`。\n- 不要在长循环里 `defer`：所有 defer 要等函数结束才执行，资源会一直占着。把循环体抽成函数。\n- 函数 panic 时 defer 仍然会执行，所以锁、文件不会泄漏。\n- `return x` 的执行顺序是：给返回值赋值 → 执行 defer → 真正返回。所以 defer 只能通过**命名返回值**改变结果。"
+    },
+    {
+      "id": "range-slice",
+      "name": "range 遍历切片 / 数组",
+      "group": "range 遍历",
+      "body": "`for i, v := range s` 同时拿到下标和元素的**副本**。只要下标写 `for i := range s`，只要元素写 `for _, v := range s`。\n\n**写法**\n\n```go\nfor i, v := range nums { }\nfor i := range nums { }       // 只要下标\nfor _, v := range nums { }    // 只要值\nfor range nums { }            // 只是循环 len 次\n```\n\n**例子**\n\n```go\nfunc twoSum(nums []int, target int) []int {\n\tseen := map[int]int{}\n\tfor i, n := range nums {\n\t\tif j, ok := seen[target-n]; ok {\n\t\t\treturn []int{j, i}\n\t\t}\n\t\tseen[n] = i\n\t}\n\treturn nil\n}\n```\n\n**注意**\n\n- `v` 是元素的**拷贝**，修改 `v` 不会改变切片。要修改元素写 `s[i] = ...`；元素是大结构体时用下标访问 `\u0026s[i]` 也能避免拷贝。\n- `range` 开始时就确定了长度，循环中 `append` 不会让循环变长。\n- Go 1.22 起每次迭代的 `i`、`v` 是新变量，在闭包、goroutine 里捕获它们是安全的。\n- 遍历数组 `range arr` 时会先**复制整个数组**；大数组用 `range \u0026arr` 或 `range arr[:]`。"
+    },
+    {
+      "id": "range-map",
+      "name": "range 遍历 map",
+      "group": "range 遍历",
+      "body": "`for k, v := range m` 遍历 map 的键值对。**遍历顺序是随机的**，每次运行都可能不同。\n\n**写法**\n\n```go\nfor k, v := range m { }\nfor k := range m { }   // 只要键\n```\n\n**例子：按 key 排序后输出**\n\n```go\nkeys := make([]string, 0, len(m))\nfor k := range m {\n\tkeys = append(keys, k)\n}\nslices.Sort(keys) // 需要稳定顺序时先排序\nfor _, k := range keys {\n\tfmt.Println(k, m[k])\n}\n```\n\nGo 1.23 起也可以写 `slices.Sorted(maps.Keys(m))`。\n\n**注意**\n\n- 不要依赖 map 遍历顺序（测试里断言输出顺序会时好时坏）。\n- 遍历时 `delete` 当前或其他键是安全的；遍历时**新增**的键可能被遍历到也可能不会。\n- 并发读写 map 会直接 fatal（不是 panic，无法 recover），需要加锁或用 `sync.Map`。"
+    },
+    {
+      "id": "range-string",
+      "name": "range 遍历字符串",
+      "group": "range 遍历",
+      "body": "`for i, r := range s` 按 **UTF-8 解码**遍历字符串：`i` 是这个字符在字节序列中的**起始字节下标**，`r` 是 `rune`（Unicode 码点）。\n\n**写法**\n\n```go\nfor i, r := range \"Go语言\" {\n\tfmt.Println(i, string(r))\n}\n// 0 G\n// 1 o\n// 2 语   ← 中文占 3 个字节\n// 5 言\n```\n\n**对比按字节遍历**\n\n```go\nfor i := 0; i \u003c len(s); i++ {\n\tb := s[i] // byte，中文会被拆成 3 个字节\n}\n```\n\n**例子：统计字符个数**\n\n```go\nfunc countRunes(s string) int {\n\tn := 0\n\tfor range s {\n\t\tn++\n\t}\n\treturn n // 等价于 utf8.RuneCountInString(s)\n}\n```\n\n**注意**\n\n- `len(s)` 是字节数，不是字符数。\n- 遇到非法 UTF-8 字节时，`r` 是 `utf8.RuneError`（U+FFFD），`i` 前进 1 个字节。\n- 题目只包含 ASCII（如小写字母）时，按字节遍历 `s[i]` 更快也更简单。"
+    },
+    {
+      "id": "range-chan",
+      "name": "range 读取 channel",
+      "group": "range 遍历",
+      "body": "`for v := range ch` 不断从 channel 接收值，**直到 channel 被关闭且缓冲区读空**才退出循环。它是消费者最常用的写法。\n\n**写法**\n\n```go\nfor v := range ch {\n\thandle(v)\n}\n```\n\n**例子：生产者-消费者**\n\n```go\nch := make(chan int)\ngo func() {\n\tdefer close(ch)       // 生产者负责关闭，range 才能结束\n\tfor i := 0; i \u003c 3; i++ {\n\t\tch \u003c- i\n\t}\n}()\nfor v := range ch {\n\tfmt.Println(v)        // 0 1 2\n}\n```\n\n**注意**\n\n- **没有人 close，range 就永远阻塞**：所有 goroutine 都在等时会报 `all goroutines are asleep - deadlock!`，否则就是 goroutine 泄漏。\n- 只能有一个“关闭者”，通常是发送方；多个发送方时用 `sync.WaitGroup` 等它们都结束后再关闭。\n- `range ch` 只返回一个值（没有下标）。\n- 需要同时响应取消信号时，用 `for { select { ... } }` 代替 `range`。"
+    },
+    {
+      "id": "range-int",
+      "name": "range 整数（Go 1.22+）",
+      "group": "range 遍历",
+      "body": "Go 1.22 起可以直接 `range` 一个整数 `n`，得到 `0, 1, ..., n-1`，是 `for i := 0; i \u003c n; i++` 的简写。\n\n**写法**\n\n```go\nfor i := range 10 { }  // i 从 0 到 9\nfor range 3 { }        // 只是重复 3 次\n```\n\n**例子**\n\n```go\nvar wg sync.WaitGroup\nfor i := range 5 {\n\twg.Add(1)\n\tgo func() {\n\t\tdefer wg.Done()\n\t\tfmt.Println(i) // 1.22 起每次迭代都是新的 i，不需要传参\n\t}()\n}\nwg.Wait()\n```\n\n**注意**\n\n- 需要 `go.mod` 里 `go` 版本 ≥ 1.22。\n- `n` 小于等于 0 时循环一次也不执行。\n- `i` 的类型和 `n` 相同：`range int64(5)` 得到 `int64`。"
+    },
+    {
+      "id": "range-func",
+      "name": "range 迭代器函数（Go 1.23+）",
+      "group": "range 遍历",
+      "body": "Go 1.23 起，`range` 可以遍历特定签名的**函数**（迭代器）。标准库 `iter` 包定义了 `iter.Seq[V]`（`func(yield func(V) bool)`）和 `iter.Seq2[K, V]`。\n\n**写法**\n\n```go\n// 定义一个迭代器：每产出一个值就调用 yield，yield 返回 false 表示调用方 break 了\nfunc Count(n int) iter.Seq[int] {\n\treturn func(yield func(int) bool) {\n\t\tfor i := 0; i \u003c n; i++ {\n\t\t\tif !yield(i) {\n\t\t\t\treturn\n\t\t\t}\n\t\t}\n\t}\n}\n\nfor v := range Count(3) { } // 0 1 2\n```\n\n**例子：遍历链表**\n\n```go\nfunc (l *List) All() iter.Seq[int] {\n\treturn func(yield func(int) bool) {\n\t\tfor n := l.head; n != nil; n = n.next {\n\t\t\tif !yield(n.val) {\n\t\t\t\treturn\n\t\t\t}\n\t\t}\n\t}\n}\n\nfor v := range list.All() {\n\tif v \u003e 10 {\n\t\tbreak // 会让 yield 返回 false\n\t}\n}\n```\n\n**注意**\n\n- **yield 返回 false 后必须立即停止**，继续调用会 panic。\n- 标准库里已经有很多迭代器：`maps.Keys(m)`、`slices.Values(s)`、`slices.Sorted(seq)`、`strings.SplitSeq`（1.24）等。\n- 迭代器适合“惰性产出 + 可提前停止”的场景，普通情况下返回切片更直白。"
+    },
+    {
+      "id": "multi-return",
+      "name": "多返回值",
+      "group": "函数",
+      "body": "Go 函数可以返回多个值，最常见的是 `(结果, error)` 和 `(值, bool)`。调用方必须接收全部返回值（不要的用 `_`）。\n\n**写法**\n\n```go\nfunc divmod(a, b int) (int, int) {\n\treturn a / b, a % b\n}\n\nq, r := divmod(7, 3)   // 2 1\nq, _ = divmod(9, 2)    // 不需要的值用 _ 丢弃\n```\n\n**例子**\n\n```go\nfunc minMax(nums []int) (lo, hi int, ok bool) {\n\tif len(nums) == 0 {\n\t\treturn 0, 0, false\n\t}\n\tlo, hi = nums[0], nums[0]\n\tfor _, n := range nums[1:] {\n\t\tlo, hi = min(lo, n), max(hi, n)\n\t}\n\treturn lo, hi, true\n}\n```\n\n**注意**\n\n- `error` 惯例放在**最后一个**返回值。\n- 一个多返回值的调用可以直接作为另一个函数的全部参数：`f(g())`，前提是参数个数和类型完全对应。\n- 返回值超过 3 个通常说明该定义一个结构体了。"
+    },
+    {
+      "id": "named-return",
+      "name": "命名返回值",
+      "group": "函数",
+      "body": "给返回值起名字后，它们在函数开头就被声明并初始化为零值，可以直接赋值，最后写一个空的 `return`（裸返回）。\n\n**写法**\n\n```go\nfunc split(sum int) (x, y int) {\n\tx = sum * 4 / 9\n\ty = sum - x\n\treturn // 返回当前的 x, y\n}\n```\n\n**例子：defer 里统一处理错误**\n\n```go\nfunc copyFile(dst, src string) (err error) {\n\tin, err := os.Open(src)\n\tif err != nil {\n\t\treturn err\n\t}\n\tdefer in.Close()\n\n\tout, err := os.Create(dst)\n\tif err != nil {\n\t\treturn err\n\t}\n\tdefer func() {\n\t\t// Close 失败（比如磁盘满了写不进去）也要报告出来\n\t\tif cerr := out.Close(); cerr != nil \u0026\u0026 err == nil {\n\t\t\terr = cerr\n\t\t}\n\t}()\n\t_, err = io.Copy(out, in)\n\treturn err\n}\n```\n\n**注意**\n\n- 命名返回值最有用的场景是**在 defer 里修改返回值**（错误包装、recover 后设置 err）。\n- 长函数里用裸 `return` 会让人不清楚到底返回了什么，建议显式写出返回值。\n- 小心在内层作用域用 `:=` 遮蔽了命名返回值，编译器会对裸 return 报错 `result parameter err not in scope at return`。"
+    },
+    {
+      "id": "func-value",
+      "name": "函数是一等值",
+      "group": "函数",
+      "body": "函数可以赋值给变量、作为参数传递、作为返回值，也可以放进 map、结构体字段里。函数类型写作 `func(参数) 返回值`。\n\n**写法**\n\n```go\nvar op func(int, int) int = add\nops := map[string]func(int, int) int{\n\t\"+\": func(a, b int) int { return a + b },\n\t\"-\": func(a, b int) int { return a - b },\n}\nfmt.Println(ops[\"+\"](1, 2)) // 3\n\nfunc apply(nums []int, f func(int) int) { }\n```\n\n**例子：中间件**\n\n```go\ntype Handler func(string) string\n\nfunc Logging(next Handler) Handler {\n\treturn func(s string) string {\n\t\tlog.Println(\"in:\", s)\n\t\treturn next(s)\n\t}\n}\n```\n\n**注意**\n\n- 函数类型的零值是 `nil`，调用 nil 函数会 panic，可选回调要先判空。\n- 函数之间不能用 `==` 比较（只能和 nil 比），所以函数不能当 map 的 key。\n- 方法也能当值用：`f := obj.Method`（见「方法值」）。"
+    },
+    {
+      "id": "closure",
+      "name": "匿名函数与闭包",
+      "group": "函数",
+      "body": "`func(...) { ... }` 可以在函数内部直接定义匿名函数。匿名函数能访问外层的变量，并且**捕获的是变量本身（引用），不是值的拷贝**，这就是闭包。\n\n**写法**\n\n```go\nadd := func(a, b int) int { return a + b }\nfunc() { fmt.Println(\"立即执行\") }()\ngo func() { ... }()\ndefer func() { ... }()\n```\n\n**例子：计数器**\n\n```go\nfunc counter() func() int {\n\tn := 0\n\treturn func() int {\n\t\tn++        // 修改的是外层的 n，n 会一直活着\n\t\treturn n\n\t}\n}\n\nc := counter()\nc(); c()\nfmt.Println(c()) // 3\n```\n\n**例子：排序用的比较函数**\n\n```go\nslices.SortFunc(people, func(a, b Person) int {\n\treturn cmp.Compare(a.Age, b.Age)\n})\n```\n\n**注意**\n\n- 多个闭包共享同一个外层变量；在 goroutine 里修改捕获的变量需要加锁。\n- Go 1.22 之前，循环里启动 goroutine 捕获循环变量 `i` 会全部拿到最后一个值，需要 `i := i` 或传参；1.22 起每次迭代都是新变量。\n- 被闭包捕获的变量会逃逸到堆上，热点路径里大量创建闭包会增加 GC 压力。"
+    },
+    {
+      "id": "recursive-closure",
+      "name": "递归的闭包",
+      "group": "函数",
+      "body": "匿名函数要递归调用自己，必须**先用 `var` 声明变量，再赋值**。因为 `f := func() { f() }` 里，右边的函数体还看不到正在声明的 `f`。\n\n**写法**\n\n```go\nvar dfs func(node *TreeNode) int\ndfs = func(node *TreeNode) int {\n\tif node == nil {\n\t\treturn 0\n\t}\n\treturn 1 + max(dfs(node.Left), dfs(node.Right))\n}\n```\n\n**例子：DFS 时直接修改外层结果**\n\n```go\nfunc diameterOfBinaryTree(root *TreeNode) int {\n\tbest := 0\n\tvar depth func(*TreeNode) int\n\tdepth = func(n *TreeNode) int {\n\t\tif n == nil {\n\t\t\treturn 0\n\t\t}\n\t\tl, r := depth(n.Left), depth(n.Right)\n\t\tbest = max(best, l+r) // 闭包可以直接更新外层的 best\n\t\treturn 1 + max(l, r)\n\t}\n\tdepth(root)\n\treturn best\n}\n```\n\n**注意**\n\n- 这种写法在 LeetCode 树、回溯、DFS 题里非常常见，好处是不用把 `best`、`visited`、`path` 等状态一层层传参。\n- 也可以写成普通的具名函数 + 参数传状态，二者选一个最清晰的即可。\n- 递归太深（比如链表长度 10⁶）可能栈增长很多，Go 的栈会自动扩容，但仍然有上限（默认 1GB）。"
+    },
+    {
+      "id": "variadic",
+      "name": "可变参数 ...",
+      "group": "函数",
+      "body": "参数类型前加 `...`，函数就能接收任意个该类型的参数，在函数内它是一个**切片**。调用时把已有切片展开要写 `s...`。\n\n**写法**\n\n```go\nfunc sum(nums ...int) int {\n\ttotal := 0\n\tfor _, n := range nums {\n\t\ttotal += n\n\t}\n\treturn total\n}\n\nsum()            // 0\nsum(1, 2, 3)     // 6\nxs := []int{4, 5}\nsum(xs...)       // 展开切片\ns = append(s, other...) // append 也是可变参数\n```\n\n**例子：函数选项模式**\n\n```go\ntype Option func(*Server)\n\nfunc WithPort(p int) Option { return func(s *Server) { s.port = p } }\n\nfunc NewServer(opts ...Option) *Server {\n\ts := \u0026Server{port: 80}\n\tfor _, opt := range opts {\n\t\topt(s)\n\t}\n\treturn s\n}\n```\n\n**注意**\n\n- 可变参数必须是**最后一个**参数。\n- `f(xs...)` 不会复制切片，函数内修改元素会影响调用方的切片。\n- `fmt.Println(args...)` 要求 `args` 是 `[]any`；`[]string` 不能直接展开传给 `...any`。"
+    },
+    {
+      "id": "array",
+      "name": "数组 [N]T",
+      "group": "数组、切片与字符串",
+      "body": "数组长度是**类型的一部分**：`[3]int` 和 `[4]int` 是不同类型。数组是值类型，赋值和传参都会复制整个数组。\n\n**写法**\n\n```go\nvar a [26]int              // 26 个 0\nb := [3]string{\"a\", \"b\", \"c\"}\nc := [...]int{1, 2, 3}     // 长度由元素个数推导\nd := [5]int{1: 10, 3: 30}  // 指定下标初始化\n```\n\n**例子：字母计数（异位词判断）**\n\n```go\nfunc isAnagram(s, t string) bool {\n\tvar cnt [26]int\n\tfor i := 0; i \u003c len(s); i++ {\n\t\tcnt[s[i]-'a']++\n\t}\n\tfor i := 0; i \u003c len(t); i++ {\n\t\tcnt[t[i]-'a']--\n\t}\n\treturn cnt == [26]int{} // 数组可以直接用 == 比较\n}\n```\n\n**注意**\n\n- 数组能用 `==` 比较、能当 map 的 key（如 `map[[26]int][]string` 给异位词分组），切片都不行。\n- 固定大小的计数表用数组比 map 快很多，也不需要 `make`。\n- 传参会复制整个数组，大数组请传指针或切片 `a[:]`。"
+    },
+    {
+      "id": "slice-make",
+      "name": "make 创建切片",
+      "group": "数组、切片与字符串",
+      "body": "切片是对底层数组的一个“视图”，包含三部分：指针、长度 `len`、容量 `cap`。`make([]T, len, cap)` 创建指定长度和容量的切片，元素是零值。\n\n**写法**\n\n```go\ns := make([]int, 5)        // len=5 cap=5，[0 0 0 0 0]\ns := make([]int, 0, 10)    // len=0 cap=10，准备 append\ns := []int{1, 2, 3}        // 字面量\nvar s []int                // nil 切片\n```\n\n**例子**\n\n```go\n// 已知结果长度：make 定长后按下标赋值\nsquares := make([]int, len(nums))\nfor i, n := range nums {\n\tsquares[i] = n * n\n}\n\n// 只知道上限：预分配容量，再 append\nevens := make([]int, 0, len(nums))\nfor _, n := range nums {\n\tif n%2 == 0 {\n\t\tevens = append(evens, n)\n\t}\n}\n```\n\n**注意**\n\n- **常见 bug**：`s := make([]int, n)` 之后又 `append`，结果前面多出 n 个 0。定长就用下标赋值，不定长用 `make([]int, 0, n)`。\n- 预分配容量能避免 append 过程中反复扩容拷贝，是简单有效的性能优化。\n- `len(nil切片) == 0`，可以直接 range、append，不需要先判空。"
+    },
+    {
+      "id": "slice-expr",
+      "name": "切片表达式 s[i:j]",
+      "group": "数组、切片与字符串",
+      "body": "`s[i:j]` 取下标 `[i, j)` 的元素（左闭右开），得到的新切片和原切片**共享同一个底层数组**。字符串也能这样截取子串。\n\n**写法**\n\n```go\ns[1:3]   // 下标 1、2\ns[:3]    // 前 3 个\ns[2:]    // 从下标 2 到末尾\ns[:]     // 整个\ns[:len(s)-1] // 去掉最后一个（栈的 pop）\ns[1:]        // 去掉第一个（队列的 pop）\n```\n\n**例子：栈和队列**\n\n```go\nstack := []int{}\nstack = append(stack, 1, 2)     // push\ntop := stack[len(stack)-1]      // peek\nstack = stack[:len(stack)-1]    // pop\n\nqueue := []int{1, 2, 3}\nhead := queue[0]\nqueue = queue[1:]               // 出队\n```\n\n**注意**\n\n- **共享底层数组**：修改子切片的元素会影响原切片；对子切片 `append` 在容量足够时会覆盖原切片后面的元素。\n- 想要独立的副本：`out := append([]int(nil), s[i:j]...)` 或 `slices.Clone(s[i:j])`。\n- 从大切片里截取一小段长期保存，会让整个大数组无法被回收（内存泄漏），这时应该复制出来。\n- 越界（`j \u003e cap(s)` 或 `i \u003e j`）会 panic。"
+    },
+    {
+      "id": "slice-full",
+      "name": "完整切片表达式 s[i:j:k]",
+      "group": "数组、切片与字符串",
+      "body": "`s[i:j:k]` 额外限制新切片的容量为 `k-i`。这样对它 `append` 时一旦超出 `j`，就会**分配新数组**，不会覆盖原切片 `j` 之后的数据。\n\n**写法**\n\n```go\nsub := s[i:j:j]   // 容量 = 长度，append 必定复制\n```\n\n**例子：安全地返回子切片**\n\n```go\ns := []int{1, 2, 3, 4, 5}\na := s[0:2]        // len 2, cap 5\na = append(a, 99)  // 覆盖了 s[2]！s 变成 [1 2 99 4 5]\n\ns = []int{1, 2, 3, 4, 5}\nb := s[0:2:2]      // len 2, cap 2\nb = append(b, 99)  // 容量不够，分配新数组；s 不变\n```\n\n**注意**\n\n- 适合“把内部切片的一部分交给调用方，但不希望调用方 append 影响内部数据”的场景。\n- 字符串不支持三索引切片。\n- 它只防住了 append 覆盖，修改已有元素 `b[0] = x` 仍然会影响原切片（扩容之前）。"
+    },
+    {
+      "id": "append",
+      "name": "append 追加元素",
+      "group": "数组、切片与字符串",
+      "body": "`append(s, 元素...)` 在切片末尾追加元素并**返回新切片**。容量不够时会分配更大的数组并复制旧数据。\n\n**写法**\n\n```go\ns = append(s, 1)\ns = append(s, 1, 2, 3)\ns = append(s, other...)            // 拼接两个切片\ns = append(s[:i], s[i+1:]...)      // 删除下标 i（会修改原底层数组）\ns = append(s[:i], append([]int{x}, s[i:]...)...) // 在 i 处插入（slices.Insert 更清晰）\n```\n\n**例子：回溯里保存路径的副本**\n\n```go\nvar res [][]int\nvar path []int\nvar dfs func(start int)\ndfs = func(start int) {\n\tres = append(res, append([]int(nil), path...)) // 必须复制！\n\tfor i := start; i \u003c len(nums); i++ {\n\t\tpath = append(path, nums[i])\n\t\tdfs(i + 1)\n\t\tpath = path[:len(path)-1]\n\t}\n}\n```\n\n**注意**\n\n- **必须接收返回值**：`append(s, x)` 不赋值回去等于什么都没做（编译器会报 unused）。\n- 回溯题里直接 `res = append(res, path)` 是经典 bug：之后修改 path 会改掉已保存的结果，必须复制一份。\n- 扩容策略：小切片大约翻倍，大切片按约 1.25 倍增长；不要依赖具体数值。\n- 两个切片共享底层数组时，各自 append 可能互相覆盖，见「切片表达式」。"
+    },
+    {
+      "id": "copy",
+      "name": "copy 复制切片",
+      "group": "数组、切片与字符串",
+      "body": "`copy(dst, src)` 把 `src` 的元素复制到 `dst`，复制的个数是 `min(len(dst), len(src))`，返回实际复制的数量。\n\n**写法**\n\n```go\ndst := make([]int, len(src))\ncopy(dst, src)\n\nn := copy(buf, \"hello\")   // 也能从字符串复制到 []byte\ncopy(s[i:], s[i+1:])      // 原地左移，删除下标 i\ns = s[:len(s)-1]\n```\n\n**例子：轮转数组**\n\n```go\nfunc rotate(nums []int, k int) {\n\tn := len(nums)\n\tk %= n\n\ttmp := make([]int, n)\n\tcopy(tmp, nums[n-k:])     // 后 k 个放到前面\n\tcopy(tmp[k:], nums[:n-k]) // 其余接在后面\n\tcopy(nums, tmp)\n}\n```\n\n**注意**\n\n- `dst` 的**长度**决定能复制多少：`dst := make([]int, 0, 10)` 再 `copy` 一个都不会复制（len 是 0）。\n- `src` 和 `dst` 重叠也能正确处理（和 memmove 一样）。\n- 复制整个切片更简单的写法：`slices.Clone(s)`。"
+    },
+    {
+      "id": "slice2d",
+      "name": "二维切片",
+      "group": "数组、切片与字符串",
+      "body": "Go 没有内置的二维数组切片，`[][]T` 是“切片的切片”，**每一行都要单独 make**。\n\n**写法**\n\n```go\ngrid := make([][]int, m)\nfor i := range grid {\n\tgrid[i] = make([]int, n)\n}\n\n// 一次分配，行之间共享同一块内存（更省分配次数）\nflat := make([]int, m*n)\nfor i := range grid {\n\tgrid[i] = flat[i*n : (i+1)*n]\n}\n```\n\n**例子：动态规划表**\n\n```go\nfunc uniquePaths(m, n int) int {\n\tdp := make([][]int, m)\n\tfor i := range dp {\n\t\tdp[i] = make([]int, n)\n\t\tdp[i][0] = 1\n\t}\n\tfor j := range n {\n\t\tdp[0][j] = 1\n\t}\n\tfor i := 1; i \u003c m; i++ {\n\t\tfor j := 1; j \u003c n; j++ {\n\t\t\tdp[i][j] = dp[i-1][j] + dp[i][j-1]\n\t\t}\n\t}\n\treturn dp[m-1][n-1]\n}\n```\n\n**注意**\n\n- 只 `make([][]int, m)` 不初始化每行，访问 `grid[i][j]` 会 panic（每行都是 nil）。\n- 遍历时 `len(grid)` 是行数，`len(grid[0])` 是列数（先确认 grid 非空）。\n- 方向数组是网格题的常用技巧：`dirs := [][2]int{{0, 1}, {1, 0}, {0, -1}, {-1, 0}}`。"
+    },
+    {
+      "id": "builtin-minmax",
+      "name": "内置 min / max（Go 1.21+）",
+      "group": "数组、切片与字符串",
+      "body": "Go 1.21 起 `min`、`max` 是内置函数，接受**一个或多个**同类型的有序值（整数、浮点、字符串）。\n\n**写法**\n\n```go\nm := min(a, b)\nm := max(a, b, c)\nbest = max(best, cur)\nlo := min(x, 0) // 常量会自动转换成 x 的类型\n```\n\n**例子**\n\n```go\nfunc maxProfit(prices []int) int {\n\tlowest, profit := prices[0], 0\n\tfor _, p := range prices {\n\t\tlowest = min(lowest, p)\n\t\tprofit = max(profit, p-lowest)\n\t}\n\treturn profit\n}\n```\n\n**注意**\n\n- 它们不接收切片：求切片最大值用 `slices.Max(s)`（空切片会 panic）。\n- 1.21 之前要自己写 `func max(a, b int) int`；在旧代码里看到这类辅助函数不要奇怪。\n- 浮点数里有 NaN 时结果是 NaN。"
+    },
+    {
+      "id": "rune",
+      "name": "byte 与 rune",
+      "group": "数组、切片与字符串",
+      "body": "`byte` 是 `uint8` 的别名，表示一个字节；`rune` 是 `int32` 的别名，表示一个 Unicode 码点。单引号字面量 `'a'` 的类型是 rune。\n\n**写法**\n\n```go\nvar b byte = s[0]     // 取第 i 个字节\nr := 'a'              // rune，值是 97\nidx := s[i] - 'a'     // 小写字母转 0~25\nc := byte('a' + 2)    // 'c'\nunicode.IsLetter(r)\nunicode.ToLower(r)\n```\n\n**例子：判断回文（只看字母和数字）**\n\n```go\nfunc isPalindrome(s string) bool {\n\trs := []rune{}\n\tfor _, r := range s {\n\t\tif unicode.IsLetter(r) || unicode.IsDigit(r) {\n\t\t\trs = append(rs, unicode.ToLower(r))\n\t\t}\n\t}\n\tfor i, j := 0, len(rs)-1; i \u003c j; i, j = i+1, j-1 {\n\t\tif rs[i] != rs[j] {\n\t\t\treturn false\n\t\t}\n\t}\n\treturn true\n}\n```\n\n**注意**\n\n- `s[i]` 得到的是 **byte**，对中文等多字节字符会拆开；需要按字符处理时用 `range s` 或 `[]rune(s)`。\n- `'a' - 'A'` 是 32，大小写转换可以 `c - 'a' + 'A'`，但处理任意文字时用 `unicode` 包更安全。\n- `string(r)` 把一个 rune 转成字符串；`string(65)` 是 `\"A\"`，**不是** `\"65\"`。"
+    },
+    {
+      "id": "string-bytes",
+      "name": "字符串与 []byte / []rune 互转",
+      "group": "数组、切片与字符串",
+      "body": "Go 的字符串是**不可变**的字节序列。要修改内容，先转成 `[]byte` 或 `[]rune`，改完再转回 `string`。每次转换都会**复制数据**。\n\n**写法**\n\n```go\nb := []byte(s)    // 按字节，适合 ASCII\nr := []rune(s)    // 按字符，适合中文等\ns2 := string(b)\ns3 := string(r)\n```\n\n**例子：反转字符串（支持中文）**\n\n```go\nfunc reverse(s string) string {\n\tr := []rune(s)\n\tfor i, j := 0, len(r)-1; i \u003c j; i, j = i+1, j-1 {\n\t\tr[i], r[j] = r[j], r[i]\n\t}\n\treturn string(r)\n}\n\nfmt.Println(reverse(\"Go语言\")) // 言语oG\n```\n\n**注意**\n\n- `s[0] = 'x'` 编译报错：字符串不能修改。\n- 用 `[]byte` 反转中文会得到乱码，因为一个汉字是 3 个字节。\n- 热点路径里频繁 `string(b)` / `[]byte(s)` 会产生大量分配；拼接用 `strings.Builder`，比较时 `bytes.Equal` 或编译器优化过的 `string(b) == s` 不会分配。\n- 字符串常用操作见 `strings` 包；字节切片对应 `bytes` 包，函数名几乎一样。"
+    },
+    {
+      "id": "strings",
+      "name": "strings 包常用函数",
+      "group": "数组、切片与字符串",
+      "body": "`strings` 包提供字符串的查找、切分、替换、修剪等操作，`bytes` 包对 `[]byte` 提供同名函数，`unicode` 包判断字符类别。\n\n**常用函数**\n\n```go\nstrings.Contains(s, \"go\")         // 是否包含\nstrings.HasPrefix(s, \"http://\")   // 前缀 / 后缀：HasSuffix\nstrings.Index(s, \"x\")             // 第一次出现的字节下标，没有返回 -1\nstrings.Split(\"a,b,c\", \",\")       // [a b c]\nstrings.Fields(\"  a  b \")         // 按空白切分并去掉空串：[a b]\nstrings.Join([]string{\"a\", \"b\"}, \"-\") // a-b\nstrings.TrimSpace(s)              // 去掉首尾空白；Trim / TrimPrefix / TrimSuffix\nstrings.ReplaceAll(s, \"a\", \"b\")\nstrings.ToLower(s)                // ToUpper\nstrings.Repeat(\"ab\", 3)           // ababab\nstrings.Cut(\"k=v\", \"=\")           // \"k\", \"v\", true（Go 1.18+）\nstrings.EqualFold(\"Go\", \"GO\")     // 忽略大小写比较\n```\n\n**例子：解析 \"key=value\" 列表**\n\n```go\nfunc parse(s string) map[string]string {\n\tm := map[string]string{}\n\tfor _, part := range strings.Split(s, \";\") {\n\t\tk, v, ok := strings.Cut(strings.TrimSpace(part), \"=\")\n\t\tif ok {\n\t\t\tm[k] = v\n\t\t}\n\t}\n\treturn m\n}\n```\n\n**注意**\n\n- `Split(\"\", \",\")` 返回 `[\"\"]`（长度 1），不是空切片；`Fields` 对空串返回空切片。\n- `TrimLeft(s, \"ab\")` 删除的是**字符集合**中的字符，不是前缀；去前缀用 `TrimPrefix`。\n- 下标都是**字节**下标。\n- 循环里用 `+=` 拼接字符串是 O(n²)，用 `strings.Builder` 或 `strings.Join`。"
+    },
+    {
+      "id": "strings-builder",
+      "name": "strings.Builder / bytes.Buffer",
+      "group": "数组、切片与字符串",
+      "body": "`strings.Builder` 用于高效拼接字符串：内部维护一个 `[]byte`，最后 `String()` **不复制**直接得到结果。`bytes.Buffer` 类似，同时还能当 `io.Reader` 读出数据。\n\n**写法**\n\n```go\nvar sb strings.Builder        // 零值可用\nsb.Grow(64)                   // 可选：预分配\nsb.WriteString(\"hello\")\nsb.WriteByte(' ')\nsb.WriteRune('世')\nfmt.Fprintf(\u0026sb, \"%d\", 42)    // Builder 实现了 io.Writer\ns := sb.String()\n```\n\n**例子：压缩字符串 aabccc → a2bc3**\n\n```go\nfunc compress(s string) string {\n\tvar sb strings.Builder\n\tfor i := 0; i \u003c len(s); {\n\t\tj := i\n\t\tfor j \u003c len(s) \u0026\u0026 s[j] == s[i] {\n\t\t\tj++\n\t\t}\n\t\tsb.WriteByte(s[i])\n\t\tif j-i \u003e 1 {\n\t\t\tsb.WriteString(strconv.Itoa(j - i))\n\t\t}\n\t\ti = j\n\t}\n\treturn sb.String()\n}\n```\n\n**注意**\n\n- `strings.Builder` **不能复制**（复制后再写会 panic），传参要用指针 `*strings.Builder`。\n- 它不是并发安全的。\n- 只是拼接几个固定的片段，`+` 或 `fmt.Sprintf` 就够了；循环拼接才需要 Builder。"
+    },
+    {
+      "id": "strconv",
+      "name": "strconv 数字与字符串互转",
+      "group": "数组、切片与字符串",
+      "body": "`strconv` 负责数字、布尔和字符串之间的转换，比 `fmt.Sprintf` / `fmt.Sscanf` 更快、错误更明确。\n\n**常用函数**\n\n```go\nn, err := strconv.Atoi(\"123\")             // string → int\ns := strconv.Itoa(123)                    // int → string\ni, err := strconv.ParseInt(\"ff\", 16, 64)  // 指定进制和位数\ns := strconv.FormatInt(255, 2)            // \"11111111\"\nf, err := strconv.ParseFloat(\"3.14\", 64)\nb, err := strconv.ParseBool(\"true\")\nq := strconv.Quote(`a\"b`)                 // 结果是 \"a\\\"b\"：加上引号并转义\n```\n\n**例子：逆波兰表达式求值**\n\n```go\nfunc evalRPN(tokens []string) int {\n\tvar st []int\n\tfor _, t := range tokens {\n\t\tif n, err := strconv.Atoi(t); err == nil {\n\t\t\tst = append(st, n)\n\t\t\tcontinue\n\t\t}\n\t\ta, b := st[len(st)-2], st[len(st)-1]\n\t\tst = st[:len(st)-2]\n\t\tswitch t {\n\t\tcase \"+\":\n\t\t\tst = append(st, a+b)\n\t\tcase \"-\":\n\t\t\tst = append(st, a-b)\n\t\tcase \"*\":\n\t\t\tst = append(st, a*b)\n\t\tdefault:\n\t\t\tst = append(st, a/b)\n\t\t}\n\t}\n\treturn st[0]\n}\n```\n\n**注意**\n\n- **不要用 `string(n)` 把数字转字符串**，那是按码点转字符（`string(65) == \"A\"`），`go vet` 也会警告。\n- 解析失败返回的错误是 `*strconv.NumError`，可以用 `errors.Is(err, strconv.ErrRange)` 判断溢出。\n- `Atoi` 接受前导 `+` / `-`，不接受空格，需要先 `TrimSpace`。"
+    },
+    {
+      "id": "map",
+      "name": "map 字典",
+      "group": "map",
+      "body": "`map[K]V` 是哈希表：按 key 查找、插入、删除平均 O(1)。key 必须是**可比较**的类型（数字、字符串、指针、数组、只含可比较字段的结构体等），切片、map、函数不能做 key。\n\n**写法**\n\n```go\nm := map[string]int{}             // 空 map\nm := make(map[string]int, 100)    // 预估容量\nm := map[string]int{\"a\": 1, \"b\": 2}\nm[\"c\"] = 3                        // 插入 / 更新\nv := m[\"x\"]                       // 不存在时返回零值 0\ndelete(m, \"a\")                    // 删除，不存在也不报错\nn := len(m)\nclear(m)                          // Go 1.21+：清空\n```\n\n**例子：词频统计**\n\n```go\nfunc wordCount(s string) map[string]int {\n\tcnt := map[string]int{}\n\tfor _, w := range strings.Fields(s) {\n\t\tcnt[w]++ // 不存在时从零值 0 开始加，不需要先判断\n\t}\n\treturn cnt\n}\n```\n\n**例子：值是切片的分组**\n\n```go\ngroups := map[string][]string{}\nfor _, s := range strs {\n\tkey := sortString(s)\n\tgroups[key] = append(groups[key], s) // nil 切片可以直接 append\n}\n```\n\n**注意**\n\n- **nil map 可以读，不能写**：`var m map[string]int; m[\"a\"] = 1` 会 panic。\n- map 是引用语义：传给函数后修改会影响调用方。\n- map 的元素**不可取地址**：`m[k].Field = 1` 编译报错（值是结构体时），要么整个取出修改再写回，要么存指针 `map[string]*T`。\n- 遍历顺序随机；并发读写会 fatal，需要 `sync.Mutex` / `sync.RWMutex` 或 `sync.Map`。\n- 大量删除后 map 不会缩容，长期运行的服务里要注意。"
+    },
+    {
+      "id": "map-commaok",
+      "name": "comma-ok：判断 key 是否存在",
+      "group": "map",
+      "body": "`v, ok := m[k]` 第二个返回值 `ok` 表示 key 是否存在。用它区分“key 不存在”和“key 存在但值恰好是零值”。\n\n**写法**\n\n```go\nv, ok := m[key]\nif !ok {\n\t// 不存在\n}\nif _, ok := seen[x]; ok {\n\t// 已经见过\n}\n```\n\n同样的 `x, ok` 形式还出现在：类型断言 `v, ok := x.(T)`、channel 接收 `v, ok := \u003c-ch`。\n\n**例子：缓存**\n\n```go\ntype Cache struct {\n\tmu   sync.RWMutex\n\tdata map[string]string\n}\n\nfunc (c *Cache) Get(k string) (string, bool) {\n\tc.mu.RLock()\n\tdefer c.mu.RUnlock()\n\tv, ok := c.data[k]\n\treturn v, ok\n}\n```\n\n**注意**\n\n- 只写 `v := m[k]` 时无法区分“不存在”和“值为零值”，像计数 `cnt[k]++` 这种零值就有意义的场景才可以省略 ok。\n- `ok` 只是惯用名，可以是任何名字，但大家都写 `ok`。"
+    },
+    {
+      "id": "set-struct",
+      "name": "用 map 实现集合",
+      "group": "map",
+      "body": "Go 没有内置 set，用 `map[T]struct{}` 或 `map[T]bool` 表示集合。`struct{}` 是空结构体，**不占内存**，表示“只关心 key 是否存在”。\n\n**写法**\n\n```go\nset := map[string]struct{}{}\nset[\"a\"] = struct{}{}           // 加入\n_, ok := set[\"a\"]               // 判断存在\ndelete(set, \"a\")                // 删除\n\nseen := map[int]bool{}          // 另一种写法，读起来更直观\nseen[3] = true\nif seen[3] { }                  // 不存在时是 false，不需要 comma-ok\n```\n\n**例子：去重并保持顺序**\n\n```go\nfunc dedup(nums []int) []int {\n\tseen := make(map[int]struct{}, len(nums))\n\tout := nums[:0] // 复用原切片的空间\n\tfor _, n := range nums {\n\t\tif _, ok := seen[n]; ok {\n\t\t\tcontinue\n\t\t}\n\t\tseen[n] = struct{}{}\n\t\tout = append(out, n)\n\t}\n\treturn out\n}\n```\n\n**注意**\n\n- `map[T]bool` 写起来更简单，`map[T]struct{}` 更省内存且语义更明确（不会出现 `false` 值的歧义），两种都很常见。\n- `chan struct{}` 也是同样的思路：只传递“信号”，不携带数据。\n- 需要有序集合时，Go 标准库没有现成实现，可以排序后用切片，或者用第三方的平衡树 / 跳表。"
+    },
+    {
+      "id": "struct",
+      "name": "结构体 struct",
+      "group": "结构体与方法",
+      "body": "结构体把多个字段组合成一个类型。字段名**首字母大写**表示可以被其他包访问（导出），小写只在当前包可见。\n\n**写法**\n\n```go\ntype User struct {\n\tID    int64\n\tName  string\n\temail string     // 小写：包外不可见\n\tTags  []string\n}\n\ntype ListNode struct {\n\tVal  int\n\tNext *ListNode   // 自引用必须用指针\n}\n\npoint := struct{ X, Y int }{1, 2} // 匿名结构体，临时用\n```\n\n**例子**\n\n```go\ntype Stack struct {\n\titems []int\n}\n\nfunc (s *Stack) Push(v int) { s.items = append(s.items, v) }\nfunc (s *Stack) Len() int   { return len(s.items) }\n```\n\n**注意**\n\n- 结构体是**值类型**：赋值、传参都会复制所有字段（切片、map 字段只复制“引用”，底层数据仍共享）。\n- 所有字段都可比较时，结构体可以用 `==` 比较，也能做 map 的 key。\n- 字段顺序会影响内存对齐和结构体大小，见「unsafe 与内存布局」。\n- 空结构体 `struct{}` 大小为 0，常用于集合和信号 channel。"
+    },
+    {
+      "id": "struct-literal",
+      "name": "结构体字面量",
+      "group": "结构体与方法",
+      "body": "结构体字面量用来创建结构体值。推荐写**字段名**，没写到的字段自动是零值；前面加 `\u0026` 直接得到指针。\n\n**写法**\n\n```go\nu := User{Name: \"Tom\", ID: 1}   // 按字段名，顺序无所谓\nu := User{1, \"Tom\", \"\", nil}    // 按位置，必须写全且按顺序（不推荐）\np := \u0026User{Name: \"Tom\"}         // 指针\nvar zero User                   // 全部是零值\nnodes := []*TreeNode{{Val: 1}, {Val: 2}} // 切片元素类型可以省略\n```\n\n**例子：构造函数**\n\n```go\nfunc NewServer(addr string) *Server {\n\treturn \u0026Server{\n\t\taddr:    addr,\n\t\ttimeout: 5 * time.Second, // 多行写法最后一个字段后面也要有逗号\n\t\tconns:   make(map[string]net.Conn),\n\t}\n}\n```\n\n**注意**\n\n- 多行字面量**每行末尾都要有逗号**，包括最后一行。\n- 按位置初始化在结构体加字段后会编译失败，所以除了很小的类型（如 `Point{1, 2}`），都用字段名。\n- Go 没有构造函数语法，惯例是写 `NewXxx` 函数，返回 `*Xxx`。"
+    },
+    {
+      "id": "struct-tag",
+      "name": "结构体标签 tag",
+      "group": "结构体与方法",
+      "body": "字段后面的反引号字符串是**标签**，编译器不管它的含义，运行时由 `encoding/json`、数据库、校验等库通过反射读取，用来控制字段如何被处理。\n\n**写法**\n\n```go\ntype User struct {\n\tID       int64     `json:\"id\" db:\"id\"`\n\tName     string    `json:\"name\"`\n\tEmail    string    `json:\"email,omitempty\"` // 零值时省略\n\tPassword string    `json:\"-\"`               // 永远不序列化\n\tCreated  time.Time `json:\"created_at\"`\n}\n```\n\n**例子：读取标签**\n\n```go\nt := reflect.TypeOf(User{})\nf, _ := t.FieldByName(\"Email\")\nfmt.Println(f.Tag.Get(\"json\")) // email,omitempty\n```\n\n**注意**\n\n- 格式是 `key:\"value\"`，多个键用**空格**分隔，冒号后不能有空格；写错格式不会编译报错，`go vet` 会提示。\n- **只有导出字段（首字母大写）**才会被 json 等包处理，小写字段即使写了 tag 也会被忽略。\n- `omitempty` 对 `time.Time` 这类结构体不生效（它永远不是“空”），Go 1.24 新增了 `omitzero`。"
+    },
+    {
+      "id": "embed",
+      "name": "结构体嵌入（组合）",
+      "group": "结构体与方法",
+      "body": "在结构体里只写类型、不写字段名，就是**嵌入**。被嵌入类型的字段和方法会被“提升”到外层，可以直接调用。这是 Go 用组合代替继承的方式。\n\n**写法**\n\n```go\ntype Animal struct{ Name string }\n\nfunc (a Animal) Hello() string { return \"I'm \" + a.Name }\n\ntype Dog struct {\n\tAnimal          // 嵌入\n\tBreed string\n}\n\nd := Dog{Animal: Animal{Name: \"Rex\"}, Breed: \"husky\"}\nd.Hello()          // 直接调用 Animal 的方法\nd.Name             // 直接访问 Animal 的字段\nd.Animal.Name      // 也可以写全\n```\n\n**例子：嵌入锁**\n\n```go\ntype Counter struct {\n\tsync.Mutex\n\tn int\n}\n\nfunc (c *Counter) Inc() {\n\tc.Lock()          // 提升的方法\n\tdefer c.Unlock()\n\tc.n++\n}\n```\n\n**注意**\n\n- 嵌入不是继承：`Dog` 不能赋值给 `Animal` 类型的变量，被嵌入类型的方法里 `a` 仍然是 `Animal`，没有“多态重写”。\n- 嵌入导出的 `sync.Mutex` 会把 `Lock/Unlock` 也暴露给包外调用方，库代码里更推荐写成具名字段 `mu sync.Mutex`。\n- 嵌入接口可以组合接口：`type ReadWriter interface { Reader; Writer }`。\n- 外层定义了同名字段 / 方法时，外层的优先（遮蔽）。"
+    },
+    {
+      "id": "method-ptr",
+      "name": "方法与接收者",
+      "group": "结构体与方法",
+      "body": "方法就是带**接收者**的函数。接收者可以是值 `(c Counter)` 或指针 `(c *Counter)`：需要**修改**接收者、或者结构体较大、或者包含锁时，用指针接收者。\n\n**写法**\n\n```go\ntype Counter struct{ n int }\n\nfunc (c *Counter) Inc()     { c.n++ }      // 指针接收者：能修改\nfunc (c Counter) Value() int { return c.n } // 值接收者：拿到的是副本\n\nvar c Counter\nc.Inc()   // Go 自动转成 (\u0026c).Inc()\np := \u0026c\np.Value() // 自动转成 (*p).Value()\n```\n\n**例子：链表实现的栈**\n\n```go\ntype node struct {\n\tval  int\n\tnext *node\n}\n\ntype Stack struct {\n\ttop  *node\n\tsize int\n}\n\nfunc (s *Stack) Push(v int) {\n\ts.top = \u0026node{v, s.top}\n\ts.size++\n}\n\nfunc (s *Stack) Pop() (int, bool) {\n\tif s.top == nil {\n\t\treturn 0, false\n\t}\n\tv := s.top.val\n\ts.top = s.top.next\n\ts.size--\n\treturn v, true\n}\n```\n\n**注意**\n\n- 值接收者里修改字段**不会生效**（改的是副本），这是新手最常见的 bug 之一。\n- **同一个类型的方法尽量统一用一种接收者**；只要有一个方法需要指针接收者，就全部用指针。\n- 方法集规则：`T` 的方法集只包含值接收者方法；`*T` 包含全部方法。所以只有 `*T` 实现了包含指针接收者方法的接口。\n- 包含 `sync.Mutex` 的结构体必须用指针接收者，否则每次调用都复制了一把新锁（`go vet` 会报 copylocks）。"
+    },
+    {
+      "id": "method-value",
+      "name": "方法值与方法表达式",
+      "group": "结构体与方法",
+      "body": "`obj.Method`（不加括号）得到一个**绑定了接收者**的函数值，叫方法值；`Type.Method` 得到一个把接收者当第一个参数的函数，叫方法表达式。\n\n**写法**\n\n```go\nc := \u0026Counter{}\ninc := c.Inc     // 方法值：func()，已经绑定了 c\ninc()\ninc()            // c.n == 2\n\nf := (*Counter).Inc // 方法表达式：func(*Counter)\nf(c)\n```\n\n**例子：把方法当回调传出去**\n\n```go\ntype Server struct{ hits int }\n\nfunc (s *Server) handle(w http.ResponseWriter, r *http.Request) {\n\ts.hits++\n}\n\nmux := http.NewServeMux()\nsrv := \u0026Server{}\nmux.HandleFunc(\"/\", srv.handle) // 方法值满足 func(w, r) 签名\n```\n\n`defer wg.Wait()`、`go w.run()`、`time.AfterFunc(d, t.flush)` 里的 `wg.Wait`、`t.flush` 都是方法值。\n\n**注意**\n\n- 方法值在**创建时就求值并保存了接收者**：值接收者会复制一份当时的值，之后修改原变量不会影响它。\n- 对 nil 指针创建方法值不会立即 panic，调用时才可能 panic。"
+    },
+    {
+      "id": "interface-def",
+      "name": "定义接口",
+      "group": "接口与泛型",
+      "body": "接口是一组**方法签名**的集合，描述“能做什么”。Go 里的接口通常很小（1～3 个方法），名字常以 `-er` 结尾。\n\n**写法**\n\n```go\ntype Shape interface {\n\tArea() float64\n\tPerimeter() float64\n}\n\ntype Store interface {\n\tGet(ctx context.Context, key string) (string, error)\n\tSet(ctx context.Context, key, val string) error\n}\n\n// 组合接口\ntype ReadCloser interface {\n\tio.Reader\n\tio.Closer\n}\n```\n\n**例子：为了测试而抽象依赖**\n\n```go\ntype Clock interface{ Now() time.Time }\n\ntype realClock struct{}\n\nfunc (realClock) Now() time.Time { return time.Now() }\n\ntype fakeClock struct{ t time.Time }\n\nfunc (f fakeClock) Now() time.Time { return f.t }\n\nfunc isExpired(c Clock, deadline time.Time) bool {\n\treturn c.Now().After(deadline) // 测试时传 fakeClock，结果可控\n}\n```\n\n**注意**\n\n- Go 社区惯例：**接口由使用方定义**（“accept interfaces, return structs”），不要为每个结构体都预先写一个接口。\n- 接口越小越容易实现和复用：`io.Reader` 只有一个方法，却被几百个类型实现。\n- 接口值由“动态类型 + 动态值”两部分组成，两部分都为 nil 时接口才等于 nil，见「错误类型」里的 nil 接口陷阱。"
+    },
+    {
+      "id": "interface-impl",
+      "name": "隐式实现接口",
+      "group": "接口与泛型",
+      "body": "Go 的类型**不需要声明** `implements`：只要实现了接口要求的全部方法，就自动满足这个接口。这让你可以给已有类型（甚至别人的类型）定义新接口。\n\n**写法**\n\n```go\ntype Stringer interface{ String() string }\n\ntype Point struct{ X, Y int }\n\nfunc (p Point) String() string { return fmt.Sprintf(\"(%d,%d)\", p.X, p.Y) }\n\nvar s Stringer = Point{1, 2} // Point 自动实现了 Stringer\nfmt.Println(s)               // (1,2)：fmt 会调用 String()\n\n// 编译期检查某类型实现了接口（常见写法）\nvar _ Stringer = Point{}\nvar _ http.Handler = (*Server)(nil)\n```\n\n**例子：sort.Interface**\n\n```go\ntype byLen []string\n\nfunc (s byLen) Len() int           { return len(s) }\nfunc (s byLen) Less(i, j int) bool { return len(s[i]) \u003c len(s[j]) }\nfunc (s byLen) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }\n\nsort.Sort(byLen(words))\n```\n\n**注意**\n\n- 用**指针接收者**实现的方法，只有 `*T` 满足接口：`var _ Stringer = \u0026T{}` 可以，`T{}` 不行（报 `method has pointer receiver`）。\n- 实现了 `String() string` 后，`fmt.Println` 会自动使用；在 `String()` 里再用 `%v` 打印自身会无限递归。\n- 实现 `Error() string` 就是一个 `error`。"
+    },
+    {
+      "id": "any",
+      "name": "any / 空接口 interface{}",
+      "group": "接口与泛型",
+      "body": "`any` 是 `interface{}` 的别名（Go 1.18+），没有任何方法要求，所以**任何类型的值**都能放进去。取出来使用时需要类型断言或类型 switch。\n\n**写法**\n\n```go\nvar x any = 42\nx = \"hello\"\nx = []int{1, 2}\n\nitems := []any{1, \"a\", true}\nm := map[string]any{\"name\": \"Tom\", \"age\": 18} // 常见于解析任意 JSON\nfunc Println(a ...any)                         // fmt 的参数就是 ...any\n```\n\n**例子**\n\n```go\nfunc describe(v any) string {\n\tswitch x := v.(type) {\n\tcase int:\n\t\treturn \"int \" + strconv.Itoa(x)\n\tcase string:\n\t\treturn \"string \" + x\n\tdefault:\n\t\treturn fmt.Sprintf(\"other %T\", x)\n\t}\n}\n```\n\n**注意**\n\n- 用了 `any` 就失去了编译期类型检查，能用具体类型或泛型时优先不用 `any`。\n- 把值放进 `any` 可能导致分配（值逃逸到堆上），热点路径要注意。\n- `json.Unmarshal` 到 `any` 时，数字统一变成 `float64`，对象变成 `map[string]any`，数组变成 `[]any`。\n- `[]string` 不能直接当 `[]any` 用，需要逐个转换。"
+    },
+    {
+      "id": "type-assert",
+      "name": "类型断言 x.(T)",
+      "group": "接口与泛型",
+      "body": "`x.(T)` 从接口值 `x` 里取出具体类型 `T` 的值。用 `v, ok := x.(T)` 形式时断言失败不会 panic，`ok` 为 false。`T` 也可以是另一个接口，用来检查“是否还实现了某些方法”。\n\n**写法**\n\n```go\ns := x.(string)          // 失败会 panic\ns, ok := x.(string)      // 安全写法\nif f, ok := w.(http.Flusher); ok {\n\tf.Flush()            // 可选能力：实现了就用\n}\n```\n\n**例子：检查可选接口**\n\n```go\ntype Closer interface{ Close() error }\n\nfunc shutdown(services []any) {\n\tfor _, s := range services {\n\t\tif c, ok := s.(Closer); ok {\n\t\t\t_ = c.Close()\n\t\t}\n\t}\n}\n```\n\n**注意**\n\n- 只有**接口类型的值**才能做类型断言，对 `int`、结构体变量写 `x.(T)` 会编译报错。\n- 判断错误类型时优先用 `errors.As`，它能穿透包装链；直接 `err.(*MyErr)` 只看最外层。\n- 单返回值形式在类型不匹配时 panic，除非你非常确定类型，否则都用 comma-ok 形式。"
+    },
+    {
+      "id": "type-switch",
+      "name": "类型 switch",
+      "group": "接口与泛型",
+      "body": "`switch v := x.(type)` 按接口值的**动态类型**分支，每个 case 里 `v` 自动是对应的具体类型。\n\n**写法**\n\n```go\nswitch v := x.(type) {\ncase nil:\n\t// x 是 nil 接口\ncase int, int64:\n\t// 多个类型时 v 仍是 any\ncase string:\n\t// v 是 string\ncase error:\n\t// v 是 error（接口也可以作为 case）\ndefault:\n\t// v 和 x 同类型\n}\n```\n\n**例子：计算 JSON 数据的深度**\n\n```go\nfunc depth(v any) int {\n\tswitch x := v.(type) {\n\tcase map[string]any:\n\t\td := 0\n\t\tfor _, e := range x {\n\t\t\td = max(d, depth(e))\n\t\t}\n\t\treturn d + 1\n\tcase []any:\n\t\td := 0\n\t\tfor _, e := range x {\n\t\t\td = max(d, depth(e))\n\t\t}\n\t\treturn d + 1\n\tdefault:\n\t\treturn 0\n\t}\n}\n```\n\n**注意**\n\n- `.(type)` 只能用在 switch 里。\n- case 的顺序有意义：接口类型的 case（如 `error`）要放在会被它覆盖的具体类型后面。\n- 如果分支很多而且经常新增类型，考虑改成给各类型定义一个公共接口方法（多态），比类型 switch 更易扩展。"
+    },
+    {
+      "id": "generics",
+      "name": "泛型函数与泛型类型",
+      "group": "接口与泛型",
+      "body": "Go 1.18 起支持泛型：在函数名或类型名后用方括号声明**类型参数**，并用约束限制它能是哪些类型。\n\n**写法**\n\n```go\nfunc Map[T, U any](s []T, f func(T) U) []U {\n\tout := make([]U, 0, len(s))\n\tfor _, v := range s {\n\t\tout = append(out, f(v))\n\t}\n\treturn out\n}\n\ntype Stack[T any] struct{ items []T }\n\nfunc (s *Stack[T]) Push(v T) { s.items = append(s.items, v) }\n\nfunc (s *Stack[T]) Pop() (T, bool) {\n\tvar zero T                 // 泛型里取零值的写法\n\tif len(s.items) == 0 {\n\t\treturn zero, false\n\t}\n\tv := s.items[len(s.items)-1]\n\ts.items = s.items[:len(s.items)-1]\n\treturn v, true\n}\n```\n\n**使用**\n\n```go\nlens := Map([]string{\"a\", \"bb\"}, func(s string) int { return len(s) }) // 自动推导 T、U\nvar st Stack[int]   // 泛型类型使用时要写出类型参数\nst.Push(1)\n```\n\n**注意**\n\n- 方法**不能有自己的类型参数**，只能用类型上声明的：`func (s *Stack[T]) Map[U any]()` 不合法。\n- `T` 的零值写 `var zero T`；不能写 `nil` 或 `0`。\n- 只有约束允许的操作才能用：`any` 约束下不能用 `\u003c`、`+`，需要 `cmp.Ordered` 等约束。\n- 标准库的 `slices`、`maps`、`sync.OnceValue`、`atomic.Pointer[T]` 都是泛型，优先用它们。"
+    },
+    {
+      "id": "constraint",
+      "name": "类型约束",
+      "group": "接口与泛型",
+      "body": "约束就是接口，但可以额外写**类型集合**：`int | float64` 表示“只能是这些类型之一”，`~int` 表示“底层类型是 int 的所有类型”。\n\n**写法**\n\n```go\ntype Number interface {\n\t~int | ~int64 | ~float64\n}\n\nfunc Sum[T Number](nums []T) T {\n\tvar s T\n\tfor _, n := range nums {\n\t\ts += n          // 约束里的类型都支持 +，所以可以用\n\t}\n\treturn s\n}\n\n// 常用的现成约束\nany            // 任意类型\ncomparable     // 可以用 == 比较（能做 map key）\ncmp.Ordered    // 可以用 \u003c \u003e 比较：整数、浮点、字符串\n```\n\n**例子：泛型集合**\n\n```go\ntype Set[T comparable] map[T]struct{}\n\nfunc (s Set[T]) Add(v T)           { s[v] = struct{}{} }\nfunc (s Set[T]) Has(v T) bool      { _, ok := s[v]; return ok }\n\nfunc MaxOf[T cmp.Ordered](a ...T) T {\n\tm := a[0]\n\tfor _, v := range a[1:] {\n\t\tif v \u003e m {\n\t\t\tm = v\n\t\t}\n\t}\n\treturn m\n}\n```\n\n**注意**\n\n- 带类型集合（`|`、`~`）的接口**只能做约束**，不能当普通变量的类型。\n- 不写 `~` 时 `type Celsius float64` 这种自定义类型不满足 `float64` 约束。\n- 约束里还可以要求方法：`interface{ ~int; String() string }`。"
+    },
+    {
+      "id": "error-basic",
+      "name": "error 与错误处理",
+      "group": "错误处理",
+      "body": "Go 用**返回值**表示错误：`error` 是一个只有 `Error() string` 方法的内置接口，`nil` 表示成功。调用方必须显式检查。\n\n**写法**\n\n```go\nfunc Parse(s string) (Config, error) {\n\tif s == \"\" {\n\t\treturn Config{}, errors.New(\"配置为空\")\n\t}\n\t...\n\treturn cfg, nil\n}\n\ncfg, err := Parse(s)\nif err != nil {\n\treturn fmt.Errorf(\"加载配置: %w\", err)\n}\n```\n\n**哨兵错误（sentinel error）**\n\n```go\nvar ErrNotFound = errors.New(\"not found\") // 包级变量，供调用方比较\n\nfunc (s *Store) Get(k string) (string, error) {\n\tv, ok := s.m[k]\n\tif !ok {\n\t\treturn \"\", ErrNotFound\n\t}\n\treturn v, nil\n}\n\nif errors.Is(err, ErrNotFound) { ... }\n```\n\n**注意**\n\n- 错误信息惯例：**小写开头、不加句号**，因为它经常被拼接到其他错误后面。\n- 有错误时其他返回值一般是零值，调用方不应该使用它们。\n- 不要只 `log` 了错误又继续往上 `return`，同一个错误会被打印多次；要么处理，要么返回。\n- `errors.New` 每次调用都创建**不同**的错误值，所以哨兵错误必须定义成包级变量。"
+    },
+    {
+      "id": "error-wrap",
+      "name": "错误包装 %w、errors.Is / As",
+      "group": "错误处理",
+      "body": "`fmt.Errorf(\"...: %w\", err)` 在错误外面包一层上下文，同时保留原始错误。之后用 `errors.Is` 判断链上是否有某个错误值，用 `errors.As` 取出链上某种类型的错误。\n\n**写法**\n\n```go\nif err != nil {\n\treturn fmt.Errorf(\"查询用户 %d: %w\", id, err)\n}\n\nerrors.Is(err, sql.ErrNoRows)        // 链上任何一层 == sql.ErrNoRows\nvar pe *fs.PathError\nif errors.As(err, \u0026pe) {             // 链上有 *fs.PathError 就赋值给 pe\n\tfmt.Println(pe.Path)\n}\nerrors.Unwrap(err)                   // 剥掉一层\nerrors.Join(err1, err2)              // Go 1.20+：合并多个错误\n```\n\n**例子**\n\n```go\nvar ErrNotFound = errors.New(\"not found\")\n\nfunc loadUser(id int) error {\n\treturn fmt.Errorf(\"load user %d: %w\", id, ErrNotFound)\n}\n\nerr := fmt.Errorf(\"handler: %w\", loadUser(7))\nfmt.Println(err)                         // handler: load user 7: not found\nfmt.Println(err == ErrNotFound)          // false：已经被包装了\nfmt.Println(errors.Is(err, ErrNotFound)) // true\n```\n\n**注意**\n\n- 用 `%v` 只会把错误变成文字，**链就断了**，`errors.Is` 找不到原始错误。\n- `errors.As` 的第二个参数必须是**指向错误类型变量的指针**（`\u0026pe`），传错会 panic。\n- 是否用 `%w` 是 API 设计选择：包装后调用方就能依赖底层错误，相当于把它变成了你的公开接口的一部分。"
+    },
+    {
+      "id": "error-type",
+      "name": "自定义错误类型",
+      "group": "错误处理",
+      "body": "任何实现了 `Error() string` 的类型都是 error。需要携带额外信息（状态码、字段名、是否可重试）时，定义自己的错误类型，调用方用 `errors.As` 取出。\n\n**写法**\n\n```go\ntype ValidationError struct {\n\tField string\n\tMsg   string\n}\n\nfunc (e *ValidationError) Error() string {\n\treturn e.Field + \": \" + e.Msg\n}\n\n// 包装了其他错误时，实现 Unwrap 让 errors.Is / As 能继续往下找\ntype QueryError struct {\n\tSQL string\n\tErr error\n}\n\nfunc (e *QueryError) Error() string { return e.SQL + \": \" + e.Err.Error() }\nfunc (e *QueryError) Unwrap() error { return e.Err }\n```\n\n**例子**\n\n```go\nfunc validate(age int) error {\n\tif age \u003c 0 {\n\t\treturn \u0026ValidationError{Field: \"age\", Msg: \"不能为负数\"}\n\t}\n\treturn nil\n}\n\nvar ve *ValidationError\nif err := validate(-1); errors.As(err, \u0026ve) {\n\tfmt.Println(\"字段出错:\", ve.Field)\n}\n```\n\n**注意：nil 接口陷阱**\n\n```go\nfunc check() error {\n\tvar p *ValidationError = nil\n\treturn p          // 返回的 error 不是 nil！\n}\n```\n\n接口值包含“类型 + 值”，这里类型是 `*ValidationError`、值是 nil，所以 `check() != nil` 为 true。**没有错误时直接 `return nil`**，不要返回一个值为 nil 的具体类型指针。"
+    },
+    {
+      "id": "panic-recover",
+      "name": "panic 与 recover",
+      "group": "错误处理",
+      "body": "`panic` 用于**不可恢复的程序错误**（越界、空指针、违反不变量），它会沿调用栈逐层执行 defer，最终让程序崩溃。在 defer 函数里调用 `recover()` 可以捕获 panic，让当前 goroutine 恢复正常。\n\n**写法**\n\n```go\npanic(\"不应该走到这里\")\npanic(fmt.Sprintf(\"unknown op %q\", op))\n\ndefer func() {\n\tif r := recover(); r != nil {\n\t\tlog.Println(\"recovered:\", r)\n\t}\n}()\n```\n\n**例子：把 panic 转成 error**\n\n```go\nfunc safeCall(fn func()) (err error) {\n\tdefer func() {\n\t\tif r := recover(); r != nil {\n\t\t\terr = fmt.Errorf(\"panic: %v\", r) // 通过命名返回值把错误带出去\n\t\t}\n\t}()\n\tfn()\n\treturn nil\n}\n\nerr := safeCall(func() {\n\tvar m map[string]int\n\tm[\"a\"] = 1 // panic\n})\nfmt.Println(err) // panic: assignment to entry in nil map\n```\n\n**注意**\n\n- `recover` **只在 defer 的函数里直接调用才有效**，在普通代码或 defer 函数调用的其他函数里调用都返回 nil。\n- recover 只能捕获**当前 goroutine** 的 panic：一个子 goroutine panic 会让整个进程崩溃，主 goroutine 的 recover 救不了，所以每个可能 panic 的 goroutine 要自己 recover。\n- 并发读写 map、栈溢出、死锁等是 fatal error，**无法 recover**。\n- 普通的业务错误用 `error` 返回，不要用 panic 做流程控制。"
+    },
+    {
+      "id": "goroutine",
+      "name": "goroutine：go 关键字",
+      "group": "并发",
+      "body": "`go f(x)` 启动一个新的 goroutine 并发执行 `f`，当前函数**不会等待**它结束。goroutine 很轻量（初始栈约 2KB），可以轻松创建成千上万个。\n\n**写法**\n\n```go\ngo worker(jobs)\ngo func() {\n\tdefer wg.Done()\n\tprocess()\n}()\n```\n\n**例子：并发请求并收集结果**\n\n```go\nfunc fetchAll(urls []string) []int {\n\tsizes := make([]int, len(urls))\n\tvar wg sync.WaitGroup\n\tfor i, u := range urls {\n\t\twg.Add(1)\n\t\tgo func() {\n\t\t\tdefer wg.Done()\n\t\t\tsizes[i] = fetch(u) // 每个 goroutine 写不同的下标，不需要加锁\n\t\t}()\n\t}\n\twg.Wait()\n\treturn sizes\n}\n```\n\n**注意**\n\n- **main 函数返回时所有 goroutine 都会被直接终止**，需要用 WaitGroup、channel 等方式等待它们。\n- `go f(x)` 的参数在**启动时**就求值了。\n- 每个 goroutine 都要有明确的退出路径，否则就是 goroutine 泄漏（内存和资源一直被占用）。典型原因：往没人读的 channel 发送、从没人写也不关闭的 channel 接收。\n- 多个 goroutine 读写同一个变量必须同步，用 `go test -race` 检测数据竞争。\n- goroutine 里的 panic 会让整个程序崩溃。"
+    },
+    {
+      "id": "chan",
+      "name": "channel 基础",
+      "group": "并发",
+      "body": "channel 是 goroutine 之间传递数据的管道：`ch \u003c- v` 发送，`v := \u003c-ch` 接收。**无缓冲 channel** 的发送会阻塞到有人接收为止，因此它同时起到了**同步**的作用。\n\n**写法**\n\n```go\nch := make(chan int)      // 无缓冲\nch \u003c- 1                   // 发送（阻塞直到被接收）\nv := \u003c-ch                 // 接收（阻塞直到有数据）\n\u003c-done                    // 只等待信号，丢弃值\ndone := make(chan struct{}) // 只做信号用\n```\n\n**例子：等待后台任务完成**\n\n```go\ndone := make(chan struct{})\ngo func() {\n\twork()\n\tclose(done) // 或者 done \u003c- struct{}{}\n}()\n\u003c-done        // 阻塞到 work 完成\n```\n\n**例子：ping-pong 交替打印**\n\n```go\nping, pong := make(chan int), make(chan int)\ngo func() {\n\tfor v := range ping {\n\t\tfmt.Println(\"ping\", v)\n\t\tpong \u003c- v + 1\n\t}\n}()\nping \u003c- 0\nfmt.Println(\u003c-pong) // 1\n```\n\n**注意**\n\n- **nil channel 的发送和接收永远阻塞**（在 select 里可以用来“关掉”一个分支）。\n- 所有 goroutine 都阻塞时运行时会报 `fatal error: all goroutines are asleep - deadlock!`；只有部分阻塞时不会报错，而是泄漏。\n- “不要通过共享内存来通信，而要通过通信来共享内存”：channel 适合传递所有权和编排流程，简单的计数器 / 缓存用锁或原子操作更直接。"
+    },
+    {
+      "id": "chan-buffered",
+      "name": "带缓冲的 channel",
+      "group": "并发",
+      "body": "`make(chan T, n)` 创建容量为 n 的缓冲 channel：缓冲区没满时发送不阻塞，缓冲区不空时接收不阻塞。\n\n**写法**\n\n```go\nch := make(chan int, 3)\nch \u003c- 1; ch \u003c- 2; ch \u003c- 3  // 都不阻塞\n// ch \u003c- 4                 // 缓冲满了，阻塞\nlen(ch)                    // 当前缓冲中的元素个数\ncap(ch)                    // 容量 3\n```\n\n**例子：用缓冲 channel 做信号量，限制并发数**\n\n```go\nsem := make(chan struct{}, 3) // 同时最多 3 个\nvar wg sync.WaitGroup\nfor _, task := range tasks {\n\twg.Add(1)\n\tgo func() {\n\t\tdefer wg.Done()\n\t\tsem \u003c- struct{}{}        // 获取令牌，满了就等\n\t\tdefer func() { \u003c-sem }() // 释放令牌\n\t\trun(task)\n\t}()\n}\nwg.Wait()\n```\n\n**注意**\n\n- 缓冲只是削峰，不能解决“生产比消费快”的根本问题，满了照样阻塞。\n- 缓冲为 1 的 channel 常用来“确保 goroutine 发送结果后能退出”：即使接收方因为超时已经走了，发送也不会永远阻塞（避免泄漏）。\n- 不要用 `len(ch)` 做判断逻辑，在并发下它的值随时会变。"
+    },
+    {
+      "id": "chan-close",
+      "name": "关闭 channel",
+      "group": "并发",
+      "body": "`close(ch)` 表示“不会再发送了”。关闭后，接收方会先把缓冲里剩下的数据读完，然后每次接收都**立即返回零值**；`range ch` 会结束。\n\n**写法**\n\n```go\nclose(ch)\nfor v := range ch { } // 读完并在关闭后退出\nv, ok := \u003c-ch          // ok == false 表示已关闭且读空\n```\n\n**例子：广播退出信号**\n\n```go\nquit := make(chan struct{})\nfor i := 0; i \u003c 3; i++ {\n\tgo func() {\n\t\tfor {\n\t\t\tselect {\n\t\t\tcase \u003c-quit: // 关闭后所有 goroutine 都能立即收到\n\t\t\t\treturn\n\t\t\tdefault:\n\t\t\t\tdoWork()\n\t\t\t}\n\t\t}\n\t}()\n}\nclose(quit) // 一次 close 通知所有等待者，发送一个值只能通知一个\n```\n\n**注意**\n\n- **向已关闭的 channel 发送会 panic**，**重复 close 也会 panic**，close nil channel 同样 panic。\n- 原则：**由发送方关闭**；有多个发送方时，等所有发送方结束（WaitGroup）后由一个协调者关闭。\n- channel 不需要像文件那样必须关闭，只在需要通知接收方“结束了”时才关闭，不再使用的 channel 会被 GC 回收。\n- 需要“只关闭一次”的场景用 `sync.Once` 包装 close。"
+    },
+    {
+      "id": "chan-commaok",
+      "name": "v, ok := \u003c-ch",
+      "group": "并发",
+      "body": "接收时用两个变量 `v, ok := \u003c-ch`：`ok` 为 false 表示 channel **已关闭且缓冲已读空**，此时 `v` 是零值。用来区分“收到了零值”和“channel 关了”。\n\n**写法**\n\n```go\nv, ok := \u003c-ch\nif !ok {\n\t// 已关闭\n}\n\nselect {\ncase v, ok := \u003c-ch:\n\tif !ok {\n\t\tch = nil // 关闭后设为 nil，这个 case 以后永远不会被选中\n\t\tcontinue\n\t}\n\tuse(v)\n}\n```\n\n**例子：合并两个 channel**\n\n```go\nfunc merge(a, b \u003c-chan int) []int {\n\tvar out []int\n\tfor a != nil || b != nil {\n\t\tselect {\n\t\tcase v, ok := \u003c-a:\n\t\t\tif !ok {\n\t\t\t\ta = nil\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tout = append(out, v)\n\t\tcase v, ok := \u003c-b:\n\t\t\tif !ok {\n\t\t\t\tb = nil\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tout = append(out, v)\n\t\t}\n\t}\n\treturn out\n}\n```\n\n**注意**\n\n- 关闭的 channel 在 select 里**永远可读**，如果不检查 ok 并置 nil，会变成忙循环。\n- 关闭前缓冲区里的数据仍然会先被读到，`ok` 为 true。"
+    },
+    {
+      "id": "chan-dir",
+      "name": "单向 channel",
+      "group": "并发",
+      "body": "在函数参数里把 channel 声明成只发送 `chan\u003c- T` 或只接收 `\u003c-chan T`，编译器会禁止反方向的操作，让“谁负责写、谁负责读和关闭”一目了然。\n\n**写法**\n\n```go\nfunc producer(out chan\u003c- int) { out \u003c- 1; close(out) } // 只能发送和关闭\nfunc consumer(in \u003c-chan int)  { for v := range in { _ = v } } // 只能接收\n\nch := make(chan int)\ngo producer(ch) // 双向 channel 可以自动转换成单向的\nconsumer(ch)\n```\n\n**例子：生成器模式**\n\n```go\nfunc gen(nums ...int) \u003c-chan int {\n\tout := make(chan int)\n\tgo func() {\n\t\tdefer close(out)\n\t\tfor _, n := range nums {\n\t\t\tout \u003c- n\n\t\t}\n\t}()\n\treturn out // 调用方只能读，不能误写或误关闭\n}\n\nfunc square(in \u003c-chan int) \u003c-chan int {\n\tout := make(chan int)\n\tgo func() {\n\t\tdefer close(out)\n\t\tfor n := range in {\n\t\t\tout \u003c- n * n\n\t\t}\n\t}()\n\treturn out\n}\n\nfor v := range square(gen(1, 2, 3)) {\n\tfmt.Println(v) // 1 4 9\n}\n```\n\n**注意**\n\n- 箭头的位置：`\u003c-chan` 箭头在 chan 左边（数据从 chan 流出 = 只读），`chan\u003c-` 箭头在右边（数据流入 = 只写）。\n- 只接收的 channel 不能 close（编译报错），这正好保证了“由发送方关闭”。\n- `time.After`、`ctx.Done()` 返回的都是 `\u003c-chan`。"
+    },
+    {
+      "id": "select",
+      "name": "select 多路复用",
+      "group": "并发",
+      "body": "`select` 同时等待多个 channel 操作，**哪个先就绪就执行哪个**；多个同时就绪时**随机**选一个。常用于超时、取消、合并多个来源。\n\n**写法**\n\n```go\nselect {\ncase v := \u003c-ch1:\n\tuse(v)\ncase ch2 \u003c- x:\n\t// 发送成功\ncase \u003c-time.After(time.Second):\n\t// 超时\ncase \u003c-ctx.Done():\n\treturn ctx.Err()\n}\n```\n\n**例子：带超时的请求**\n\n```go\nfunc callWithTimeout(d time.Duration) (string, error) {\n\tch := make(chan string, 1) // 缓冲 1：超时后 goroutine 也能发送完退出\n\tgo func() { ch \u003c- slowCall() }()\n\tselect {\n\tcase res := \u003c-ch:\n\t\treturn res, nil\n\tcase \u003c-time.After(d):\n\t\treturn \"\", errors.New(\"timeout\")\n\t}\n}\n```\n\n**注意**\n\n- 没有任何 case 的 `select {}` 会永久阻塞。\n- 如果用无缓冲 channel，超时后 goroutine 的发送永远没人接收，goroutine 泄漏。\n- 在循环里每次都 `time.After` 会不断创建定时器；长期循环里用一个 `time.Timer` 或 `time.Ticker` 复用。\n- case 里的 `break` 只跳出 select。\n- 随机选择意味着**没有优先级**；需要优先处理退出信号时，可以在循环开头先单独非阻塞检查一次 `ctx.Done()`。"
+    },
+    {
+      "id": "select-default",
+      "name": "select 的 default：非阻塞操作",
+      "group": "并发",
+      "body": "`select` 带 `default` 分支时，如果所有 case 都没就绪，就**立即执行 default**，不阻塞。用来实现“尝试发送 / 尝试接收”。\n\n**写法**\n\n```go\nselect {\ncase ch \u003c- v:\n\t// 发送成功\ndefault:\n\t// channel 满了，丢弃或走降级逻辑\n}\n\nselect {\ncase v := \u003c-ch:\n\tuse(v)\ndefault:\n\t// 现在没有数据\n}\n```\n\n**例子：非阻塞地通知（合并多次通知）**\n\n```go\nnotify := make(chan struct{}, 1)\n\nfunc trigger() {\n\tselect {\n\tcase notify \u003c- struct{}{}: // 已有一个待处理通知就不再重复发\n\tdefault:\n\t}\n}\n```\n\n**注意**\n\n- 在 `for` 里使用带 default 的 select 而 default 什么都不做，会变成占满 CPU 的忙等待。\n- 判断“channel 是否已关闭”不能用这种方式可靠地实现，应该用 `v, ok := \u003c-ch`。"
+    },
+    {
+      "id": "waitgroup",
+      "name": "sync.WaitGroup",
+      "group": "并发",
+      "body": "`WaitGroup` 用来**等待一组 goroutine 全部结束**：启动前 `Add(n)`，每个 goroutine 结束时 `Done()`，等待方调用 `Wait()` 阻塞到计数归零。\n\n**写法**\n\n```go\nvar wg sync.WaitGroup\nfor _, t := range tasks {\n\twg.Add(1)              // 在启动 goroutine 之前 Add\n\tgo func() {\n\t\tdefer wg.Done()    // defer 保证即使 panic 也会 Done\n\t\trun(t)\n\t}()\n}\nwg.Wait()\n\n// Go 1.25 新增了 wg.Go(func() { run(t) })，自动 Add 和 Done\n```\n\n**例子：并发计算后关闭结果 channel**\n\n```go\nresults := make(chan int)\nvar wg sync.WaitGroup\nfor _, n := range nums {\n\twg.Add(1)\n\tgo func() {\n\t\tdefer wg.Done()\n\t\tresults \u003c- n * n\n\t}()\n}\ngo func() {\n\twg.Wait()      // 所有发送方都结束了\n\tclose(results) // 再关闭，range 才能结束\n}()\nsum := 0\nfor r := range results {\n\tsum += r\n}\n```\n\n**注意**\n\n- **`Add` 必须在 `go` 语句之前**调用；放在 goroutine 里面可能导致 `Wait` 在 `Add` 之前就返回。\n- WaitGroup 不能复制，传给函数要用指针 `*sync.WaitGroup`（更好的做法是用闭包，不传它）。\n- 计数变成负数会 panic（`Done` 多调用了）。\n- 需要“任意一个出错就取消其他”时，用 `golang.org/x/sync/errgroup`。"
+    },
+    {
+      "id": "mutex",
+      "name": "sync.Mutex / RWMutex",
+      "group": "并发",
+      "body": "互斥锁保护共享数据：同一时刻只有一个 goroutine 能持有锁。`RWMutex` 允许**多个读者同时读**，写者独占，适合读多写少。\n\n**写法**\n\n```go\nvar mu sync.Mutex\nmu.Lock()\ndefer mu.Unlock()\n\nvar rw sync.RWMutex\nrw.RLock()   // 读锁，可以多个 goroutine 同时持有\nrw.RUnlock()\nrw.Lock()    // 写锁，独占\nrw.Unlock()\n\nmu.TryLock() // 尝试加锁，不阻塞（很少需要）\n```\n\n**例子：并发安全的计数器**\n\n```go\ntype Counter struct {\n\tmu sync.Mutex\n\tm  map[string]int\n}\n\nfunc (c *Counter) Inc(k string) {\n\tc.mu.Lock()\n\tdefer c.mu.Unlock()\n\tif c.m == nil {\n\t\tc.m = map[string]int{}\n\t}\n\tc.m[k]++\n}\n```\n\n**注意**\n\n- **锁不能复制**：包含锁的结构体要用指针接收者、传指针，`go vet` 会检查。\n- Go 的锁**不可重入**：持有锁时再次 `Lock` 同一把锁会死锁（比如一个加锁的方法调用另一个加锁的方法）。\n- 锁的粒度尽量小：不要在持锁时做 IO、调用外部回调或往 channel 发送。\n- 多把锁要按固定顺序获取，否则可能死锁。\n- 零值就是未加锁的可用锁，不需要初始化。"
+    },
+    {
+      "id": "once",
+      "name": "sync.Once",
+      "group": "并发",
+      "body": "`once.Do(f)` 保证 `f` 在多个 goroutine 并发调用时**只执行一次**，其他调用者会等到 f 执行完毕才返回。常用于延迟初始化、单例、只关闭一次。\n\n**写法**\n\n```go\nvar (\n\tonce sync.Once\n\tcfg  *Config\n)\n\nfunc GetConfig() *Config {\n\tonce.Do(func() {\n\t\tcfg = loadConfig()\n\t})\n\treturn cfg\n}\n\n// Go 1.21+ 更简洁的写法\nvar getConfig = sync.OnceValue(loadConfig) // getConfig() 返回同一个结果\n```\n\n**例子：安全地多次关闭**\n\n```go\ntype Worker struct {\n\tquit      chan struct{}\n\tcloseOnce sync.Once\n}\n\nfunc (w *Worker) Stop() {\n\tw.closeOnce.Do(func() { close(w.quit) }) // 重复调用 Stop 不会 panic\n}\n```\n\n**注意**\n\n- 即使 `f` panic 了，Once 也认为“已经执行过”，之后不会再执行。\n- 在 `f` 里再次调用同一个 `once.Do` 会死锁。\n- 初始化可能失败时，用 `sync.OnceValues(func() (T, error))` 把错误一起缓存，或者自己用锁实现“失败可重试”。"
+    },
+    {
+      "id": "cond",
+      "name": "sync.Cond 条件变量",
+      "group": "并发",
+      "body": "`sync.Cond` 让 goroutine **等待某个条件成立**：`Wait()` 会原子地释放锁并挂起，被 `Signal()`（唤醒一个）或 `Broadcast()`（唤醒全部）唤醒后重新拿到锁。\n\n**写法**\n\n```go\nvar mu sync.Mutex\ncond := sync.NewCond(\u0026mu)\n\n// 等待方\nmu.Lock()\nfor !ready {      // 必须用 for 循环检查条件\n\tcond.Wait()\n}\nmu.Unlock()\n\n// 通知方\nmu.Lock()\nready = true\nmu.Unlock()\ncond.Broadcast()\n```\n\n**例子：阻塞队列**\n\n```go\ntype Queue struct {\n\tmu       sync.Mutex\n\tnotEmpty *sync.Cond\n\titems    []int\n}\n\nfunc NewQueue() *Queue {\n\tq := \u0026Queue{}\n\tq.notEmpty = sync.NewCond(\u0026q.mu)\n\treturn q\n}\n\nfunc (q *Queue) Put(v int) {\n\tq.mu.Lock()\n\tq.items = append(q.items, v)\n\tq.mu.Unlock()\n\tq.notEmpty.Signal()\n}\n\nfunc (q *Queue) Get() int {\n\tq.mu.Lock()\n\tdefer q.mu.Unlock()\n\tfor len(q.items) == 0 {\n\t\tq.notEmpty.Wait()\n\t}\n\tv := q.items[0]\n\tq.items = q.items[1:]\n\treturn v\n}\n```\n\n**注意**\n\n- **Wait 一定要放在 for 循环里**：被唤醒时条件可能已经被别的 goroutine 改掉了（虚假唤醒 / 抢先消费）。\n- 调用 `Wait` 前必须持有锁。\n- Cond 不能和 `select`、超时、context 配合，所以大多数场景用 channel 更简单；Cond 适合“多个等待者 + 广播”的场景。"
+    },
+    {
+      "id": "atomic",
+      "name": "sync/atomic 原子操作",
+      "group": "并发",
+      "body": "`sync/atomic` 提供无锁的原子读写、加减、比较并交换（CAS），适合简单的计数器、标志位、配置指针替换，比锁更轻。\n\n**写法**\n\n```go\nvar n atomic.Int64        // Go 1.19+ 的类型化写法，推荐\nn.Add(1)\nn.Load()\nn.Store(10)\nn.CompareAndSwap(10, 20)  // 值等于 10 才改成 20，返回是否成功\n\nvar ready atomic.Bool\nready.Store(true)\n\nvar cfg atomic.Pointer[Config]\ncfg.Store(newCfg)          // 原子替换整个配置\nc := cfg.Load()\n\natomic.AddInt64(\u0026x, 1)     // 老写法：操作普通变量的地址\n```\n\n**例子：CAS 实现“只允许一个成功”**\n\n```go\ntype Gate struct{ open atomic.Bool }\n\nfunc (g *Gate) TryOpen() bool {\n\treturn g.open.CompareAndSwap(false, true) // 只有第一个调用者返回 true\n}\n```\n\n**注意**\n\n- 一个变量只要有一处用了原子操作，**所有读写都必须用原子操作**，混用普通读写仍然是数据竞争。\n- 原子操作只保证单个变量；需要同时更新多个相关字段时还是要用锁。\n- 老式函数 `atomic.AddInt64(\u0026x, 1)` 在 32 位平台上要求 x 8 字节对齐，类型化的 `atomic.Int64` 自动保证。"
+    },
+    {
+      "id": "sync-map",
+      "name": "sync.Map",
+      "group": "并发",
+      "body": "`sync.Map` 是并发安全的 map，针对**读多写少**、或者**各 goroutine 操作不相交的 key 集合**的场景做了优化。其他场景用 `map + sync.RWMutex` 通常更快、类型也更安全。\n\n**写法**\n\n```go\nvar m sync.Map\nm.Store(\"a\", 1)\nv, ok := m.Load(\"a\")           // v 是 any，需要断言 v.(int)\nactual, loaded := m.LoadOrStore(\"a\", 2) // 已存在就返回旧值\nm.LoadAndDelete(\"a\")\nm.Delete(\"a\")\nm.Range(func(k, v any) bool {  // 返回 false 停止遍历\n\tfmt.Println(k, v)\n\treturn true\n})\n```\n\n**例子：只初始化一次的连接缓存**\n\n```go\nvar conns sync.Map // map[string]*Conn\n\nfunc getConn(addr string) *Conn {\n\tif c, ok := conns.Load(addr); ok {\n\t\treturn c.(*Conn)\n\t}\n\tc, _ := conns.LoadOrStore(addr, dial(addr)) // 并发时只有一个会被存进去\n\treturn c.(*Conn)\n}\n```\n\n**注意**\n\n- key 和 value 都是 `any`，失去了类型检查，取值要类型断言。\n- 没有 `Len()` 方法。\n- 上面例子里并发时 `dial` 可能被调用多次（只是只保留一个）；如果创建代价很大，要配合 `sync.Once` 或单飞（singleflight）。"
+    },
+    {
+      "id": "sync-pool",
+      "name": "sync.Pool 对象池",
+      "group": "并发",
+      "body": "`sync.Pool` 缓存**临时对象**以便复用，减少分配和 GC 压力。池里的对象随时可能被 GC 清掉，所以只能放“丢了也无所谓”的东西（如 buffer）。\n\n**写法**\n\n```go\nvar bufPool = sync.Pool{\n\tNew: func() any { return new(bytes.Buffer) },\n}\n\nbuf := bufPool.Get().(*bytes.Buffer)\nbuf.Reset()                 // 拿到的可能是用过的，先重置\ndefer bufPool.Put(buf)\n```\n\n**例子**\n\n```go\nfunc render(name string) string {\n\tbuf := bufPool.Get().(*bytes.Buffer)\n\tdefer func() {\n\t\tbuf.Reset()\n\t\tbufPool.Put(buf)\n\t}()\n\tbuf.WriteString(\"hello, \")\n\tbuf.WriteString(name)\n\treturn buf.String() // String() 会复制，放回池子后不影响返回值\n}\n```\n\n**注意**\n\n- **不能用来做连接池**，因为对象会被无声地回收。\n- 放回去之前要清理敏感数据；放回非常大的 buffer 会让池子长期占用大量内存，可以设置上限，超过就不放回。\n- 不要在 Put 之后继续使用这个对象。\n- 只有在 profile 证明分配是瓶颈时才值得引入。"
+    },
+    {
+      "id": "context",
+      "name": "context：取消、超时与传值",
+      "group": "并发",
+      "body": "`context.Context` 在调用链上传递**取消信号、截止时间**和少量请求范围的值。约定作为函数的**第一个参数** `ctx context.Context`。\n\n**写法**\n\n```go\nctx := context.Background()                      // 根 context\nctx, cancel := context.WithCancel(parent)\nctx, cancel := context.WithTimeout(parent, 2*time.Second)\nctx, cancel := context.WithDeadline(parent, t)\ndefer cancel()                                   // 一定要调用，释放资源\n\n\u003c-ctx.Done()      // 被取消或超时时关闭\nctx.Err()         // context.Canceled 或 context.DeadlineExceeded\nctx = context.WithValue(ctx, key, v)\n```\n\n**例子：可取消的 worker**\n\n```go\nfunc worker(ctx context.Context, jobs \u003c-chan int) error {\n\tfor {\n\t\tselect {\n\t\tcase \u003c-ctx.Done():\n\t\t\treturn ctx.Err()\n\t\tcase j, ok := \u003c-jobs:\n\t\t\tif !ok {\n\t\t\t\treturn nil\n\t\t\t}\n\t\t\tprocess(j)\n\t\t}\n\t}\n}\n\nctx, cancel := context.WithTimeout(context.Background(), time.Second)\ndefer cancel()\nerr := worker(ctx, jobs)\n```\n\n**注意**\n\n- **`cancel` 必须调用**（通常 `defer cancel()`），否则子 context 和定时器要等父 context 结束才释放，`go vet` 会提示。\n- 取消是**协作式**的：被调用的函数要自己检查 `ctx.Done()`，context 不会强行终止 goroutine。\n- 父 context 取消时所有子 context 都会被取消，反过来不会。\n- `WithValue` 只放请求范围的元数据（trace id、用户身份），**不要用来传可选参数**；key 用自定义的未导出类型避免冲突。\n- 不要把 context 存进结构体字段，也不要传 nil context（用 `context.TODO()`）。"
+    },
+    {
+      "id": "timer",
+      "name": "time.Timer / Ticker / After",
+      "group": "并发",
+      "body": "`time` 包的定时器通过 channel 通知时间到了：`time.After(d)` 返回一个 d 之后会收到值的 channel；`Timer` 可以停止和重置；`Ticker` 按固定间隔反复触发。\n\n**写法**\n\n```go\n\u003c-time.After(100 * time.Millisecond)\n\nt := time.NewTimer(time.Second)\ndefer t.Stop()\nselect {\ncase \u003c-t.C:\ncase \u003c-done:\n}\nt.Reset(2 * time.Second)\n\ntk := time.NewTicker(time.Second)\ndefer tk.Stop()\nfor range tk.C { ... }\n\ntime.AfterFunc(d, func() { ... }) // 时间到后在新 goroutine 里执行\n```\n\n**例子：定期刷新，直到被取消**\n\n```go\nfunc flushLoop(ctx context.Context, flush func()) {\n\ttk := time.NewTicker(500 * time.Millisecond)\n\tdefer tk.Stop()\n\tfor {\n\t\tselect {\n\t\tcase \u003c-tk.C:\n\t\t\tflush()\n\t\tcase \u003c-ctx.Done():\n\t\t\tflush() // 退出前最后刷一次\n\t\t\treturn\n\t\t}\n\t}\n}\n```\n\n**注意**\n\n- **Ticker 用完要 Stop**（Go 1.23 起未引用的 Ticker 也能被回收，但显式 Stop 仍是好习惯）。\n- 循环里写 `case \u003c-time.After(d)` 每次都会新建一个定时器；需要“空闲超时”时复用一个 Timer 并 `Reset`。\n- Go 1.23 起 `Reset` / `Stop` 后不会再收到旧的过期值，之前的版本需要先排空 `t.C`，旧代码里常看到这种写法。\n- Ticker 在处理慢于间隔时会丢弃多余的 tick，不会堆积。"
+    },
+    {
+      "id": "fmt",
+      "name": "fmt 格式化输出",
+      "group": "标准库",
+      "body": "`fmt` 负责格式化输出和字符串拼接。`Print` 系列写到标准输出，`Sprint` 系列返回字符串，`Fprint` 系列写到任意 `io.Writer`，`Errorf` 生成错误。\n\n**常用动词**\n\n```go\nfmt.Printf(\"%d %s %v\\n\", 42, \"go\", []int{1}) // 42 go [1]\n%v    默认格式      %+v  结构体带字段名     %#v  Go 语法表示\n%T    类型          %q   带引号的字符串      %x   十六进制\n%5d   宽度 5        %-5s 左对齐             %05d 补零\n%.2f  保留两位小数   %p   指针地址           %%   百分号本身\n%w    （仅 Errorf）包装错误\n```\n\n**例子**\n\n```go\ntype P struct{ X, Y int }\np := P{1, 2}\nfmt.Printf(\"%v %+v %#v %T\\n\", p, p, p, p)\n// {1 2} {X:1 Y:2} main.P{X:1, Y:2} main.P\n\ns := fmt.Sprintf(\"%-6s|%6.2f|\", \"go\", 3.14159) // \"go    |  3.14|\"\nfmt.Fprintf(os.Stderr, \"error: %v\\n\", err)\n```\n\n**注意**\n\n- 类型实现了 `String() string` 时，`%v` / `%s` 会调用它；实现了 `Error()` 的优先用 `Error()`。\n- 动词和参数类型不匹配不会编译报错，输出会变成 `%!d(string=x)`，`go vet` 能发现大部分这类问题。\n- `fmt.Sprintf` 有反射开销，热点路径里拼接数字用 `strconv`，大量拼接用 `strings.Builder`。\n- `Println` 在参数之间加空格并换行；`Print` 只在两个都不是字符串的参数之间加空格。"
+    },
+    {
+      "id": "time",
+      "name": "time 时间与时长",
+      "group": "标准库",
+      "body": "`time.Time` 表示时间点，`time.Duration` 表示时长（本质是 int64 纳秒）。时长用常量相乘表示：`3 * time.Second`。\n\n**写法**\n\n```go\nnow := time.Now()\nd := 1500 * time.Millisecond        // 1.5s\ntime.Sleep(100 * time.Millisecond)\nelapsed := time.Since(start)        // 等于 time.Now().Sub(start)\ndeadline := now.Add(5 * time.Minute)\nnow.Before(deadline); now.After(t)\nt.Truncate(time.Hour)               // 向下取整到小时\nt.Unix(); t.UnixMilli()\ntime.Unix(sec, 0)\n\n// 格式化用固定的参考时间 2006-01-02 15:04:05\ns := now.Format(\"2006-01-02 15:04:05\")\nt, err := time.Parse(time.RFC3339, \"2024-01-02T15:04:05Z\")\n```\n\n**例子：滑动窗口限流**\n\n```go\ntype Limiter struct {\n\twindow time.Duration\n\tlimit  int\n\thits   []time.Time\n}\n\nfunc (l *Limiter) Allow(now time.Time) bool {\n\tcut := now.Add(-l.window)\n\ti := 0\n\tfor i \u003c len(l.hits) \u0026\u0026 !l.hits[i].After(cut) {\n\t\ti++\n\t}\n\tl.hits = l.hits[i:] // 丢掉窗口外的记录\n\tif len(l.hits) \u003e= l.limit {\n\t\treturn false\n\t}\n\tl.hits = append(l.hits, now)\n\treturn true\n}\n```\n\n**注意**\n\n- **整数变量乘时长要先转换**：`n * time.Second` 在 `n` 是 `int` 变量时编译报错，写 `time.Duration(n) * time.Second`。\n- 比较时间用 `t1.Equal(t2)`，不要用 `==`（`==` 还会比较时区和单调时钟读数）。\n- 把 `now` 作为参数传入（而不是在函数里调用 `time.Now()`），测试时就能精确控制时间。\n- 格式化的布局字符串是“2006 年 1 月 2 日 15:04:05”这个固定时间，不是 `yyyy-MM-dd`。"
+    },
+    {
+      "id": "sort-slices",
+      "name": "排序：sort / slices / cmp",
+      "group": "标准库",
+      "body": "Go 1.21 起推荐用泛型的 `slices` 包排序和查找，用 `cmp.Compare` 写比较函数。老代码里常见 `sort.Slice` / `sort.Ints`。\n\n**写法**\n\n```go\nslices.Sort(nums)                       // 升序\nslices.SortFunc(people, func(a, b Person) int {\n\treturn cmp.Compare(a.Age, b.Age)    // 负数 a 在前，0 相等，正数 b 在前\n})\nslices.SortStableFunc(...)              // 稳定排序\ni, found := slices.BinarySearch(nums, x)\nslices.Contains(s, x); slices.Index(s, x)\nslices.Reverse(s); slices.Max(s); slices.Min(s)\nslices.Equal(a, b); slices.Clone(s)\nkeys := slices.Sorted(maps.Keys(m))     // Go 1.23+\n\nsort.Ints(nums)                         // 老写法\nsort.Slice(s, func(i, j int) bool { return s[i] \u003c s[j] })\nidx := sort.Search(n, func(i int) bool { return nums[i] \u003e= x }) // 第一个满足条件的下标\n```\n\n**例子：多关键字排序**\n\n```go\n// 按分数降序，分数相同按名字升序\nslices.SortFunc(students, func(a, b Student) int {\n\tif c := cmp.Compare(b.Score, a.Score); c != 0 {\n\t\treturn c\n\t}\n\treturn strings.Compare(a.Name, b.Name)\n})\n// Go 1.22+ 也可以写成 cmp.Or(cmp.Compare(b.Score, a.Score), strings.Compare(a.Name, b.Name))\n```\n\n**例子：合并区间**\n\n```go\nslices.SortFunc(intervals, func(a, b []int) int { return a[0] - b[0] })\n```\n\n**注意**\n\n- `slices.Sort` / `sort.Slice` **不稳定**，相等元素的相对顺序可能改变，需要稳定时用 `SortStableFunc`。\n- 比较函数用 `a - b` 在数值很大时可能溢出，`cmp.Compare` 更安全。\n- `sort.Search` 要求条件对下标是“先 false 后 true”的单调关系。\n- 排序是原地进行的，会修改传入的切片。"
+    },
+    {
+      "id": "heap",
+      "name": "container/heap 堆",
+      "group": "标准库",
+      "body": "`container/heap` 在任何实现了 `heap.Interface` 的类型上提供堆操作。你需要实现 5 个方法：`Len`、`Less`、`Swap`（来自 sort.Interface）和 `Push`、`Pop`。\n\n**写法：最小堆**\n\n```go\ntype IntHeap []int\n\nfunc (h IntHeap) Len() int           { return len(h) }\nfunc (h IntHeap) Less(i, j int) bool { return h[i] \u003c h[j] } // 改成 \u003e 就是最大堆\nfunc (h IntHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }\nfunc (h *IntHeap) Push(x any)        { *h = append(*h, x.(int)) }\nfunc (h *IntHeap) Pop() any {\n\told := *h\n\tn := len(old)\n\tx := old[n-1]\n\t*h = old[:n-1]\n\treturn x\n}\n\nh := \u0026IntHeap{5, 2, 8}\nheap.Init(h)\nheap.Push(h, 1)\nmin := heap.Pop(h).(int) // 1\ntop := (*h)[0]           // 只看堆顶不弹出\n```\n\n**例子：第 K 大的元素（大小为 K 的最小堆）**\n\n```go\nfunc findKthLargest(nums []int, k int) int {\n\th := \u0026IntHeap{}\n\tfor _, n := range nums {\n\t\theap.Push(h, n)\n\t\tif h.Len() \u003e k {\n\t\t\theap.Pop(h) // 弹出最小的，堆里始终是最大的 k 个\n\t\t}\n\t}\n\treturn (*h)[0]\n}\n```\n\n**注意**\n\n- **调用 `heap.Push(h, x)` / `heap.Pop(h)`**，不要直接调用 `h.Push` / `h.Pop`：你写的 Push / Pop 只负责在切片末尾增删，调整堆结构的是 `heap` 包。\n- Push / Pop 必须是**指针接收者**，因为要修改切片长度。\n- 元素在堆里的位置会变，需要更新某个元素的优先级时，记录下标并调用 `heap.Fix(h, i)`。"
+    },
+    {
+      "id": "list",
+      "name": "container/list 双向链表",
+      "group": "标准库",
+      "body": "`container/list` 是标准库的双向链表，支持 O(1) 的头尾插入、删除任意节点、把节点移到头部。最经典的用法是和 map 一起实现 **LRU 缓存**。\n\n**写法**\n\n```go\nl := list.New()\ne := l.PushFront(1)      // 返回 *list.Element\nl.PushBack(2)\nl.MoveToFront(e)\nl.Remove(e)\nback := l.Back()         // 最后一个元素\nv := back.Value.(int)    // Value 是 any\nfor e := l.Front(); e != nil; e = e.Next() { }\n```\n\n**例子：LRU 缓存**\n\n```go\ntype entry struct{ key, val int }\n\ntype LRUCache struct {\n\tcap   int\n\tll    *list.List\n\titems map[int]*list.Element\n}\n\nfunc (c *LRUCache) Get(key int) int {\n\tif e, ok := c.items[key]; ok {\n\t\tc.ll.MoveToFront(e)\n\t\treturn e.Value.(*entry).val\n\t}\n\treturn -1\n}\n\nfunc (c *LRUCache) Put(key, val int) {\n\tif e, ok := c.items[key]; ok {\n\t\te.Value.(*entry).val = val\n\t\tc.ll.MoveToFront(e)\n\t\treturn\n\t}\n\tc.items[key] = c.ll.PushFront(\u0026entry{key, val})\n\tif c.ll.Len() \u003e c.cap {\n\t\told := c.ll.Back()\n\t\tc.ll.Remove(old)\n\t\tdelete(c.items, old.Value.(*entry).key) // 所以 entry 里要存 key\n\t}\n}\n```\n\n**注意**\n\n- `Value` 是 `any`，取出时要类型断言；存指针（`*entry`）才能原地修改。\n- 遍历时删除元素要先保存 `next := e.Next()`，因为 Remove 后 `e.Next()` 返回 nil。\n- 大多数情况下切片比链表更快（缓存友好），只有需要 O(1) 删除中间节点时才用链表。"
+    },
+    {
+      "id": "json",
+      "name": "encoding/json",
+      "group": "标准库",
+      "body": "`json.Marshal` 把 Go 值编码成 JSON，`json.Unmarshal` 把 JSON 解码到 Go 值。字段名、是否省略由结构体标签控制。\n\n**写法**\n\n```go\ntype User struct {\n\tID    int      `json:\"id\"`\n\tName  string   `json:\"name\"`\n\tEmail string   `json:\"email,omitempty\"`\n\tTags  []string `json:\"tags\"`\n\tpass  string   // 小写字段不会被编码\n}\n\nb, err := json.Marshal(u)               // []byte\nb, err := json.MarshalIndent(u, \"\", \"  \")\nvar u User\nerr := json.Unmarshal(b, \u0026u)            // 必须传指针\n\n// 流式：直接读写 io.Reader / io.Writer\nerr := json.NewDecoder(r.Body).Decode(\u0026req)\nerr := json.NewEncoder(w).Encode(resp)\n```\n\n**例子：处理未知结构**\n\n```go\nvar data map[string]any\n_ = json.Unmarshal([]byte(`{\"n\": 1, \"list\": [1, 2]}`), \u0026data)\nn := data[\"n\"].(float64)        // 数字默认解成 float64\nlist := data[\"list\"].([]any)\n```\n\n**注意**\n\n- **只有导出字段**会被编解码。\n- 解码时 JSON 里多出来的字段默认被忽略，缺少的字段保持零值；需要严格校验用 `dec.DisallowUnknownFields()`。\n- nil 切片编码成 `null`，空切片编码成 `[]`；前端如果要求数组，记得初始化。\n- 大整数（如 int64 的 ID）解到 `any` 时会变成 float64 丢精度，用 `dec.UseNumber()` 或明确的结构体类型。\n- 自定义编码：实现 `MarshalJSON() ([]byte, error)` / `UnmarshalJSON([]byte) error`。"
+    },
+    {
+      "id": "io",
+      "name": "io / bufio / os",
+      "group": "标准库",
+      "body": "`io.Reader`（`Read(p []byte) (n int, err error)`）和 `io.Writer`（`Write(p []byte) (n int, err error)`）是 Go 里最重要的两个接口：文件、网络连接、HTTP body、压缩流、缓冲区都实现了它们，可以随意组合。\n\n**写法**\n\n```go\ndata, err := io.ReadAll(r)             // 读到 EOF\nn, err := io.Copy(dst, src)            // 从 Reader 复制到 Writer\nr := io.LimitReader(src, 1\u003c\u003c20)        // 最多读 1MB\nr := io.TeeReader(src, w)              // 读的同时写一份到 w\nw := io.MultiWriter(f, os.Stdout)\n\nf, err := os.Open(\"a.txt\")             // 只读\nf, err := os.Create(\"b.txt\")           // 创建 / 截断\ndefer f.Close()\ndata, err := os.ReadFile(\"a.txt\")      // 一次读完\n\nsc := bufio.NewScanner(f)              // 按行读\nfor sc.Scan() {\n\tline := sc.Text()\n}\nerr = sc.Err()\n\nbw := bufio.NewWriter(f)\ndefer bw.Flush()                       // 一定要 Flush\n```\n\n**例子：统计 Reader 的行数**\n\n```go\nfunc countLines(r io.Reader) (int, error) {\n\tsc := bufio.NewScanner(r)\n\tn := 0\n\tfor sc.Scan() {\n\t\tn++\n\t}\n\treturn n, sc.Err()\n}\n\ncountLines(strings.NewReader(\"a\\nb\\nc\")) // 3：测试时用 strings.Reader 代替文件\n```\n\n**注意**\n\n- `Read` 可能**只读到一部分**数据就返回（n \u003c len(p)），也可能同时返回 `n \u003e 0` 和 `io.EOF`；要读满用 `io.ReadFull`。\n- `io.EOF` 表示正常结束，不是错误，要单独判断：`if err == io.EOF { break }`。\n- `bufio.Scanner` 默认单行最长 64KB，超长会失败，可以用 `sc.Buffer` 调大。\n- `bufio.Writer` 不 `Flush` 会丢数据。\n- 函数参数尽量写成 `io.Reader` / `io.Writer` 而不是 `*os.File`，更通用也更好测试。"
+    },
+    {
+      "id": "http",
+      "name": "net/http 服务端与客户端",
+      "group": "标准库",
+      "body": "`net/http` 包含生产可用的 HTTP 服务器和客户端。服务端的核心是 `http.Handler` 接口：`ServeHTTP(w http.ResponseWriter, r *http.Request)`。\n\n**写法：服务端**\n\n```go\nmux := http.NewServeMux()\nmux.HandleFunc(\"GET /users/{id}\", func(w http.ResponseWriter, r *http.Request) {\n\tid := r.PathValue(\"id\")            // Go 1.22+ 路由支持方法和路径参数\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.WriteHeader(http.StatusOK)       // 要在 Write 之前调用\n\tjson.NewEncoder(w).Encode(map[string]string{\"id\": id})\n})\nsrv := \u0026http.Server{Addr: \":8080\", Handler: mux, ReadHeaderTimeout: 5 * time.Second}\nlog.Fatal(srv.ListenAndServe())\n```\n\n**写法：中间件**\n\n```go\nfunc logging(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tstart := time.Now()\n\t\tnext.ServeHTTP(w, r)\n\t\tlog.Println(r.Method, r.URL.Path, time.Since(start))\n\t})\n}\n```\n\n**写法：客户端**\n\n```go\nclient := \u0026http.Client{Timeout: 3 * time.Second}\nreq, _ := http.NewRequestWithContext(ctx, \"GET\", url, nil)\nresp, err := client.Do(req)\nif err != nil {\n\treturn err\n}\ndefer resp.Body.Close()                // 必须关闭\nbody, err := io.ReadAll(resp.Body)\n```\n\n**测试**：`httptest.NewRecorder()` 记录响应，`httptest.NewServer(handler)` 启动临时服务器。\n\n**注意**\n\n- **`http.Get` 和默认 Client 没有超时**，生产代码要自己设置 `Timeout`。\n- **`resp.Body` 一定要 Close**，而且最好读完，否则连接无法复用。\n- 非 2xx 状态码**不会**返回 error，要自己检查 `resp.StatusCode`。\n- `WriteHeader` 只能调用一次，第一次 `Write` 时如果没调用过会自动写 200。\n- 每个请求在独立的 goroutine 里处理，handler 访问共享状态要加锁。"
+    },
+    {
+      "id": "net",
+      "name": "net 网络编程",
+      "group": "标准库",
+      "body": "`net` 包提供 TCP / UDP / Unix socket。`net.Conn` 同时实现了 `io.Reader` 和 `io.Writer`，可以直接套用 `bufio`、`io.Copy` 等工具。\n\n**写法：TCP 服务端**\n\n```go\nln, err := net.Listen(\"tcp\", \"127.0.0.1:9000\")\nif err != nil {\n\treturn err\n}\ndefer ln.Close()\nfor {\n\tconn, err := ln.Accept()\n\tif err != nil {\n\t\treturn err\n\t}\n\tgo handle(conn) // 每个连接一个 goroutine\n}\n```\n\n**写法：客户端**\n\n```go\nconn, err := net.DialTimeout(\"tcp\", addr, 2*time.Second)\ndefer conn.Close()\nconn.SetDeadline(time.Now().Add(5 * time.Second)) // 读写超时\n```\n\n**例子：回显服务**\n\n```go\nfunc handle(c net.Conn) {\n\tdefer c.Close()\n\tsc := bufio.NewScanner(c)\n\tfor sc.Scan() {\n\t\tfmt.Fprintln(c, \"echo:\", sc.Text())\n\t}\n}\n```\n\n**测试技巧**：`net.Pipe()` 返回一对在内存中相连的 Conn，不需要真实端口。\n\n**注意**\n\n- TCP 是**字节流**，没有消息边界：一次 Write 的数据可能被拆成多次 Read，也可能多次 Write 被合并读到。需要自己定义协议（按行、长度前缀等）。\n- Deadline 是**绝对时间**，每次读写前都要重新设置。\n- 监听 `:9000` 会暴露到所有网卡，只在本机用时写 `127.0.0.1:9000`。"
+    },
+    {
+      "id": "sql",
+      "name": "database/sql",
+      "group": "标准库",
+      "body": "`database/sql` 定义了通用的数据库访问接口，具体数据库通过驱动接入（如 MySQL 的 `go-sql-driver/mysql`）。`*sql.DB` 是**连接池**，不是单个连接，全局创建一个即可。\n\n**写法**\n\n```go\ndb, err := sql.Open(\"mysql\", dsn)   // 不会立即连接\ndb.SetMaxOpenConns(20)\ndb.SetMaxIdleConns(10)\ndb.SetConnMaxLifetime(time.Hour)\n\nvar name string\nerr := db.QueryRowContext(ctx, \"SELECT name FROM users WHERE id = ?\", id).Scan(\u0026name)\nif errors.Is(err, sql.ErrNoRows) { ... }\n\nrows, err := db.QueryContext(ctx, \"SELECT id, name FROM users WHERE age \u003e ?\", 18)\ndefer rows.Close()\nfor rows.Next() {\n\tvar u User\n\tif err := rows.Scan(\u0026u.ID, \u0026u.Name); err != nil { return err }\n}\nerr = rows.Err()\n\nres, err := db.ExecContext(ctx, \"UPDATE users SET name = ? WHERE id = ?\", name, id)\nn, _ := res.RowsAffected()\n```\n\n**例子：事务**\n\n```go\nfunc transfer(ctx context.Context, db *sql.DB, from, to, amount int) (err error) {\n\ttx, err := db.BeginTx(ctx, nil)\n\tif err != nil {\n\t\treturn err\n\t}\n\tdefer func() {\n\t\tif err != nil {\n\t\t\ttx.Rollback()\n\t\t}\n\t}()\n\tif _, err = tx.ExecContext(ctx, \"UPDATE acct SET bal = bal - ? WHERE id = ?\", amount, from); err != nil {\n\t\treturn err\n\t}\n\tif _, err = tx.ExecContext(ctx, \"UPDATE acct SET bal = bal + ? WHERE id = ?\", amount, to); err != nil {\n\t\treturn err\n\t}\n\treturn tx.Commit()\n}\n```\n\n**注意**\n\n- **永远用占位符 `?` 传参**，不要拼接 SQL 字符串，否则会 SQL 注入。\n- `rows` 必须 `Close`，否则连接不会归还连接池；循环结束后检查 `rows.Err()`。\n- 可能为 NULL 的列用 `sql.NullString` 或指针 `*string` 接收。\n- 事务里的操作必须用 `tx`，用 `db` 会拿到另一个连接，不在事务内。"
+    },
+    {
+      "id": "encoding",
+      "name": "编码与哈希：hex / base64 / binary / crypto",
+      "group": "标准库",
+      "body": "`encoding/*` 和 `hash/*`、`crypto/*` 处理字节的编码、校验和哈希。它们大多遵循同一套接口：哈希实现了 `io.Writer`，写进去再 `Sum`。\n\n**常用写法**\n\n```go\nhex.EncodeToString(b)                     // []byte → \"0a1f...\"\nbase64.StdEncoding.EncodeToString(b)\nbase64.URLEncoding.DecodeString(s)        // URL 安全的变体（JWT 用 RawURLEncoding）\nbinary.BigEndian.PutUint32(buf, n)        // 整数写成大端字节\nn := binary.BigEndian.Uint32(buf[:4])\ncrc := crc32.ChecksumIEEE(data)\n\nsum := sha256.Sum256(data)                // [32]byte\nh := sha256.New()\nio.Copy(h, f)                             // 流式计算大文件哈希\ndigest := h.Sum(nil)\n\nmac := hmac.New(sha256.New, key)\nmac.Write(msg)\nsig := mac.Sum(nil)\nhmac.Equal(sig, expected)                 // 常数时间比较，防时序攻击\n\nf := fnv.New32a()                         // 非加密的快速哈希，适合分片 / 一致性哈希\nf.Write([]byte(key))\nidx := f.Sum32() % n\n```\n\n**例子：长度前缀的消息编码**\n\n```go\nfunc writeMsg(w io.Writer, msg []byte) error {\n\tvar hdr [4]byte\n\tbinary.BigEndian.PutUint32(hdr[:], uint32(len(msg)))\n\tif _, err := w.Write(hdr[:]); err != nil {\n\t\treturn err\n\t}\n\t_, err := w.Write(msg)\n\treturn err\n}\n```\n\n**注意**\n\n- 签名、token 比较要用 `hmac.Equal` / `subtle.ConstantTimeCompare`，不要用 `==` 或 `bytes.Equal`。\n- 密码存储不要用 SHA256，要用 bcrypt / argon2 这类慢哈希。\n- 随机数：安全相关用 `crypto/rand`，`math/rand` 只适合模拟和测试。\n- 网络协议一般用大端（BigEndian），x86 内存里是小端。"
+    },
+    {
+      "id": "regexp",
+      "name": "regexp 正则表达式",
+      "group": "标准库",
+      "body": "`regexp` 使用 RE2 语法，**保证线性时间**，不会出现灾难性回溯；代价是不支持反向引用和环视（lookahead）。\n\n**写法**\n\n```go\nvar reEmail = regexp.MustCompile(`^[\\w.+-]+@[\\w-]+\\.[\\w.]+$`) // 包级变量，只编译一次\n\nreEmail.MatchString(s)\nre.FindString(s)                    // 第一个匹配\nre.FindAllString(s, -1)             // 所有匹配\nm := re.FindStringSubmatch(s)       // m[0] 整体，m[1] 第一个分组\nre.ReplaceAllString(s, \"$1\")\nre.Split(s, -1)\n```\n\n**例子：提取日志里的字段**\n\n```go\nvar reLog = regexp.MustCompile(`(\\w+)=(\\S+)`)\n\nfunc parseLog(line string) map[string]string {\n\tout := map[string]string{}\n\tfor _, m := range reLog.FindAllStringSubmatch(line, -1) {\n\t\tout[m[1]] = m[2]\n\t}\n\treturn out\n}\n\nparseLog(\"level=info user=tom cost=12ms\") // map[cost:12ms level:info user:tom]\n```\n\n**注意**\n\n- 用反引号写正则，避免反斜杠要转义两次。\n- `MustCompile` 在正则写错时 panic，适合包级常量正则；运行时输入的正则用 `Compile` 并处理错误。\n- 不要在循环或 handler 里反复编译同一个正则。\n- 简单的前缀、包含判断用 `strings` 包更快。"
+    },
+    {
+      "id": "slog",
+      "name": "log/slog 结构化日志",
+      "group": "标准库",
+      "body": "Go 1.21 起标准库提供 `log/slog` 结构化日志：每条日志是“消息 + 键值对”，可以输出成文本或 JSON，方便检索和分析。\n\n**写法**\n\n```go\nlogger := slog.New(slog.NewJSONHandler(os.Stdout, \u0026slog.HandlerOptions{Level: slog.LevelInfo}))\nslog.SetDefault(logger)\n\nslog.Info(\"user login\", \"user_id\", 42, \"ip\", ip)\nslog.Error(\"query failed\", \"err\", err, \"sql\", q)\nreqLog := logger.With(\"request_id\", rid)   // 带上公共字段\nreqLog.Debug(\"cache miss\", slog.String(\"key\", k))\n```\n\n输出类似：`{\"time\":\"...\",\"level\":\"INFO\",\"msg\":\"user login\",\"user_id\":42,\"ip\":\"1.2.3.4\"}`\n\n**例子：测试里捕获日志**\n\n```go\nvar buf bytes.Buffer\nlog := slog.New(slog.NewJSONHandler(\u0026buf, nil))\nlog.Info(\"hello\", \"n\", 1)\n// buf.String() 里就是 JSON，可以断言内容\n```\n\n**注意**\n\n- 键值对必须成对出现，漏写会生成 `!BADKEY`，`go vet` 能检查。\n- 低于当前级别的日志不会输出，但**参数仍会被求值**；昂贵的计算可以先 `logger.Enabled(ctx, level)` 判断。\n- 敏感信息（密码、token）不要打进日志，可以给类型实现 `LogValue()` 做脱敏。"
+    },
+    {
+      "id": "runtime",
+      "name": "runtime 与调试",
+      "group": "标准库",
+      "body": "`runtime` 包可以查看和控制 Go 运行时：goroutine 数量、调度、GC、内存统计、调用栈。主要用于诊断和测试，业务代码很少需要。\n\n**常用写法**\n\n```go\nruntime.NumGoroutine()         // 当前 goroutine 数，检测泄漏\nruntime.NumCPU()\nruntime.GOMAXPROCS(0)          // 传 0 只查询不修改\nruntime.Gosched()              // 让出 CPU\nruntime.GC()                   // 强制 GC（测试用）\n\nvar m runtime.MemStats\nruntime.ReadMemStats(\u0026m)       // m.HeapAlloc, m.NumGC ...\n\nbuf := make([]byte, 1\u003c\u003c16)\nn := runtime.Stack(buf, true)  // 所有 goroutine 的栈\n\ndebug.SetGCPercent(50)         // runtime/debug\ndebug.SetMemoryLimit(512 \u003c\u003c 20)\npprof.StartCPUProfile(f)       // runtime/pprof\n```\n\n**例子：测试 goroutine 是否泄漏**\n\n```go\nfunc TestNoLeak(t *testing.T) {\n\tbefore := runtime.NumGoroutine()\n\tstartAndStopWorkers()\n\ttime.Sleep(50 * time.Millisecond) // 给 goroutine 退出的时间\n\tif after := runtime.NumGoroutine(); after \u003e before {\n\t\tt.Fatalf(\"goroutine 泄漏：%d → %d\", before, after)\n\t}\n}\n```\n\n**注意**\n\n- 线上排查优先用 `net/http/pprof` 暴露的接口和 `go tool pprof`，而不是手工打印。\n- `GOMAXPROCS` 默认等于 CPU 核数；Go 1.25 起在容器里会自动参考 cgroup 的 CPU 限制。\n- 不要在业务代码里调用 `runtime.GC()` 来“优化内存”。"
+    },
+    {
+      "id": "reflect",
+      "name": "reflect 反射",
+      "group": "标准库",
+      "body": "`reflect` 在运行时检查值的类型和结构：`reflect.TypeOf(x)` 得到类型信息，`reflect.ValueOf(x)` 得到值。`encoding/json`、ORM、校验库都靠它读取字段和标签。\n\n**写法**\n\n```go\nt := reflect.TypeOf(u)          // 类型\nv := reflect.ValueOf(u)         // 值\nt.Kind()                        // reflect.Struct / Slice / Ptr ...\nfor i := 0; i \u003c t.NumField(); i++ {\n\tf := t.Field(i)\n\tfmt.Println(f.Name, f.Type, f.Tag.Get(\"json\"), v.Field(i).Interface())\n}\n\n// 修改值：必须传指针，再 Elem()\npv := reflect.ValueOf(\u0026u).Elem()\npv.FieldByName(\"Name\").SetString(\"Jerry\")\n\nreflect.DeepEqual(a, b)         // 深度比较（测试里常用）\n```\n\n**例子：按标签收集非零字段**\n\n```go\nfunc nonZero(x any) []string {\n\tv := reflect.ValueOf(x)\n\tt := v.Type()\n\tvar out []string\n\tfor i := range t.NumField() {\n\t\tif !v.Field(i).IsZero() {\n\t\t\tout = append(out, t.Field(i).Tag.Get(\"json\"))\n\t\t}\n\t}\n\treturn out\n}\n```\n\n**注意**\n\n- 反射代码慢、难读，而且把编译期错误变成了运行期 panic；能用接口或泛型解决的问题不要用反射。\n- 修改值要求它“可设置”（`CanSet()`）：必须通过指针拿到，并且字段是导出的。\n- 对未导出字段调用 `.Interface()` 会 panic。\n- `reflect.DeepEqual` 认为 nil 切片和空切片**不相等**。"
+    },
+    {
+      "id": "unsafe",
+      "name": "unsafe 与内存布局",
+      "group": "标准库",
+      "body": "`unsafe` 包绕过 Go 的类型安全：`unsafe.Sizeof` 查看类型占用的字节数，`unsafe.Pointer` 可以在任意指针类型间转换。日常主要用它**理解内存布局和对齐**。\n\n**写法**\n\n```go\nunsafe.Sizeof(x)         // 类型大小（不包括指向的数据）\nunsafe.Alignof(x)        // 对齐要求\nunsafe.Offsetof(s.f)     // 字段偏移\n\nunsafe.Sizeof(\"\")        // 16：字符串头 = 指针 + 长度\nunsafe.Sizeof([]int{})   // 24：切片头 = 指针 + len + cap\nunsafe.Sizeof(struct{}{}) // 0\n```\n\n**例子：字段顺序影响结构体大小**\n\n```go\ntype A struct {\n\ta bool  // 1 字节 + 7 字节填充\n\tb int64 // 8\n\tc bool  // 1 字节 + 7 字节填充\n}\ntype B struct {\n\tb int64 // 8\n\ta bool  // 1\n\tc bool  // 1 + 6 字节填充\n}\nfmt.Println(unsafe.Sizeof(A{}), unsafe.Sizeof(B{})) // 24 16（64 位平台）\n```\n\n把大字段放前面、小字段放一起可以减少填充，大量对象时能明显省内存。\n\n**注意**\n\n- `unsafe.Pointer` 的转换必须遵守文档里列出的几种合法模式，否则 GC 可能出问题，而且代码不保证跨版本、跨平台可用。\n- 零拷贝的 `string` ↔ `[]byte` 转换（`unsafe.String` / `unsafe.Slice`）要保证之后不再修改字节，否则破坏了字符串不可变的假设。\n- 普通业务代码基本不需要 unsafe；`fieldalignment` 等 lint 工具可以自动提示字段排列问题。"
+    }
+  ]
+}
