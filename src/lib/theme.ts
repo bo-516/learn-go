@@ -8,7 +8,7 @@ type Resolved = "light" | "dark";
 // 这里接管之后的切换，并在“跟随系统”时响应系统配色的变化。
 const media = window.matchMedia("(prefers-color-scheme: dark)");
 // 顶栏背景色（--surface），同步给手机浏览器的地址栏
-const BAR_COLOR: Record<Resolved, string> = { light: "#FFFFFF", dark: "#151D21" };
+const BAR_COLOR: Record<Resolved, string> = { light: "#FFFFFF", dark: "#0D0E10" };
 const ORDER: ThemePref[] = ["auto", "light", "dark"];
 
 let pref: ThemePref = parse(readString(KEYS.theme));
