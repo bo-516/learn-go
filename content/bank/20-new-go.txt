@@ -331,7 +331,7 @@ func TestProcessorFuncAndChain(t *testing.T) {
 --- explain
 **思路**
 
-這就是 `net/http.Handler` 与 `http.HandlerFunc` 的完整浓缩模型：为函数类型 `ProcessorFunc` 实现接口方法 `Process`，方法体内直接调用 `f(s)`；而在 `Chain` 中，为了保证 `middlewares[0]` 在最外层最先收到输入，需要从切片末尾 `len(middlewares)-1` 倒序向前包裹。
+这就是 `net/http.Handler` 与 `http.HandlerFunc` 的完整浓缩模型：为函数类型 `ProcessorFunc` 实现接口方法 `Process`，方法体内直接调用 `f(s)`；而在 `Chain` 中，为了保证 `middlewares[0]` 在最外层最先收到输入，需要从切片末尾 `len(middlewares)-1` 倒序向前包裹。
 
 **代码讲解**
 
@@ -437,7 +437,7 @@ func TestCheckModulePath(t *testing.T) {
 
 1. `strings.Split(version[1:], ".")`：去掉开头的 `"v"` 后必须恰好切成 3 段，并用 `strconv.Atoi` 转换及 `strconv.Itoa(n) != p` 过滤掉类似 `"01"` 或 `"+1"` 的非规范数字。
 2. `major >= 2`：构造 `wantSuffix := "/v" + strconv.Itoa(major)`，检查 `strings.HasSuffix` 且前缀部分非空。
-3. `major <= 1`：拒绝以 `/v0`、`/v1` 或 `/vN`（$N \ge 2$）结尾的路径。
+3. `major <= 1`：拒绝以 `/v0`、`/v1` 或 `/vN`（`N >= 2`）结尾的路径。
 
 **易错点**
 
@@ -602,4 +602,4 @@ func TestPermissionBitmask(t *testing.T) {
 
 **易错点**
 
-- 判断组合权限 `HasAll(PermRead | PermExec)` 时，若誤写成 `cur&p != 0`，只要拥有 `PermRead` 就会错误地返回 `true`。
+- 判断组合权限 `HasAll(PermRead | PermExec)` 时，若误写成 `cur&p != 0`，只要拥有 `PermRead` 就会错误地返回 `true`。

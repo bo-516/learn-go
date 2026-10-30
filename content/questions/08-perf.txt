@@ -1,10 +1,8 @@
 === perf-29
-cat: perf
 group: Linux
 level: 2
+hot: true
 title: 线上报警磁盘空间满（No space left on device），但 du 统计文件总和却很小，怎么排查？
-tags: Linux, 磁盘满, Inode, 已删除未释放文件, lsof
-tasks: perf-29-1
 --- answer
 这是 Linux 线上运维中最经典的两大磁盘陷阱，按以下两步可在 30 秒内定位根因：
 
@@ -21,7 +19,7 @@ tasks: perf-29-1
 - **根因**：**Inode 耗尽（`df -i` 显示 `IUse% = 100%`）**！例如定时任务、缓存目录或未清理的临时会话生成了数百万个几字节的零碎小文件，把文件系统的 Inode 号分配光了，导致无法创建任何新文件。
 - **定位命令**：`df -i` 确认 Inode 满，再用 `find / -xdev -printf '%h\n' | sort | uniq -c | sort -k 1 -nr | head -20` 找出包含小文件最多的目录并分批清理（用 `find dir -type f -delete`，避免 `rm *` 报 `Argument list too long`）。
 --- deep
-### 为什么 `rm` 不会立刻释放磁盘空间？（Linux VFS 引用计数双条件）
+**原理展开**
 
 Linux 内核决定是否真正释放一个文件占用的磁盘数据块（Data Blocks）和 Inode，必须**同时满足两个计数归零**：
 
@@ -40,79 +38,158 @@ Linux 内核决定是否真正释放一个文件占用的磁盘数据块（Data 
 2. 但 Go 业务进程的 `os.File` 依然打开着它（`i_count == 1`），并且还在源源不断地往这个“幽灵文件”里 `write()` 追加日志；
 3. 磁盘空间一字节都没释放，甚至还在继续涨！
 
-### 在不重启进程且已 `rm` 的绝境下如何瞬间救火？
-
-假设线上核心交易进程不能重启，而 80GB 的日志文件已经被误 `rm` 了：
+假设线上核心交易进程不能重启，而 80GB 的日志文件已经被误 `rm` 了，可在不重启进程的情况下瞬间救火：
 1. 执行 `lsof +L1` 找到该进程 PID（如 `12345`）和对应的文件描述符 FD（如 `4w`）；
-2. 执行截断指令：
-   ```bash
-   truncate -s 0 /proc/12345/fd/4
-   ```
-   内核会直接将 `/proc/<pid>/fd/<fd>` 指向的底层 Inode 长度截断为 0，80GB 磁盘空间在 100 毫秒内原地满血释放，且业务进程毫发无损！
+2. 执行 `truncate -s 0 /proc/12345/fd/4`，内核会直接将 `/proc/<pid>/fd/<fd>` 指向的底层 Inode 长度截断为 0，80GB 磁盘空间在 100 毫秒内原地释放，且业务进程毫发无损。
+
+**代码示例**
+
+```go
+// 原地安全清空活跃日志文件（严禁 os.Remove 删除正在被进程持有的大日志）
+func TruncateActiveLog(f *os.File) error {
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	// 注意：若文件未以 O_APPEND 打开，Truncate(0) 不会自动重置文件读写偏移量，必须显式 Seek(0, 0)
+	_, err := f.Seek(0, 0)
+	return err
+}
+```
+
+**常见追问**
+
+- 除了“文件被删除但句柄未关闭”之外，还有哪些原因会导致 `df` 显示已用空间远大于 `du` 统计总和？→ **挂载点遮蔽（Mount Point Masking）**：例如原来 `/data` 目录下已经写了 50GB 文件，后来运维把一块新磁盘直接 `mount` 到了 `/data` 目录上；此时原 `/data` 下的 50GB 文件被新挂载点遮蔽，`du` 看不到它们，但根分区 `df` 依然实打实占着这 50GB。
+- 为什么 ext4 文件系统上 `df` 显示还有 3% 的剩余空间，普通业务进程（非 root）却已经报 `No space left on device` 了？→ ext4 默认保留了 **5% 的磁盘块（Reserved Blocks）** 专供 `root` 用户和系统守护进程应急使用（防止磁盘 100% 满时连 `sshd` 或系统日志都无法写入）；在大容量数据盘上可通过 `tune2fs -m 1 /dev/nvme0n1p1` 将预留比例调小到 1%。
+- 如果一个目录里有 500 万个零碎小文件把 Inode 占满了，为什么直接敲 `rm -f /tmp/sess/*` 会报错失败？→ 因为通配符 `*` 是由 Shell（bash/zsh）在调用 `execve` 前展开成参数列表的，500 万个文件名远远超过了内核 `ARG_MAX`（通常 2MB）上限，直接报 `Argument list too long`；应使用 `find /tmp/sess -mindepth 1 -delete` 或 `rsync --delete-before -a /empty_dir/ /tmp/sess/`。
+
+**实战建议**
+
+- 生产环境日志轮转（Logrotate）优先采用 **`copytruncate`** 或信号通知进程重开文件描述符（`USR1` / `SIGHUP`），严禁运维脚本对活跃日志文件直接执行 `rm`。
+- 节点监控（Node Exporter）必须同时对 **磁盘容量使用率（`node_filesystem_avail_bytes`）** 和 **Inode 使用率（`node_filesystem_files_free`）** 设置告警阈值（如 `> 85%` 告警）。
 
 === perf-30
-cat: perf
-group: 综合
+group: Linux
 level: 3
-title: 线上偶发请求超时，排查发现是 DNS 解析慢（5 秒毛刺），是什么原因？如何解决？
-tags: DNS, Kubernetes, CoreDNS, ndots, Conntrack, Go
-tasks: perf-30-1
+hot: true
+title: 线上高并发节点偶发建连超时（1s/3s 毛刺），dmesg 报错 nf_conntrack: table full, dropping packet，是什么原因？如何排查和调优？
 --- answer
-在 Kubernetes 容器环境或高并发 Linux 服务器上，“DNS 解析偶发 5 秒毛刺（5000ms）”是一个极其高频的经典线上疑难杂症。为什么刚好是 **5 秒**？因为 Linux `/etc/resolv.conf` 默认的 DNS 超时重试时间（`timeout:5`）正好是 5 秒！
+在 Linux 高并发网关、Kubernetes 节点（尤其是使用 `iptables` 模式的 `kube-proxy` 或开启了有状态防火墙 `netfilter` 的宿主机）上，**`nf_conntrack`（连接跟踪表）满或并发源端口冲突**是导致偶发建连丢包超时（1s/3s SYN 重传毛刺）的头号元凶。
 
-**三大常见根因与排查**
+**1. 什么是 `nf_conntrack`？为什么它会满？**
+- Linux 内核的 `netfilter` 框架通过 `nf_conntrack` 模块记录每一条经过本机的 TCP/UDP/ICMP 连接五元组状态（用于 NAT 地址转换和有状态防火墙规则匹配）。
+- **表满原因**：
+  1. **突发高并发短连接 + 超长默认超时**：内核默认 `nf_conntrack_tcp_timeout_established = 432000`（整整 **5 天**！），且 `nf_conntrack_tcp_timeout_time_wait = 120`（2 分钟）。如果节点上有大量未开启长连接复用的 HTTP/RPC 短连接，几十万个 `TIME_WAIT` 或半死不活的僵尸连接会把 `nf_conntrack_max`（默认往往只有 `65536` 或 `131072`）彻底塞满；
+  2. **一旦表满**：任何新建连接的第一个 `SYN` 包或 UDP 包到达内核时，直接报错 `nf_conntrack: table full, dropping packet` 并静默丢弃！客户端被迫等待 **1 秒（TCP 初始 SYN RTO）** 后才能重传。
 
-**1. K8s 默认 `ndots:5` 引发的 4~5 倍冗余 DNS 查询放大**
-- K8s Pod 默认的 `/etc/resolv.conf` 包含：
-  `search default.svc.cluster.local svc.cluster.local cluster.local`
-  `options ndots:5`
-- **原理**：当请求域名中的点号 `.` 少于 5 个（例如调外部接口 `api.weixin.qq.com`，只有 3 个点）时，解析器会认为它是集群内部短域名，**依次拼接所有的 `search` 后缀去查一遍（每次还并发查 A 记录 IPv4 和 AAAA 记录 IPv6）**！前 6 次全返回 `NXDOMAIN`，最后才查真正的 `api.weixin.qq.com.`，把 CoreDNS 的 QPS 放大了近 10 倍。
+**2. 排查三板斧**
+1. **查内核日志与当前水位**：
+   - `dmesg -T | grep nf_conntrack` 确认是否有 `table full`；
+   - 对比当前已用表项 `sysctl net.netfilter.nf_conntrack_count` 与上限 `sysctl net.netfilter.nf_conntrack_max`。
+2. **查 `conntrack` 内部丢包与并发冲突统计（极易漏查的隐形杀手！）**：
+   - 执行 **`conntrack -S`**，重点观察两个指标：
+     - `drop`：因表满或内存分配失败直接丢弃的包数；
+     - `insert_failed`：**即使表没满也会发生的并发 CAS 源端口冲突丢包**！例如两个并发 UDP 请求或 DNAT 映射恰好选了相同五元组，后插入的包在内核哈希桶自旋锁检查时直接 `insert_failed` 被丢弃。
+3. **分析表内连接状态分布**：`conntrack -L | awk '{print $4}' | sort | uniq -c | sort -nr`，看究竟是 `TIME_WAIT` 过多还是 `ESTABLISHED` 泄漏。
 
-**2. Linux 内核 UDP `nf_conntrack` 并发竞态丢包（正好卡 5 秒！）**
-- DNS 默认使用 UDP 协议。当同一个客户端并发发起 A（IPv4）和 AAAA（IPv6）两个 UDP DNS 请求时，在开启了 `netfilter`（如 kube-proxy iptables 模式）的节点上，两个 UDP 包可能同时到达内核并尝试插入同一条 `conntrack` 表项；
-- 后者在 CAS 冲突中直接被内核静默丢弃（可通过 `conntrack -S` 看到 `insert_failed` 计数增长）！被丢包的那个请求只能傻等 **5 秒超时** 后才触发重试。
-
-**3. Go 语言 DNS 解析器（Pure Go vs cgo）线程耗尽**
-- Go 默认使用纯 Go 实现的 DNS 解析器（`GODEBUG=netdns=go`，在协程中非阻塞收发 UDP）；但如果启用了 cgo 且存在特殊 NSS 配置，走到系统调用 `getaddrinfo`（`netdns=cgo`），每个阻塞的 DNS 查询都会独占一个 OS 线程（M），瞬间创建上千个系统线程拖垮进程。
-
-**彻底根治方案**
-1. **部署 NodeLocal DNSCache**，并开启 `options single-request-reopen` 或强制走 TCP；
-2. **调小 Pod 的 `ndots: 2`**，或在代码中访问外部固定域名时末尾加上根点（FQDN：`api.weixin.qq.com.`）；
-3. **在 Go 进程内对 `net.Dialer` 增加带 Singleflight 与 Stale-While-Revalidate 的进程内 DNS 缓存**（避免每次新建连接都查 DNS）。
+**3. 体系化根治与内核调优**
+1. **调大跟踪表容量与哈希桶大小**（桶大小 `buckets` 应为 `max` 的 `1/4`，减少哈希链表遍历耗时）：
+   - `sysctl -w net.netfilter.nf_conntrack_max=1048576`
+   - `echo 262144 > /sys/module/nf_conntrack/parameters/hashsize`
+2. **收紧 TCP 跟踪超时时间**：
+   - 将 `nf_conntrack_tcp_timeout_time_wait` 从 `120s` 调小到 `30s`；
+   - 将 `nf_conntrack_tcp_timeout_established` 从 `432000s`（5 天）调小到 `1800s`（30 分钟）。
+3. **架构层治本**：全面消灭业务短连接（开启 HTTP Keep-Alive / 连接池复用）；K8s 集群将 `kube-proxy` 从 `iptables` 升级为 **IPVS 或 eBPF（Cilium Socket-LB）**；纯内网高吞吐网关对无需 NAT 的端口配置 `iptables -t raw -A PREROUTING -p tcp --dport 8080 -j NOTRACK` 彻底绕过连接跟踪。
 --- deep
-### 为什么 `api.weixin.qq.com` 会在 K8s 里触发 8 次 DNS 查询？
+**原理展开**
 
-看一眼 K8s Pod 里的 `/etc/resolv.conf`：
-```
-nameserver 10.96.0.10
-search prod.svc.cluster.local svc.cluster.local cluster.local ec2.internal
-options ndots:5
-```
-
-当你请求 `api.weixin.qq.com`（包含 **3** 个 `.`，小于 `ndots:5`）时，解析器执行的查询序列是：
-1. `api.weixin.qq.com.prod.svc.cluster.local.` (A + AAAA) -> NXDOMAIN
-2. `api.weixin.qq.com.svc.cluster.local.` (A + AAAA) -> NXDOMAIN
-3. `api.weixin.qq.com.cluster.local.` (A + AAAA) -> NXDOMAIN
-4. `api.weixin.qq.com.ec2.internal.` (A + AAAA) -> NXDOMAIN
-5. `api.weixin.qq.com.` (A + AAAA) -> **终于拿到 IP！**
+为什么有时候 `nf_conntrack_count` 只有上限的 30%，没有报 `table full`，但 `conntrack -S` 里的 `insert_failed` 依然在涨，导致偶发 1s~5s 毛刺？
 
 ```
-解决办法对比：
-1. Pod YAML 配置 dnsConfig: options: [{name: ndots, value: "2"}, {name: timeout, value: "1"}, {name: attempts, value: "2"}]
-2. 进程内缓存：重写 http.Transport 的 DialContext，将域名解析结果在内存中缓存 30~60s，后台异步刷新！
+内核 nf_conntrack 包处理流水线（乐观无锁并发插入机制）：
+  数据包进入 ──► 1. nf_conntrack_in(): 查全局哈希表，发现五元组不存在（尚未插入）
+             ──► 2. 经过 iptables PREROUTING / OUTPUT 规则做 SNAT/DNAT 选定源端口
+             ──► 3. nf_conntrack_confirm(): 在出口处正式将五元组插入全局哈希桶！
+                     └── 若在 (1) 到 (3) 的微秒级窗口内，另一个 CPU 核心上的并发包
+                         恰好抢先插入了相同的五元组 ──► CAS 冲突！触发 insert_failed 直接丢包！
 ```
 
-### Go 服务为什么强烈建议做进程内 DNS 缓存？
+同时，当 `nf_conntrack_max` 设置过大（如 `1048576`）但哈希桶 `nf_conntrack_buckets` 依然维持默认的 `16384` 时，每个哈希桶挂接的双向链表平均长度高达 64 个节点，每次软中断（SoftIRQ `NET_RX`）收包查表都要遍历长链表，导致宿主机 **`%si`（软中断 CPU）飙高到 100%**！
 
-与 Java（JVM 默认缓存 DNS）不同，**Go 标准库的 `net.Resolver` 没有任何内置 DNS 缓存**！只要连接池因为波动新建 TCP 连接（或者短连接未复用），每次 `DialContext` 都会实打实地向 CoreDNS 发 UDP 包。在 `http.Transport.DialContext` 层包一层带 `Singleflight` 和过期兜底（Serve Stale on Error）的内存 DNS 缓存，即便 CoreDNS 整个集群短暂重启，你的 Go 服务也能靠本地缓存的旧 IP 零报错平稳度过！
+**代码示例**
+
+```go
+// Linux nf_conntrack 状态跟踪表容量管理、过期回收与 UNREPLIED Early-Drop 驱逐模型
+type conntrackEntry struct {
+	state    string
+	expireAt int64
+}
+
+type ConntrackTable struct {
+	mu         sync.Mutex
+	maxEntries int
+	entries    map[string]*conntrackEntry
+	EarlyDrops int64
+	Drops      int64
+}
+
+func (t *ConntrackTable) Track(tuple, state string, ttlSec, nowSec int64) (bool, string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if ent, ok := t.entries[tuple]; ok {
+		if nowSec < ent.expireAt {
+			ent.state = state
+			ent.expireAt = nowSec + ttlSec
+			return true, "updated"
+		}
+		delete(t.entries, tuple)
+	}
+	// 1. 表满时先清理已到期的 TIME_WAIT / CLOSE 条目
+	if len(t.entries) >= t.maxEntries {
+		for k, ent := range t.entries {
+			if nowSec >= ent.expireAt {
+				delete(t.entries, k)
+			}
+		}
+	}
+	// 2. 仍满则触发内核 early_drop：驱逐最早过期的 UNREPLIED 半连接
+	if len(t.entries) >= t.maxEntries {
+		var victim string
+		for k, ent := range t.entries {
+			if ent.state == "UNREPLIED" && (victim == "" || ent.expireAt < t.entries[victim].expireAt) {
+				victim = k
+			}
+		}
+		if victim != "" {
+			delete(t.entries, victim)
+			t.EarlyDrops++
+		}
+	}
+	if len(t.entries) >= t.maxEntries {
+		t.Drops++
+		return false, "table_full"
+	}
+	t.entries[tuple] = &conntrackEntry{state: state, expireAt: nowSec + ttlSec}
+	return true, "inserted"
+}
+```
+
+**常见追问**
+
+- 为什么我只调大了 `/etc/sysctl.conf` 里的 `net.netfilter.nf_conntrack_max = 1048576`，重启压测后机器网络软中断（`ksoftirqd` CPU）反而被打爆了？→ 因为没有同步调大哈希桶数量 `nf_conntrack_buckets`（位于 `/sys/module/nf_conntrack/parameters/hashsize`）！`conntrack` 表是哈希桶加链表结构，只加 `max` 不加 `hashsize` 会让哈希冲突剧增，每次收发包都在内核态做长链表遍历；黄金比例是 **`max = 4 * hashsize` 或 `2 * hashsize`**。
+- 当宿主机 `nf_conntrack` 表真的满了，内核有内置的“提前强制踢掉老连接”机制吗？→ Linux 内核有一个 `early_drop`（位于 `net/netfilter/nf_conntrack_core.c`）**早期驱逐**机制：当表满时，内核会在新包所属的哈希桶链表上最多扫描 8 个处于**未收到回包确认（`UNREPLIED`）**状态的半连接并将其踢掉腾出位置；但如果桶里全是已握手的 `ESTABLISHED` 或 `TIME_WAIT` 连接，`early_drop` 也无能为力，只能丢弃新包。
+- 怎么对高吞吐的纯转发服务（如自建四层/七层网关，不需要本机状态防火墙和 NAT）彻底关闭 `nf_conntrack` 开销？→ 使用 `iptables` 的 `raw` 表（优先级高于 `conntrack` 钩子）同时对入站和出站流量打上 `NOTRACK`（新版为 `-j CT --notrack`）标记：`iptables -t raw -A PREROUTING -p tcp --dport 80 -j CT --notrack` 和 `iptables -t raw -A OUTPUT -p tcp --sport 80 -j CT --notrack`。
+
+**实战建议**
+
+- 所有 K8s 宿主机和网关机器必须将 `node_nf_conntrack_entries / node_nf_conntrack_entries_limit` 纳入 Prometheus 核心监控，水位超过 **70%** 立即告警。
+- 在排查 K8s 偶发网络建连超时或 UDP 丢包时，除了看网卡丢包 `ethtool -S`，务必养成第一时间跑 **`conntrack -S`** 检查 `drop`、`early_drop` 和 `insert_failed` 计数的习惯。
 
 === perf-31
-cat: perf
 group: 综合
 level: 3
+hot: true
 title: 容器频繁发生 OOMKilled（退出码 137），但监控显示 Go Heap 只有容器限制的一半，怎么排查？
-tags: OOMKilled, 容器内存, GOMEMLIMIT, PageCache, Mmap, Cgo
-tasks: perf-31-1
 --- answer
 当 Kubernetes Pod 因退出码 `137`（`SIGKILL`，`Reason: OOMKilled`）重启，但 Grafana 上 `go_memstats_heap_inuse_bytes` 才 1GB（容器 Limit 是 2GB）时，说明**另外那 1GB 内存并不在 Go 的存活堆（Heap Inuse）里**。
 
@@ -133,7 +210,9 @@ tasks: perf-31-1
 **4. 容器内存在多个进程（如日志采集脚本、子进程 `exec.Command`）**
 - cgroup Limit 限制的是整个 Pod 容器内所有进程的 RSS 总和。若 Go 进程通过 `os/exec` 并发拉起了多个 `ffmpeg` / `git` / `python` 子进程，子进程的内存同样算在同一个 cgroup 账上！
 --- deep
-### 一张图看懂容器 cgroup `memory.current` 的完整构成
+**原理展开**
+
+一张图看懂容器 cgroup `memory.current` 的完整构成：
 
 ```
 ┌─────────────────────────── Container Memory Limit (e.g. 2048 MiB) ───────────────────────────┐
@@ -147,22 +226,52 @@ tasks: perf-31-1
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 为什么 `go tool pprof inuse_space` 经常比监控上的容器内存小得多？
-
-线上排查内存告警时，新手最常犯的错误是直接看 `pprof/heap`（默认展示 `inuse_space`）：
+线上排查内存告警时，为什么 `go tool pprof inuse_space` 经常比监控上的容器内存小得多？
 1. `pprof/heap` **只包含上一次 GC 结束时存活的堆对象**（甚至不包含当前 GC 周期内新分配还没来得及回收的临时对象，也不包含 Goroutine 栈 `StackInuse`！）；
-2. 要看真实的 Go 运行时账本，应该查 **`/metrics` 或 `/debug/pprof/heap?debug=1`** 中的：
-   - `HeapInuse`：正在使用的堆 Span（包含页内碎片，往往比 `HeapAlloc` 大 10%~30%）；
-   - `HeapIdle - HeapReleased`：已空闲但 Go runtime 留在手里没调 `madvise` 归还给 OS 的物理内存；
-   - `StackInuse`：所有协程栈占用的物理内存（例如 10 万个曾扩容到 8KB 的协程栈就是 800MB，全部不在 heap profile 里！）。
+2. 要看真实的 Go 运行时账本，应该查 `/metrics` 或 `/debug/pprof/heap?debug=1` 中的 `HeapInuse`（正在使用的堆 Span，包含页内碎片）、`HeapIdle - HeapReleased`（已空闲但 Go runtime 留在手里没调 `madvise` 归还给 OS 的物理内存）以及 `StackInuse`（所有协程栈占用的物理内存）。
+
+**代码示例**
+
+```go
+// 自顶向下拆解容器 cgroup 内存、进程 RSS 与 Go runtime.MemStats 账本，定位隐形内存去向
+func DiagnoseMemoryGap(cgroupCurrent, processRSS int64, ms *runtime.MemStats) string {
+	threshold := cgroupCurrent * 30 / 100
+	// 1. 容器总用量远大于 Go 进程 RSS -> 文件 PageCache、tmpfs 或子进程占用
+	if cgroupCurrent-processRSS > threshold {
+		return "page_cache_or_subprocesses"
+	}
+	// 2. Go 进程 RSS 远大于 Go 运行时向 OS 申请且未释放的内存 -> Cgo malloc 或 syscall.Mmap
+	goRetainedSys := int64(ms.Sys - ms.HeapReleased)
+	if processRSS-goRetainedSys > threshold {
+		return "off_heap_cgo_or_mmap"
+	}
+	// 3. 协程栈膨胀或未释放空闲页占比过高
+	if int64(ms.StackInuse) > threshold {
+		return "goroutine_stack_bloat"
+	}
+	if int64(ms.HeapIdle-ms.HeapReleased) > threshold {
+		return "unreleased_heap_idle"
+	}
+	return "go_heap_inuse"
+}
+```
+
+**常见追问**
+
+- 容器里读写了 5GB 的本地临时文件产生了大量 Page Cache，难道 Linux 内核在内存紧张时不会自动回收 Page Cache 吗，为什么还是触发了 OOMKilled？→ 干净的 Page Cache（Clean Pages）确实可以被内核回收，但在以下两种情况下来不及回收就会直接 OOM：一是程序高频写入导致大量**脏页（Dirty Pages）**尚未刷盘，在写回磁盘完成前内核无法回收它们；二是 Go 进程或子进程在几毫秒内发生**突发大块内存分配**，内核直接内存回收（Direct Reclaim）速度跟不上分配速度。
+- 为什么容器里挂载的 `emptyDir: { medium: Memory }`（即 `/dev/shm` 或 `tmpfs`）写文件会直接导致 Pod OOMKilled？→ 因为 `tmpfs` 是基于内存的文件系统，而且它占用的内存在内核里属于**不可回收的共享内存页（Shmem）**，100% 计入当前 Pod 的 cgroup 内存配额中，且绝对无法像普通磁盘 Page Cache 那样被丢弃回收！
+- 开启 `GOMEMLIMIT` 后，如果存活堆对象真的已经涨到了 `GOMEMLIMIT` 的 100%，会发生什么？→ Go 运行时为了避免频繁 GC 把 CPU 100% 占满（GC 颠簸 Thrashing），内置了 **CPU 利用率上限保护（50% CPU Limit）**：当 GC 占用的 CPU 超过 50% 时，运行时宁可让堆内存突破 `GOMEMLIMIT`（最终由 OS OOMKill 兜底），也不会让进程陷入无限 STW 假死。
+
+**实战建议**
+
+- 所有运行在 K8s 容器中的 Go 1.19+ 服务，务必通过环境变量或 `automemlimit` 库将 **`GOMEMLIMIT` 设置为容器内存 Limit 的 `80% ~ 85%`**。
+- 容器内严禁将大量业务日志直接写进容器本地 RootFS（既产生 Page Cache 又有 overlayfs 写放大），应直接写 `stdout` 或挂载独立宿主机卷配合异步轮转。
 
 === perf-32
-cat: perf
 group: Go
 level: 2
+hot: true
 title: 怎么正确阅读 CPU 火焰图、内存火焰图和差分火焰图（Diff Flame Graph）？
-tags: 火焰图, pprof, 性能分析, CPU, 内存调优
-tasks: perf-32-1
 --- answer
 火焰图（Flame Graph，由 Brendan Gregg 发明）是定位性能瓶颈最直观的可视化利器，但很多工程师会误读它的坐标轴含义。
 
@@ -182,12 +291,9 @@ tasks: perf-32-1
    - 发版后 CPU 涨了 20% 或内存慢泄漏时，对比两个时间点（或发版前后）的 profile：
    - **红色块**代表耗时/内存增长的热点（越红增长越多），**蓝色块**代表减少的部分，1 秒揪出劣化代码！
 --- deep
-### 理解 `Flat (Self)` 与 `Cum (Cumulative)` 的本质区别
+**原理展开**
 
-假设调用链是 `Handler() -> Service() -> MarshalJSON()`，其中：
-- `Handler()` 自身逻辑耗时 `1ms`，调用了 `Service()`；
-- `Service()` 自身逻辑耗时 `2ms`，调用了 `MarshalJSON()`；
-- `MarshalJSON()` 自身耗时 `97ms`。
+理解 `Flat (Self)` 与 `Cum (Cumulative)` 的本质区别：假设调用链是 `Handler() -> Service() -> MarshalJSON()`，其中 `Handler()` 自身逻辑耗时 `1ms`，`Service()` 自身逻辑耗时 `2ms`，`MarshalJSON()` 自身耗时 `97ms`。
 
 ```
 火焰图形状（顶部为被调用者）：
@@ -206,17 +312,66 @@ tasks: perf-32-1
 | `Service` | `2ms` (2%) | `99ms` (99%) | 只是中间商 |
 | `MarshalJSON` | **`97ms` (97%)** | `97ms` (97%) | **真正的热点！优化它！** |
 
-### 为什么颜色在普通火焰图里没有任何性能含义？
-
 在普通火焰图（非差分火焰图）中，深红、橙色、黄色只是为了区分相邻方块的**随机暖色调**，**颜色深浅与耗时高低毫无关系**，只看**横向宽度（Width）**！只有在 `-diff_base` 生成的**红蓝差分火焰图**中，颜色才代表增长（红）与下降（蓝）。
 
+**代码示例**
+
+```go
+// 解析火焰图折叠调用栈（funcA;funcB;funcC samples），计算每个函数的 Flat 与去重后的 Cum
+type FlameStat struct {
+	Flat int64
+	Cum  int64
+}
+
+func ComputeFlameStats(lines []string) map[string]FlameStat {
+	stats := make(map[string]FlameStat)
+	for _, line := range lines {
+		spaceIdx := strings.LastIndexByte(line, ' ')
+		if spaceIdx <= 0 {
+			continue
+		}
+		frames := strings.Split(line[:spaceIdx], ";")
+		samples, err := strconv.ParseInt(line[spaceIdx+1:], 10, 64)
+		if err != nil || len(frames) == 0 {
+			continue
+		}
+		// 1. 栈顶叶子节点累加 Flat（即暴露在顶部的平顶宽度）
+		leaf := frames[len(frames)-1]
+		st := stats[leaf]
+		st.Flat += samples
+		stats[leaf] = st
+
+		// 2. 调用链上所有出现过的函数（递归去重）累加 Cum
+		seen := make(map[string]struct{}, len(frames))
+		for _, fn := range frames {
+			if _, ok := seen[fn]; !ok {
+				seen[fn] = struct{}{}
+				s := stats[fn]
+				s.Cum += samples
+				stats[fn] = s
+			}
+		}
+	}
+	return stats
+}
+```
+
+**常见追问**
+
+- 如果接口响应很慢（P99 高达 2 秒），但抓出来的 **CPU 火焰图却非常空闲**，是怎么回事？应该改抓什么火焰图？→ 因为 CPU 火焰图只采样**正在 CPU 上运行的线程（On-CPU）**！如果协程阻塞在等待网络 I/O、等待锁或 `time.Sleep` 上（处于 `_Gwaiting` 状态），它根本不消耗 CPU，所以在 CPU 火焰图里完全隐形；此时应该抓 **Off-CPU 火焰图（`fgprof`）**，或者 Go 原生的 **`mutex` / `block` / `trace` profile**。
+- 在 CPU 火焰图里看到 `runtime.mallocgc` 和 `runtime.gcBgMarkWorker` 占了 35% 的宽度，应该怎么顺藤摸瓜找到业务代码？→ CPU 火焰图里的 `gcBgMarkWorker` 是后台并发标记协程，它的调用栈顶看不到是谁分配了这些内存；此时应立刻切换到 **`pprof/heap` 的 `alloc_space` 或 `alloc_objects` 火焰图**，直接揪出每秒疯狂制造短命堆对象的业务函数。
+- 为什么有些小函数在代码里明明被调用了，但在火焰图里却看不到它的那一格？→ 因为 Go 编译器在编译期对该短小函数实施了**函数内联（Function Inlining）**，将其指令直接展开到了父函数内部（`pprof` 默认会通过符号表还原内联帧，若传了 `--noinlines` 则内联帧会合并进父函数）。
+
+**实战建议**
+
+- 排查线上内存缓慢上涨（Memory Leak）时，永远不要只抓单张 `heap` 图硬看，而是间隔 30 分钟抓两张，执行 `go tool pprof -http=:8080 -diff_base=heap_t1.pb.gz heap_t2.pb.gz`，答案会在 3 秒内浮出水面。
+- 优化 CPU 热点前，先同时看 `alloc_space` 火焰图：在 Go 项目中，**80% 的 CPU 高负载本质上是由高频内存分配与序列化引发的**，消除堆逃逸往往能同时把 CPU 和 GC 降下来。
+
 === perf-33
-cat: perf
 group: 综合
 level: 3
+hot: false
 title: 服务刚启动或滚动发布刚上线的前几秒大量报错超时（冷启动毛刺），可能是什么原因？怎么解决？
-tags: 冷启动, 滚动发布, 连接池预热, 本地缓存, 优雅上下线, 慢启动
-tasks: perf-33-1
 --- answer
 每次 K8s 滚动发布（Rolling Update）新 Pod 刚接流量的前 5~10 秒，监控上都会出现一波 P99 飙升甚至超时报错（Cold Start Latency Spike），是微服务稳定性的头号杀手。
 
@@ -237,9 +392,9 @@ tasks: perf-33-1
 **4. 负载均衡器缺少慢启动（Slow Start / Warmup Window）**
 - **解法**：在网关/Service Mesh（如 Envoy `slow_start_config`）或 RPC 客户端配置 **30~60 秒线性慢启动窗口**：新节点刚上线第 1 秒只分配 5% 权重，随着时间推移在 30 秒内平滑递增到 100% 正常权重！
 --- deep
-### 标准生产级服务启动与就绪（Readiness）生命周期编排
+**原理展开**
 
-很多团队的 `/healthz` 和 `/readyz` 直接写死返回 `200 OK`，导致容器刚跑起 `main()` 第一行还没连上数据库，K8s 就把流量切过来了。
+很多团队的 `/healthz` 和 `/readyz` 直接写死返回 `200 OK`，导致容器刚跑起 `main()` 第一行还没连上数据库，K8s 就把流量切过来了。标准生产级服务启动与就绪（Readiness）生命周期编排如下：
 
 ```
 [进程启动 main()]
@@ -254,25 +409,69 @@ tasks: perf-33-1
 2. 标记 atomic.Bool ready = true（/readyz 开始返回 200 OK）
       │
       ▼
-3. 负载均衡器感知就绪，开启 30s Slow-Start 线性渐进加权放量 (5% -> 20% -> 50% -> 100%)
+3. 负载均衡器感知就绪，开启 30s Slow-Start 线性渐进加权放量 (10% -> 30% -> 60% -> 100%)
 ```
 
-### 慢启动权重公式（Linear Slow-Start Weight）
+在客户端负载均衡（如 gRPC Picker）中，针对上线时间不足 `warmupWindow`（如 `30s`）的新实例，按线性慢启动公式计算其动态权重比例：
 
-在客户端负载均衡（如 gRPC Picker）中，针对上线时间不足 `warmupDuration`（如 30s）的新实例，计算其动态权重比例：
-$$W(t) = \max\left(W_{\min}, \min\left(1.0, \frac{t - t_{\text{start}}}{T_{\text{warmup}}}\right)\right)$$
-例如设定最小起步权重 $W_{\min} = 0.1$（10%），预热窗口 $T_{\text{warmup}} = 30\text{s}$：
-- 刚上线时（$t=0\text{s}$）拿到 10% 的流量，温和填满本地缓存；
+```text
+W(t) = max(W_min, min(1.0, (t - t_start) / T_warmup))
+```
+
+例如设定最小起步权重 `W_min = 0.1`（10%），预热窗口 `T_warmup = 30s`：
+- 刚上线时（`t = 0s`）拿到 10% 的流量，温和填满本地缓存；
 - 15 秒时拿到 50% 流量；
 - 30 秒后恢复 100% 满额权重，彻底消灭滚动发布毛刺！
 
+**代码示例**
+
+```go
+// 并发预建下游连接池（Warmup）+ 负载均衡器线性慢启动（Slow-Start）权重计算
+func WarmupDBPool(ctx context.Context, db *sql.DB, minConns int) error {
+	conns := make([]*sql.Conn, 0, minConns)
+	defer func() {
+		// 全部建立完毕后再统一 Close 归还回 sql.DB 空闲连接池，强制撑开物理连接数
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}()
+	for range minConns {
+		c, err := db.Conn(ctx)
+		if err != nil {
+			return err
+		}
+		conns = append(conns, c)
+	}
+	return nil
+}
+
+func SlowStartWeight(uptime, warmupWindow time.Duration, minWeight float64) float64 {
+	if warmupWindow <= 0 || uptime >= warmupWindow {
+		return 1.0
+	}
+	if uptime <= 0 {
+		return minWeight
+	}
+	return max(minWeight, float64(uptime)/float64(warmupWindow))
+}
+```
+
+**常见追问**
+
+- 为什么预热 `database/sql` 连接池时，在一个循环里连续调 10 次 `db.Ping()` **并不能**真正建立 10 条连接，而只会复用第 1 条连接？→ 因为第一次 `db.Ping()` 执行完就会把那条连接立即放回空闲池，第二次 `db.Ping()` 直接复用了刚才那条空闲连接，最终池子里只有 **1 条**物理连接！正确做法是通过 `db.Conn(ctx)` 并发或连续借出 `N` 条独立连接握在手里，全部借出成功后再统一调用 `conn.Close()` 归还到空闲池。
+- 既然已经在 `/readyz` 返回 `200` 之前预热好了连接池，为什么还需要负载均衡器的 **Slow-Start（慢启动）**？→ 因为**动态流量触发的本地缓存（如基于用户 ID 或商品 ID 的 LRU 缓存）**无法在启动时 100% 穷举预加载；如果一上来就涌入 100% 流量，冷缓存导致的缓存未命中风暴依然会瞬间给下游 Redis 造成毛刺。
+- K8s 的 `livenessProbe`（存活探针）和 `readinessProbe`（就绪探针）能共用同一个检查下游 DB 的接口吗？→ **绝对禁止**！如果 `livenessProbe` 也去检查下游 DB，一旦 DB 发生 5 秒抖动，K8s 会误以为所有业务 Pod 死锁了而把全集群 Pod 全部杀掉重启，进而引发灭顶的冷启动雪崩；`livenessProbe` 只能做进程内自检，只有 `readinessProbe` 才能检查依赖就绪状态。
+
+**实战建议**
+
+- 对 `database/sql` 务必同时配置 `SetMaxOpenConns`、`SetMaxIdleConns`（建议与 `MaxOpenConns` 接近，防止波峰波谷反复拆建连接）并在 `Readiness` 开放前完成物理连接预建。
+- 对核心高 QPS 服务，在网关（Envoy / Nginx）或 RPC 注册中心开启 `30s ~ 60s` 的 `slow_start` 慢启动权重爬坡。
+
 === perf-34
-cat: perf
 group: Linux
 level: 2
+hot: false
 title: 线上日志打印过多打满磁盘 I/O，拖慢了业务接口响应，如何定位和治理？
-tags: 日志治理, 磁盘IO, 异步日志, 日志采样, zap, slog
-tasks: perf-34-1
 --- answer
 “一行 `log.Info` 把 P99 延迟从 5ms 拖慢到 500ms”是高并发系统中极易被忽视的性能杀手。
 
@@ -290,10 +489,9 @@ tasks: perf-34-1
 2. **环形缓冲区异步批量刷盘（Buffered / Async Writer + Drop-on-Full）**：业务协程只写内存 RingBuffer，满时宁可丢弃非核心日志并累加 `dropped_logs_total` 指标，也**绝不阻塞业务主流程**；
 3. **高频重复日志限流采样（Log Sampling，如 `zapcore.NewSamplerWithOptions`）**：当下游故障每秒报 5 万次相同的连接拒绝错误时，每秒前 100 条正常打印，之后每 100 条只采样打印 1 条！
 --- deep
-### 为什么故障雪崩时“报错日志”往往是压死骆驼的最后一根稻草？
+**原理展开**
 
-平时正常运行时，只有 0.01% 的请求会走入 `if err != nil { log.Error(...) }` 分支，每秒只有几条错误日志；
-一旦下游 Redis 或 DB 发生网络闪断：
+为什么故障雪崩时“报错日志”往往是压死骆驼的最后一根稻草？平时正常运行时，只有 0.01% 的请求会走入 `if err != nil { log.Error(...) }` 分支，每秒只有几条错误日志；一旦下游 Redis 或 DB 发生网络闪断：
 1. 瞬间 **100% 的请求（每秒 50,000 次）** 全部进入 `log.Error("redis timeout", zap.Stack("stack"))` 分支；
 2. 每次获取调用栈 `runtime.Callers` + 写入数 KB 的堆栈文本，瞬间产生 **200MB/s** 的磁盘写流量；
 3. 磁盘 I/O 被打满 -> `write()` 阻塞 -> 日志锁阻塞 -> 原本已经恢复的下游请求也因为业务协程卡在打日志上而全部超时！
@@ -307,13 +505,59 @@ tasks: perf-34-1
 
 这样即使每秒爆发 10 万条完全相同的错误日志，经过 `first=10, thereafter=1000` 采样后，每秒最多只会写入 `10 + 100 = 110` 条，削减了 **99.9%** 的磁盘 I/O 风暴，同时一条关键报错类型都不会漏！
 
+**代码示例**
+
+```go
+// 仿 zapcore.sampler 实现按时间窗口前 first 条全放行、超出后每 thereafter 条抽样 1 条的防刷屏采样器
+type sampleCounter struct {
+	tick  int64
+	count int
+}
+
+type LogSampler struct {
+	mu         sync.Mutex
+	window     time.Duration
+	first      int
+	thereafter int
+	counters   map[string]*sampleCounter
+}
+
+func (s *LogSampler) ShouldLog(msgKey string, now time.Time) bool {
+	tick := now.UnixNano() / int64(s.window)
+	s.mu.Lock()
+	c, ok := s.counters[msgKey]
+	if !ok || c.tick != tick {
+		c = &sampleCounter{tick: tick, count: 1}
+		s.counters[msgKey] = c
+	} else {
+		c.count++
+	}
+	n := c.count
+	s.mu.Unlock()
+
+	if n <= s.first {
+		return true
+	}
+	return s.thereafter > 0 && (n-s.first)%s.thereafter == 0
+}
+```
+
+**常见追问**
+
+- 在 `zap` 中开启 `zapcore.BufferedWriteSyncer`（异步缓冲写）时，进程收到信号退出或发生 `panic` 时怎么防止缓冲区里最后 256KB 的遗言日志丢失？→ 必须在 `main()` 顶层 `defer logger.Sync()`，并在统一信号处理与 `recover()` 拦截器中显式调用 `logger.Sync()` 强制将内存缓冲区刷入内核描述符。
+- 为什么在 `Error` 日志里默认开启自动打印堆栈（`zap.AddStacktrace(zapcore.ErrorLevel)`）在高并发服务里非常危险？→ 因为每次 `runtime.Callers` 展开调用栈并格式化符号名不仅耗时数微秒，还会生成数千字节的多行文本；业务可预期的常规错误（如参数校验失败、下游超时）绝不应打印完整调用栈，只有未预期的 `DPanic` / `Panic` 才需要堆栈。
+- 为什么即使把日志级别设为了 `Info`，代码里写 `slog.Debug("detail", "body", string(largeBytes))` 依然会浪费大量内存？→ 因为在调用 `slog.Debug(...)` 函数之前，实参表达式 `string(largeBytes)` 已经在调用方处求值并完成了字节切片到堆字符串的拷贝！对于昂贵的日志参数，应先判断 `if logger.Enabled(ctx, slog.LevelDebug)` 或实现 `slog.LogValuer` 延迟求值。
+
+**实战建议**
+
+- 生产环境日志库一律开启 **`Sampler` 窗口限流采样**（例如每秒同模板前 `100` 条全打，后续每 `100` 条采 `1` 条）和 **`BufferedWriteSyncer` 批量刷盘**。
+- 严禁在循环体内或高频热路径上直接调用 `fmt.Sprintf` 构造日志消息，统一使用结构化强类型字段（如 `slog.Int`、`slog.String`）。
+
 === perf-35
-cat: perf
 group: 综合
 level: 3
+hot: false
 title: 跨可用区或跨机房调用偶发网络抖动，如何体系化地定位和容灾？
-tags: 网络抖动, TCP重传, 跨可用区, 对冲请求, 区域亲和路由, eBPF
-tasks: perf-35-1
 --- answer
 在多可用区（Multi-AZ）或混合云部署下，经常遇到“应用层监控报警偶发 P999 毛刺（200ms~1s），但上下游服务本身的 CPU、GC、DB 全都很空闲”的情况——这通常是**跨机房/跨 AZ 物理链路抖动或交换机微突发丢包（Micro-burst）**导致的 TCP 超时重传（RTO 最小 200ms）。
 
@@ -332,9 +576,9 @@ tasks: perf-35-1
 3. **只读/幂等接口开启对冲请求（Hedged Requests）**：当请求超过 P95 延迟（如 15ms）仍未返回时，立刻向另一个可用区的副本并发发出备份请求，谁先回用谁。
 4. **主动连接驱逐（Outlier Detection + SubConn Eviction）**：当某条长连接连续发生超时，强制关闭该连接并重新建连，让四元组重新哈希走健康的 ECMP 交换机链路。
 --- deep
-### 为什么一次 TCP SYN 丢包会让接口至少卡顿 1000ms？
+**原理展开**
 
-在 Linux 内核中：
+为什么一次 TCP SYN 丢包会让接口至少卡顿 1000ms？在 Linux 内核中：
 - **已建立连接的数据包重传（RTO）**：基于动态测量的 RTT 计算，内网最小 RTO（`TCP_RTO_MIN`）通常是 **200ms**（如果开启了早期重传 ER / RACK-TLP 可能更快）。
 - **新建连接的第一次握手包（SYN）丢包**：因为此时还没有测量过该连接的 RTT，内核只能使用静态初始重传超时 `TCP_TIMEOUT_INIT`，在 Linux 内核中固定为 **1 秒（1000ms）**！
 
@@ -346,16 +590,56 @@ Client ─── SYN (第1次重传) ──► Server (1ms 建连成功)
 结果：P999 延迟直接出现 1001ms 的断崖式毛刺！
 ```
 
-### 同可用区亲和路由（Zone-Aware Routing）算法
-
-在多可用区部署（如 `az-east-1a`, `az-east-1b`, `az-east-1c`）下，客户端负载均衡器选择下游节点时遵循以下三级水位线：
+在多可用区部署（如 `az-east-1a`, `az-east-1b`, `az-east-1c`）下，客户端负载均衡器通过**同可用区亲和路由（Zone-Aware Routing）**消除跨机房抖动：
 
 ```
 客户端位于 az-east-1a，待选下游健康节点池 endpoints:
   ├── 1. 筛选出同可用区 (Zone == "az-east-1a") 且未超载的健康节点列表 localPool
-  ├── 2. 检查同可用区健康占比：len(localPool) / totalLocal >= minHealthyRatio (如 50%)
-  │      ├── 满足：100% 流量在 localPool 内部轮询（零跨 AZ 流量，最低延迟）
-  │      └── 不满足（本 AZ 大面积故障）：自动降级退化为全集群跨 AZ 全局负载均衡！
+  └── 2. 检查同可用区健康占比：len(localPool) / totalLocal >= minHealthyRatio (如 50%)
+         ├── 满足：100% 流量在 localPool 内部轮询（零跨 AZ 流量，最低延迟）
+         └── 不满足（本 AZ 大面积故障）：自动降级退化为全集群跨 AZ 全局负载均衡！
 ```
 
-这样既在平时消除了 100% 的跨机房网络抖动与云厂商跨 AZ 流量账单，又能在单可用区发生局部故障时无缝自动溢出到兄弟可用区。
+**代码示例**
+
+```go
+// 具备最低健康水位保护（Panic Threshold）的同可用区亲和路由选择器
+type Endpoint struct {
+	Addr    string
+	Zone    string
+	Healthy bool
+}
+
+func SelectZoneEndpoints(clientZone string, all []Endpoint, minLocalHealthyRatio float64) []Endpoint {
+	var globalHealthy, localHealthy []Endpoint
+	localTotal := 0
+	for _, ep := range all {
+		if ep.Zone == clientZone {
+			localTotal++
+			if ep.Healthy {
+				localHealthy = append(localHealthy, ep)
+			}
+		}
+		if ep.Healthy {
+			globalHealthy = append(globalHealthy, ep)
+		}
+	}
+	if localTotal > 0 && len(localHealthy) > 0 {
+		if float64(len(localHealthy))/float64(localTotal) >= minLocalHealthyRatio {
+			return localHealthy
+		}
+	}
+	return globalHealthy // 本 AZ 健康率跌破安全阈值，打破隔离降级到全集群节点池
+}
+```
+
+**常见追问**
+
+- 为什么一条建立好的 gRPC（HTTP/2）长连接一旦遭遇某台核心交换机故障丢包，后续复用这条连接的所有并发 RPC 请求都会一起卡死（TCP 队头阻塞）？→ 因为 HTTP/2 是在**单条 TCP 连接**上多路复用多个 Stream，在操作系统内核视角它们属于同一个字节流；只要中间丢了 1 个 TCP 段，内核为了保证按序交付，会把后续已经到达网卡的所有其他 Stream 数据包全部扣留在接收缓冲区里等待重传！因此高并发 gRPC 客户端必须建立**连接池（多条底层 SubConn）**并配置 `MaxConnectionAge` 定期轮换连接。
+- 既然 TCP 连接复用这么重要，为什么 Go 标准库的 `http.DefaultTransport` 在高并发调下游微服务时还是经常退化成短连接狂建新连接？→ 因为 `http.DefaultTransport` 默认的 **`MaxIdleConnsPerHost` 只有区区 `2`**！当并发度为 200 时，200 个请求同时完成，只有 2 条连接能放回空闲池，剩下 198 条连接被当场 `Close()` 关闭（变成一地 `TIME_WAIT`），下一波请求来时又要重新三次握手；生产环境必须显式将 `MaxIdleConnsPerHost` 调大到 `100 ~ 256`。
+- 同机房亲和路由为什么必须设置一个 `minLocalHealthyRatio`（Panic Threshold，如 50%）？→ 如果 `az-a` 的 10 台下游挂了 8 台只剩 2 台存活，此时若仍死守“不跨机房”，`az-a` 的全部上游流量会把仅存的 2 台机器瞬间压垮导致级联雪崩；跌破安全阈值时必须立即将流量溢出分摊到全集群。
+
+**实战建议**
+
+- 自定义所有对内 `http.Client` 的 `Transport`：显式设置 **`MaxIdleConnsPerHost: 100`**、`IdleConnTimeout: 90 * time.Second`，并将 `net.Dialer.Timeout`（建连超时）收紧至 `300ms ~ 500ms`。
+- 对核心只读查询接口配置基于 P99 阈值的**对冲请求（Hedged Requests）**与**异常节点弹出（Outlier Detection）**，无需人工介入即可自动绕过劣化交换机链路。

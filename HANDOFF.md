@@ -193,51 +193,51 @@ pnpm build
 ### B. 新增 60 道面试题与 61 个可运行编程任务
 按 9 大领域全量新增 60 道面试题（均含要点答案 `--- answer` 与深入讲解 `--- deep`）以及配套的 61 个编程任务（均含题面 `--- desc`、参考答案与起始代码 `--- solution`、单元测试 `--- test` 及解析 `--- explain`）：
 1. **Go 语言基础（6 题 / 7 任务）**：`content/questions/01-go.txt`、`content/bank/20-new-go.txt`
-   - `go-30`（Go 1.22 循环变量语义与闭包捕获，`go-30-1`, `go-30-2`）
-   - `go-31`（Go 1.23 `iter.Seq` / `iter.Seq2` 迭代器与 `slices`/`maps` 联动，`go-31-1`）
-   - `go-32`（`errors.Join` 多错误包装与自定义 `Unwrap() []error` 树匹配，`go-32-1`）
-   - `go-33`（`unsafe.String` / `unsafe.Slice` 零拷贝转换与只读内存陷阱，`go-33-1`）
-   - `go-34`（`log/slog` 结构化日志、`slog.LogValuer` 脱敏与自定义 `Handler`，`go-34-1`）
-   - `go-35`（`comparable` 约束与含 `any` 接口的泛型可比较类型陷阱，`go-35-1`）
+   - `go-30`（Go 1.23 `range` 函数迭代器 `iter.Seq` / `iter.Seq2` 与 `slices`、`maps` 联动，`go-30-1`, `go-30-2`）
+   - `go-31`（类型定义 `type T U` 与类型别名 `type T = U` 区别及 Go 1.24 泛型类型别名，`go-31-1`）
+   - `go-32`（函数类型实现接口原理与 `http.HandlerFunc` 中间件装饰器链，`go-32-1`）
+   - `go-33`（`go.mod`、`go.sum`、`go.work` 职责与 Go 1.24 `tool` 指令及主版本路径校验，`go-33-1`）
+   - `go-34`（`byte` 与 `rune` 区别、下标遍历与 `for range` 遍历 UTF-8 字符串及按字符安全截断，`go-34-1`）
+   - `go-35`（无类型常量 `untyped constant` 与 `iota` 位掩码权限集合运算，`go-35-1`）
 2. **并发编程（6 题 / 6 任务）**：`content/questions/02-conc.txt`、`content/bank/21-new-conc.txt`
-   - `conc-24`（`context.WithoutCancel` 与 `context.AfterFunc` 异步清理，`conc-24-1`）
-   - `conc-25`（`sync.OnceFunc` / `OnceValue` / `OnceValues` 与 panic 重入语义，`conc-25-1`）
-   - `conc-26`（`atomic.Pointer[T]` 与 Read-Copy-Update (RCU) 无锁热更新配置，`conc-26-1`）
-   - `conc-27`（有界并发 `FanOut` / `FanIn` 保序收集与快速取消，`conc-27-1`）
-   - `conc-28`（`RateLimiter` 动态速率调整与等待队列公平唤醒，`conc-28-1`）
-   - `conc-29`（读写锁写饥饿原理与写优先锁实现，`conc-29-1`）
+   - `conc-24`（`sync.Cond` 条件变量原理、虚假唤醒防范与支持重复广播的状态栅栏实现，`conc-24-1`）
+   - `conc-25`（带权重的信号量 `semaphore.Weighted` 原理与严格 FIFO 防大任务饥饿实现，`conc-25-1`）
+   - `conc-26`（Go 1.21 `context.AfterFunc` 与 `context.WithoutCancel` 原理及实战用法，`conc-26-1`）
+   - `conc-27`（并发与时间依赖代码的可靠测试：虚拟时钟注入与 `testing/synctest` 气泡机制，`conc-27-1`）
+   - `conc-28`（运行时 `gFree` 复用与常驻 `goroutine` 池的权衡及空闲自动缩容池实现，`conc-28-1`）
+   - `conc-29`（`select` 多路就绪随机伪打乱原理与双层 `select` 高低优先级通道消费，`conc-29-1`）
 3. **Runtime 与内存（6 题 / 6 任务）**：`content/questions/03-rt.txt`、`content/bank/22-new-rt.txt`
-   - `rt-19`（`GOMEMLIMIT` 软内存限制、GC 死亡螺旋与内存压舱石对比，`rt-19-1`）
-   - `rt-20`（`runtime/metrics` 零 STW 监控采集替代 `ReadMemStats`，`rt-20-1`）
-   - `rt-21`（Arena 内存分配思想与对象池批量重置生命周期管理，`rt-21-1`）
-   - `rt-22`（`runtime.SetFinalizer` 复活陷阱与 `runtime.AddCleanup` 改进，`rt-22-1`）
-   - `rt-23`（PGO 反馈导向优化内联与接口去虚拟化原理，`rt-23-1`）
-   - `rt-24`（SwissTable Map 内部结构、控制字节探测与缩容陷阱，`rt-24-1`）
+   - `rt-19`（Go 1.24 `weak.Pointer` 弱指针与 `unique` 包值驻留原理及适用场景，`rt-19-1`）
+   - `rt-20`（`runtime/metrics` 零 STW 监控采集与 `runtime.ReadMemStats` 区别，`rt-20-1`）
+   - `rt-21`（PGO 反馈导向优化原理：热路径函数内联与接口调用去虚拟化，`rt-21-1`）
+   - `rt-22`（`GODEBUG` 环境变量与 Go 1.21+ 向后兼容及 `godebug` 行为控制策略，`rt-22-1`）
+   - `rt-23`（内存分配器内部碎片与 `mspan` 页尾碎片成因及结构体字段对齐优化，`rt-23-1`）
+   - `rt-24`（`goroutine` 状态机流转与 P 的 `gopark` / `goready`（含 `runnext` 槽位）调度流转模拟，`rt-24-1`）
 4. **MySQL 与 Redis（8 题 / 8 任务）**：`content/questions/04-db.txt`、`content/bank/23-new-db.txt`
-   - `db-32`（在线 DDL `INSTANT` / `INPLACE` / `COPY` 与 `gh-ost` 影子表同步，`db-32-1`）
-   - `db-33`（`database/sql` 连接池 4 参数调优与坏连接重试安全，`db-33-1`）
-   - `db-34`（隐式类型转换与字符集不一致导致的索引失效，`db-34-1`）
-   - `db-35`（乐观锁 CAS 更新 vs `SELECT ... FOR UPDATE` 悲观锁适用边界，`db-35-1`）
-   - `db-36`（Redis Resp3 Client-Side Caching 客户端缓存在线广播失效，`db-36-1`）
-   - `db-37`（Redis Cluster 跨 Slot 批量请求拆分聚合与 `MOVED` / `ASK` 重定向，`db-37-1`）
-   - `db-38`（HyperLogLog / RoaringBitmap UV 去重与多维标签交并集统计，`db-38-1`）
-   - `db-39`（Lua 脚本原子性与超时 `SCRIPT KILL` / `SHUTDOWN NOSAVE` 事故防范，`db-39-1`）
+   - `db-32`（索引下推 ICP 与 Multi-Range Read (MRR) 减少回表与随机 I/O 原理，`db-32-1`）
+   - `db-33`（InnoDB 自增整型/时间有序主键 `UUIDv7` 对比随机 UUID 的 B+ 树页分裂影响，`db-33-1`）
+   - `db-34`（误删数据利用全量备份与 `ROW` 格式 `binlog` 时间点恢复 PITR 及闪回，`db-34-1`）
+   - `db-35`（`database/sql`、`sqlx`、`sqlc` 与 `GORM` 选型权衡及泛型 `sql.Null[T]` 处理，`db-35-1`）
+   - `db-36`（数据库读写分离实现、Context 路由标记、事务感知与从库延迟水位熔断路由，`db-36-1`）
+   - `db-37`（Redis Stream 消费者组 PEL、`XACK` 与 `XAUTOCLAIM` 超时认领可靠队列实现，`db-37-1`）
+   - `db-38`（Redis 内存占用优化手段与小 Hash 分桶 `listpack` 紧凑编码，`db-38-1`）
+   - `db-39`（Redis Cluster 扩缩容哈希槽 Slot 迁移与支持 `MOVED` / `ASK` 重定向的客户端请求路由，`db-39-1`）
 5. **Web 开发（7 题 / 7 任务）**：`content/questions/05-web.txt`、`content/bank/24-new-web.txt`
-   - `web-23`（Go 1.22+ `http.ServeMux` 方法路由、路径参数 `{id}` 与优先级冲突检测，`web-23-1`）
-   - `web-24`（`http.ResponseController` 单连接读写截止时间控制与 SSE 流式推送，`web-24-1`）
-   - `web-25`（OAuth 2.1 授权码模式 + PKCE (`S256`) 防授权码拦截攻击，`web-25-1`）
-   - `web-26`（Webhook 签名验签 `HMAC-SHA256`、常量时间比较与时间戳防重放，`web-26-1`）
-   - `web-27`（SSR 服务端发起请求防 SSRF 内网地址段黑名单与自定义 `DialContext` 校验，`web-27-1`）
-   - `web-28`（大文件流式分块上传、断点续传 Range 校验与 SHA-256 完整性合并，`web-28-1`）
-   - `web-29`（BFF 层接口聚合、核心依赖强校验与非核心依赖超时静默降级，`web-29-1`）
+   - `web-23`（HTTP `Range` 断点续传与分片下载协议、`206 Partial Content` 及零拷贝传输，`web-23-1`）
+   - `web-24`（SSE 服务端流式推送协议、`http.ResponseController` 刷新续期与 WebSocket 选型，`web-24-1`）
+   - `web-25`（OAuth 2.0 授权码 + PKCE (`S256`) 流程与 OIDC 身份认证原理，`web-25-1`）
+   - `web-26`（CSRF 跨站请求伪造原理与 `SameSite`、CSRF Token 及 `Sec-Fetch-Site` 无状态防护，`web-26-1`）
+   - `web-27`（零停机发布：`SO_REUSEPORT` 进程热重启与 K8s 滚动更新就绪探针摘流及在途排空，`web-27-1`）
+   - `web-28`（API 网关核心职责、`httputil.ReverseProxy.Rewrite` 防伪造内部头与安全提取真实 IP，`web-28-1`）
+   - `web-29`（高并发日志规范、`log/slog` 零装箱设计与 `LogValuer` 脱敏及高频日志采样，`web-29-1`）
 6. **网络、RPC 与消息队列（7 题 / 7 任务）**：`content/questions/06-net.txt`、`content/bank/25-new-net.txt`
-   - `net-22`（HTTP/3 与 QUIC 0-RTT、流级别队头阻塞消除与连接迁移，`net-22-1`）
-   - `net-23`（HTTP 强缓存與协商缓存 `ETag` / `If-None-Match` 304 及 `If-Match` 412 并发防覆盖，`net-23-1`）
+   - `net-22`（DNS 完整解析过程、Go 纯 Go 解析器 `netgo` 与 `cgo` 差异及 K8s `ndots` 搜索域展开，`net-22-1`）
+   - `net-23`（HTTP 强缓存与协商缓存 `ETag` / `If-None-Match` 304 及 `If-Match` 412 并发防覆盖，`net-23-1`）
    - `net-24`（mTLS 双向认证、SAN 域名白名单校验与 `GetCertificate` 零停机证书热加载，`net-24-1`）
-   - `net-25`（gRPC 负载均衡策略 Pick First / Round Robin / P2C 最小负载二选一算法，`net-25-1`）
-   - `net-26`（对冲请求 Hedged Requests 消除长尾 P999 毛刺与配额抑制，`**net-26-1**`）
-   - `net-27`（消息队列消费重平衡 Rebalance 抖动、增量协作分配与世代号 Fencing，`net-27-1`）
-   - `net-28`（死信队列 DLQ、指数退避重试分级队列与毒丸消息隔离，`net-28-1`）
+   - `net-25`（gRPC / HTTP/2 连接级与流级两级流控窗口原理及超大消息传输问题，`net-25-1`）
+   - `net-26`（分布式事务消息、本地消息表与 RocketMQ 风格两阶段事务消息 Half Message 回查协调，`net-26-1`）
+   - `net-27`（消息队列消费失败的阶梯延迟重试队列与死信队列 DLQ 设计，`net-27-1`）
+   - `net-28`（QUIC 协议 0-RTT 建连、流级无队头阻塞与基于 Connection ID 及 `PATH_CHALLENGE` 的连接迁移，`net-28-1`）
 7. **分布式与系统设计（7 题 / 7 任务）**：`content/questions/07-arch.txt`、`content/bank/26-new-arch.txt`
    - `arch-21`（高可用配置中心设计与基于 `close(chan)` 广播的长轮询实时推送，`arch-21-1`）
    - `arch-22`（分布式定时任务调度系统、时间槽抢占幂等与分片广播执行，`arch-22-1`）
@@ -248,7 +248,7 @@ pnpm build
    - `arch-27`（百亿级历史订单表冷热分离归档判定与跨冷热库无缝游标分页，`arch-27-1`）
 8. **线上排查与性能优化（7 题 / 7 任务）**：`content/questions/08-perf.txt`、`content/bank/27-new-perf.txt`
    - `perf-29`（磁盘空间满 `df` vs `du` 不一致、`lsof +L1` 幽灵文件与 `Truncate(0)` 原地截断，`perf-29-1`）
-   - `perf-30`（K8s DNS 5 秒毛刺、`ndots:5`、`conntrack` 竞态与进程内 Singleflight+Stale DNS 缓存，`perf-30-1`）
+   - `perf-30`（Linux `nf_conntrack` 连接跟踪表满、并发源端口冲突 `insert_failed` 与 Early-Drop 驱逐模拟，`perf-30-1`）
    - `perf-31`（容器 OOMKilled 137 内存账本拆解：PageCache、Cgo/Mmap、StackInuse 与 HeapIdle，`perf-31-1`）
    - `perf-32`（CPU/内存/差分火焰图阅读法则与 Collapsed Stacks 的 `Flat` / `Cum` 计算，`perf-32-1`）
    - `perf-33`（滚动发布冷启动毛刺、连接池/缓存预热与线性慢启动 Slow-Start 权重，`perf-33-1`）

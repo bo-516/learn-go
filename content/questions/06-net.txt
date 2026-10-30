@@ -181,7 +181,7 @@ hot: false
 title: 什么是 mTLS（双向 TLS）？在 Go 中如何配置服务端与客户端双向证书校验及证书热加载？
 --- answer
 普通的 HTTPS 是**单向 TLS**：只有客户端校验服务端的证书（确认服务端不是假冒的钓鱼网站），而服务端不认识客户端证书。
-**mTLS（Mutual TLS，双向 TLS）** 要求在 TLS 握手阶段**服务端和客户端双方互相出示并校验对方的 X.509 数字证书**，廣泛用于微服务网格（Service Mesh 如 Istio）、零信任内网 RPC、金融支付接口和 Kubernetes 组件间通信。
+**mTLS（Mutual TLS，双向 TLS）** 要求在 TLS 握手阶段**服务端和客户端双方互相出示并校验对方的 X.509 数字证书**，广泛用于微服务网格（Service Mesh 如 Istio）、零信任内网 RPC、金融支付接口和 Kubernetes 组件间通信。
 
 **1. mTLS 握手相比普通 TLS 多了哪几步？**
 
@@ -462,7 +462,7 @@ title: 消息消费失败时如何设计重试队列与死信队列（DLQ）？
 
 1. **RocketMQ / RabbitMQ vs Kafka 的原生能力差异**：
    - **RocketMQ** 原生为每个 Consumer Group 自动创建了 `%RETRY%<group>` 重试队列（内置 16 个延迟级别：10s, 30s, 1m, 2m ... 2h）和 `%DLQ%<group>` 死信队列，消费者只需返回 `ConsumeRetryLater` 即可自动进入阶梯延迟重试；
-   - **Kafka** 是基于分区连续 Offset 日志的模型，它**不能跳过 Offset 100 先去确认 Offset 101**（只要提交了 101 就意味着 $\le 101$ 全部消费成功）。因此在 Kafka 中实现非阻塞重试，必须在应用层封装：**消费者把失败的消息附加 `x-retry-count` Header 主动 Produce 发送到专门的 `order.retry`（或 `order.dlq`）Topic，确认写入重试 Topic 成功后，立即 Commit 主 Topic 的 Offset 继续往前走**！
+   - **Kafka** 是基于分区连续 Offset 日志的模型，它**不能跳过 Offset 100 先去确认 Offset 101**（只要提交了 101 就意味着 `<= 101` 全部消费成功）。因此在 Kafka 中实现非阻塞重试，必须在应用层封装：**消费者把失败的消息附加 `x-retry-count` Header 主动 Produce 发送到专门的 `order.retry`（或 `order.dlq`）Topic，确认写入重试 Topic 成功后，立即 Commit 主 Topic 的 Offset 继续往前走**！
 2. **顺序消息（同一订单 ID 的创建 -> 支付 -> 发货）的死锁矛盾**：
    如果业务严格要求同一个 `order_id` 的消息必须按顺序消费，那么当“订单创建”消息消费失败时，**绝对不能把它扔到异步重试队列然后继续消费后面的“订单支付”消息**（否则会先消费支付、后消费创建，顺序彻底乱套）！对于严格顺序消息，只能**在当前消费者本地做有限次数的带退避阻塞重试**，若仍失败则将整个相同的路由键（Sharding Key）关联的后续消息一并拦截转入挂起表。
 

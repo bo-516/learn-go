@@ -451,6 +451,7 @@ func TestAvoidsHotNode(t *testing.T) {
 
 === arch-05-1
 title: 超时降级：返回兜底数据
+race: true
 --- desc
 降级是在下游故障时主动返回兜底数据，保证核心功能可用。实现 `WithFallback(ctx, timeout, primary, fallback)`：
 
@@ -525,11 +526,11 @@ func TestPrimaryError(t *testing.T) {
 }
 
 func TestPrimaryHangs(t *testing.T) {
-	var seen context.Context
+	seen := make(chan context.Context, 1)
 	start := time.Now()
 	v, degraded := WithFallback(context.Background(), 30*time.Millisecond,
 		func(ctx context.Context) (string, error) {
-			seen = ctx
+			seen <- ctx
 			time.Sleep(500 * time.Millisecond) // 完全不理会 ctx
 			return "too late", nil
 		}, fb)
@@ -539,9 +540,13 @@ func TestPrimaryHangs(t *testing.T) {
 	if d := time.Since(start); d > 200*time.Millisecond {
 		t.Fatalf("耗时 %v，应在超时后立即返回", d)
 	}
-	time.Sleep(10 * time.Millisecond)
-	if seen == nil || seen.Err() == nil {
-		t.Fatal("返回前应取消传给 primary 的 ctx")
+	select {
+	case ctx := <-seen:
+		if ctx == nil || ctx.Err() == nil {
+			t.Fatal("返回前应取消传给 primary 的 ctx")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("primary 未被调用")
 	}
 }
 

@@ -82,10 +82,10 @@ package main
 ```
 
 LeetCode 题目的头部还有 `no`、`slug`、`difficulty`、`category`、`topics`、`go`（Go 知识点）。此外：
-- `content/questions/*.txt` 定义新增面试题（头部含 `cat`、`group`、`level`、`title`、`tags`、`tasks`，正文含 `--- answer` 和 `--- deep`）；
+- `content/questions/*.txt` 定义新增面试题（头部含可选的 `group` 以及 `level`、`hot`、`title`，正文含 `--- answer` 和 `--- deep`）；
 - `content/deep/*.txt` 按题号补充面试题的 `--- deep` 深入讲解；
 - `content/explain/*.txt` 按任务 ID 补充 `--- explain` 题解；
-- `content/syntax/*.txt` 定义 Go 语法速查卡片（含 `group`、`title`、`summary` 和 `--- body`）。
+- `content/syntax/*.txt` 定义 Go 语法速查卡片（含 `name`、`group` 和 `--- body`）。
 
 **起始代码由参考答案自动生成**，在 solution 里用三种注释标记：
 

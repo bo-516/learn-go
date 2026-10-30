@@ -45,7 +45,7 @@ c.Broadcast()
 深挖 `sync.Cond` 在运行时的底层实现（`runtime.notifyList`）：
 
 - `sync.Cond` 内部包含一个 `notifyList` 结构，维护了两个无锁/细粒度锁计数器：`wait`（下一个等待者的票号 ticket）和 `notify`（下一个待唤醒的票号），以及挂起协程的 `sudog` 双向链表。
-- 调用 `c.Wait()` 时：先原子递增拿到自己的等待票号 $t$，然后调用 **`c.L.Unlock()` 释放用户互斥锁**，接着把当前 G 按票号挂入 `notifyList` 并 `gopark` 休眠；被唤醒后，在 `Wait()` 返回给调用方之前，再次调用 **`c.L.Lock()` 重新获取用户锁**。
+- 调用 `c.Wait()` 时：先原子递增拿到自己的等待票号 `t`，然后调用 **`c.L.Unlock()` 释放用户互斥锁**，接着把当前 G 按票号挂入 `notifyList` 并 `gopark` 休眠；被唤醒后，在 `Wait()` 返回给调用方之前，再次调用 **`c.L.Lock()` 重新获取用户锁**。
 - **为什么修改共享状态时必须加锁 `c.L.Lock()`？**
   假设等待方在检查 `!ready` 为真之后、还没来得及把自身挂入 `notifyList` 之前，通知方不加锁直接改了 `ready = true` 并立刻调了 `Broadcast()`——此时通知就会丢失（Lost Wakeup），随后等待方挂起后永远没人再唤醒它！因为等待方从“检查条件”到“拿到等待票号”全程持有 `c.L`，所以只要通知方在修改 `ready = true` 时也持有 `c.L`，就绝不可能发生信号丢失。
 
@@ -324,7 +324,7 @@ title: 如何可靠地测试并发和依赖时间的代码？Go 1.24/1.25 的 te
 
 **2. Go 1.24（实验）/ Go 1.25（正式）：`testing/synctest` 包**
 
-标准库新增的 `testing/synctest` 在运行时内部提供了**受控的并发测试气泡（Bubble）與虚拟时钟（Fake Clock）**：
+标准库新增的 `testing/synctest` 在运行时内部提供了**受控的并发测试气泡（Bubble）与虚拟时钟（Fake Clock）**：
 
 - **`synctest.Run(func())`（Go 1.25 为 `synctest.Test(t, func(t *testing.T))`）**：在独立的“气泡（bubble）”中执行测试函数及其启动的所有子 goroutine；
 - **自动推进虚拟时钟**：气泡内所有的 `time.Now`、`time.Sleep`、`time.NewTimer`、`time.NewTicker`、`context.WithTimeout` 都使用从 2000-01-01 00:00:00 UTC 开始的**虚拟时钟**。只有当气泡内的**所有 goroutine 都进入了阻塞状态（Durably Blocked，如等待 channel、锁或 sleep）**时，运行时才会**瞬间将虚拟时钟快进到下一个最早到期的定时器时刻**！原本需要 sleep 10 秒的测试，在微秒级（0ms）就能跑完；
@@ -412,8 +412,8 @@ title: Go 中 goroutine 已经很轻量了，为什么有时还需要 goroutine 
 
 **2. “限制并发数（Semaphore）” vs “复用协程池（Worker Pool）”**
 
-- **仅限制并发度**（如 `errgroup.SetLimit(N)` 或信号量）：每次任务仍新建和销毁 goroutine，但保证同时存活的最多只有 $N$ 个。实际上 Go 运行时内部每个 P 本身就维护了空闲 G 列表（`gFree`）来复用已退出的 `_Gdead` 结构体，因此**运行时自己已经在做 G 对象池化了**！
-- **复用常驻 Worker Pool 的额外收益與代价**：
+- **仅限制并发度**（如 `errgroup.SetLimit(N)` 或信号量）：每次任务仍新建和销毁 goroutine，但保证同时存活的最多只有 `N` 个。实际上 Go 运行时内部每个 P 本身就维护了空闲 G 列表（`gFree`）来复用已退出的 `_Gdead` 结构体，因此**运行时自己已经在做 G 对象池化了**！
+- **复用常驻 Worker Pool 的额外收益与代价**：
   - **优点**：省去了每次任务重新清零栈和扩容栈的开销（常驻 worker 的栈在热身扩到合适大小后保持稳定）；支持自定义任务队列排队、优先级调度、拒绝策略和统一的 `recover()` 兜底；
   - **缺点**：引入了跨协程队列同步的锁开销，如果把阻塞 I/O 任务和 CPU 任务混在同一个固定小池子里，容易发生**池饥饿死锁（Thread Pool Starvation）**；且调用栈上下文断开，排查栈回溯不如直接 `go` 直观。
 --- deep
@@ -483,9 +483,9 @@ func (p *AdaptivePool) worker() {
 
 **常见追问**
 
-- 在固定大小的 Worker Pool 中，什么情况下会发生致命的**死锁（Pool Starvation Deadlock）**？→ 假设池子大小只有 `4` 个 worker，現在同时进来了 4 个父任务 A1~A4 占满了全部 4 个 worker；而父任务 A1~A4 的代码内部又向**同一个 Pool** 提交了子任务 B1~B4，并同步等待 B1~B4 完成才退出。此时 B1~B4 在队列里永远等不到空闲的 worker，而占着 worker 的 A1~A4 又在等 B1~B4，4 个 worker 瞬间永久死锁！直接 `go func()` 则不会有这个问题。
+- 在固定大小的 Worker Pool 中，什么情况下会发生致命的**死锁（Pool Starvation Deadlock）**？→ 假设池子大小只有 `4` 个 worker，现在同时进来了 4 个父任务 A1~A4 占满了全部 4 个 worker；而父任务 A1~A4 的代码内部又向**同一个 Pool** 提交了子任务 B1~B4，并同步等待 B1~B4 完成才退出。此时 B1~B4 在队列里永远等不到空闲的 worker，而占着 worker 的 A1~A4 又在等 B1~B4，4 个 worker 瞬间永久死锁！直接 `go func()` 则不会有这个问题。
 - 用 `errgroup.SetLimit(N)` 和用 `NewPool(N)` 在高并发下性能差多少？→ 对于耗时在毫秒级以上的网络/数据库 I/O 任务，200ns 的协程创建差异连 **0.01%** 都不到，完全可以忽略，优先用 `errgroup`；只有当每个任务本身只有几百纳秒且每秒百万次调用时，常驻池才有可观测的收益。
-- 为什么 `net/http` 服务端对每个新连接直接 `go c.serve(ctx)` 而不搞连接协程池，但在同连接内复用？→ 因为 HTTP/1.1 Keep-Alive 和 HTTP/2 多路复用本质上已经讓一个连接协程持续处理成百上千个请求了，连接级别本身就已经实现了协程复用。
+- 为什么 `net/http` 服务端对每个新连接直接 `go c.serve(ctx)` 而不搞连接协程池，但在同连接内复用？→ 因为 HTTP/1.1 Keep-Alive 和 HTTP/2 多路复用本质上已经让一个连接协程持续处理成百上千个请求了，连接级别本身就已经实现了协程复用。
 
 **实战建议**
 
@@ -504,7 +504,7 @@ title: select 有多个分支同时就绪时如何实现优先级消费？
 ```go
 func ConsumePriority(ctx context.Context, high, low <-chan Job) {
     for {
-        // 第一步：只要 high 通道里有数据，就通过带 default 的非阻塞 select 优先把它徹底排空！
+        // 第一步：只要 high 通道里有数据，就通过带 default 的非阻塞 select 优先把它彻底排空！
         select {
         case <-ctx.Done():
             return
@@ -599,7 +599,7 @@ func StrictPriorityConsume[T any](ctx context.Context, high, low <-chan T, fn fu
 
 **常见追问**
 
-- 如果有 **3 个或更多等级**（如 `high`、`medium`、`low`）甚至动态优先级的任务，还适合用嵌套 `select` 吗？→ 不适合，超过 2 层后嵌套 `select` 代码会迅速膨胀且难以维护。当优先级档位 $\ge 3$ 或按任意整数权重排序时，应该改用**基于最小堆（`container/heap`）的优先级队列 + `sync.Cond`（或长度为 1 的唤醒信号 channel）**。
+- 如果有 **3 个或更多等级**（如 `high`、`medium`、`low`）甚至动态优先级的任务，还适合用嵌套 `select` 吗？→ 不适合，超过 2 层后嵌套 `select` 代码会迅速膨胀且难以维护。当优先级档位 `>= 3` 或按任意整数权重排序时，应该改用**基于最小堆（`container/heap`）的优先级队列 + `sync.Cond`（或长度为 1 的唤醒信号 channel）**。
 - 如果高优先级流量持续打满，导致低优先级队列永远得不到执行（饥饿），生产环境怎么兼顾“高优优先”与“低优保底”？→ 采用**加权轮询配额（Weighted Fair Queuing / Deficit Round Robin）**：例如每连续消费最多 10 条 `high` 消息后，如果 `low` 非空，强制消费 1 条 `low` 消息，保证低优先级任务至少有 ~10% 的保底带宽。
 - 在双层 `select` 的第一步中，如果忘写 `default:` 分支会发生什么？→ 第一步的 `select` 就会退化成只监听 `high` 的**阻塞等待**！只要 `high` 没消息，协程就永远卡死在第一步，哪怕 `low` 里塞满了 10000 条消息也永远走不到第二步！
 

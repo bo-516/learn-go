@@ -429,159 +429,211 @@ func TestFlowControllerTwoLevelWindow(t *testing.T) {
 - 只扣减 `streamWin` 忘了同步扣减 `connWin`，会导致单条连接上的多个并发流突破连接级总缓冲上限。
 
 === net-26-1
-title: 实现本地消息表（Transactional Outbox）中继投递与幂等去重状态机
+title: 实现 RocketMQ 风格的两阶段事务消息（Half Message 与状态回查）协调器
 --- desc
-模拟可靠事件投递的完整闭环：生产者端的 **`OutboxRelay`**（本地消息表中继器）与消费者端的 **`IdempotentConsumer`**（幂等去重器）：
+模拟 RocketMQ 两阶段事务消息的核心状态机 `TxMessageBroker`：
 
-1. `OutboxRelay.ProcessPending(now time.Time, publish func(id, payload string) error) (sent int)`：
-   - 按顺序扫描 `records` 中状态为 `"PENDING"` 且 `now >= NextRetryAt` 的记录；
-   - 调用 `publish(r.ID, r.Payload)`：
-     - 如果返回 `nil`：将状态改为 `"SENT"`，`sent++`；
-     - 如果返回错误：`r.Retries++`；若 `r.Retries >= maxRetries`，将状态改为 `"DEAD"`（不再重试）；否则保持 `"PENDING"` 并将 `r.NextRetryAt` 设为 `now.Add(baseBackoff)`。
-2. `IdempotentConsumer.Consume(msgID string, handler func() error) error`：
-   - 如果 `msgID` 已经成功消费过，直接返回 `nil` 且**不重复调用 `handler()`**；
-   - 否则调用 `handler()`：若成功（返回 `nil`），记录 `msgID` 为已消费并返回 `nil`；若失败（返回非 nil 错误），**不记录**为已消费（允许下次重试）并返回该错误。
+1. **事务状态枚举 `LocalTxState`**：
+   - `TxCommit`：本地事务提交成功，半消息应正式提交并对消费者可见；
+   - `TxRollback`：本地事务回滚失败，半消息应直接删除丢弃；
+   - `TxUnknown`：未知状态（如生产者二阶段确认超时、或回查时本地事务仍未结束），半消息继续暂存等待后续回查。
+2. **`SendMessageInTransaction(msg HalfMessage, execLocalTx func(HalfMessage) LocalTxState)`**：
+   - **第一阶段（半消息暂存）**：先将 `msg` 存入 `halfMsgs`（此时对消费者**不可见**，不能放入 `committed` 队列）；
+   - **第二阶段（执行本地事务并处理二阶段状态）**：调用 `state := execLocalTx(msg)`：
+     - 若 `state == TxCommit`：将该消息从 `halfMsgs` 中删除，并追加到对消费者可见的 `committed` 切片中；
+     - 若 `state == TxRollback`：将该消息直接从 `halfMsgs` 中删除；
+     - 若 `state == TxUnknown`：保留在 `halfMsgs` 中等待后台回查。
+3. **`RunTransactionCheck(checkLocalTx func(HalfMessage) LocalTxState)`**：
+   - 按半消息发送顺序（`halfOrder`）依次对仍留在 `halfMsgs` 中的每条半消息调用回查函数 `state := checkLocalTx(*m)`：
+     - 若返回 `TxCommit`：从 `halfMsgs` 中删除并追加到 `committed` 可见列表；
+     - 若返回 `TxRollback`：从 `halfMsgs` 中删除丢弃；
+     - 若返回 `TxUnknown`：递增 `m.CheckCount++`；当 **`m.CheckCount >= maxChecks`**（达到最大回查次数上限）时，将其从 `halfMsgs` 中强制删除丢弃（防止死事务半消息永久堆积）；否则继续保留等待下一轮回查。
 --- solution
 package main
 
-import "time"
+type LocalTxState int
 
-type OutboxRecord struct {
-	ID          string
-	Payload     string
-	Status      string // "PENDING", "SENT", "DEAD"
-	Retries     int
-	NextRetryAt time.Time
+const (
+	TxUnknown LocalTxState = iota
+	TxCommit
+	TxRollback
+)
+
+type HalfMessage struct {
+	ID         string
+	Topic      string
+	Payload    string
+	CheckCount int
 }
 
-type OutboxRelay struct {
-	records     []*OutboxRecord
-	maxRetries  int
-	baseBackoff time.Duration
+type TxMessageBroker struct {
+	maxChecks int
+	halfMsgs  map[string]*HalfMessage
+	halfOrder []string
+	committed []HalfMessage
 }
 
-func NewOutboxRelay(records []*OutboxRecord, maxRetries int, baseBackoff time.Duration) *OutboxRelay {
-	return &OutboxRelay{records: records, maxRetries: maxRetries, baseBackoff: baseBackoff}
+func NewTxMessageBroker(maxChecks int) *TxMessageBroker {
+	return &TxMessageBroker{
+		maxChecks: maxChecks,
+		halfMsgs:  make(map[string]*HalfMessage),
+	}
 }
 
-func (o *OutboxRelay) ProcessPending(now time.Time, publish func(id, payload string) error) int {
-	sent := 0
+func (b *TxMessageBroker) SendMessageInTransaction(msg HalfMessage, execLocalTx func(HalfMessage) LocalTxState) {
 	// @solution
-	for _, r := range o.records {
-		if r.Status != "PENDING" || now.Before(r.NextRetryAt) {
+	cp := msg
+	cp.CheckCount = 0
+	b.halfMsgs[msg.ID] = &cp
+	b.halfOrder = append(b.halfOrder, msg.ID)
+
+	switch execLocalTx(cp) {
+	case TxCommit:
+		delete(b.halfMsgs, msg.ID)
+		b.committed = append(b.committed, cp)
+	case TxRollback:
+		delete(b.halfMsgs, msg.ID)
+	case TxUnknown:
+		// 保持在 halfMsgs 中等待后续 RunTransactionCheck 回查
+	}
+	// @starter
+	// // TODO: 先暂存半消息，再根据 execLocalTx 返回的 TxCommit / TxRollback / TxUnknown 处理状态
+	// @end
+}
+
+func (b *TxMessageBroker) RunTransactionCheck(checkLocalTx func(HalfMessage) LocalTxState) {
+	// @solution
+	for _, id := range b.halfOrder {
+		m, ok := b.halfMsgs[id]
+		if !ok {
 			continue
 		}
-		if err := publish(r.ID, r.Payload); err == nil {
-			r.Status = "SENT"
-			sent++
-		} else {
-			r.Retries++
-			if r.Retries >= o.maxRetries {
-				r.Status = "DEAD"
-			} else {
-				r.NextRetryAt = now.Add(o.baseBackoff)
+		switch checkLocalTx(*m) {
+		case TxCommit:
+			delete(b.halfMsgs, id)
+			b.committed = append(b.committed, *m)
+		case TxRollback:
+			delete(b.halfMsgs, id)
+		case TxUnknown:
+			m.CheckCount++
+			if m.CheckCount >= b.maxChecks {
+				delete(b.halfMsgs, id)
 			}
 		}
 	}
 	// @starter
-	// // TODO: 扫描到期的 PENDING 记录并调用 publish，更新 SENT / DEAD / NextRetryAt
+	// // TODO: 按序回查仍处于 halfMsgs 中的半消息，处理提交、回滚及最大回查次数超限丢弃
 	// @end
-	return sent
 }
 
-type IdempotentConsumer struct {
-	processed map[string]bool
+func (b *TxMessageBroker) VisibleMessages() []HalfMessage {
+	return b.committed
 }
 
-func NewIdempotentConsumer() *IdempotentConsumer {
-	return &IdempotentConsumer{processed: make(map[string]bool)}
-}
-
-func (c *IdempotentConsumer) Consume(msgID string, handler func() error) error {
-	// @solution
-	if c.processed[msgID] {
-		return nil
-	}
-	if err := handler(); err != nil {
-		return err
-	}
-	c.processed[msgID] = true
-	return nil
-	// @starter
-	// return handler() // TODO: 已成功处理过的 msgID 直接跳过，失败时不标记已处理
-	// @end
+func (b *TxMessageBroker) PendingHalfCount() int {
+	return len(b.halfMsgs)
 }
 --- test
 package main
 
 import (
-	"errors"
+	"slices"
 	"testing"
-	"time"
 )
 
-func TestOutboxRelayAndIdempotentConsumer(t *testing.T) {
-	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	r1 := &OutboxRecord{ID: "m1", Payload: "p1", Status: "PENDING"}
-	r2 := &OutboxRecord{ID: "m2", Payload: "p2", Status: "PENDING"}
-	relay := NewOutboxRelay([]*OutboxRecord{r1, r2}, 2, 10*time.Second)
+func TestTxMessageBrokerTwoPhaseAndCheck(t *testing.T) {
+	broker := NewTxMessageBroker(2) // 最多允许回查 2 次
 
-	// 第 1 轮：m1 发送成功，m2 发送失败（进入退避 t0+10s）
-	sent := relay.ProcessPending(t0, func(id, _ string) error {
-		if id == "m2" {
-			return errors.New("broker timeout")
+	// 1. 正常本地事务成功：验证第一阶段执行本地事务期间，半消息已暂存但对消费者不可见；第二阶段返回 TxCommit 后变为可见
+	broker.SendMessageInTransaction(HalfMessage{ID: "m1", Topic: "order", Payload: "created-1"}, func(HalfMessage) LocalTxState {
+		if broker.PendingHalfCount() != 1 || len(broker.VisibleMessages()) != 0 {
+			t.Fatalf("during local tx, message must be staged as invisible half-message: pending=%d visible=%d",
+				broker.PendingHalfCount(), len(broker.VisibleMessages()))
 		}
-		return nil
+		return TxCommit
 	})
-	if sent != 1 || r1.Status != "SENT" || r2.Status != "PENDING" || r2.Retries != 1 {
-		t.Fatalf("round 1: sent=%d r1=%+v r2=%+v", sent, r1, r2)
+
+	// 2. 本地事务失败 -> 立即 Rollback 删除半消息，消费者不可见
+	broker.SendMessageInTransaction(HalfMessage{ID: "m2", Topic: "order", Payload: "created-2"}, func(HalfMessage) LocalTxState {
+		return TxRollback
+	})
+
+	// 3. 本地事务执行完后网络闪断未收到二阶段确认（TxUnknown）-> 暂存为半消息等待回查
+	broker.SendMessageInTransaction(HalfMessage{ID: "m3", Topic: "order", Payload: "created-3"}, func(HalfMessage) LocalTxState {
+		return TxUnknown
+	})
+	broker.SendMessageInTransaction(HalfMessage{ID: "m4", Topic: "order", Payload: "created-4"}, func(HalfMessage) LocalTxState {
+		return TxUnknown
+	})
+	broker.SendMessageInTransaction(HalfMessage{ID: "m5", Topic: "order", Payload: "created-5"}, func(HalfMessage) LocalTxState {
+		return TxUnknown
+	})
+
+	// 此时消费者只能看到 m1，m3/m4/m5 仍处于半消息不可见状态
+	if len(broker.VisibleMessages()) != 1 || broker.VisibleMessages()[0].ID != "m1" {
+		t.Fatalf("visible messages before check = %+v, want only [m1]", broker.VisibleMessages())
+	}
+	if broker.PendingHalfCount() != 3 {
+		t.Fatalf("PendingHalfCount = %d, want 3 (m3, m4, m5)", broker.PendingHalfCount())
 	}
 
-	// 在 t0+5s 时还没到 m2 的 NextRetryAt (t0+10s)，不应触发重试
-	if s := relay.ProcessPending(t0.Add(5*time.Second), func(string, string) error { return nil }); s != 0 {
-		t.Fatalf("at +5s should skip m2 before NextRetryAt, sent=%d", s)
+	// 第 1 轮事务状态回查：
+	// - m3 查库确认本地订单已落库（返回 TxCommit）
+	// - m4 仍在执行中（返回 TxUnknown，CheckCount 变为 1）
+	// - m5 查库发现本地事务已回滚（返回 TxRollback，立即从半消息队列删除）
+	broker.RunTransactionCheck(func(m HalfMessage) LocalTxState {
+		switch m.ID {
+		case "m3":
+			return TxCommit
+		case "m5":
+			return TxRollback
+		default:
+			return TxUnknown
+		}
+	})
+
+	var visIDs []string
+	for _, m := range broker.VisibleMessages() {
+		visIDs = append(visIDs, m.ID)
+	}
+	if !slices.Equal(visIDs, []string{"m1", "m3"}) {
+		t.Fatalf("visible after check 1 = %v, want [m1 m3]", visIDs)
+	}
+	if broker.PendingHalfCount() != 1 {
+		t.Fatalf("PendingHalfCount after check 1 = %d, want 1 (only m4 left)", broker.PendingHalfCount())
 	}
 
-	// 在 t0+10s 时 m2 第二次失败，达到 maxRetries=2，状态变为 DEAD
-	relay.ProcessPending(t0.Add(10*time.Second), func(string, string) error {
-		return errors.New("still down")
+	// 第 2 轮事务状态回查：m4 此时传入的 CheckCount 应为 1，再次返回 TxUnknown 后达到 maxChecks(2)，被强制丢弃清理
+	broker.RunTransactionCheck(func(m HalfMessage) LocalTxState {
+		if m.ID == "m4" && m.CheckCount != 1 {
+			t.Fatalf("expected m4 CheckCount=1 on 2nd check, got %d", m.CheckCount)
+		}
+		return TxUnknown
 	})
-	if r2.Status != "DEAD" {
-		t.Fatalf("expected r2 Status=DEAD after maxRetries, got %s", r2.Status)
+	if broker.PendingHalfCount() != 0 {
+		t.Fatalf("m4 should be discarded after reaching maxChecks=2, PendingHalfCount=%d", broker.PendingHalfCount())
 	}
-
-	// 测试消费端幂等：失败后允许重试，成功后重复投递只执行 1 次
-	consumer := NewIdempotentConsumer()
-	calls := 0
-	_ = consumer.Consume("m1", func() error {
-		calls++
-		return errors.New("transient db error")
-	})
-	_ = consumer.Consume("m1", func() error {
-		calls++
-		return nil
-	})
-	_ = consumer.Consume("m1", func() error {
-		calls++
-		return nil
-	})
-	if calls != 2 { // 第 1 次失败 + 第 2 次成功，第 3 次被幂等拦截！
-		t.Fatalf("consumer handler calls = %d, want 2", calls)
+	if len(broker.VisibleMessages()) != 2 {
+		t.Fatalf("discarded half message m4 must not become visible")
 	}
 }
 --- explain
 **思路**
 
-本地消息表模式由两部分配成闭环：发送侧 `OutboxRelay` 只捞取 `Status == "PENDING"` 且已到达退避时间 `NextRetryAt` 的消息投递，超过最大重试次数转为 `"DEAD"`；消费侧 `IdempotentConsumer` 只在 `handler()` 返回 `nil` 时才将 `msgID` 记入去重表，保证失败可重试、成功不重入。
+RocketMQ 事务消息通过**两阶段提交 + 事务状态回查**解决“本地事务与发消息原子性”问题：
+1. 第一阶段先把消息作为**半消息（Half Message）**暂存在 `halfMsgs`（在内部系统 Topic `RMQ_SYS_TRANS_HALF_TOPIC` 中，对下游消费者不可见）；
+2. 第二阶段执行本地数据库事务 `execLocalTx`：若明确返回 `TxCommit` 则把消息转移到对消费者可见的 `committed` 队列；若返回 `TxRollback` 则直接从 `halfMsgs` 删除；
+3. 若因进程崩溃或网络超时返回了 `TxUnknown`，则由 Broker 定时触发 `RunTransactionCheck` 回调生产者的回查接口 `checkLocalTx`，当累计回查达到 `maxChecks` 仍为 `TxUnknown` 时自动丢弃半消息。
 
 **代码讲解**
 
-1. `if r.Status != "PENDING" || now.Before(r.NextRetryAt)`：跳过已发送、已死信或尚在退避冷却期内的记录。
-2. `if err := handler(); err != nil { return err }`：消费失败直接返回错误，不写 `c.processed[msgID] = true`，等待 MQ 下一次重投。
+1. `b.halfMsgs[msg.ID] = &cp`：先写入半消息暂存区，确保执行本地事务前消息已在 Broker 落盘。
+2. `switch execLocalTx(cp)`：根据本地事务结果决定立即投递、删除还是留待回查。
+3. `m.CheckCount++` 与 `if m.CheckCount >= b.maxChecks`：防止异常事务的半消息无限期驻留内存。
 
 **易错点**
 
-- 如果在调用 `handler()` **之前**就把 `c.processed[msgID] = true` 写死了，一旦 `handler()` 执行中途因为数据库超时报错，下次重试时就会被误判为“已消费过”直接丢弃消息！
+- 半消息在收到 `TxCommit` 之前**绝对不能**放入 `committed` 列表，否则一旦本地事务回滚，下游消费者就会读到幽灵消息。
 
 === net-27-1
 title: 实现 MQ 消费失败的阶梯延迟重试与死信队列（DLQ）分流器

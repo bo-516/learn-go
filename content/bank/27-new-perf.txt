@@ -96,158 +96,152 @@ func TestDiagnoseDiskFullAndTruncate(t *testing.T) {
 - 切记 `Truncate(0)` 不会自动修改文件描述符的 `offset`，必须配合 `Seek(0, 0)`。
 
 === perf-30-1
-title: 实现带 Singleflight 合并与故障旧值兜底（Serve-Stale）的进程内 DNS 缓存解析器
+title: 实现 Linux nf_conntrack 连接跟踪表容量淘汰与 Early-Drop 驱逐模拟器
 race: true
 --- desc
-为解决 K8s 下 CoreDNS 偶发 5 秒超时毛刺与高频重复解析，请实现进程内 DNS 缓存器 `CachingResolver`：
+为模拟并诊断 Linux 内核 `nf_conntrack: table full, dropping packet` 故障与内核表满自救机制，请实现连接跟踪表模拟器 `ConntrackTable` 的 `Track(tuple string, state string, ttlSec int64, nowSec int64) (accepted bool, reason string)`：
 
-1. `Resolve(host string, now time.Time) ([]string, error)`：
-   - **命中未过期缓存**：若 `host` 在缓存中且 `now.Before(entry.expireAt)`，直接返回缓存的 IP 切片副本；
-   - **缓存未命中或已过期**：调用底层 `lookup(host) ([]string, error)`：
-     - **并发去重（Singleflight）**：同一时刻针对同一个 `host` 的多个并发 `Resolve` 请求，底层 `lookup(host)` **只允许执行 1 次**，共享结果；
-     - **查询成功（`err == nil`）**：更新缓存（过期时间设为 `now.Add(ttl)`）并返回结果；
-     - **查询失败（`err != nil`，模拟 CoreDNS 超时故障）**：如果缓存中存在该 `host` **已过期的历史记录（Stale Cache）**，**返回该历史旧 IP 列表与 `nil` 错误（Serve Stale on Error 容灾）**！只有既查失败又没有任何历史缓存时，才返回 `err`。
+1. **已存在未过期表项刷新**：若 `tuple` 在表中且未过期（`nowSec < entry.expireAt`），更新其 `state` 和 `expireAt = nowSec + ttlSec`，返回 `(true, "updated")`；
+2. **表满时的两级自救驱逐（当表中当前条目数 `>= maxEntries` 且本次为新五元组或已过期五元组时）**：
+   - **第一级：清理所有已过期条目（Expired Eviction）**：遍历删除所有 `nowSec >= entry.expireAt` 的条目（例如已到期的 `TIME_WAIT` 连接）；
+   - **第二级：Early-Drop 驱逐半连接（Unreplied Eviction）**：若清理过期条目后表依然满（`len >= maxEntries`），仿照 Linux 内核 `early_drop` 机制，寻找表中任意一条状态为 `"UNREPLIED"` 且 `expireAt` 最小（最早过期）的条目将其强制删除，并将 `t.EarlyDrops` 计数 `+1`；
+3. **最终判定**：
+   - 若经过上述两级驱逐后仍有空位（`len < maxEntries`），插入新条目 `{state: state, expireAt: nowSec + ttlSec}`，返回 `(true, "inserted")`；
+   - 若表中全是未过期的 `"ESTABLISHED"` / `"TIME_WAIT"` 活跃连接导致无法腾出空位，将 `t.Drops` 计数 `+1`，返回 `(false, "table_full")`。
 --- solution
 package main
 
-import (
-	"sync"
-	"time"
-)
+import "sync"
 
-type dnsEntry struct {
-	ips      []string
-	expireAt time.Time
+type conntrackEntry struct {
+	state    string
+	expireAt int64
 }
 
-type dnsCall struct {
-	wg  sync.WaitGroup
-	ips []string
-	err error
+type ConntrackTable struct {
+	mu         sync.Mutex
+	maxEntries int
+	entries    map[string]*conntrackEntry
+	EarlyDrops int64
+	Drops      int64
 }
 
-type CachingResolver struct {
-	mu       sync.Mutex
-	ttl      time.Duration
-	cache    map[string]dnsEntry
-	inflight map[string]*dnsCall
-	lookup   func(host string) ([]string, error)
-}
-
-func NewCachingResolver(ttl time.Duration, lookup func(string) ([]string, error)) *CachingResolver {
-	return &CachingResolver{
-		ttl:      ttl,
-		cache:    make(map[string]dnsEntry),
-		inflight: make(map[string]*dnsCall),
-		lookup:   lookup,
+func NewConntrackTable(maxEntries int) *ConntrackTable {
+	return &ConntrackTable{
+		maxEntries: maxEntries,
+		entries:    make(map[string]*conntrackEntry),
 	}
 }
 
-func (r *CachingResolver) Resolve(host string, now time.Time) ([]string, error) {
+func (t *ConntrackTable) Track(tuple string, state string, ttlSec int64, nowSec int64) (bool, string) {
 	// @solution
-	r.mu.Lock()
-	if ent, ok := r.cache[host]; ok && now.Before(ent.expireAt) {
-		r.mu.Unlock()
-		return ent.ips, nil
-	}
-	if call, ok := r.inflight[host]; ok {
-		r.mu.Unlock()
-		call.wg.Wait()
-		return call.ips, call.err
-	}
-	call := &dnsCall{}
-	call.wg.Add(1)
-	r.inflight[host] = call
-	r.mu.Unlock()
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
-	ips, err := r.lookup(host)
-
-	r.mu.Lock()
-	delete(r.inflight, host)
-	if err == nil {
-		r.cache[host] = dnsEntry{ips: ips, expireAt: now.Add(r.ttl)}
-		call.ips, call.err = ips, nil
-	} else if stale, ok := r.cache[host]; ok {
-		call.ips, call.err = stale.ips, nil
-	} else {
-		call.ips, call.err = nil, err
+	if ent, ok := t.entries[tuple]; ok {
+		if nowSec < ent.expireAt {
+			ent.state = state
+			ent.expireAt = nowSec + ttlSec
+			return true, "updated"
+		}
+		delete(t.entries, tuple)
 	}
-	r.mu.Unlock()
 
-	call.wg.Done()
-	return call.ips, call.err
+	if len(t.entries) >= t.maxEntries {
+		for k, ent := range t.entries {
+			if nowSec >= ent.expireAt {
+				delete(t.entries, k)
+			}
+		}
+	}
+
+	if len(t.entries) >= t.maxEntries {
+		var victimKey string
+		var victimExpire int64
+		for k, ent := range t.entries {
+			if ent.state == "UNREPLIED" {
+				if victimKey == "" || ent.expireAt < victimExpire || (ent.expireAt == victimExpire && k < victimKey) {
+					victimKey = k
+					victimExpire = ent.expireAt
+				}
+			}
+		}
+		if victimKey != "" {
+			delete(t.entries, victimKey)
+			t.EarlyDrops++
+		}
+	}
+
+	if len(t.entries) >= t.maxEntries {
+		t.Drops++
+		return false, "table_full"
+	}
+
+	t.entries[tuple] = &conntrackEntry{
+		state:    state,
+		expireAt: nowSec + ttlSec,
+	}
+	return true, "inserted"
 	// @starter
-	// return r.lookup(host) // TODO: 实现 TTL 缓存、并发 Singleflight 合并与故障 Serve-Stale 兜底
+	// return false, "table_full" // TODO: 实现五元组更新、过期回收、UNREPLIED Early-Drop 与 table_full 丢包统计
 	// @end
 }
 --- test
 package main
 
-import (
-	"errors"
-	"sync"
-	"sync/atomic"
-	"testing"
-	"time"
-)
+import "testing"
 
-func TestCachingResolverSingleflightAndStale(t *testing.T) {
-	var lookups atomic.Int32
-	var shouldFail atomic.Bool
+func TestConntrackTableEvictionAndFullDrop(t *testing.T) {
+	tbl := NewConntrackTable(2)
 
-	res := NewCachingResolver(30*time.Second, func(host string) ([]string, error) {
-		lookups.Add(1)
-		time.Sleep(15 * time.Millisecond)
-		if shouldFail.Load() {
-			return nil, errors.New("dns i/o timeout (5s)")
-		}
-		return []string{"10.0.0.1"}, nil
-	})
-
-	t0 := time.Now()
-	// 1. 20 个协程并发解析冷域名，只应触发 1 次底层 UDP 查询
-	var wg sync.WaitGroup
-	for range 20 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ips, err := res.Resolve("api.pay.internal", t0)
-			if err != nil || len(ips) != 1 || ips[0] != "10.0.0.1" {
-				t.Errorf("unexpected resolve: %v, %v", ips, err)
-			}
-		}()
+	// 1. 插入两条连接填满表：c1 为 TIME_WAIT (TTL=30s)，c2 为 UNREPLIED (TTL=30s)
+	if ok, r := tbl.Track("c1", "TIME_WAIT", 30, 100); !ok || r != "inserted" {
+		t.Fatalf("c1 track = %v, %q", ok, r)
 	}
-	wg.Wait()
-	if lookups.Load() != 1 {
-		t.Fatalf("lookups = %d, want 1", lookups.Load())
+	if ok, r := tbl.Track("c2", "UNREPLIED", 30, 100); !ok || r != "inserted" {
+		t.Fatalf("c2 track = %v, %q", ok, r)
 	}
 
-	// 2. TTL 过期后，模拟 CoreDNS 挂掉报错 -> 应优雅降级返回过期的旧 IP (10.0.0.1)，零报错！
-	shouldFail.Store(true)
-	ips, err := res.Resolve("api.pay.internal", t0.Add(time.Minute))
-	if err != nil || len(ips) != 1 || ips[0] != "10.0.0.1" {
-		t.Fatalf("expected stale IP fallback when DNS fails, got ips=%v err=%v", ips, err)
+	// 2. 已存在连接 c1 状态刷新，不占新槽位
+	if ok, r := tbl.Track("c1", "TIME_WAIT", 20, 105); !ok || r != "updated" {
+		t.Fatalf("c1 update = %v, %q", ok, r)
 	}
 
-	// 3. 从未缓存过的全新域名在 DNS 故障时应如实返回错误
-	if _, err := res.Resolve("never.seen.internal", t0); err == nil {
-		t.Fatal("expected error for cold host when DNS fails")
+	// 3. 在 t=110s（c1 过期时间为 125s，均未过期）插入新连接 c3 -> 触发 Early-Drop 踢掉 UNREPLIED 的 c2！
+	if ok, r := tbl.Track("c3", "ESTABLISHED", 300, 110); !ok || r != "inserted" {
+		t.Fatalf("c3 should succeed via early_drop of c2, got %v, %q", ok, r)
+	}
+	if tbl.EarlyDrops != 1 {
+		t.Fatalf("EarlyDrops = %d, want 1", tbl.EarlyDrops)
+	}
+
+	// 4. 在 t=115s（c1=TIME_WAIT@125, c3=ESTABLISHED@410，无 UNREPLIED 也无过期）插入 c4 -> 触发 table_full 丢包！
+	if ok, r := tbl.Track("c4", "ESTABLISHED", 300, 115); ok || r != "table_full" {
+		t.Fatalf("c4 should fail with table_full, got %v, %q", ok, r)
+	}
+	if tbl.Drops != 1 {
+		t.Fatalf("Drops = %d, want 1", tbl.Drops)
+	}
+
+	// 5. 到 t=130s 时，c1 (TIME_WAIT@125) 已过期，此时插入 c4 应清理过期 c1 后成功插入
+	if ok, r := tbl.Track("c4", "ESTABLISHED", 300, 130); !ok || r != "inserted" {
+		t.Fatalf("c4 at t=130 should evict expired c1 and succeed, got %v, %q", ok, r)
 	}
 }
 --- explain
 **思路**
 
-在 Go 服务内加一层 DNS 缓存要解决两个核心问题：
-1. **并发击穿（Singleflight）**：缓存过期的瞬间如果有 500 个请求同时建连，只能发 1 个 DNS 请求。
-2. **故障旧值兜底（Serve Stale on Error）**：后端服务的 IP 往往几天甚至几周都不变。当 CoreDNS 偶发抖动超时（5s 毛刺）时，继续使用 1 分钟前刚过期的旧 IP 列表几乎 100% 能正常连通，从而让业务对 DNS 故障完全无感！
+这道题还原了 Linux 内核 `nf_conntrack` 表满时的真实防线与局限性：
+1. **为什么调小 `nf_conntrack_tcp_timeout_time_wait` 能救命？** 因为只有当 `nowSec >= ent.expireAt` 时，大量的短连接 `TIME_WAIT` 表项才能被及时回收腾出槽位。
+2. **为什么内核的 `early_drop` 救不了短连接风暴？** 因为内核 `early_drop` 只敢驱逐尚未收到回包的 `"UNREPLIED"` 半连接；如果表里塞满的全是已经完成握手的 `"ESTABLISHED"`（默认存活 5 天）或未到期的 `"TIME_WAIT"`（默认 120s），`early_drop` 找不到可驱逐目标，只能直接触发 `nf_conntrack: table full, dropping packet`（`Drops++`）！
 
 **代码讲解**
 
-- 当 `r.lookup(host)` 返回 `err != nil` 时，检查 `if stale, ok := r.cache[host]; ok`，若存在旧记录则将 `call.ips, call.err = stale.ips, nil` 返回给所有等待的调用方。
+- 按顺序执行：已存在未过期五元组原地续期 → 表满时先扫一遍回收 `nowSec >= ent.expireAt` 的过期表项 → 仍满则找最早到期的 `"UNREPLIED"` 表项执行 `EarlyDrops` → 依然满则记入 `Drops` 并返回 `"table_full"`。
 
 **易错点**
 
-- 注意在缓存未命中发起 `r.lookup(host)` 前必须保留 `r.cache[host]` 中的旧条目（不要在过期时立刻 `delete(r.cache, host)`），否则 `lookup` 失败时就找不到旧值兜底了。
+- 如果 `tuple` 本身已经在表中但**已过期**（`nowSec >= ent.expireAt`），应当先将其旧记录删除，再作为新连接走后续容量判定与插入逻辑，返回值应为 `"inserted"` 而非 `"updated"`。
 
 === perf-31-1
 title: 实现容器内存水位拆解与隐藏内存（Cgo / Mmap / PageCache）诊断器
@@ -476,7 +470,7 @@ race: true
 1. `SlowStartWeight(uptime, warmupWindow time.Duration, minWeight float64) float64`：
    - 若 `warmupWindow <= 0` 或 `uptime >= warmupWindow`，说明预热已完成，返回满额权重 `1.0`；
    - 若 `uptime <= 0`，返回起步最小权重 `minWeight`；
-   - 当 `0 < uptime < warmupWindow` 时，按时间进度比例 `ratio := float64(uptime) / float64(warmupWindow)` 计算，若 `ratio < minWeight` 则返回 `minWeight`，否则返回 `ratio`（即 $\max(\text{minWeight}, \min(1.0, \text{uptime}/\text{warmupWindow}))$）。
+   - 当 `0 < uptime < warmupWindow` 时，按时间进度比例 `ratio := float64(uptime) / float64(warmupWindow)` 计算，若 `ratio < minWeight` 则返回 `minWeight`，否则返回 `ratio`（即 `max(minWeight, min(1.0, uptime/warmupWindow))`）。
 --- solution
 package main
 

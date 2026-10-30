@@ -104,7 +104,7 @@ func (c *SafeCounter) Inc(key string) int {
 理解 `defer` 的生命周期是避免资源泄漏的基础：**Go 的 `defer` 是函数作用域（Function-scoped），而不是块作用域（Block-scoped）**。
 
 在运行时实现上：
-- 对于普通确定次数的 `defer`（不在循环内、且函数内总数 $\le 8$ 个），Go 1.14+ 编译器采用**开放编码（Open-coded defers）**：直接在栈帧上用一个 1 字节的延迟位图（deferbit）记录哪些 `defer` 已被激活，并在每个 `return` 语句前直接内联插入清理函数调用，开销几乎等同于普通函数调用（几纳秒）。
+- 对于普通确定次数的 `defer`（不在循环内、且函数内总数 `<= 8` 个），Go 1.14+ 编译器采用**开放编码（Open-coded defers）**：直接在栈帧上用一个 1 字节的延迟位图（deferbit）记录哪些 `defer` 已被激活，并在每个 `return` 语句前直接内联插入清理函数调用，开销几乎等同于普通函数调用（几纳秒）。
 - **一旦 `defer` 出现在 `for` 循环内部**：由于编译期不知道循环会执行多少次，编译器**无法使用开放编码优化**，必须退化为每次循环都在堆上分配一个 `_defer` 结构体节点，并头插法挂到当前 goroutine 的 `g._defer` 单向链表上！
   如果 `paths` 有 5 万个文件，循环结束前不仅 5 万个操作系统文件描述符（fd）全部开着不关（直接触发 `EMFILE: too many open files`），还会在当前协程的 `_defer` 链表上堆积 5 万个节点，发生严重的内存滞留。
 
@@ -223,7 +223,7 @@ func FetchAllStd(ctx context.Context, urls []string, limit int) ([]string, error
 
 这道题在面试中的真正考察目的不是打印数字本身，而是检验你对 **Go 并发同步原语的选型直觉**：
 
-1. **Channel 令牌传递法（CSP 风格）**：把空结构体 `struct{}{}` 当作“接力棒”，谁拿到接力棒谁打印，打完把棒交给下一个人。根据 Go 内存模型（The Go Memory Model）：**无缓冲 channel 上的第 $k$ 次发送完成 Happens-Before 第 $k$ 次接收完成；容量为 $C$ 的带缓冲 channel 上的第 $k$ 次接收完成 Happens-Before 第 $k+C$ 次发送完成**。因此通过 channel 传递信号天然建立了严格的跨协程可见性与顺序保证。
+1. **Channel 令牌传递法（CSP 风格）**：把空结构体 `struct{}{}` 当作“接力棒”，谁拿到接力棒谁打印，打完把棒交给下一个人。根据 Go 内存模型（The Go Memory Model）：**无缓冲 channel 上的第 `k` 次发送完成 Happens-Before 第 `k` 次接收完成；容量为 `C` 的带缓冲 channel 上的第 `k` 次接收完成 Happens-Before 第 `k+C` 次发送完成**。因此通过 channel 传递信号天然建立了严格的跨协程可见性与顺序保证。
 2. **为什么用 `chan struct{}` 而不是 `chan bool` 或 `chan int`？**
    在 Go 中，空结构体 `struct{}` 的内存大小是 **0 字节**（`unsafe.Sizeof(struct{}{}) == 0`）。编译器和运行时对元素大小为 0 的 channel 有专门优化，仅传递同步信号而不发生多余的数据拷贝，且代码语义上明确表达“我只关心事件发生，不关心值内容”。
 3. **替代方案对比**：除了双 channel 接力，还可以用 **`sync.Cond`（条件变量 + 共享状态 `turn`）** 或 **单共享变量 + 自旋/状态机**，其中 `sync.Cond` 在需要扩展到“任意复杂条件唤醒”时更加灵活。
@@ -274,7 +274,7 @@ func PrintSequenceCond(n int) []int {
 
 **实战建议**
 
-- 在面试手写此类多协程顺序协同代码时，**写完第一件事就是手动推演“最后一次循环（$i = N$）”的退出路径**：检查最后一个发送操作是否还有人接收，会不会导致其中一个协程永久卡死在最后一轮发送上。
+- 在面试手写此类多协程顺序协同代码时，**写完第一件事就是手动推演“最后一次循环（`i = N`）”的退出路径**：检查最后一个发送操作是否还有人接收，会不会导致其中一个协程永久卡死在最后一轮发送上。
 - 纯信号通知的 channel 类型一律写成 `chan struct{}`。
 
 === code-06
@@ -428,9 +428,9 @@ func AggregateOrderPage(ctx context.Context, uid int64) (*PageView, error) {
 
 **令牌桶（Token Bucket）**与**漏桶（Leaky Bucket）**的核心区别在于对**突发流量（Burst）**的处理：
 - **漏桶**：无论输入流量多么波峰波谷，输出永远像水滴一样以恒定速率流出，虽然绝对平滑，但无法利用系统空闲算力快速处理合理的短时突发请求；
-- **令牌桶**：桶容量为 $B$，平时空闲时桶里攒满了 $B$ 个令牌，当瞬间涌入 $B$ 个请求时可以**零等待全部放行**，之后再限制为平均速率 $R\text{ req/s}$。
+- **令牌桶**：桶容量为 `B`，平时空闲时桶里攒满了 `B` 个令牌，当瞬间涌入 `B` 个请求时可以**零等待全部放行**，之后再限制为平均速率 `R req/s`。
 
-在工程实现中，除了答案里的 `Allow() bool`（非阻塞立即判断），生产级限流器（如标准库扩展 `golang.org/x/time/rate`）还采用**预支未来令牌（Reservation / Debt）**的思想来支持阻塞等待 `Wait(ctx)`：当桶里当前只有 0.2 个令牌而请求需要 1 个令牌时，直接让 `tokens` 变成 `-0.8`，并计算出欠下的 0.8 个令牌需要等待 $\frac{0.8}{R}$ 秒才能补齐。只要这个等待时间不超过 `ctx` 的剩余超时时间（Deadline），就让当前协程 `select` 等待对应时长后放行！
+在工程实现中，除了答案里的 `Allow() bool`（非阻塞立即判断），生产级限流器（如标准库扩展 `golang.org/x/time/rate`）还采用**预支未来令牌（Reservation / Debt）**的思想来支持阻塞等待 `Wait(ctx)`：当桶里当前只有 0.2 个令牌而请求需要 1 个令牌时，直接让 `tokens` 变成 `-0.8`，并计算出欠下的 0.8 个令牌需要等待 `0.8 / R` 秒才能补齐。只要这个等待时间不超过 `ctx` 的剩余超时时间（Deadline），就让当前协程 `select` 等待对应时长后放行！
 
 **代码示例**
 
@@ -515,7 +515,7 @@ func (b *TokenBucket) WaitN(ctx context.Context, n int) error {
 ```go
 // 另一种高精度单机滑动窗口实现：环形分桶滑动窗口（Ring Buffer Buckets，类似 Hystrix / Sentinel）
 // 将 1 秒大窗口切分为 10 个 100ms 的小格子，既比两窗口估算更准，又只需固定 10 个 int64 的 O(1) 内存
-typeBucketWindow struct {
+type BucketWindow struct {
 	mu       sync.Mutex
 	buckets  []int
 	slotDur  time.Duration
@@ -523,15 +523,15 @@ typeBucketWindow struct {
 	limit    int
 }
 
-func NewBucketWindow(limit int, window time.Duration, slots int) *typeBucketWindow {
-	return &typeBucketWindow{
+func NewBucketWindow(limit int, window time.Duration, slots int) *BucketWindow {
+	return &BucketWindow{
 		buckets: make([]int, slots),
 		slotDur: window / time.Duration(slots),
 		limit:   limit,
 	}
 }
 
-func (w *typeBucketWindow) Allow(now time.Time) bool {
+func (w *BucketWindow) Allow(now time.Time) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	curSlot := now.UnixNano() / int64(w.slotDur)
@@ -559,7 +559,7 @@ func (w *typeBucketWindow) Allow(now time.Time) bool {
 
 **常见追问**
 
-- 滑动窗口近似计数器（`prev*weight + cur`）在什么极端情况下会有误差？→ 它假设上一个窗口内的请求是**均匀分布**的。如果上一个窗口的 100 个请求全部集中在上一窗口的第 1 秒（00:01），那么到了 01:15 时这批请求其实早就超过 60 秒了，但公式仍然按 $75\%$ 算了 75 个配额占用（偏保守）；不过在真实高并发流量下误差极小（Cloudflare 实测误差 < 0.003%）。
+- 滑动窗口近似计数器（`prev*weight + cur`）在什么极端情况下会有误差？→ 它假设上一个窗口内的请求是**均匀分布**的。如果上一个窗口的 100 个请求全部集中在上一窗口的第 1 秒（00:01），那么到了 01:15 时这批请求其实早就超过 60 秒了，但公式仍然按 `75%` 算了 75 个配额占用（偏保守）；不过在真实高并发流量下误差极小（Cloudflare 实测误差 < 0.003%）。
 - Redis ZSET 滑动窗口脚本里，为什么 `ZADD` 的 member 必须传**唯一请求 ID（`ARGV[4]`）**而不能直接传时间戳？→ 因为在同一个毫秒内完全可能有几十个并发请求同时到达！如果把毫秒时间戳既当 score 又当 member，同一个毫秒内的多次请求会因为 ZSET 集合元素去重而覆盖成 1 条，导致限流彻底失效。
 - 在 Redis Cluster 集群模式下运行限流脚本需要注意什么？→ 必须保证单个限流操作只访问同一个 `KEYS[1]`，如果涉及多个 key 必须使用 Hash Tag（如 `{user:123}:rate`）保证落在同一个哈希槽（Slot）上，且绝不能在 Lua 脚本里拼接访问未在 `KEYS` 中声明的动态 key。
 
@@ -809,10 +809,10 @@ func RunPipeline(ctx context.Context, shutdownTimeout time.Duration) error {
 **原理展开**
 
 **Fan-out（扇出）**与 **Fan-in（扇入 / Merge）**是构建流式数据处理管道（Pipeline）的核心算子：
-- **Fan-out**：1 个输入 channel 被 $M$ 个并发 worker 协程同时读取，用于将 CPU 密集或 I/O 密集的中间处理步骤并行化；
-- **Fan-in（本题的 `Merge`）**：将 $N$ 个输入 channel 的结果汇聚回 1 个输出 channel，供下游统一消费。
+- **Fan-out**：1 个输入 channel 被 `M` 个并发 worker 协程同时读取，用于将 CPU 密集或 I/O 密集的中间处理步骤并行化；
+- **Fan-in（本题的 `Merge`）**：将 `N` 个输入 channel 的结果汇聚回 1 个输出 channel，供下游统一消费。
 
-在实现 `Merge` 时，最关键的是**反向传播取消信号（Cancellation Propagation）**：如果下游消费者只读了前 5 条数据就因为报错或满足条件提前退出了（比如 `take(5)`），如果下游不通过 `ctx` 通知上游，那么 `Merge` 内部启动的 $N$ 个搬运协程就会永久卡死在 `out <- v` 发送语句上，连带上游的所有生产者一起全部泄漏！
+在实现 `Merge` 时，最关键的是**反向传播取消信号（Cancellation Propagation）**：如果下游消费者只读了前 5 条数据就因为报错或满足条件提前退出了（比如 `take(5)`），如果下游不通过 `ctx` 通知上游，那么 `Merge` 内部启动的 `N` 个搬运协程就会永久卡死在 `out <- v` 发送语句上，连带上游的所有生产者一起全部泄漏！
 
 此外，当输入的 channel 数量确定为 2 个时，还可以用**单协程 `select` + 置 `nil` 技巧**实现，连 `sync.WaitGroup` 和额外子协程都不需要。
 
@@ -875,7 +875,7 @@ func MergeTwo[T any](ctx context.Context, a, b <-chan T) <-chan T {
 1. **双重堆分配与类型断言开销**：`list.Element` 的 `Value` 字段是 `any`（`interface{}`）。每次 `ll.PushFront(&entry[K, V]{key, val})` 实际上在堆上分配了**两个**独立的对象（一个 `entry` 结构体 + 内部再次 `new(Element)`），读取时还要做接口类型断言，且链表节点在内存中分散，对 CPU Cache 极不友好；
 2. **`Get` 操作退化为串行写锁**：因为 `Get` 命中后必须调用 `MoveToFront` 修改链表指针，所以**不能用 `sync.RWMutex` 的读锁 `RLock`**，只能用互斥锁 `Lock()`，高并发读场景下所有核全部争抢同一把锁。
 
-在生产级缓存（如 `groupcache`、知乎/字节内部组件）中，通常**手写侵入式双向链表（Intrusive Doubly Linked List）**，并使用**哈希分片锁（Sharded LRU）**将锁竞争降低 $N$ 倍。
+在生产级缓存（如 `groupcache`、知乎/字节内部组件）中，通常**手写侵入式双向链表（Intrusive Doubly Linked List）**，并使用**哈希分片锁（Sharded LRU）**将锁竞争降低 `N` 倍。
 
 **代码示例**
 
@@ -1002,7 +1002,7 @@ func (c *TTLCache[K, V]) GetAndEvict(key K, now time.Time) (V, bool) {
    - **Full Jitter（全抖动）**：`sleep = rand(0, min(maxDelay, base * 2^attempt))`，打散效果最好，总重试次数最少；
    - **Equal Jitter（等分抖动，本题代码采用）**：`sleep = temp/2 + rand(0, temp/2)`，既有保底的最小退避间隔，又能把脉冲平摊到半个窗口宽度上；
    - **Decorrelated Jitter（去相关抖动）**：`sleep = min(maxDelay, rand(base, prevSleep * 3))`。
-2. **级联重试放大（Retry Amplification）**：如果网关层重试 3 次，BFF 服务层重试 3 次，DAO 数据库层又重试 3 次，那么底层数据库慢一下，会被放大成 $3 \times 3 \times 3 = 27$ 倍的请求风暴！
+2. **级联重试放大（Retry Amplification）**：如果网关层重试 3 次，BFF 服务层重试 3 次，DAO 数据库层又重试 3 次，那么底层数据库慢一下，会被放大成 `3 * 3 * 3 = 27` 倍的请求风暴！
 
 **代码示例**
 
@@ -1060,7 +1060,7 @@ func (b *RetryBudget) CanRetry() bool {
 
 编写 Go `net/http` 中间件看似简单，但标准库 `http.ResponseWriter` 的接口设计隐藏了三个极易踩坑的机制：
 
-1. **隐式状态码与重复 `WriteHeader`**：如果業務 Handler 直接调用了 `w.Write([]byte("ok"))` 而没有先调 `w.WriteHeader(200)`，标准库内部会自动以 `200 OK` 发送响应头；反之，如果中间件或 Handler 不小心调用了两次 `WriteHeader`，标准库会在日志里打出烦人的 `http: superfluous response.WriteHeader call` 警告。此外，统计响应体字节数（`bytes_written`）也需要拦截 `Write([]byte)` 方法。
+1. **隐式状态码与重复 `WriteHeader`**：如果业务 Handler 直接调用了 `w.Write([]byte("ok"))` 而没有先调 `w.WriteHeader(200)`，标准库内部会自动以 `200 OK` 发送响应头；反之，如果中间件或 Handler 不小心调用了两次 `WriteHeader`，标准库会在日志里打出烦人的 `http: superfluous response.WriteHeader call` 警告。此外，统计响应体字节数（`bytes_written`）也需要拦截 `Write([]byte)` 方法。
 2. **接口隐藏（Interface Hiding）与 Go 1.20 `http.ResponseController`**：
    底层的 `*http.response` 不仅实现了 `ResponseWriter`（只有 `Header`、`Write`、`WriteHeader` 三个方法），还实现了 `http.Flusher`（SSE 流式推送必需）、`http.Hijacker`（WebSocket 升级连接必需）、`io.ReaderFrom`（`sendfile` 零拷贝传输必需）。
    一旦你用自定义的 `&statusRecorder{ResponseWriter: w}` 把 `w` 包装起来传给下游，下游做类型断言 `w.(http.Flusher)` 就会立刻失败！**Go 1.20 引入了 `http.NewResponseController(w)`**，它会自动循环调用包装层的 `Unwrap() http.ResponseWriter` 方法找到最底层的原始 `ResponseWriter`，因此所有自定义包装器都必须实现 `Unwrap()`。
@@ -1070,7 +1070,7 @@ func (b *RetryBudget) CanRetry() bool {
 **代码示例**
 
 ```go
-// 完整生产级 ResponseWriter 包装器：支持记录状态码、统计响应字节数、防止重复 WriteHeader，并兼容 Unwrap 與 Flusher
+// 完整生产级 ResponseWriter 包装器：支持记录状态码、统计响应字节数、防止重复 WriteHeader，并兼容 Unwrap 与 Flusher
 type responseRecorder struct {
 	http.ResponseWriter
 	status      int
@@ -1143,9 +1143,9 @@ func (r *responseRecorder) Unwrap() http.ResponseWriter {
                   +-------------------------------+ (立即重新回到 Open 并重置冷却计时)
 ```
 
-除了经典的“三态状态机熔断器（Hystrix / gobreaker）”，Google SRE 书中还提出了更先进的**自适应客户端节流（Adaptive Throttling，被 Kratos、go-zero 采用）**：它没有显式的 Open/Half-Open 状态切换跳变，而是维护滑动窗口内的总请求数 $requests$ 和下游接受成功数 $accepts$，计算客户端拒绝概率：
-$$P_{\text{drop}} = \max\left(0, \frac{requests - K \cdot accepts}{requests + 1}\right)$$
-其中倍乘因子 $K$ 通常取 $1.5 \sim 2.0$。当下游正常（$accepts = requests$）时，分子为负，拒绝概率为 $0$；当下游错误率超过 $1 - \frac{1}{K}$（如 $K=2$ 时错误率 $> 50\%$），拒绝概率随着错误率升高平滑线性上升，下游一旦恢复，$accepts$ 增加，流量自动平滑恢复，彻底消除了半开状态切换时的流量冲击台阶！
+除了经典的“三态状态机熔断器（Hystrix / gobreaker）”，Google SRE 书中还提出了更先进的**自适应客户端节流（Adaptive Throttling，被 Kratos、go-zero 采用）**：它没有显式的 Open/Half-Open 状态切换跳变，而是维护滑动窗口内的总请求数 `requests` 和下游接受成功数 `accepts`，计算客户端拒绝概率：
+`P_drop = max(0, (requests - K * accepts) / (requests + 1))`
+其中倍乘因子 `K` 通常取 `1.5 ~ 2.0`。当下游正常（`accepts = requests`）时，分子为负，拒绝概率为 `0`；当下游错误率超过 `1 - 1/K`（如 `K = 2` 时错误率 `> 50%`），拒绝概率随着错误率升高平滑线性上升，下游一旦恢复，`accepts` 增加，流量自动平滑恢复，彻底消除了半开状态切换时的流量冲击台阶！
 
 **代码示例**
 

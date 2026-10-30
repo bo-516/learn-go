@@ -51,11 +51,13 @@ cat /sys/fs/cgroup/cpu.stat        # 检查 nr_throttled 确认是否被 cgroup 
 --- deep
 **原理展开**
 
-Linux 内核每 **5 秒**（由 `LOAD_FREQ = 5*HZ` 定义）采样一次当前的活跃任务数 $n$（所有处于 `TASK_RUNNING` 和 `TASK_UNINTERRUPTIBLE` 状态的线程数之和），并用**指数移动平均**（Exponentially Weighted Moving Average）更新 1、5、15 分钟三个值：
+Linux 内核每 **5 秒**（由 `LOAD_FREQ = 5*HZ` 定义）采样一次当前的活跃任务数 `n`（所有处于 `TASK_RUNNING` 和 `TASK_UNINTERRUPTIBLE` 状态的线程数之和），并用**指数移动平均**（Exponentially Weighted Moving Average）更新 1、5、15 分钟三个值：
 
-$$L_t = L_{t-1} \cdot e^{-5/T} + n \cdot (1 - e^{-5/T})$$
+```text
+L(t) = L(t-1) * e^(-5/T) + n * (1 - e^(-5/T))
+```
 
-其中 $T$ 分别为 60、300、900 秒。因此所谓的“1 分钟负载”并不是过去 60 秒的算术平均值，而是历史值权重占 $e^{-5/60} \approx 92\%$、最新采样占 $8\%$ 的衰减曲线。
+其中 `T` 分别为 60、300、900 秒。因此所谓的“1 分钟负载”并不是过去 60 秒的算术平均值，而是历史值权重占 `e^(-5/60) ≈ 92%`、最新采样占 `8%` 的衰减曲线。
 
 为什么 Linux 要把 `D` 状态（不可中断睡眠）算进负载？因为早期 Unix 只统计 CPU 运行队列，后来 Linux 开发者认为 load average 应该反映**对系统全部关键资源（包括 CPU 和磁盘 IO）的需求总和**。线程进入 `D` 状态是因为正在等待内核态的关键操作（如块设备读写、页错误加载、`mutex_lock` 内核互斥锁），此时若响应信号提前中断，会导致内核数据结构与硬件状态不一致，所以内核不允许信号打断它。
 
@@ -574,7 +576,7 @@ func TestNoLeak(t *testing.T) {
 
 传统的 CPU Profile 只采集 **On-CPU** 时间（线程正在 CPU 核上执行指令的时刻）。一旦 goroutine 因为等待网络响应、等待 `sync.Mutex`、等待数据库连接池 `sql.DB` 的空闲连接、或者等待定时器而进入 `_Gwaiting` 状态，它就不再消耗任何 CPU 时间，因此在 CPU 火焰图上**完全隐身**。
 
-这类 **Off-CPU 延迟**可以通过 Little 定律 $L = \lambda \cdot W$ 来理解：假设服务每秒请求数 $\lambda = 1000\text{ QPS}$，平时平均响应时间 $W = 5\text{ms}$，那么系统中同时在途的请求 goroutine 数 $L = 1000 \times 0.005 = 5$ 个；当某个下游或锁让平均等待时间变成 $W = 2\text{s}$ 时，CPU 依然很闲，但同时阻塞在途的 goroutine 数会瞬间膨胀到 $L = 1000 \times 2 = 2000$ 个！这就是为什么**阻塞时抓一张 `goroutine` profile 往往能一眼看到罪魁祸首**：哪里等待时间最长，哪里堆积的 goroutine 就最多。
+这类 **Off-CPU 延迟**可以通过 Little 定律 `L = λ * W` 来理解：假设服务每秒请求数 `λ = 1000 QPS`，平时平均响应时间 `W = 5ms`，那么系统中同时在途的请求 goroutine 数 `L = 1000 * 0.005 = 5` 个；当某个下游或锁让平均等待时间变成 `W = 2s` 时，CPU 依然很闲，但同时阻塞在途的 goroutine 数会瞬间膨胀到 `L = 1000 * 2 = 2000` 个！这就是为什么**阻塞时抓一张 `goroutine` profile 往往能一眼看到罪魁祸首**：哪里等待时间最长，哪里堆积的 goroutine 就最多。
 
 **代码示例**
 
@@ -616,7 +618,7 @@ func traceHTTPRequest(req *http.Request) *http.Request {
 **常见追问**
 
 - 为什么 `net/http` 的默认 `Transport` 在高并发调用同一个微服务时会导致连接排队和大量 `TIME_WAIT`？→ `http.DefaultTransport` 的 `MaxIdleConnsPerHost` 默认只有 **2**，如果还设置了较小的 `MaxConnsPerHost`，超出部分的请求就会在客户端内存队列里干等（阻塞在 `Transport.getConn`），CPU 极低但延迟极高。
-- 容器 CPU 使用率只有 30%，为什么还会出现严重的 CFS CPU 限流（`nr_throttled` 暴增）？→ 假设容器 limit 是 2 核（每 100ms 配额 200ms），但 `GOMAXPROCS` 是宿主机核数 32。当一个突发请求到来唤醒 20 个线程并行处理时，只需 10ms（$20 \times 10\text{ms} = 200\text{ms}$）就把当前 100ms 周期的配额全部耗尽，剩下 90ms 整个进程被内核强行冻结；按秒平均下来 CPU 使用率看似不高，但每次请求都平白无故多了近 90ms 的停顿。
+- 容器 CPU 使用率只有 30%，为什么还会出现严重的 CFS CPU 限流（`nr_throttled` 暴增）？→ 假设容器 limit 是 2 核（每 100ms 配额 200ms），但 `GOMAXPROCS` 是宿主机核数 32。当一个突发请求到来唤醒 20 个线程并行处理时，只需 10ms（`20 * 10ms = 200ms`）就把当前 100ms 周期的配额全部耗尽，剩下 90ms 整个进程被内核强行冻结；按秒平均下来 CPU 使用率看似不高，但每次请求都平白无故多了近 90ms 的停顿。
 - Mutex Profile 和 Block Profile 有什么区别？→ `mutex` 只记录 `sync.Mutex` 和 `sync.RWMutex` 的锁争用等待时间；`block` 的范围更广，还包含 channel 收发阻塞、`select` 阻塞、`sync.WaitGroup.Wait` 和 `sync.Cond.Wait` 的等待时间（但不包含网络 I/O 和 `time.Sleep`）。
 
 **实战建议**

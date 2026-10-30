@@ -392,7 +392,7 @@ title: 如何实现 Go 服务的零停机发布（SO_REUSEPORT 热重启 vs Kube
    在 Linux 内核中，开启 `SO_REUSEPORT` 的每个进程都拥有**各自独立的 SYN 半连接队列和 Accept 全连接队列**！当老进程调用 `srv.Shutdown()` 关闭自己的 `listen_fd` 时，虽然新到的 SYN 包会全部转给新进程，但**当时已经躺在这个老进程自己的全连接队列里、还没来得及被 `accept()` 取走的那几个连接，会被内核直接丢弃并回复 `RST`**！
    （只有使用 `BPF_PROG_TYPE_SK_REUSEPORT` eBPF 程序在老进程排空前先把新连接优雅导流给新进程，或者采用 `ExtraFiles` 共享同一个内核 `listen_fd` 队列，才能在单机做到 100% 零握手丢失）。
 2. **Kubernetes 优雅下线的黄金时间公式**：
-   $$\text{preStop Sleep (5s)} + \text{srv.Shutdown 超时 (20s)} < \text{terminationGracePeriodSeconds (30s)}$$
+   `preStop Sleep (5s) + srv.Shutdown 超时 (20s) < terminationGracePeriodSeconds (30s)`
    如果两者之和超过了 K8s 的 `terminationGracePeriodSeconds`，kubelet 到点会直接发送不可捕获的 `SIGKILL`（`kill -9`）强杀容器，导致优雅关闭功亏一篑。
 
 **代码示例**
@@ -469,7 +469,7 @@ Go 标准库的 `net/http/httputil.ReverseProxy` 是一个极其强悍的生产�
   X-Internal-User-ID: 1 (管理员 ID)
   ```
   根据 HTTP/1.1 规范，`Connection` 头里列出的所有 Header 名都属于 **Hop-by-Hop（逐跳头）**，反向代理在转发给下游前必须将它们全部删掉！
-- **旧版 `Director` 的致命缺陷**：`Director(req)` 是在 `ReverseProxy` **清理 Hop-by-Hop 头之前**执行的！這会导致两种安全事故：① 攻击者利用 `Connection: X-Real-IP` 让网关在 `Director` 之后把刚刚设置好的安全头给删掉了！② 开发者在 `Director` 里忘了清理客户端伪造的 `X-Forwarded-For`。
+- **旧版 `Director` 的致命缺陷**：`Director(req)` 是在 `ReverseProxy` **清理 Hop-by-Hop 头之前**执行的！这会导致两种安全事故：① 攻击者利用 `Connection: X-Real-IP` 让网关在 `Director` 之后把刚刚设置好的安全头给删掉了！② 开发者在 `Director` 里忘了清理客户端伪造的 `X-Forwarded-For`。
 - **Go 1.20+ `Rewrite(pr *ProxyRequest)` 的修复**：`Rewrite` 接收包含只读原始请求 `pr.In` 和已彻底清理完所有逐跳头的新出站请求 `pr.Out`，并提供安全的 `pr.SetXForwarded()` 方法！
 
 **代码示例**
@@ -534,7 +534,7 @@ title: 高并发 Go 服务的日志规范应该怎样设计？log/slog 如何实
    - `INFO`：关键业务状态变迁（如订单支付成功、服务启动停止、采样后的 Access Log）；
    - `DEBUG`：开发调试细节，生产默认关闭（可通过管理接口按租户或按单个染色请求动态开启）。
 3. **敏感信息自动脱敏**：手机号、身份证、密码、Token、银行卡号禁止明文落盘；
-4. **高频重复日志采样（Log Sampling）**：同一秒内完全相同的错误最多打印前 $N$ 条，后续按比例抽样。
+4. **高频重复日志采样（Log Sampling）**：同一秒内完全相同的错误最多打印前 `N` 条，后续按比例抽样。
 
 **2. Go 1.21+ 标准库 `log/slog` 的三大高性能实践**
 
@@ -611,7 +611,7 @@ func (h *ContextAndSampleHandler) WithGroup(name string) slog.Handler {
 
 - `slog.Info("msg", "id", id)` 和 `slog.LogAttrs(ctx, slog.LevelInfo, "msg", slog.Int("id", id))` 有什么性能区别？→ 前者接收 `...any`，传入的 `"id"` 和 `id` 会先组合成键值对，如果是基本类型可能触发接口装箱；而 `LogAttrs` 显式接收 `...slog.Attr` 值类型，Go 编译器能对其做彻底的逃逸消除，在极致性能热路径上推荐用 `LogAttrs`。
 - 如果用自定义的 `slog.Handler` 包装了底层 Handler，在调用 `WithAttrs` 时需要注意什么？→ 必须返回一个**新的外层包装 Handler 实例**（包裹住 `h.next.WithAttrs(attrs)`），不能直接返回 `h.next.WithAttrs(attrs)`，否则调用 `logger.With("module", "pay")` 生成的子 Logger 就会把你外层的 TraceID 注入和采样逻辑全部丢掉！
-- 生产环境高频日志采样（参考 `zap.NewProduction` 的采样器策略）通常怎么设定规则？→ 按 **`(日志级别 + 消息模板 msg)`** 作为哈希分桶 Key，在每 **1 秒**的时间窗口内：**前 $N$ 条（如 100 条）100% 原样输出**；同一秒内超出 100 条后的相同日志，**每 $M$ 条（如每 100 条）只输出 1 条**。这样既绝对不会漏掉任何偶发错误，又能在下游雪崩报错时将每秒 10 万条日志瞬間压降到每秒 1100 条，保护磁盘 I/O 不被打挂！
+- 生产环境高频日志采样（参考 `zap.NewProduction` 的采样器策略）通常怎么设定规则？→ 按 **`(日志级别 + 消息模板 msg)`** 作为哈希分桶 Key，在每 **1 秒**的时间窗口内：**前 `N` 条（如 100 条）100% 原样输出**；同一秒内超出 100 条后的相同日志，**每 `M` 条（如每 100 条）只输出 1 条**。这样既绝对不会漏掉任何偶发错误，又能在下游雪崩报错时将每秒 10 万条日志瞬间压降到每秒 1100 条，保护磁盘 I/O 不被打挂！
 
 **实战建议**
 

@@ -377,84 +377,113 @@ func TestNullOrValueAndBuildInQuery(t *testing.T) {
 - 传入空切片 `[]int{}` 时如果不提前拦截，拼出来的 `WHERE id IN ()` 发到 MySQL 会直接报 1064 语法错误。
 
 === db-36-1
-title: 实现带“读己之写”粘性窗口的数据库读写分离路由器
+title: 实现支持 Context 路由标记、事务感知与从库延迟水位熔断的读写分离路由器
 race: true
 --- desc
-实现读写分离路由器 `RWRouter`：
+实现生产级读写分离路由器 `DBRouter`，综合处理**显式主库标记、事务上下文、SQL 读写/加锁识别、以及从库复制延迟（Replication Lag）超阈值自动熔断与轮询负载均衡**：
 
-- 包含一个主库节点名 `primary`（如 `"master"`）和一组只读从库节点名 `replicas`（如 `["slave-1", "slave-2"]`）；
-- `RouteWrite(userID string, now time.Time) string`：写操作永远路由到 `primary`，并记录该 `userID` 的最后写入时间为 `now`；
-- `RouteRead(ctx context.Context, userID string, now time.Time) string`：
-  1. 如果 `ctx` 被 `WithForcePrimary(ctx)` 标记过，或者 `replicas` 为空，返回 `primary`；
-  2. 如果该 `userID` 曾经写入过，且距离最后写入时间**严格小于** `stickyWindow`（主从延迟保护窗口，例如 2 秒），为了保证用户能“读己之写”，自动返回 `primary`；
-  3. 否则按轮询（Round-Robin）顺序依次返回 `replicas` 中的从库节点。
+1. **Context 路由标记**：
+   - `WithPrimary(ctx context.Context) context.Context`：显式标记本次查询强制走主库；
+   - `WithTx(ctx context.Context) context.Context`：标记当前操作处于数据库事务内；
+2. **动态更新从库延迟水位**：
+   - `UpdateReplicaLag(replica string, lag time.Duration)`：并发安全地记录某个从库当前的复制延迟（未上报过的从库默认延迟为 `0`）；
+3. **综合路由决策 `RouteSQL(ctx context.Context, sqlStr string) string`**：
+   - 若 `ctx` 被 `WithPrimary(ctx)` 或 `WithTx(ctx)` 标记过，必须返回 `primary`（事务内的任何查询都必须走主库连接）；
+   - 将 `sqlStr` 去除首尾空格并转为大写后：若**不是**以 `"SELECT "` 开头（如 `INSERT`、`UPDATE`、`DELETE`），或者包含悲观锁子句 `"FOR UPDATE"` 或 `"LOCK IN SHARE MODE"`，必须返回 `primary`；
+   - 否则，从 `replicas` 中按原顺序筛选出当前延迟 **`lag <= maxLag`** 的健康从库列表 `healthy`：
+     - 若 `healthy` 为空（未配置从库，或所有从库延迟均超过 `maxLag` 触发熔断），自动降级回退返回 `primary`；
+     - 否则使用原子计数器 `seq := r.rr.Add(1)`，按 `(seq - 1) % uint64(len(healthy))` 在健康从库间轮询返回 `healthy[idx]`。
 --- solution
 package main
 
 import (
 	"context"
+	// @solution
+	"strings"
+	// @end
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-type forcePrimaryKey struct{}
+type ctxPrimaryKey struct{}
+type ctxTxKey struct{}
 
-func WithForcePrimary(ctx context.Context) context.Context {
-	return context.WithValue(ctx, forcePrimaryKey{}, true)
-}
-
-type RWRouter struct {
-	primary      string
-	replicas     []string
-	stickyWindow time.Duration
-	rr           atomic.Uint64
-	mu           sync.RWMutex
-	lastWrite    map[string]time.Time
-}
-
-func NewRWRouter(primary string, replicas []string, stickyWindow time.Duration) *RWRouter {
-	return &RWRouter{
-		primary:      primary,
-		replicas:     replicas,
-		stickyWindow: stickyWindow,
-		lastWrite:    make(map[string]time.Time),
-	}
-}
-
-func (r *RWRouter) RouteWrite(userID string, now time.Time) string {
+func WithPrimary(ctx context.Context) context.Context {
 	// @solution
-	if userID != "" {
-		r.mu.Lock()
-		r.lastWrite[userID] = now
-		r.mu.Unlock()
-	}
-	return r.primary
+	return context.WithValue(ctx, ctxPrimaryKey{}, true)
 	// @starter
-	// return r.primary // TODO: 记录 userID 的写入时间并返回主库
+	// return ctx // TODO: 使用 context.WithValue 注入强制主库标记
 	// @end
 }
 
-func (r *RWRouter) RouteRead(ctx context.Context, userID string, now time.Time) string {
+func WithTx(ctx context.Context) context.Context {
 	// @solution
-	if len(r.replicas) == 0 {
+	return context.WithValue(ctx, ctxTxKey{}, true)
+	// @starter
+	// return ctx // TODO: 使用 context.WithValue 注入事务上下文标记
+	// @end
+}
+
+type DBRouter struct {
+	primary  string
+	replicas []string
+	maxLag   time.Duration
+	rr       atomic.Uint64
+	mu       sync.RWMutex
+	lags     map[string]time.Duration
+}
+
+func NewDBRouter(primary string, replicas []string, maxLag time.Duration) *DBRouter {
+	return &DBRouter{
+		primary:  primary,
+		replicas: replicas,
+		maxLag:   maxLag,
+		lags:     make(map[string]time.Duration),
+	}
+}
+
+func (r *DBRouter) UpdateReplicaLag(replica string, lag time.Duration) {
+	// @solution
+	r.mu.Lock()
+	r.lags[replica] = lag
+	r.mu.Unlock()
+	// @starter
+	// // TODO: 并发安全地更新从库复制延迟水位
+	// @end
+}
+
+func (r *DBRouter) RouteSQL(ctx context.Context, sqlStr string) string {
+	// @solution
+	if force, _ := ctx.Value(ctxPrimaryKey{}).(bool); force {
 		return r.primary
 	}
-	if force, _ := ctx.Value(forcePrimaryKey{}).(bool); force {
+	if inTx, _ := ctx.Value(ctxTxKey{}).(bool); inTx {
 		return r.primary
 	}
-	if userID != "" {
-		r.mu.RLock()
-		last, ok := r.lastWrite[userID]
-		r.mu.RUnlock()
-		if ok && now.Sub(last) < r.stickyWindow {
-			return r.primary
+	upper := strings.ToUpper(strings.TrimSpace(sqlStr))
+	if !strings.HasPrefix(upper, "SELECT ") ||
+		strings.Contains(upper, "FOR UPDATE") ||
+		strings.Contains(upper, "LOCK IN SHARE MODE") {
+		return r.primary
+	}
+
+	r.mu.RLock()
+	healthy := make([]string, 0, len(r.replicas))
+	for _, rep := range r.replicas {
+		if r.lags[rep] <= r.maxLag {
+			healthy = append(healthy, rep)
 		}
 	}
-	idx := (r.rr.Add(1) - 1) % uint64(len(r.replicas))
-	return r.replicas[idx]
+	r.mu.RUnlock()
+
+	if len(healthy) == 0 {
+		return r.primary
+	}
+	idx := (r.rr.Add(1) - 1) % uint64(len(healthy))
+	return healthy[idx]
 	// @starter
-	// return "" // TODO: 检查强制主库标记、粘性时间窗，否则轮询从库
+	// return "" // TODO: 检查 WithPrimary/WithTx、写语句与加锁读，筛选延迟 <= maxLag 的健康从库轮询或熔断回退主库
 	// @end
 }
 --- test
@@ -462,58 +491,105 @@ package main
 
 import (
 	"context"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 )
 
-func TestRWRouterStickyAndRoundRobin(t *testing.T) {
-	r := NewRWRouter("master", []string{"s1", "s2"}, 2*time.Second)
-	t0 := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+func TestDBRouterComprehensive(t *testing.T) {
+	r := NewDBRouter("master", []string{"rep-1", "rep-2", "rep-3"}, 3*time.Second)
+	bg := context.Background()
 
-	// 1. 未发生写入的用户正常轮询从库 s1 -> s2 -> s1
-	if got := r.RouteRead(context.Background(), "u1", t0); got != "s1" {
-		t.Fatalf("read 1 = %q, want s1", got)
+	// 1. 普通 SELECT 在健康从库间轮询负载均衡
+	got := []string{
+		r.RouteSQL(bg, "SELECT id, name FROM users WHERE id = 1"),
+		r.RouteSQL(bg, "  select * from orders where user_id = 9 "),
+		r.RouteSQL(bg, "SELECT count(*) FROM items"),
+		r.RouteSQL(bg, "SELECT 1"),
 	}
-	if got := r.RouteRead(context.Background(), "u1", t0); got != "s2" {
-		t.Fatalf("read 2 = %q, want s2", got)
-	}
-
-	// 2. 用户 u1 发生写操作，在接下来 2s 内读请求自动粘性路由到 master
-	if got := r.RouteWrite("u1", t0); got != "master" {
-		t.Fatalf("write = %q, want master", got)
-	}
-	if got := r.RouteRead(context.Background(), "u1", t0.Add(500*time.Millisecond)); got != "master" {
-		t.Fatalf("sticky read within window = %q, want master", got)
-	}
-	// 同时其他未写入的用户 u2 仍然正常走从库
-	if got := r.RouteRead(context.Background(), "u2", t0.Add(500*time.Millisecond)); got != "s1" {
-		t.Fatalf("u2 read = %q, want s1", got)
+	want := []string{"rep-1", "rep-2", "rep-3", "rep-1"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("normal SELECT round-robin = %v, want %v", got, want)
 	}
 
-	// 3. 超过 2s 粘性窗口后，u1 恢复走从库
-	if got := r.RouteRead(context.Background(), "u1", t0.Add(2*time.Second)); got != "s2" {
-		t.Fatalf("u1 read after sticky window = %q, want s2", got)
+	// 2. DML 写操作与 SELECT ... FOR UPDATE / LOCK IN SHARE MODE 必须强制走主库
+	for _, q := range []string{
+		"INSERT INTO orders VALUES (1)",
+		"UPDATE users SET balance = 100 WHERE id = 1",
+		"DELETE FROM sessions WHERE expired = 1",
+		"SELECT balance FROM accounts WHERE id = 1 FOR UPDATE",
+		"SELECT * FROM inventory WHERE sku = 99 LOCK IN SHARE MODE",
+	} {
+		if node := r.RouteSQL(bg, q); node != "master" {
+			t.Fatalf("query %q routed to %q, want master", q, node)
+		}
 	}
 
-	// 4. 强制主库 Context
-	ctx := WithForcePrimary(context.Background())
-	if got := r.RouteRead(ctx, "u2", t0); got != "master" {
-		t.Fatalf("force primary read = %q, want master", got)
+	// 3. 事务上下文 WithTx 与强制主库标记 WithPrimary 必须走主库
+	if node := r.RouteSQL(WithTx(bg), "SELECT * FROM users WHERE id = 1"); node != "master" {
+		t.Fatalf("SELECT inside transaction routed to %q, want master", node)
 	}
+	if node := r.RouteSQL(WithPrimary(bg), "SELECT * FROM users WHERE id = 1"); node != "master" {
+		t.Fatalf("SELECT with WithPrimary routed to %q, want master", node)
+	}
+
+	// 4. 从库 rep-2 复制延迟飙升至 10s (> 3s)，自动熔断摘除，只在 rep-1 和 rep-3 间轮询
+	r.UpdateReplicaLag("rep-2", 10*time.Second)
+	healthyGot := []string{
+		r.RouteSQL(bg, "SELECT * FROM products"),
+		r.RouteSQL(bg, "SELECT * FROM products"),
+	}
+	if !slices.Equal(healthyGot, []string{"rep-1", "rep-3"}) {
+		t.Fatalf("after rep-2 lag spike, got %v, want [rep-1 rep-3]", healthyGot)
+	}
+
+	// 5. 所有从库延迟均超阈值时，自动熔断回退到主库 master
+	r.UpdateReplicaLag("rep-1", 5*time.Second)
+	r.UpdateReplicaLag("rep-3", 6*time.Second)
+	if node := r.RouteSQL(bg, "SELECT * FROM products"); node != "master" {
+		t.Fatalf("when all replicas lag, got %q, want master", node)
+	}
+
+	// 6. rep-2 追平延迟后自动恢复挂载
+	r.UpdateReplicaLag("rep-2", 200*time.Millisecond)
+	if node := r.RouteSQL(bg, "SELECT * FROM products"); node != "rep-2" {
+		t.Fatalf("when rep-2 recovers, got %q, want rep-2", node)
+	}
+
+	// 7. 并发读写延迟水位与路由决策（配合 -race 检测锁保护）
+	var wg sync.WaitGroup
+	for i := range 16 {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := range 50 {
+				r.UpdateReplicaLag("rep-1", time.Duration(j%5)*time.Second)
+				_ = r.RouteSQL(bg, "SELECT id FROM users")
+			}
+		}(i)
+	}
+	wg.Wait()
 }
 --- explain
 **思路**
 
-结合三种路由策略：写请求统一走 `primary` 并在 `lastWrite` 中记下该用户的写入时刻；读请求依次判断 `WithForcePrimary` 上下文标志、`now.Sub(last) < stickyWindow` 写后粘性保护窗口，都不命中时用原子计数器 `(r.rr.Add(1) - 1) % uint64(len(r.replicas))` 无锁轮询从库。
+读写分离路由器不能简单地按“是不是 `SELECT`”一刀切，必须依次守住四道防线：
+1. **Context 显式路由与事务感知**：通过 `WithPrimary`（关键写后即读）或 `WithTx`（事务内的读必须复用主库事务连接）直接路由到 `primary`；
+2. **加锁读拦截**：`SELECT ... FOR UPDATE` 和 `LOCK IN SHARE MODE` 需要加行锁，从库是只读的，必须发往 `primary`；
+3. **从库延迟水位健康过滤**：读锁检查 `r.lags[rep] <= r.maxLag`，动态剔除复制延迟超标的慢从库；
+4. **原子轮询与全熔断兜底**：在健康从库列表上用 `(r.rr.Add(1) - 1) % uint64(len(healthy))` 轮询；若全部从库延迟超标则降级回退到 `primary`。
 
 **代码讲解**
 
-1. `ctx.Value(forcePrimaryKey{}).(bool)`：使用包私有的空结构体类型 `forcePrimaryKey{}` 作为 Context Key，避免与其他包冲突。
-2. `now.Sub(last) < r.stickyWindow`：在主从复制可能尚未同步完成的窗口期内，只把刚写过数据的那个用户路由到主库，既保证了“读己之写”一致性，又不会把其他 99% 只读用户的流量压到主库上。
+1. `ctxPrimaryKey{}` 与 `ctxTxKey{}`：使用独立的私有空结构体类型作为 `context.WithValue` 的 key，零内存分配且绝不与外部包 key 冲突。
+2. `strings.Contains(upper, "FOR UPDATE")`：拦截伪装成普通 `SELECT` 的当前读（加锁读）。
+3. `healthy` 切片过滤与 `r.rr.Add(1)`：仅对健康从库消耗轮询序号，写请求与主库直连请求不干扰从库负载均衡节奏。
 
 **易错点**
 
-- 原子自增 `r.rr.Add(1)` 返回的是加 1 后的值（从 1 开始），减 1 后再取模才能让第一个请求从下标 `0`（`"s1"`）开始。
+- 忘记拦截 `SELECT ... FOR UPDATE`，会导致加锁读落到只读从库（`read_only=ON`）直接报错失败。
+- 所有从库延迟超标导致 `len(healthy) == 0` 时，必须在取模前提前返回 `r.primary`，否则会发生除以 `0` 的 panic。
 
 === db-37-1
 title: 模拟 Redis Stream 消费者组的 PEL 跟踪、XACK 与超时认领（XAUTOCLAIM）
@@ -720,7 +796,7 @@ func TestShardedHashStore(t *testing.T) {
 --- explain
 **思路**
 
-通过整数除法 `id / bucketSize` 将相邻的 `bucketSize` 个 ID 聚合到同一个外层 Hash Key 下，并用取模 `id % bucketSize` 作为 Hash 内部的短字段名，使每个 Hash 的元素个数严格不超过 `bucketSize`（$\le 512$），从而让 Redis 始终保持零指针开销的 `listpack` 紧凑内存编码。
+通过整数除法 `id / bucketSize` 将相邻的 `bucketSize` 个 ID 聚合到同一个外层 Hash Key 下，并用取模 `id % bucketSize` 作为 Hash 内部的短字段名，使每个 Hash 的元素个数严格不超过 `bucketSize`（`<= 512`），从而让 Redis 始终保持零指针开销的 `listpack` 紧凑内存编码。
 
 **代码讲解**
 
@@ -732,93 +808,168 @@ func TestShardedHashStore(t *testing.T) {
 - `bucketSize` 必须小于或等于 Redis 配置的 `hash-max-listpack-entries`（默认 512），通常取 100 或 256 最稳妥。
 
 === db-39-1
-title: 实现 Redis Cluster 哈希槽（Hash Slot）与 Hash Tag 计算
+title: 实现支持 MOVED 与 ASK 重定向的 Redis Cluster 客户端请求路由器
 --- desc
-Redis Cluster 将所有 Key 映射到 `0 ～ 16383` 共 16384 个槽中，规则如下：
+在 Redis Cluster 在线扩缩容迁移哈希槽（`MIGRATING` / `IMPORTING`）期间，客户端请求可能收到两种不同的重定向响应：
 
-1. **提取 Hash Tag**：如果 `key` 中包含 `'{'` 且在其后面存在 `'}'`，并且**第一个 `'{'` 与其后第一个 `'}'` 之间的子串非空**（长度 `>= 1`），则只对该大括号内的子串计算 CRC16；
-2. 如果不满足上述条件（比如没有大括号，`}` 在 `{` 前面，或者大括号内为空 `"{}abc"`），则对整个 `key` 字符串计算 CRC16；
-3. 最终槽位号为 `crc16(effectiveKey) & 16383`（测试中已提供标准 `crc16` 函数）。
+- **`MOVED <slot> <targetNode>`**（例如 `"MOVED 8888 node-b:6379"`）：表示槽 `slot` 已经**永久迁移**到 `targetNode`。客户端必须**更新本地槽位路由表缓存**（`c.slots[slot] = targetNode`），然后直接向 `targetNode` 重新发送原命令 `cmd`；
+- **`ASK <slot> <targetNode>`**（例如 `"ASK 8888 node-b:6379"`）：表示槽 `slot` 正在迁移中途，当前请求的 key 已在 `targetNode` 上。客户端**绝不能更新本地槽位路由表缓存**（后续该槽的其他 key 默认仍先访问原节点），并且必须**先向 `targetNode` 发送一条 `"ASKING"` 命令**开启一次性临时许可，紧接着再向 `targetNode` 发送原命令 `cmd`。
 
-请实现 `ExtractHashTag(key string) string` 和 `CalcSlot(key string) uint16`。
+请实现 `ClusterClient` 的 `Exec(slot int, cmd string, send func(node, cmd string) string) string` 与 `SlotNode(slot int) string`。
 --- solution
 package main
 
-import "strings"
-
-func ExtractHashTag(key string) string {
+import (
 	// @solution
-	start := strings.IndexByte(key, '{')
-	if start >= 0 {
-		end := strings.IndexByte(key[start+1:], '}')
-		if end > 0 { // end > 0 保证了 '{' 和 '}' 之间至少有 1 个字符
-			return key[start+1 : start+1+end]
-		}
+	"strings"
+	// @end
+)
+
+type ClusterClient struct {
+	slots map[int]string
+}
+
+func NewClusterClient(initialSlots map[int]string) *ClusterClient {
+	cp := make(map[int]string, len(initialSlots))
+	for k, v := range initialSlots {
+		cp[k] = v
 	}
-	return key
+	return &ClusterClient{slots: cp}
+}
+
+func (c *ClusterClient) SlotNode(slot int) string {
+	// @solution
+	return c.slots[slot]
 	// @starter
-	// return key // TODO: 提取第一个有效非空的 {...} 子串，否则返回原 key
+	// return "" // TODO: 返回本地路由表缓存中 slot 对应的节点地址
 	// @end
 }
 
-func CalcSlot(key string) uint16 {
-	tag := ExtractHashTag(key)
-	return crc16([]byte(tag)) & 16383
-}
-
-func crc16(data []byte) uint16 {
-	var crc uint16
-	for _, b := range data {
-		crc ^= uint16(b) << 8
-		for range 8 {
-			if crc&0x8000 != 0 {
-				crc = (crc << 1) ^ 0x1021
-			} else {
-				crc <<= 1
-			}
+func (c *ClusterClient) Exec(slot int, cmd string, send func(node, cmd string) string) string {
+	// @solution
+	node := c.slots[slot]
+	resp := send(node, cmd)
+	parts := strings.Fields(resp)
+	if len(parts) == 3 {
+		switch strings.TrimPrefix(parts[0], "-") {
+		case "MOVED":
+			target := parts[2]
+			c.slots[slot] = target
+			return send(target, cmd)
+		case "ASK":
+			target := parts[2]
+			_ = send(target, "ASKING")
+			return send(target, cmd)
 		}
 	}
-	return crc
+	return resp
+	// @starter
+	// return "" // TODO: 先向 c.slots[slot] 发送 cmd，处理 MOVED（更新路由表重发）与 ASK（不更新路由表，先发 ASKING 再重发）
+	// @end
 }
 --- test
 package main
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
-func TestRedisClusterHashSlot(t *testing.T) {
-	// 相同 Hash Tag 的两个不同 Key 必须落入完全相同的哈希槽
-	s1 := CalcSlot("order:{u1001}:items")
-	s2 := CalcSlot("payment:{u1001}:status")
-	if s1 != s2 {
-		t.Fatalf("expected same slot for same hash tag {u1001}, got %d vs %d", s1, s2)
+func TestClusterClientMovedAndAsk(t *testing.T) {
+	c := NewClusterClient(map[int]string{8888: "node-a:6379"})
+
+	// 1. 槽 8888 处于 MIGRATING -> IMPORTING 迁移中途：
+	// k1 仍在 node-a 上正常返回；k2 已迁往 node-b，node-a 返回 ASK 临时重定向
+	var callLog []string
+	askingGranted := false
+	sendDuringMigration := func(node, cmd string) string {
+		callLog = append(callLog, node+"|"+cmd)
+		if node == "node-a:6379" {
+			if cmd == "GET k1" {
+				return "val-1"
+			}
+			if cmd == "GET k2" {
+				return "ASK 8888 node-b:6379"
+			}
+		}
+		if node == "node-b:6379" {
+			if cmd == "ASKING" {
+				askingGranted = true
+				return "OK"
+			}
+			if cmd == "GET k2" {
+				if !askingGranted {
+					// 若客户端未先发 ASKING 直接查 IMPORTING 槽，目标节点会拒绝并返回 MOVED
+					return "MOVED 8888 node-a:6379"
+				}
+				askingGranted = false // ASKING 是一次性临时许可，用完即失效
+				return "val-2"
+			}
+		}
+		return "ERR"
 	}
-	if tag := ExtractHashTag("order:{u1001}:items"); tag != "u1001" {
-		t.Fatalf("tag = %q, want u1001", tag)
+
+	if got := c.Exec(8888, "GET k1", sendDuringMigration); got != "val-1" {
+		t.Fatalf("GET k1 = %q, want val-1", got)
 	}
-	// 空大括号 "{}" 按 Redis 规范不生效，应使用完整 key
-	if tag := ExtractHashTag("{}foo"); tag != "{}foo" {
-		t.Fatalf("empty braces should fallback to full key, got %q", tag)
+	callLog = nil
+	if got := c.Exec(8888, "GET k2", sendDuringMigration); got != "val-2" {
+		t.Fatalf("GET k2 via ASK = %q, want val-2", got)
 	}
-	// 多个大括号时，以第一个 '{' 及其后的第一个 '}' 为准
-	if tag := ExtractHashTag("{a}{b}"); tag != "a" {
-		t.Fatalf("got %q, want a", tag)
+	// 验证 ASK 必须先向目标节点发 ASKING，再发原命令
+	wantAskLog := []string{
+		"node-a:6379|GET k2",
+		"node-b:6379|ASKING",
+		"node-b:6379|GET k2",
 	}
-	// Redis 官方文档标准测试向量：CalcSlot("123456789") == 12739
-	if got := CalcSlot("123456789"); got != 12739 {
-		t.Fatalf("CalcSlot(\"123456789\") = %d, want 12739", got)
+	if !slices.Equal(callLog, wantAskLog) {
+		t.Fatalf("ASK call log = %v, want %v", callLog, wantAskLog)
+	}
+	// 验证 ASK 绝不能修改本地路由表缓存！
+	if gotNode := c.SlotNode(8888); gotNode != "node-a:6379" {
+		t.Fatalf("after ASK, SlotNode(8888) = %q, want node-a:6379 (must not update local table)", gotNode)
+	}
+
+	// 2. 槽 8888 迁移彻底完成：node-a 返回 MOVED 永久重定向
+	callLog = nil
+	sendAfterMigration := func(node, cmd string) string {
+		callLog = append(callLog, node+"|"+cmd)
+		if node == "node-a:6379" {
+			return "MOVED 8888 node-b:6379"
+		}
+		if node == "node-b:6379" && cmd == "GET k1" {
+			return "val-1-from-b"
+		}
+		return "ERR"
+	}
+
+	if got := c.Exec(8888, "GET k1", sendAfterMigration); got != "val-1-from-b" {
+		t.Fatalf("GET k1 via MOVED = %q, want val-1-from-b", got)
+	}
+	// 验证 MOVED 已刷新本地路由表缓存，后续请求直接发往 node-b
+	if gotNode := c.SlotNode(8888); gotNode != "node-b:6379" {
+		t.Fatalf("after MOVED, SlotNode(8888) = %q, want node-b:6379", gotNode)
+	}
+	callLog = nil
+	_ = c.Exec(8888, "GET k1", sendAfterMigration)
+	if !slices.Equal(callLog, []string{"node-b:6379|GET k1"}) {
+		t.Fatalf("subsequent request should go directly to node-b, got %v", callLog)
 	}
 }
 --- explain
 **思路**
 
-严格按照 Redis Cluster 源码（`cluster.c` 中的 `keyHashSlot`）规则：查找第一个 `'{'` 的位置 `start`，再从 `key[start+1:]` 中查找第一个 `'}'` 的偏移量 `end`。只有当 `end > 0`（即大括号内部至少有 1 个字节）时，才截取 `key[start+1 : start+1+end]` 作为有效键参与 `CRC16 & 16383` 计算。
+这道题把 Redis Cluster 槽迁移期间客户端路由的黄金法则落到了代码中：
+- 收到 `MOVED <slot> <target>`：说明槽已经彻底归属新节点，**更新本地 `c.slots[slot] = target`** 并重发原命令；
+- 收到 `ASK <slot> <target>`：说明槽仍在迁移中，**保持本地 `c.slots[slot]` 不变**，先向 `target` 发 `"ASKING"` 亮明临时通行证，再向 `target` 重发原命令。
 
 **代码讲解**
 
-1. `start := strings.IndexByte(key, '{')`：找左大括号。
-2. `end := strings.IndexByte(key[start+1:], '}')`：在左大括号之后找右大括号。
-3. `if end > 0`：若 `end == 0` 说明是紧挨着的空括号 `"{}"`，按规范需回退对整个 `key` 哈希。
+1. `parts := strings.Fields(resp)`：按空白字符切分响应字符串，提取指令头 `parts[0]` 和目标节点地址 `parts[2]`。
+2. `case "MOVED"`：执行 `c.slots[slot] = target` 永久更新本地槽缓存后重发。
+3. `case "ASK"`：不改 `c.slots`，先调 `send(target, "ASKING")` 再调 `send(target, cmd)`。
 
 **易错点**
 
-- 忽略空括号 `"{}foo"` 的特判（误返回空字符串 `""`），会导致所有带空括号的 key 全部算出相同的 CRC16（0），落到 0 号槽。
+- 处理 `ASK` 时误更新了 `c.slots[slot] = target`：会导致后续属于该槽但尚未迁移到 `target` 的存量 key 全部直接打到处于 `IMPORTING` 状态的 `target` 节点上，被 `target` 用 `MOVED` 踢回源节点，造成多余的乒乓重定向。
+- 处理 `ASK` 时漏发 `"ASKING"` 命令：处于 `IMPORTING` 状态的目标节点默认拒绝不带 `ASKING` 前置标记的请求，直接返回 `-MOVED` 指回源节点，引发客户端死循环。

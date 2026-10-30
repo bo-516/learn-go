@@ -112,7 +112,7 @@ func TestWeakBlobCache(t *testing.T) {
 
 **易错点**
 
-- 千万不要写成 `if wp.Value() != nil { return wp.Value() }`（調用两次 `wp.Value()`）：如果第一次判断非 `nil` 后刚好发生 GC 把对象回收了，第二次调用 `wp.Value()` 就会返回 `nil`！必须只调用一次赋给局部变量 `ptr` 再判断。
+- 千万不要写成 `if wp.Value() != nil { return wp.Value() }`（调用两次 `wp.Value()`）：如果第一次判断非 `nil` 后刚好发生 GC 把对象回收了，第二次调用 `wp.Value()` 就会返回 `nil`！必须只调用一次赋给局部变量 `ptr` 再判断。
 
 === rt-20-1
 title: 用 runtime/metrics 读取运行时指标与计算直方图分位数
@@ -159,7 +159,11 @@ func HistogramQuantile(h *metrics.Float64Histogram, q float64) float64 {
 	for i, c := range h.Counts {
 		cum += c
 		if cum >= target {
-			return h.Buckets[i+1]
+			upper := h.Buckets[i+1]
+			if math.IsInf(upper, 1) {
+				return h.Buckets[i]
+			}
+			return upper
 		}
 	}
 	return h.Buckets[len(h.Buckets)-1]
@@ -213,16 +217,16 @@ func TestHistogramQuantile(t *testing.T) {
 --- explain
 **思路**
 
-`metrics.Read` 接收一个预先填充好 `Name` 字段的 `[]metrics.Sample` 切片，无 STW 地将当前值填入每个元素的 `Value` 中；直方图 `Float64Histogram` 的第 `i` 个桶 `Counts[i]` 对应区间 `[Buckets[i], Buckets[i+1])`，累加 `Counts` 直到达到目标排名 `ceil(total * q)`，返回该桶的上界 `Buckets[i+1]`。
+`metrics.Read` 接收一个预先填充好 `Name` 字段的 `[]metrics.Sample` 切片，无 STW 地将当前值填入每个元素的 `Value` 中；直方图 `Float64Histogram` 的第 `i` 个桶 `Counts[i]` 对应区间 `[Buckets[i], Buckets[i+1])`，累加 `Counts` 直到达到目标排名 `ceil(total * q)`，返回该桶的上界 `Buckets[i+1]`（若最末桶上界为 `+Inf` 则回退返回下界 `Buckets[i]`）。
 
 **代码讲解**
 
 1. `samples[0].Value.Uint64()`：这两个指标的类型都是 `KindUint64`，直接用 `.Uint64()` 取出。
-2. `target := uint64(math.Ceil(float64(total) * q))`：例如 100 个样本求 p99，第 99 个样本落在下标为 2 的桶（累计 $50+40+9 = 99$），上界为 `Buckets[3] = 0.010`。
+2. `target := uint64(math.Ceil(float64(total) * q))`：例如 100 个样本求 p99，第 99 个样本落在下标为 2 的桶（累计 `50+40+9 = 99`），上界为 `Buckets[3] = 0.010`。
 
 **易错点**
 
-- 访问 `sample.Value.Uint64()` 前ต้อง确认指标名称拼写完全正确；如果指标名拼错，`Value.Kind()` 会是 `KindBad`，此时调 `Uint64()` 会触发 panic。
+- 访问 `sample.Value.Uint64()` 前必须确认指标名称拼写完全正确；如果指标名拼错，`Value.Kind()` 会是 `KindBad`，此时调 `Uint64()` 会触发 panic。
 
 === rt-21-1
 title: 模拟 PGO 接口去虚拟化（Devirtualization）与热路径分发
@@ -455,100 +459,159 @@ func TestSizeClassFragmentation(t *testing.T) {
 - 注意处理 `reqSize <= 0` 和 `reqSize > 256` 的边界返回。
 
 === rt-24-1
-title: 解析 runtime.Stack 调用栈文本统计各阻塞状态的 goroutine 数量
+title: 模拟 Goroutine 状态机与 P 的 gopark / goready（含 runnext 槽位）调度流转
 --- desc
-当线上拉取 `/debug/pprof/goroutine?debug=2` 或调用 `runtime.Stack(buf, true)` 时，每个 goroutine 的第一行格式如下：
+在 Go 运行时中，阻塞原语（如 channel、锁、网络 I/O）通过 `gopark` 和 `goready` 驱动 Goroutine 在 `_Grunnable`、`_Grunning` 和 `_Gwaiting` 之间流转，并利用 P 的 `runnext` 槽位实现局部性优先调度。
 
-```text
-goroutine 1 [running]:
-main.main()
-	/app/main.go:10 +0x25
+请为简化版逻辑处理器 `MiniP` 实现三个核心调度方法：
 
-goroutine 18 [chan receive, 5 minutes]:
-main.worker()
-	/app/main.go:20 +0x40
-
-goroutine 19 [IO wait]:
-internal/poll.runtime_pollWait()
-```
-
-请实现 `CountGoroutineStates(stackDump string) map[string]int`：解析文本中所有以 `"goroutine "` 开头且包含 `[...]` 的标题行，提取方括号中逗号 `,` 之前的**基础状态名**（如 `"running"`、`"chan receive"`、`"IO wait"`），统计每种状态的 goroutine 数量。
+1. `Schedule() *SimG`（对应运行时的 `schedule()` → `execute()`）：
+   - 挑选下一个可运行的 G 上核：优先取出 `p.runnext`（并将其置为 `nil`）；若 `p.runnext == nil`，则从本地 FIFO 队列 `p.runq` 队首弹出第 1 个 G；若两者均为空，将 `p.running` 置为 `nil` 并返回 `nil`；
+   - 将选中 G 的 `Status` 设为 `Grunning`、`WaitReason` 清空为 `""`，赋给 `p.running` 并返回。
+2. `GoPark(reason string) *SimG`（对应运行时的 `gopark`）：
+   - 若当前 `p.running == nil`，直接返回 `nil`；
+   - 将当前正在运行的 `p.running` 状态从 `Grunning` 改为 `Gwaiting`，记录 `WaitReason = reason`，解除与 P 的绑定（`p.running = nil`），并立即调用 `p.Schedule()` 调度下一个就绪协程上核运行，返回新上核的协程。
+3. `GoReady(g *SimG)`（对应运行时的 `goready` + `runqput(_p_, g, true)`）：
+   - 将被唤醒的 `g` 状态改为 `Grunnable`，清空 `WaitReason = ""`；
+   - 优先放入 `p.runnext` 槽位：若 `p.runnext` 原本已有旧协程 `old`，先将 `old` 踢入 `p.runq` 队尾，再将 `g` 放入 `p.runnext`；
+   - 若当前 P 空闲（`p.running == nil`），立即调用 `p.Schedule()` 让刚就绪的协程上核执行。
 --- solution
 package main
 
-import "strings"
+type GStatus string
 
-func CountGoroutineStates(stackDump string) map[string]int {
-	counts := make(map[string]int)
+const (
+	Grunnable GStatus = "_Grunnable"
+	Grunning  GStatus = "_Grunning"
+	Gwaiting  GStatus = "_Gwaiting"
+)
+
+type SimG struct {
+	ID         int
+	Status     GStatus
+	WaitReason string
+}
+
+type MiniP struct {
+	running *SimG
+	runnext *SimG
+	runq    []*SimG
+}
+
+func (p *MiniP) Schedule() *SimG {
 	// @solution
-	for _, line := range strings.Split(stackDump, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "goroutine ") {
-			continue
-		}
-		openIdx := strings.IndexByte(line, '[')
-		closeIdx := strings.IndexByte(line, ']')
-		if openIdx < 0 || closeIdx <= openIdx {
-			continue
-		}
-		inside := line[openIdx+1 : closeIdx]
-		state, _, _ := strings.Cut(inside, ",")
-		state = strings.TrimSpace(state)
-		if state != "" {
-			counts[state]++
-		}
+	var next *SimG
+	if p.runnext != nil {
+		next = p.runnext
+		p.runnext = nil
+	} else if len(p.runq) > 0 {
+		next = p.runq[0]
+		p.runq = p.runq[1:]
+	}
+	if next == nil {
+		p.running = nil
+		return nil
+	}
+	next.Status = Grunning
+	next.WaitReason = ""
+	p.running = next
+	return next
+	// @starter
+	// return nil // TODO: 优先从 runnext、其次从 runq 队首取出 G，设为 Grunning 并赋给 p.running
+	// @end
+}
+
+func (p *MiniP) GoPark(reason string) *SimG {
+	// @solution
+	if p.running == nil {
+		return nil
+	}
+	cur := p.running
+	cur.Status = Gwaiting
+	cur.WaitReason = reason
+	p.running = nil
+	return p.Schedule()
+	// @starter
+	// return nil // TODO: 将当前 running 协程设为 Gwaiting 及 reason，解绑后调用 Schedule()
+	// @end
+}
+
+func (p *MiniP) GoReady(g *SimG) {
+	// @solution
+	g.Status = Grunnable
+	g.WaitReason = ""
+	if p.runnext != nil {
+		p.runq = append(p.runq, p.runnext)
+	}
+	p.runnext = g
+	if p.running == nil {
+		p.Schedule()
 	}
 	// @starter
-	// // TODO: 解析 "goroutine <id> [<state>, ...]:" 行并按基础 state 聚合计数
+	// // TODO: 将 g 设为 Grunnable 并抢占放入 runnext（旧 runnext 踢入 runq 队尾），若 P 空闲则调用 Schedule()
 	// @end
-	return counts
 }
 --- test
 package main
 
-import (
-	"maps"
-	"testing"
-)
+import "testing"
 
-func TestCountGoroutineStates(t *testing.T) {
-	dump := `
-goroutine 1 [running]:
-main.main()
-	/app/main.go:12 +0x25
+func TestMiniPGoparkAndGoready(t *testing.T) {
+	p := &MiniP{}
+	g1 := &SimG{ID: 1, Status: Gwaiting, WaitReason: "init"}
+	g2 := &SimG{ID: 2, Status: Gwaiting, WaitReason: "chan receive"}
+	g3 := &SimG{ID: 3, Status: Gwaiting, WaitReason: "select"}
 
-goroutine 34 [chan receive, 12 minutes]:
-main.consumer()
-	/app/main.go:40 +0x60
-
-goroutine 35 [chan receive]:
-main.consumer()
-	/app/main.go:40 +0x60
-
-goroutine 50 [IO wait, 2 minutes]:
-net.(*netFD).Read()
-`
-	got := CountGoroutineStates(dump)
-	want := map[string]int{
-		"running":      1,
-		"chan receive": 2,
-		"IO wait":      1,
+	// 1. P 空闲时 GoReady(g1) 应直接调度 g1 上核运行
+	p.GoReady(g1)
+	if p.running != g1 || g1.Status != Grunning || g1.WaitReason != "" {
+		t.Fatalf("after GoReady(g1): running=%v, status=%v, reason=%q", p.running, g1.Status, g1.WaitReason)
 	}
-	if !maps.Equal(got, want) {
-		t.Fatalf("got %v, want %v", got, want)
+
+	// 2. g1 运行期间先后唤醒 g2、g3：g2 先入 runnext，随后 g3 顶替 runnext 并把 g2 踢入 runq
+	p.GoReady(g2)
+	p.GoReady(g3)
+	if p.runnext != g3 || g3.Status != Grunnable {
+		t.Fatalf("expected g3 in runnext, got %v", p.runnext)
+	}
+	if len(p.runq) != 1 || p.runq[0] != g2 {
+		t.Fatalf("expected g2 kicked to runq, got %v", p.runq)
+	}
+
+	// 3. g1 因 "chan receive" 调用 GoPark：g1 变为 _Gwaiting，且优先从 runnext 调度 g3 上核！
+	next := p.GoPark("chan receive")
+	if g1.Status != Gwaiting || g1.WaitReason != "chan receive" {
+		t.Fatalf("g1 should be _Gwaiting(chan receive), got (%v, %q)", g1.Status, g1.WaitReason)
+	}
+	if next != g3 || p.running != g3 || g3.Status != Grunning {
+		t.Fatalf("expected g3 scheduled from runnext, got %v", next)
+	}
+
+	// 4. g3 因 "IO wait" 调用 GoPark：从 runq 弹出 g2 上核
+	next = p.GoPark("IO wait")
+	if next != g2 || p.running != g2 || g2.Status != Grunning {
+		t.Fatalf("expected g2 scheduled from runq, got %v", next)
+	}
+
+	// 5. g2 再次唤醒 g1 后自身 GoPark：g1 从 runnext 立即接棒运行
+	p.GoReady(g1)
+	next = p.GoPark("semacquire")
+	if next != g1 || g1.Status != Grunning || g1.WaitReason != "" {
+		t.Fatalf("expected g1 re-scheduled with cleared WaitReason, got %+v", g1)
 	}
 }
 --- explain
 **思路**
 
-逐行扫描调用栈文本，识别以 `"goroutine "` 开头的协程头行，截取 `[` 与 `]` 之间的内容，再用 `strings.Cut(inside, ",")` 去掉后面的阻塞时长（如 `", 12 minutes"`），保留前面的核心等待原因字符串做哈希计数。
+这道题还原了 Go 调度器（`runtime/proc.go`）在阻塞与唤醒时的核心状态流转：
+1. `GoPark` 将当前 `_Grunning` 的协程改为 `_Gwaiting` 并写入 `waitReason`（就是我们在 pprof 栈中看到的 `"chan receive"`、`"IO wait"`），然后调用 `dropg`（`p.running = nil`）解绑，绝不阻塞底层的 M 和 P，紧接着调用 `Schedule()` 切换下一个协程。
+2. `GoReady` 将阻塞协程从 `_Gwaiting` 改回 `_Grunnable`，并通过 `runqput(_p_, g, true)` 优先塞进 `runnext` 槽位；如果 `runnext` 里本来就有协程，就把旧协程踢进本地 FIFO 队列 `runq` 尾部。
 
 **代码讲解**
 
-1. `strings.HasPrefix(line, "goroutine ")`：只处理每个协程块的第一行标题。
-2. `line[openIdx+1 : closeIdx]`：提取方括号内的状态描述。
-3. `state, _, _ := strings.Cut(inside, ",")`：无论有没有 `, N minutes` 后缀，`strings.Cut` 的第一个返回值 `state` 都是逗号前的内容（没有逗号时返回整个 `inside`），非常简洁。
+- `Schedule()`：严格遵循 `runnext` 优先于 `runq` 队首的顺序，选中后将其状态改为 `Grunning`。
+- `GoReady(g)`：利用 `runnext` 长度为 1 的特权槽位，让刚被 channel 或锁唤醒的协程在下一次调度时第一个上核，最大化利用 CPU L1/L2 Cache 局部性。
 
 **易错点**
 
-- 不要直接把带分钟数的完整字符串作为 key，否则 `"chan receive"` 和 `"chan receive, 12 minutes"` 会被分到两个不同的统计桶里。
+- 当 `GoReady` 被调用且当前 P 处于空闲状态（`p.running == nil`）时，别忘了立即调用 `p.Schedule()` 使协程进入 `Grunning` 状态；且协程恢复就绪或运行时要把上一次遗留的 `WaitReason` 清空。

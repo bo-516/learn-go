@@ -17,7 +17,7 @@ Go 1.24 在标准库中引入了两个与内存管理和 GC 紧密相关的重�
 - **作用**：`h := unique.Make(val)` 将任意可比较类型 `T` 的值在全局并发安全驻留池中去重，返回一个轻量级的 `unique.Handle[T]`（底层只包了一个指向唯一副本的指针）；
 - **极速比较与省内存**：
   1. 内存中所有相等的 `val`（如成百万个重复的字符串标签 `"env=production"` 或 IP 地址结构）只存储**唯一一份**；
-  2. 比较两个 `unique.Handle[T]` 是否相等（`h1 == h2`）只需要做一次 **8 字节指针比较（$O(1)$）**，不再需要逐字节对比长字符串！
+  2. 比较两个 `unique.Handle[T]` 是否相等（`h1 == h2`）只需要做一次 **8 字节指针比较（`O(1)`）**，不再需要逐字节对比长字符串！
   3. 当没有任何 `Handle` 引用某个驻留值时，因为 `unique` 内部正是用 `weak.Pointer` + `runtime.AddCleanup` 实现的，GC 会自动把不再使用的驻留值清理掉，不会像手写的全局 `map[string]string` 那样永久泄漏内存。
 --- deep
 **原理展开**
@@ -157,12 +157,19 @@ func histogramQuantile(h *metrics.Float64Histogram, q float64) float64 {
 	if total == 0 {
 		return 0
 	}
-	target := uint64(float64(total) * q)
+	target := uint64(math.Ceil(float64(total) * q))
+	if target == 0 {
+		target = 1
+	}
 	var cum uint64
 	for i, c := range h.Counts {
 		cum += c
 		if cum >= target {
-			return h.Buckets[i+1] // Buckets 长度为 len(Counts)+1，代表分桶的上下界
+			upper := h.Buckets[i+1] // Buckets 长度为 len(Counts)+1，代表分桶的上下界
+			if math.IsInf(upper, 1) {
+				return h.Buckets[i] // 若落入尾部的 +Inf 溢出桶，回退返回该桶下界
+			}
+			return upper
 		}
 	}
 	return h.Buckets[len(h.Buckets)-1]
@@ -194,7 +201,7 @@ title: 什么是 PGO（Profile-Guided Optimization）？Go 编译器是如何利
 
 **2. Go 编译器利用 PGO 做了哪些具体优化？**
 
-- **更激进的热函数内联（Inlining）**：默认情况下，编译器為了防止二进制体积爆炸，只内联 AST 节点预算（budget）$\le 80$ 的短小函数。开启 PGO 后，对于 CPU profile 中占比极高的**热点函数**，编译器会将内联预算大幅放宽（例如提高到 2000），消除热路径上的函数调用开销并解锁更多后续优化；对从不执行的冷路径（如错误处理函数）则抑制内联；
+- **更激进的热函数内联（Inlining）**：默认情况下，编译器为了防止二进制体积爆炸，只内联 AST 节点预算（budget）`<= 80` 的短小函数。开启 PGO 后，对于 CPU profile 中占比极高的**热点函数**，编译器会将内联预算大幅放宽（例如提高到 2000），消除热路径上的函数调用开销并解锁更多后续优化；对从不执行的冷路径（如错误处理函数）则抑制内联；
 - **接口调用去虚拟化（Devirtualization）**：在静态编译时，编译器不知道接口调用 `r.Read(buf)` 具体是哪个实现类。PGO 从 profile 中发现 99% 的情况实际类型都是 `*bytes.Reader`，就会把接口调用改写为：
   ```go
   if br, ok := r.(*bytes.Reader); ok {
@@ -274,7 +281,7 @@ title: GODEBUG 环境变量有什么用？Go 1.21+ 的向后兼容与 godebug �
 
 Go 运行时不仅用 `GODEBUG` 控制分支，还在标准库每次触发“旧版兼容行为与新版默认行为不一致”的那个瞬间，**自动递增一个对应的非默认行为原子计数器**，并通过 `runtime/metrics` 暴露为 `/godebug/non-default-behavior/<name>:events`！
 
-举个例子：Go 1.23 改变了 `time.NewTimer` 和 `time.NewTicker` 的底层实现（缓冲容量为 1 的 timer 在 `Reset` 或 `Stop` 时立即同步清空旧通知，對應开关 `asynctimerchan=0`）。如果你先升级了 Go 1.24 工具链，保持 `go.mod` 为 `go 1.22`（或设置 `//go:debug asynctimerchan=1`）上线运行一周，同时在 Prometheus 中观察 `/godebug/non-default-behavior/asynctimerchan:events` 指标：如果该计数始终为 `0`，说明你的代码完全不依赖旧版 bug 行为，可以 100% 放心地切换到新默认行为！
+举个例子：Go 1.23 改变了 `time.NewTimer` 和 `time.NewTicker` 的底层实现（缓冲容量为 1 的 timer 在 `Reset` 或 `Stop` 时立即同步清空旧通知，对应开关 `asynctimerchan=0`）。如果你先升级了 Go 1.24 工具链，保持 `go.mod` 为 `go 1.22`（或设置 `//go:debug asynctimerchan=1`）上线运行一周，同时在 Prometheus 中观察 `/godebug/non-default-behavior/asynctimerchan:events` 指标：如果该计数始终为 `0`，说明你的代码完全不依赖旧版 bug 行为，可以 100% 放心地切换到新默认行为！
 
 **代码示例**
 
@@ -286,10 +293,7 @@ Go 运行时不仅用 `GODEBUG` 控制分支，还在标准库每次触发“旧
 
 package main
 
-import (
-	"fmt"
-	"runtime/metrics"
-)
+import "runtime/metrics"
 
 // 2. 巡检当前进程是否触发过任何非默认的 GODEBUG 旧版兼容行为
 func CheckNonDefaultGodebugs() map[string]uint64 {
@@ -338,8 +342,8 @@ Go 的内存分配器借鉴了 TCMalloc，采用 **mcache（P 本地） → mcen
 
 **1. 内部碎片（Internal Fragmentation / Size Class 取整浪费）**
 
-- Go 将 $\le 32\text{KB}$ 的小对象划分为 **67 个固定大小的规格（Size Classes）**：如 `8B, 16B, 24B, 32B, 48B, 64B, 80B ...`；
-- 当你申请一个 **33 字节**的结构体时，分配器会向上取整放入 **48 字节**的槽位（slot）中，多出来的 $48 - 33 = 15$ 字节就是**内部碎片**（Go 将每档规格的最大内部浪费率控制在约 **12.5%** 以内）。
+- Go 将 `<= 32KB` 的小对象划分为 **67 个固定大小的规格（Size Classes）**：如 `8B, 16B, 24B, 32B, 48B, 64B, 80B ...`；
+- 当你申请一个 **33 字节**的结构体时，分配器会向上取整放入 **48 字节**的槽位（slot）中，多出来的 `48 - 33 = 15` 字节就是**内部碎片**（Go 将每档规格的最大内部浪费率控制在约 **12.5%** 以内）。
 
 **2. 外部 / Span 级碎片（Span Pinning，`HeapInuse - HeapAlloc` 过大）**
 
@@ -359,7 +363,7 @@ Go 的内存分配器借鉴了 TCMalloc，采用 **mcache（P 本地） → mcen
    如果代码里分配了大量极小的 `int64`、`bool` 或 8 字节短字符串（不含指针），每个都占一个独立的 8B/16B 槽位太浪费了。Go 的 `mcache` 专门维护了一个 **16 字节的 `tiny` 块**：当申请 `< 16B` 且不含指针（noscan）的微对象时，分配器会把多个微对象像拼积木一样紧挨着塞进同一个 16 字节块里，将小对象的内部碎片降低数倍！
 2. **如何量化监控进程的碎片率？**
    在 `runtime.MemStats`（或 `runtime/metrics`）中：
-   $$\text{Span 碎片浪费字节} = \text{HeapInuse} - \text{HeapAlloc}$$
+   `Span 碎片浪费字节 = HeapInuse - HeapAlloc`
    其中 `HeapInuse` 是所有正在被使用的 span 占用的总页字节数，而 `HeapAlloc` 是这些 span 中真正存活的对象字节数。如果 `HeapInuse` 是 2GB，而 `HeapAlloc` 只有 300MB，说明有 **1.7GB** 的内存都浪费在了“半空不空的稀疏 span”里！
 
 **代码示例**
@@ -397,7 +401,7 @@ func (a *UserArena) Alloc(u User) *User {
 **常见追问**
 
 - 为什么 Go 的 GC 不设计成像 Java G1/ZGC 那样的**移动压缩式 GC（Moving / Compacting GC）**来彻底消除 Span 碎片？→ ① Go 本身基于 TCMalloc 的分规格 `mspan` 设计，同一规格的对象大小完全一致，空闲槽位可以直接通过位图（`allocBits`）原地复用，不会像传统连续堆那样因为尺寸不一而无法塞入新对象；② Go 允许通过 `unsafe.Pointer` 和 cgo 与 C 语言交互，且大量栈和寄存器直接持有指针，移动对象需要维护极其复杂的对象钉住（Pinning）与全局指针重写机制，得不偿失。
-- 大对象（$> 32\text{KB}$）的碎片是怎么计算的？→ 超过 32KB 的大对象不走 `mcache/mcentral` 的 Size Class，而是直接从 `mheap` 按 **8KB 页的整数倍**分配独立的 span。因此如果你申请一个 `33KB`（`32KB + 1B`）的 `[]byte`，它会占用 5 个页（`40KB`），产生近 `7KB` 的页尾内部碎片！
+- 大对象（`> 32KB`）的碎片是怎么计算的？→ 超过 32KB 的大对象不走 `mcache/mcentral` 的 Size Class，而是直接从 `mheap` 按 **8KB 页的整数倍**分配独立的 span。因此如果你申请一个 `33KB`（`32KB + 1B`）的 `[]byte`，它会占用 5 个页（`40KB`），产生近 `7KB` 的页尾内部碎片！
 - `sync.Pool` 对减少 Span 碎片有帮助吗？→ 有很大帮助。把高频创建销毁的短命对象放进 `sync.Pool` 复用后，它们不会去和刚创建的长生命周期对象混杂抢占新的 span，大大降低了长短命对象同处一个 span 的概率。
 
 **实战建议**

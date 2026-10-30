@@ -1,10 +1,8 @@
 === arch-21
-cat: arch
 group: 基础
 level: 2
+hot: true
 title: 如何设计一个高可用的配置中心？长轮询（Long Polling）实时推送是怎么实现的？
-tags: 配置中心, 长轮询, 高可用, Apollo, Nacos
-tasks: arch-21-1
 --- answer
 高可用配置中心的核心矛盾是：**变更推送要秒级生效（实时性）**，同时**配置中心全挂时业务进程仍能正常启动和运行（高可用容灾）**。
 
@@ -20,13 +18,13 @@ tasks: arch-21-1
 
 **2. 客户端四级容灾（保证配置中心挂了业务不挂）**
 1. **内存缓存（`atomic.Pointer`）**：业务代码读取配置是纯内存无锁操作，绝不发起网络请求。
-2. **長轮询实时更新 + 定时全量兜底拉取（如每 5 分钟一次）**：防止极端网络闪断漏掉某次通知。
+2. **长轮询实时更新 + 定时全量兜底拉取（如每 5 分钟一次）**：防止极端网络闪断漏掉某次通知。
 3. **本地磁盘快照（Local File Snapshot）**：每次拉取成功都原子写入本地磁盘（Write Temp + Rename）。当配置中心集群全挂且业务容器重启时，直接读取本地磁盘快照启动！
 4. **代码默认值兜底**。
 --- deep
-### 为什么配置中心是线上事故的高发区？
+**原理展开**
 
-一次错误的配置变更（比如把超时时间从 `500ms` 改成 `500s`，或者写出非法 JSON）通过长轮询在 100 毫秒内推送到全集群 5000 台机器，破坏力比发版代码大得多（发版通常有 10% 灰度，而配置很多时候是全量广播）。
+为什么配置中心是线上事故的高发区？一次错误的配置变更（比如把超时时间从 `500ms` 改成 `500s`，或者写出非法 JSON）通过长轮询在 100 毫秒内推送到全集群 5000 台机器，破坏力比发版代码大得多（发版通常有 10% 灰度，而配置很多时候是全量广播）。
 
 ```
 ┌──────────────┐   1. Watch(ver=5, timeout=30s)   ┌──────────────────────┐
@@ -41,22 +39,73 @@ tasks: arch-21-1
                                                        └───────────┘
 ```
 
-### 生产级配置中心的三大工程铁律
+生产级配置中心的三大工程铁律：
+1. **用 `close(notifyCh)` 实现零锁百万级广播**：在 Go 中实现长轮询挂起队列时，最优雅的做法是在当前版本维护一个 `notifyCh chan struct{}`。所有来 `Watch` 的协程拿到当前的 `notifyCh` 后直接 `select` 等待。当管理员 `Publish` 新版本时，加锁更新数据并直接 `close(oldNotifyCh)`，再新建一个 `notifyCh`。利用 Go **关闭 channel 会瞬间唤醒所有等待在它上面的接收协程**的语言特性，无需遍历连接列表逐个发送。
+2. **客户端惊群打散（Jitter）**：如果某热门配置（被 5000 个实例监听）发布了新版本，`close(notifyCh)` 瞬间唤醒 5000 个长轮询请求。如果长轮询只返回通知信号（如 Apollo 只推 `notificationId`，客户端再调拉取接口），客户端必须在发起拉取前加上 `0~500ms` 的随机抖动，防止瞬间打爆服务端带宽。
+3. **本地磁盘原子落盘（Write Temp + Rename）**：客户端更新本地缓存文件时，绝不能直接 `os.WriteFile` 覆盖原文件（进程写一半被 OOM Kill 会留下半截损坏的 JSON），必须先写同目录下的临时文件 `.config.tmp`，`Sync()` 刷盘后再调用 `os.Rename` 原子替换。
 
-1. **用 `close(notifyCh)` 实现零锁百万级广播**：
-   在 Go 中实现长轮询挂起队列时，最优雅的做法是在当前版本维护一个 `notifyCh chan struct{}`。所有来 `Watch` 的协程拿到当前的 `notifyCh` 后直接 `select { case <-notifyCh: ... case <-ctx.Done(): ... }`。当管理员 `Publish` 新版本时，加锁更新数据并直接 `close(oldNotifyCh)`，再新建一个 `notifyCh`。利用 Go **关闭 channel 会瞬间唤醒所有等待在它上面的接收协程**的语言特性，无需遍历连接列表逐个发送！
-2. **客户端惊群打散（Jitter）**：
-   如果某热门配置（被 5000 个实例监听）发布了新版本，`close(notifyCh)` 瞬间唤醒 5000 个长轮询请求。如果长轮询只返回通知信号（如 Apollo 只推 notificationId，客户端再调拉取接口），客户端必须在发起拉取前加上 `0~500ms` 的随机抖动，防止瞬间打爆服务端带宽。
-3. **灰度发布与一键回滚**：
-   所有配置变更必须保留完整的版本历史表（审计日志 + Diff），支持先推送给 1~2 台金丝雀机器验证无误后再全量发布。
+**代码示例**
+
+```go
+// 基于 close(notifyCh) 广播与 atomic.Pointer 无锁读的配置监听核心实现
+type ConfigHub struct {
+	mu       sync.RWMutex
+	version  int64
+	data     string
+	notifyCh chan struct{}
+}
+
+func NewConfigHub(initVal string) *ConfigHub {
+	return &ConfigHub{version: 1, data: initVal, notifyCh: make(chan struct{})}
+}
+
+func (h *ConfigHub) Publish(newData string) int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.version++
+	h.data = newData
+	close(h.notifyCh) // 瞬间唤醒所有挂起在旧版本上的 Watch 协程
+	h.notifyCh = make(chan struct{})
+	return h.version
+}
+
+func (h *ConfigHub) Watch(ctx context.Context, clientVer int64) (int64, string, bool) {
+	h.mu.RLock()
+	if h.version > clientVer {
+		ver, data := h.version, h.data
+		h.mu.RUnlock()
+		return ver, data, true
+	}
+	ch := h.notifyCh
+	h.mu.RUnlock()
+
+	select {
+	case <-ch:
+		h.mu.RLock()
+		defer h.mu.RUnlock()
+		return h.version, h.data, true
+	case <-ctx.Done():
+		return clientVer, "", false // 30s 长轮询超时未变更，对应 304 Not Modified
+	}
+}
+```
+
+**常见追问**
+
+- 如果长轮询超时时间设得太长（比如 10 分钟），会有什么问题？→ 企业内网的七层负载均衡（Nginx / ALB）或 NAT 网关通常有默认的空闲超时时间（如 60 秒），超过会被中间件主动断开或静默丢弃连接；因此长轮询服务端 Hold 时间通常设为 `30s`，客户端 HTTP 超时设为 `35s`。
+- 客户端通过 `atomic.Pointer[AppConfig]` 热更新配置时，如何防止业务在一个请求生命周期内读到“前半段用旧配置、后半段用新配置”的不一致状态？→ 业务请求入口处调用一次 `cfg := globalCfg.Load()` 将不可变的配置快照指针绑定到局部栈变量或 `context` 中，整个请求链路使用同一份快照。
+- 配置变更引发线上故障时，如何做到秒级止血？→ 配置中心必须对每次变更生成不可变的版本号快照（Audit Log），并提供不依赖重新走审批编译流程的“一键回滚到上一版本”按钮，同时支持先推 1 台金丝雀实例验证后再全量广播。
+
+**实战建议**
+
+- 客户端配置结构在热加载前必须做严格的 **Schema 与边界合法性校验**（例如连接池大小不能 `<= 0`、超时时间不能小于 `1ms`），一旦解析或校验失败，立即拒绝应用新配置并触发告警，继续沿用内存中的旧版本。
+- 严禁把配置中心当成高频 KV 存储或分布式协调锁使用，所有业务代码读取配置都必须走进程内 `atomic.Pointer` 内存快照。
 
 === arch-22
-cat: arch
 group: 治理
 level: 3
+hot: false
 title: 如何设计一个分布式定时任务调度系统？如何避免任务重复执行和单点故障？
-tags: 分布式调度, 定时任务, 时间轮, 分片广播, 幂等
-tasks: arch-22-1
 --- answer
 单机 `crontab` 或进程内 `time.Ticker` 在多副本集群下面临两个致命问题：**单点故障（机器挂了任务停了）**和**多副本重复执行（10 台机器在同一秒同时发了 10 份对账单）**。
 
@@ -70,14 +119,12 @@ tasks: arch-22-1
 
 **3. 阻塞与过期策略与分片广播**
 - **单机串行 / 丢弃后续 / 覆盖之前**：如果定时任务每分钟触发一次，但上一次执行耗时 3 分钟还没跑完，执行器必须根据策略拒绝并发重入或排队。
-- **分片广播（Sharding Broadcast）**：扫表处理 1000 万条到期订单时，一台 Worker 跑太慢。调度中心向全部 $N$ 台存活 Worker 广播触发，同时下发各自的 `(shardIndex, shardTotal)`（如 `0/3, 1/3, 2/3`），每台 Worker 执行 `WHERE id % shardTotal = shardIndex`，实现无锁水平扩容！
+- **分片广播（Sharding Broadcast）**：扫表处理 1000 万条到期订单时，一台 Worker 跑太慢。调度中心向全部 `N` 台存活 Worker 广播触发，同时下发各自的 `(shardIndex, shardTotal)`（如 `0/3, 1/3, 2/3`），每台 Worker 执行 `WHERE id % shardTotal = shardIndex`，实现无锁水平扩容！
 --- deep
-### 为什么有了调度锁，业务任务依然必须做幂等？
+**原理展开**
 
-很多工程师以为：“既然调度中心已经用了分布式锁保证同一周期只触发一次，我的业务代码就不需要考虑幂等了。”——这是大错特错的！
-
-考虑以下两类必然发生的异常：
-1. **网络超时重试（Ack 丢失）**：调度中心调 Worker A 触发任务，Worker A 已经在跑了，但由于网络抖动响应超时，调度中心以为 Worker A 挂了，立刻故障转移（Failover）調用 Worker B，此时 A 和 B 并发执行同一个周期的任务。
+很多工程师以为：“既然调度中心已经用了分布式锁保证同一周期只触发一次，我的业务代码就不需要考虑幂等了。”——这是严重错误的！考虑以下两类必然发生的异常：
+1. **网络超时重试（Ack 丢失）**：调度中心调 Worker A 触发任务，Worker A 已经在跑了，但由于网络抖动响应超时，调度中心以为 Worker A 挂了，立刻故障转移（Failover）调用 Worker B，此时 A 和 B 并发执行同一个周期的任务。
 2. **进程级时钟偏移或锁过期**：调度节点 GC 停顿或数据库慢查询导致锁超时释放。
 
 ```
@@ -85,21 +132,56 @@ tasks: arch-22-1
 Worker 落库/执行前校验：INSERT INTO job_execution_log (fire_key, status) VALUES (...) ON CONFLICT DO NOTHING
 ```
 
-### 大任务分片广播（MapReduce 思想）
+当一个定时任务需要处理百万级数据（如凌晨 2 点全量结算昨日收益）时，严禁单线程大事务全表扫描，应采用**分片广播（MapReduce 思想）**：
+- 利用分片参数 `shardIndex`（当前机器序号 `0..N-1`）和 `shardTotal`（总存活机器数 `N`），Worker `i` 只捞取 `mod(user_id, shardTotal) == shardIndex` 的数据；
+- 如果某台 Worker 执行中途宕机，调度中心感知心跳断开后，针对失败的分片单独触发重跑，结合业务侧的按周期唯一状态位，既跑得快又能安全断点续传。
 
-当一个定时任务需要处理百万级数据（如凌晨 2 点全量结算昨日收益）时：
-1. **严禁单线程大事务全表扫描**。
-2. 利用分片参数 `shardIndex`（当前机器序号 `0..N-1`）和 `shardTotal`（总存活机器数 `N`）：
-   - Worker `i` 只捞取 `mod(user_id, shardTotal) == shardIndex` 的数据；
-   - 如果某台 Worker 执行中途宕机，调度中心感知心跳断开后，针对失败的分片单独触发重跑，结合业务侧的按天/按周期唯一状态位，既跑得快又能安全断点续传。
+**代码示例**
+
+```go
+// 构造周期唯一调度幂等键，并按分片广播参数切分本节点负责的数据集
+func BuildFireKey(jobID string, scheduledAt time.Time) string {
+	// 按分钟对齐计划触发时间槽，防止多节点时钟微小偏差生成不同的幂等键
+	slot := scheduledAt.UTC().Truncate(time.Minute).Format(time.RFC3339)
+	return fmt.Sprintf("%s:%s", jobID, slot)
+}
+
+func FilterShardItems(itemIDs []int64, shardIndex, shardTotal int) []int64 {
+	if shardTotal <= 0 || shardIndex < 0 || shardIndex >= shardTotal {
+		return nil
+	}
+	var res []int64
+	mod := int64(shardTotal)
+	target := int64(shardIndex)
+	for _, id := range itemIDs {
+		rem := id % mod
+		if rem < 0 {
+			rem += mod
+		}
+		if rem == target {
+			res = append(res, id)
+		}
+	}
+	return res
+}
+```
+
+**常见追问**
+
+- 如果用数据库行锁 `SELECT ... FOR UPDATE` 抢占调度权，怎么防止某台调度器拿锁后网络调用卡死导致锁长时间不释放？→ 必须将“抢占推进 `trigger_next_time`（纯 DB 快事务）”与“发起远程 RPC 调用 Worker”拆成两步：先在极短事务内完成 `next_time` 的乐观锁推进并写入触发记录表，提交事务释放行锁后，再异步发起 RPC 调用。
+- 分片广播执行到一半时，集群突然扩容或缩容了一台 Worker 怎么办？→ **同一批次触发的分片参数 `(shardIndex, shardTotal)` 在本轮调度发起瞬间就已经快照固化**并随请求下发给各 Worker；运行中途发生节点增减不会改变在途任务的分片除数，只有失败分片重试或下一周期触发时才会按新拓扑分配。
+- 时间轮（Timing Wheel）相比最小堆（`time.Timer` 四叉堆）有什么优势？→ 最小堆插入和删除的时间复杂度是 `O(log N)`，当单机维护数十万个定时任务时堆调整开销明显；时间轮通过环形数组槽位加双向链表，把任务的插入和取消复杂度降到了 `O(1)`，非常适合海量长连接心跳超时与大规模任务调度。
+
+**实战建议**
+
+- 所有定时任务处理逻辑必须遵循**“先捞取主键游标、再逐条或小批次幂等处理”**的原则，并在业务表记录处理水位或幂等流水号，保证任务随时被强杀重启都能接着跑。
+- 对耗时可能超过调度周期的任务，务必在调度中心配置**“单机串行”或“丢弃后续调度（Discard Subsequent）”**阻塞策略，防止慢任务堆积把 Worker 协程池打满。
 
 === arch-23
-cat: arch
 group: 基础
 level: 3
+hot: false
 title: MySQL 数据如何实时同步到 Elasticsearch？如果出现乱序或延迟怎么保证最终一致？
-tags: MySQL, Elasticsearch, Binlog, CDC, 最终一致性
-tasks: arch-23-1
 --- answer
 将 MySQL 数据实时同步到 Elasticsearch（用于全文检索或多维复杂筛选）的核心要求是：**业务无侵入、准实时（秒级延迟）、乱序免疫（最终强一致）**。
 
@@ -118,7 +200,7 @@ tasks: arch-23-1
   - 写入 ES 时携带 `?version=<mysql_version>&version_type=external`。
   - ES 内部会原子比对：只有当传入的 `version` **严格大于** ES 当前文档已存储的 `_version` 时才允许写入；如果是迟到的旧版本数据，ES 直接返回 `409 Version Conflict`，消费端捕获并忽略该冲突即可，天然免疫一切乱序！
 --- deep
-### 存量全量迁移与增量同步如何无缝衔接（零停机）？
+**原理展开**
 
 新建一个 ES 索引同步一张已有 5000 万行的 MySQL 表时，如果先跑全量脚本再开增量消费，中间脱节的数据会丢失；如果同时跑，全量读出的旧数据又可能覆盖掉增量刚写入的新数据！
 
@@ -129,23 +211,56 @@ tasks: arch-23-1
 3. 全量跑完后，增量消费持续追平 Kafka 积压
 ```
 
-只要全量写入和增量写入**统一使用 `version_type=external`**（以数据行的 `version` 字段为准）：
+只要全量写入和增量写入**统一使用 `version_type=external`**（以数据行的 `version` 字段或 Binlog 位点序为准）：
 - 假如增量先把 `id=100, version=5` 写进了 ES；
 - 随后全量游标扫到了旧快照 `id=100, version=4` 并尝试写入 ES；
-- ES 发现 `4 <= 5`，直接拒绝全量的旧覆盖（返回 409 Conflict），数据毫发无损！
+- ES 发现 `4 <= 5`，直接拒绝全量的旧覆盖（返回 `409 Conflict`），数据毫发无损！
 
-### 生产调优与巡检对账
+**代码示例**
 
-1. **ES Bulk 攒批写入**：绝对不能一条 Binlog 发一次 ES HTTP 请求（ES 单次 Refresh 开销极大）。消费端必须用 `Batcher`（例如每凑够 500 条或每 200ms 触发一次 ` Bulk` 批量请求）。
-2. **离线/准实时对账补偿（Reconciliation）**：没有任何流式管道能保证 100% 不丢消息。生产上必须配一个定时巡检任务，对比近 10 分钟 MySQL `updated_at` 变更的主键列表与 ES 中的 `_version`，发现不一致自动回源 MySQL 重刷修复。
+```go
+// 模拟 ES 外部版本号（External Version）的乱序免疫幂等写入与墓碑删除保护
+type DocRecord struct {
+	DocID   string
+	Version int64
+	Payload string
+	Deleted bool
+}
+
+type ExternalVersionIndex struct {
+	mu   sync.Mutex
+	docs map[string]DocRecord
+}
+
+func (idx *ExternalVersionIndex) ApplyEvent(ev DocRecord) (applied bool) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if cur, ok := idx.docs[ev.DocID]; ok && ev.Version <= cur.Version {
+		// 迟到的旧版本事件（或重复投递），模仿 ES 409 Version Conflict 直接忽略
+		return false
+	}
+	// 即使是删除事件也必须保留高版本墓碑（Tombstone），防止被晚到的旧版本 UPDATE 复活
+	idx.docs[ev.DocID] = ev
+	return true
+}
+```
+
+**常见追问**
+
+- 如果 MySQL 发生了一条物理删除（`DELETE`），而在此之前的旧 `UPDATE` 消息因为网络重试晚到了，会不会把已删除的文档重新在 ES 里“诈尸”建出来？→ 会，如果直接彻底抹除 ES 元数据的话！ES 内部通过 `index.gc_deletes`（默认保留 60 秒删除墓碑版本号）拦截短时间内的乱序旧写入；在工程实践中，更稳妥的做法是使用**逻辑删除标记（`is_deleted = 1` + 递增 `version`）**同步到 ES，再由夜间低峰期任务清理过期墓碑。
+- 多表关联（JOIN）的宽表怎么同步到 ES？→ 如果以主表（如 `orders`）拉宽从表（如 `merchant`），Canal 监听到从表变更时，不要在消费端直接去扫主表全量更新，而是通过反查关联 ID 列表拆分为按主键 ID 的增量重刷消息，或者借助 Flink CDC 在流计算层维护双流 Join 状态后输出到 ES。
+- 为什么同步消费端绝不能一条 Binlog 发一次 ES 请求？→ ES 每次写入请求都有网络开销与 Segment 解析成本，逐条写入几百 QPS 就会打满 ES 队列；必须使用 `Bulk API` 攒批（例如每凑满 `500` 条或每 `200ms` 刷一次）。
+
+**实战建议**
+
+- 生产环境必须配置一条独立的**准实时对账补偿任务（Reconciliation）**：每 10 分钟抽样或扫描 MySQL 近期 `updated_at` 变更记录的主键与 `version`，与 ES 中的 `_version` 比对，发现缺失或落后自动触发回源重刷。
+- 开启 MySQL `binlog_format=ROW` 和 `binlog_row_image=FULL`，确保 Binlog 中包含变更前后的全部列，避免消费端频繁回查数据库主库。
 
 === arch-24
-cat: arch
 group: 设计题
 level: 3
+hot: true
 title: 如何设计一个支撑亿级并发读写的计数系统（如点赞数、播放量、未读数）？
-tags: 系统设计, 计数系统, 写聚合, Redis, 高并发
-tasks: arch-24-1
 --- answer
 微博/短视频场景下的计数系统（播放量、点赞数、评论数、转评赞汇总）具有极端的读写特征：**读写比都极高（大 V 发博瞬间每秒数十万次点赞写 + 数百万次刷屏读）**。
 
@@ -161,9 +276,9 @@ tasks: arch-24-1
 - **多级缓存**：热点大 V 的计数通过本地缓存（1~2 秒短 TTL）挡住 99% 的读流量，绝不穿透到 Redis。
 - **紧凑编码合并存储**：一篇文章往往有多个维度计数（阅读、点赞、评论、收藏、转发）。不要拆成 5 个独立的 Redis String Key（Key 元数据开销比 8 字节整数大 10 倍），而是打包成固定字节数组或小型 Hash（配合 `hash-max-listpack-entries` 压缩）紧凑存储。
 --- deep
-### 区分“模糊计数”与“精确带去重计数”
+**原理展开**
 
-面试回答计数系统设计题时，第一步一定要先向面试官确认业务类型：
+面试回答计数系统设计题时，第一步一定要先区分业务对精确度与去重的要求：
 
 | 计数类型 | 典型场景 | 核心诉求 | 架构设计要点 |
 | :--- | :--- | :--- | :--- |
@@ -186,17 +301,57 @@ tasks: arch-24-1
 └────────────────────────────┘
 ```
 
-### 优雅停机（Graceful Shutdown）防丢数据
+**代码示例**
 
-使用进程内内存聚合缓冲（Write-Behind）时，最关键的工程细节是：**当容器收到 `SIGTERM` 准备滚动重启时，必须先停止接收新请求，并调用 `Flush()` 将内存 Buffer 中尚未到期的余量全部刷入下游存储后才能退出**，否则每次发版都会丢掉最后几百毫秒的计数。
+```go
+// 双缓冲交换（Swap Map）写后微批聚合器：Add 高频累加与 Flush 后台落盘互不阻塞
+type BatchCounter struct {
+	mu  sync.Mutex
+	buf map[string]int64
+}
+
+func NewBatchCounter() *BatchCounter {
+	return &BatchCounter{buf: make(map[string]int64)}
+}
+
+func (c *BatchCounter) Add(key string, delta int64) {
+	c.mu.Lock()
+	c.buf[key] += delta
+	c.mu.Unlock()
+}
+
+// Flush 原子替换当前 map 并返回非零增量快照，供调用方在锁外执行批量 RPC/DB 写入
+func (c *BatchCounter) Flush() map[string]int64 {
+	c.mu.Lock()
+	old := c.buf
+	c.buf = make(map[string]int64)
+	c.mu.Unlock()
+
+	for k, v := range old {
+		if v == 0 {
+			delete(old, k) // +1 与 -1 抵消为 0 的键无需落库
+		}
+	}
+	return old
+}
+```
+
+**常见追问**
+
+- 使用进程内内存微批聚合（Write-Behind）时，如果容器重启或发版，内存里还没来得及 Flush 的计数岂不是丢了？→ 必须在优雅停机（Graceful Shutdown）流程中：收到 `SIGTERM` 后先摘除网关流量停止接收新计数，再同步调用一次 `Flush()` 将残余 Buffer 刷入 Redis/Kafka 后才退出进程；若追求机器断电都不丢，则入口先写 Kafka，在 Kafka Consumer 层做内存窗口聚合。
+- 如果用户点了赞（`+1`），由于多级本地缓存有 2 秒延迟，用户刷新页面发现自己的点赞没加上去，体验很差怎么破？→ 实施**“读己之写（Read-Your-Own-Writes）”前端/网关态合并**：查询接口除了返回公共缓存的计数值 `cnt` 外，结合当前登录用户的点赞状态 `is_liked` 做本地修正展示，保证操作者本人立即看到最新状态。
+- 亿级帖子的计数在 Redis 里长期存放内存太贵怎么办？→ 采用冷热分层：Redis 只保留近 7 天活跃或最近被访问过的热帖计数（配合 TTL 淘汰），未命中时通过 `singleflight` 合并回源查询底层 TiKV / HBase / MySQL 并回填 Redis。
+
+**实战建议**
+
+- 在 `Flush()` 实现中，千万不要在持有互斥锁 `mu.Lock()` 的状态下直接发起 Redis 或 MySQL 网络请求；必须采用**指针交换（Swap Pointer/Map）**把旧 `map` 换出来，解锁后再去做耗时的网络 I/O。
+- 对于同一时间窗内先点赞（`+1`）又取消点赞（`-1`）净增量为 `0` 的 Key，在 `Flush` 阶段直接过滤剔除，省去无意义的下游写操作。
 
 === arch-25
-cat: arch
 group: 设计题
 level: 3
+hot: false
 title: 如何设计一个全平台消息通知与推送系统（站内信、邮件、短信、App Push）？
-tags: 系统设计, 消息推送, 读扩散, 写扩散, 渠道网关
-tasks: arch-25-1
 --- answer
 全平台通知系统需要解决两个层面的核心问题：**多渠道外部推送的可靠性与限流（短信/邮件/Push）**，以及**站内信（Inbox）个人点对点与全员公告的存储模型**。
 
@@ -214,7 +369,7 @@ tasks: arch-25-1
 - **点对点私信/个人通知（写扩散）**：直接写入接收者的收件箱表 `user_inbox (user_id, msg_id, is_read)`。
 - **全员系统公告/千万粉丝大 V 通知（读扩散）**：如果给 5000 万用户每人插入一条收件箱记录，数据库会被瞬间写爆！正确做法是：只往公共广播表 `broadcast_msg (msg_id, content, created_at)` 写 **1 条**记录；当活跃用户打开站内信列表时，根据用户上次拉取游标 `last_broadcast_id`，将 `broadcast_msg` 中新增的公告实时合并（或懒加载同步）到个人收件箱中。
 --- deep
-### 站内信“未读数红点”与全员公告的工程实现
+**原理展开**
 
 在读扩散 + 写扩散混合模型下，用户登录 App 首页时需要极速展示“未读消息总数（红点）”：
 
@@ -232,13 +387,51 @@ global_broadcasts: [ {id: 101, time: ...}, {id: 105, time: ...}, {id: 108, time:
 - 既不需要在发全员公告时写 5000 万次 Redis，又能让在线用户在毫秒级算出准确的个人总未读数！
 - 当用户真正点击进入“消息列表”时，再把 `id > last_ack_broadcast_id` 的公告懒写入（Lazy Materialize）用户的个人收件箱并推进 `last_ack_broadcast_id`。
 
+**代码示例**
+
+```go
+// 读写扩散混合站内信未读数计算与一键已读游标推进
+type UserInboxState struct {
+	PersonalUnread     int
+	LastAckBroadcastID int64
+}
+
+type HybridInbox struct {
+	mu         sync.RWMutex
+	broadcasts []int64 // 单调递增的全员广播消息 ID 列表
+	users      map[string]*UserInboxState
+}
+
+func (s *HybridInbox) CountUnread(userID string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var personal int
+	var lastAck int64
+	if u, ok := s.users[userID]; ok {
+		personal, lastAck = u.PersonalUnread, u.LastAckBroadcastID
+	}
+	// 二分查找大于 lastAck 的全员公告条数
+	idx := sort.Search(len(s.broadcasts), func(i int) bool { return s.broadcasts[i] > lastAck })
+	return personal + (len(s.broadcasts) - idx)
+}
+```
+
+**常见追问**
+
+- 如果一个新用户今天刚注册，难道要把系统过去 3 年发过的 200 条历史全员公告都算成他的未读消息吗？→ 绝对不能！在用户首次初始化收件箱游标（或计算未读公告）时，必须以 **`max(last_ack_broadcast_id, 用户注册时刻对应的最大公告 ID)`** 作为起点，只统计该用户注册之后发布的新公告。
+- 为什么验证码短信（P0）和双十一促销短信（P2）必须分不同的 Kafka Topic 和不同的消费协程池？→ 如果混用同一个队列，运营人员上午 10 点一键下发 1000 万条促销短信，会把队列积压几十万条，导致正在登录或支付的用户收不到验证码短信，引发核心交易P0级故障。
+- 外部第三方短信/Push 通道偶发超时，重试时怎么避免给用户连发两条扣款短信？→ 网关层落库时必须校验业务方传入的幂等键 `request_id`，且在调用支持幂等流水号的三方通道 API 时透传同一批次号；若通道返回“状态未知（Timeout）”，先通过回执查询接口确认是否已受理，再决定是否切备通道重发。
+
+**实战建议**
+
+- 全站公共广播列表 `global_broadcasts` 只保留有效期内（如近 90 天）的公告并在各节点进程内存中缓存，利用二分查找（`sort.Search`）即可在几十纳秒内算出读扩散未读数。
+- 通知网关对外必须内置**全局防疲劳频控（如单用户单日营销推送上限）**与**夜间静默期拦截**，防止业务方脚本写死循环把用户手机打爆并耗光公司短信余额。
+
 === arch-26
-cat: arch
 group: 治理
 level: 3
+hot: true
 title: 如何设计一个集群级的分布式全局限流系统？如何兼顾性能与精确度？
-tags: 分布式限流, 令牌桶, 本地预取, Redis, 微服务治理
-tasks: arch-26-1
 --- answer
 在网关或微服务集群（比如 200 个 Pod）中保护下游核心依赖或限制租户 API 配额时，面临一个两难困境：
 - **纯单机限流**：每台机器配额 `total / N`。一旦扩缩容或机器间负载不均，配额极不准确。
@@ -256,9 +449,9 @@ tasks: arch-26-1
 - **动态批次大小**：剩余配额充足时按 `batch` 预取；当中心池余量不足 `batch` 时，返回实际剩余量（甚至降级为逐个申请）。
 - **故障自动降级（Fallback）**：一旦中心 Redis 超时或宕机，节点立刻无缝切换为按 `全局总配额 / 预估节点数` 的**本地单机限流模式**，绝不因为限流组件故障导致业务中断。
 --- deep
-### 集中式限流 vs 本地批量预取的性能账本
+**原理展开**
 
-假设某大型 API 网关集群有 100 个节点，要对某个大客户做全局 `100,000 QPS` 的限流控制：
+假设某大型 API 网关集群有 100 个节点，要对某个大客户做全局 `100,000 QPS` 的限流控制，对比集中式限流与本地批量预取的性能账本：
 
 | 维度 | 每次请求调 Redis Lua | 本地批量预取（Batch = 100）+ 远端中心池 |
 | :--- | :--- | :--- |
@@ -277,13 +470,73 @@ tasks: arch-26-1
 
 这种**“把分布式高频同步转化为分批租借（Lease / Batch Allocation）”**的思想，不仅用于分布式限流，在**分布式发号器（美团 Leaf 号段模式）**和**高并发库存预分配**中也是完全相通的核心架构范式。
 
+**代码示例**
+
+```go
+// 支持本地批量预取（Batch Lease）与远端故障自动降级的分布式限流器核心逻辑
+type QuotaRemote interface {
+	Acquire(sec int64, want int) (int, error)
+}
+
+type BatchRateLimiter struct {
+	mu            sync.Mutex
+	remote        QuotaRemote
+	batchSize     int
+	fallbackQuota int
+	curSec        int64
+	localTokens   int
+	fallbackUsed  int
+}
+
+func (l *BatchRateLimiter) Allow(nowSec int64) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// 1. 跨秒窗口重置本地已预取但未用完的过期令牌及降级计数
+	if nowSec != l.curSec {
+		l.curSec = nowSec
+		l.localTokens = 0
+		l.fallbackUsed = 0
+	}
+	// 2. 本地缓存仍有令牌，零网络开销直接扣减放行
+	if l.localTokens > 0 {
+		l.localTokens--
+		return true
+	}
+	// 3. 本地令牌耗尽，向中心配额池批量预取 batchSize 个令牌
+	granted, err := l.remote.Acquire(nowSec, l.batchSize)
+	if err != nil {
+		// 4. 远端中心池超时或故障：无缝降级为本地单机兜底配额
+		if l.fallbackUsed < l.fallbackQuota {
+			l.fallbackUsed++
+			return true
+		}
+		return false
+	}
+	if granted <= 0 {
+		return false
+	}
+	l.localTokens = granted - 1
+	return true
+}
+```
+
+**常见追问**
+
+- 如果集群有 100 台机器，全局限流阈值只有 `50 QPS`（低配额场景），每台机器还按 `batch = 50` 预取会有什么问题？→ 第一台机器一下子把全部 50 个令牌全领走了，如果它后续只有 2 个请求，剩下 48 个令牌就烂在它本地过期浪费了！因此生产实现中 **`batchSize` 必须根据 `globalQuota / nodeCount` 动态自适应计算**，当全局剩余配额很少或单机均摊配额很低时，自动退化为 `batch = 1`。
+- Redis Lua 令牌桶脚本里为什么不能直接调用 `redis.call('TIME')` 之后再结合随机逻辑，或者为什么要注意时钟漂移？→ 如果由客户端传入当前机器时间戳计算令牌补充量，当多台业务机器 NTP 时钟相差几十毫秒时，时钟慢的机器会把桶里的 `last_refill_time` 往回拨，导致令牌被重复发放；应统一使用 Redis 服务端自身的 `redis.call('TIME')` 作为唯一时钟源。
+- 限流组件发生 Redis 连接超时时，应该默认放行（Fail-Open）还是默认拒绝（Fail-Closed）？→ 绝大多数网关限流组件应采用**降级为本地单机限流（Local Quota Fallback）**而非全放行或全拒绝：既避免因 Redis 抖动导致全站业务 500 瘫痪，又防止故障期间毫无保护把下游 DB 冲垮。
+
+**实战建议**
+
+- 对超高频热点的租户或接口开启 `Batch Lease` 本地预取模式；对低频高价值接口（如提现、发短信，配额 `< 10 QPS`）直接使用 `batch = 1` 的中心化精确限流。
+- 监控面板必须同时采集**本地预取命中率**、**窗口末尾过期作废令牌数（Waste Rate）**以及**远端降级触发次数**。
+
 === arch-27
-cat: arch
 group: 设计题
 level: 3
+hot: false
 title: 历史订单表数据量达到百亿级，如何设计冷热数据分离与归档方案？
-tags: 冷热分离, 数据归档, 分库分表, TiDB, 对象存储
-tasks: arch-27-1
 --- answer
 电商或支付系统的订单表随着时间推移会无限膨胀。当数据量达到百亿级时，如果冷热数据混存在昂贵的在线 OLTP 数据库（SSD 高配 MySQL）中，不仅存储成本高昂、B+ 树层级加深拖慢在线交易，还会导致 DDL 变更和备份恢复无法进行。
 
@@ -302,15 +555,13 @@ tasks: arch-27-1
 - 按单号查询（单号内嵌时间戳）：直接解析单号中的时间位，精准路由到热库或冷库；
 - 按用户分页查列表：优先查热库（前几页 99% 在热库），当热库返回条数不足 `pageSize` 或游标时间跨越了 3 个月分界线时，自动拼接冷库查询结果。
 --- deep
-### 为什么按时间范围分区（Range Partition）是冷热归档的神器？
+**原理展开**
 
-如果单表或分库分表内部配合了按月分区（或按月分表 `orders_202601`）：
-- **用 `DELETE` 删 1 亿条旧数据**：会产生海量的 Undo Log 和 Binlog，打满磁盘 IOPS，引发严重的主从延迟，且文件大小不变（产生大量表空间洞）。
+为什么按时间范围分区（Range Partition）或按月分表是冷热归档的神器？
+- **用 `DELETE` 删 1 亿条旧数据**：会产生海量的 Undo Log 和 Binlog，打满磁盘 IOPS，引发严重的主从延迟，且底层 `.ibd` 文件大小不变（产生大量表空间空洞碎片）。
 - **先把未完结的极少数非终态老订单捞出迁移，然后直接 `DROP PARTITION`**：属于文件系统级的元数据删除操作，秒级释放数十 GB 磁盘空间，零页碎片，零主从复制风暴！
 
-### 冷热联邦分页游标（Cursor Pagination across Hot & Cold）
-
-当用户在 App 里一直往下滑动“我的订单”跨越 3 个月分界线时，如何做到无缝衔接、不重不漏？
+当用户在 App 里一直往下滑动“我的订单”跨越 3 个月分界线时，如何通过**冷热联邦分页游标（Cursor Pagination across Hot & Cold）**做到无缝衔接、不重不漏？
 
 ```
 请求：ListOrders(userID, cursorTime, limit=10)
@@ -322,4 +573,54 @@ tasks: arch-27-1
          直接只查 ColdStore(time < cursorTime, limit=10)，无需再碰热库！
 ```
 
-同时，为了应对极少数“6 个月前下单但至今仍未完结/刚发起售后”的特例，若按单号查热库未命中，读路径只需多做一次 Fallback 回源冷库（配合布隆过滤器防穿透），即可对业务上层完全透明。
+**代码示例**
+
+```go
+// 判断订单是否满足归档条件，以及跨越冷热边界的游标分页无缝拼接查询
+type Order struct {
+	ID        int64
+	Status    string
+	CreatedAt int64
+}
+
+func CanArchiveOrder(o Order, cutoffUnix int64) bool {
+	isTerminal := o.Status == "COMPLETED" || o.Status == "CLOSED"
+	return isTerminal && o.CreatedAt <= cutoffUnix
+}
+
+func QueryOrdersPage(hotOrders, coldOrders []Order, beforeTime int64, cutoffUnix int64, limit int) []Order {
+	var res []Order
+	// 1. 游标仍在热数据时间窗内时，优先扫描热库
+	if beforeTime > cutoffUnix {
+		for _, o := range hotOrders {
+			if o.CreatedAt < beforeTime {
+				res = append(res, o)
+				if len(res) == limit {
+					return res
+				}
+			}
+		}
+	}
+	// 2. 热库不足 limit 条（或游标已进入冷数据区）时，自动从冷库补齐剩余条数
+	for _, o := range coldOrders {
+		if o.CreatedAt < beforeTime {
+			res = append(res, o)
+			if len(res) == limit {
+				return res
+			}
+		}
+	}
+	return res
+}
+```
+
+**常见追问**
+
+- 为什么归档条件必须是 `CreatedAt <= cutoff && Status IN ('COMPLETED', 'CLOSED')`，而不能只看创建时间？→ 如果一笔 4 个月前创建的订单至今还在“售后仲裁中”或“分期履约中”，业务状态机随时会对它发起状态流转更新；如果只按时间归档进只读/慢速冷库，在线写事务就会找不到记录报错。
+- 如果采用 `DELETE` 小批次清理热库，为什么决不能写 `DELETE FROM orders WHERE created_at < '2026-01-01' LIMIT 5000`？→ 如果 `created_at` 区分度不够或未走最优索引，范围 `DELETE` 在 `REPEATABLE READ` 隔离级别下会锁住扫描过的大量间隙（Gap Lock），极易阻塞在线正常下单；正确做法是**先在从库/只读事务查出 500 个明确的主键 ID，再用 `DELETE FROM orders WHERE id IN (...)` 按主键精准删除**。
+- 按订单号单点查询时，如何避免每次都先查热库再查冷库？→ 分布式订单号生成时（如变种 Snowflake 或业务基因法）将**下单年月日（如 `260501`）编码进订单号前几位**，并且对于极少数“超过 3 个月仍未终结而留在热库”的特例，在冷库未命中时 fallback 查一次热库即可。
+
+**实战建议**
+
+- 归档作业必须接入**主从延迟熔断器**：每删完一个批次（如 500 行），检查 MySQL 从库 `Seconds_Behind_Master` 或 Binlog 写入速率，一旦超过阈值（如延迟 `> 2s`）立即自动休眠退避。
+- 冷数据归档落盘前必须执行**双向行数与 Checksum 校验**，确认冷库可查且字段无损后，才允许触发热库删除。

@@ -5,13 +5,16 @@ title: Go 1.23 的 range 迭代器（iter.Seq）是怎么工作的？slices、ma
 --- answer
 Go 1.23 正式支持 **range-over-func**（对函数进行 `for range` 遍历），并在标准库新增了 `iter` 包，统一了自定义容器和流式序列的遍历方式。
 
-**1. 三种标准迭代器签名（`iter` 包）**
+**1. 两种标准迭代器类型（`iter` 包）与三种语言级函数签名**
+
+Go 1.23 语言规范支持对满足以下三种签名的函数进行 `for range` 遍历，标准库 `iter` 包为最常用的单值和键值对序列定义了两个泛型类型：
 
 ```go
 package iter
 
-type Seq[V any]     func(yield func(V) bool)
-type Seq2[K, V any] func(yield func(K, V) bool)
+type Seq[V any]     func(yield func(V) bool)    // 单值迭代器：for v := range seq
+type Seq2[K, V any] func(yield func(K, V) bool) // 键值对迭代器：for k, v := range seq2
+// 此外语言规范还支持无值函数签名：func(yield func() bool)，用于 for range seq
 ```
 
 - **推模式（Push Iterator）**：迭代器本身是一个高阶函数，接收编译器生成的 `yield` 回调函数作为参数；
@@ -115,7 +118,7 @@ title: 类型定义（type T U）和类型别名（type T = U）有什么区别�
 
 **3. Go 1.24 的泛型类型别名（Generic Type Aliases）**
 
-Go 1.18 引入泛型时暂不支持带类型参数的别名，**Go 1.24 正式補齐了泛型类型别名**：
+Go 1.18 引入泛型时暂不支持带类型参数的别名，**Go 1.24 正式补齐了泛型类型别名**：
 
 ```go
 // Go 1.24+：别名也可以携带类型参数和约束
@@ -372,7 +375,7 @@ for i, r := range s {
 
 **3. 常见操作规范**
 
-- **统计字符（码点）个数**：使用 `utf8.RuneCountInString(s)`（复杂度 $O(N)$，但无需分配内存），**不要用** `len([]rune(s))`（会把整个字符串拷贝分配成新切片）；
+- **统计字符（码点）个数**：使用 `utf8.RuneCountInString(s)`（复杂度 `O(N)`，但无需分配内存），**不要用** `len([]rune(s))`（会把整个字符串拷贝分配成新切片）；
 - **按字符位置截取或反转字符串**：如果包含非 ASCII 字符，不能直接按字节切片 `s[:n]`（可能从汉字中间劈开产生非法 UTF-8 乱码），需结合 `utf8.DecodeRuneInString` 或转为 `[]rune` 处理。
 --- deep
 **原理展开**
@@ -381,7 +384,7 @@ for i, r := range s {
 
 1. **编译器对 `for range s` 的改写**：当 `s[i] < 0x80`（最高位为 0，单字节 ASCII）时，循环直接内联取 `rune(s[i])` 并将下标 `+1`，速度极快；当遇到多字节字符（`s[i] >= 0x80`）时，调用 `runtime.decoderune(s, i)` 解码出码点 `r` 和所占字节宽度 `width`（2～4 字节），下一轮下标跳到 `i + width`。
 2. **遇到非法 UTF-8 字节序列时会怎样？**
-   如果字符串里混入了损坏的二进制字节（比如截取了半个汉字 `s[:3]`），`for range` **不会 panic，也不会报错**，而是将该非法字节替换为 Unicode 替换字符 **`utf8.RuneError`（即 `'\uFFFD'`，显示为 ``）**，且只前进 **1 个字节**继续向后遍历！
+   如果字符串里混入了损坏的二进制字节（比如截取了半个汉字 `s[:3]`），`for range` **不会 panic，也不会报错**，而是将该非法字节替换为 Unicode 替换字符 **`utf8.RuneError`（即 `'\uFFFD'`，显示为 `�`）**，且只前进 **1 个字节**继续向后遍历！
 3. **编译器对 `for _, r := range []rune(s)` 的优化**：如果只是读取遍历，直接写 `for _, r := range s` 零内存分配；即使需要修改字符而转为 `[]rune(s)`，也要注意每个 `rune` 占 4 字节，大文本转换会使内存体积膨胀 1.3～4 倍。
 
 **代码示例**
@@ -402,7 +405,7 @@ func TruncateRunes(s string, maxRunes int) string {
 	return s // 总字符数不超过 maxRunes，直接返回原字符串
 }
 
-// 如何区分字符串中是“真的包含 '' (\uFFFD) 字符”还是“包含非法的 UTF-8 损坏字节”？
+// 如何区分字符串中是“真的包含 '�' (\uFFFD) 字符”还是“包含非法的 UTF-8 损坏字节”？
 func HasInvalidUTF8(s string) bool {
 	// 标准库 utf8.ValidString 极其高效（支持按字长快速跳过 ASCII）
 	return !utf8.ValidString(s)
@@ -412,7 +415,7 @@ func HasInvalidUTF8(s string) bool {
 **常见追问**
 
 - 在 `for i, r := range "你好"` 中，打印出来的 `i` 依次是多少？如果想拿到“第几个字符（0, 1, 2...）”的序号怎么办？→ `i` 依次是 **`0` 和 `3`**（因为 `'你'` 在 UTF-8 中占 3 个字节 `0, 1, 2`）。需要连续字符序号时，必须自己在循环外声明一个 `idx := 0` 并在每次迭代末尾 `idx++`。
-- 如果把字符串中的合法 `''`（`\uFFFD`，占 3 个字节 `0xEF 0xBF 0xBD`）和一个损坏的单字节 `0xFF` 放在一起，用 `utf8.DecodeRuneInString` 怎么区分它们？→ 两者返回的 `r` 都是 `utf8.RuneError`，但返回值中的字节宽度 `size` 不同：**损坏的非法字节返回的 `size == 1`**，而真正合法的替换字符 `''` 编码返回的 **`size == 3`**！
+- 如果把字符串中的合法 `'�'`（`\uFFFD`，占 3 个字节 `0xEF 0xBF 0xBD`）和一个损坏的单字节 `0xFF` 放在一起，用 `utf8.DecodeRuneInString` 怎么区分它们？→ 两者返回的 `r` 都是 `utf8.RuneError`，但返回值中的字节宽度 `size` 不同：**损坏的非法字节返回的 `size == 1`**，而真正合法的替换字符 `'�'` 编码返回的 **`size == 3`**！
 - Emoji 组合字符（比如带肤色修饰符或家庭组合 `'👨‍👩‍👧‍👦'`）用 `utf8.RuneCountInString` 算出来为什么不是 1？→ 因为 Unicode 中一个视觉上的“字素簇（Grapheme Cluster）”可能由多个 `rune` 通过零宽连接符（ZWJ `\u200d`）拼接而成，严格按视觉字符切分需要使用 Unicode UAX #29 分词算法（如 `rivo/uniseg`）。
 
 **实战建议**
@@ -470,6 +473,7 @@ const (
 	OrderStatusPending                    // 1
 	OrderStatusPaid                       // 2
 	OrderStatusShipped                    // 3
+	orderStatusCount                      // 内部哨兵常量：始终等于枚举项总数 (4)
 )
 
 // 利用 iota + 10*iota 生成字节单位常量（_ 跳过 0）
@@ -481,14 +485,17 @@ const (
 	TB                    // 1 << 40
 )
 
-// 2. 利用数组下标越界实现“编译期静态断言（Compile-time Assertion）”
-// 如果将来有人删改了枚举却忘了同步更新名称表，编译期就会直接报错！
+// 2. 用索引数组按枚举下标映射名称（O(1) 数组直接寻址，零 map 哈希开销）
 var statusNames = [...]string{
 	OrderStatusUnknown: "unknown",
 	OrderStatusPending: "pending",
 	OrderStatusPaid:    "paid",
 	OrderStatusShipped: "shipped",
 }
+
+// 真正的编译期长度静态断言：
+// 若新增或删减了枚举常量却忘了同步更新 statusNames，编译期就会因数组类型长度不匹配直接报错！
+var _ [int(orderStatusCount)]struct{} = [len(statusNames)]struct{}{}
 
 func (s OrderStatus) String() string {
 	if int(s) < len(statusNames) {

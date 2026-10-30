@@ -53,13 +53,33 @@ func FetchAll(parentCtx context.Context, ids []int, fn func(context.Context, int
 	}
 	return results, nil
 	// @starter
-	// var results []string
+	// ctx, cancel := context.WithCancel(parentCtx)
+	// defer cancel()
+	//
+	// var (
+	// 	wg      sync.WaitGroup
+	// 	results []string
+	// 	errCh   = make(chan error) // Bug 2: 无缓冲错误通道，多个协程报错时会阻塞泄漏
+	// )
 	// for _, id := range ids {
-	// 	val, err := fn(parentCtx, id)
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
-	// 	results = append(results, val) // TODO: 改为并发执行、预分配按索引写入，并在出错时 cancel 其他协程且无协程泄漏
+	// 	wg.Add(1)
+	// 	go func(itemID int) {
+	// 		defer wg.Done()
+	// 		val, err := fn(ctx, itemID)
+	// 		if err != nil {
+	// 			cancel()
+	// 			errCh <- err
+	// 			return
+	// 		}
+	// 		results = append(results, val) // Bug 1: 多协程并发 append 导致 Data Race 与乱序
+	// 	}(id)
+	// }
+	// go func() {
+	// 	wg.Wait()
+	// 	close(errCh)
+	// }()
+	// if err := <-errCh; err != nil {
+	// 	return nil, err
 	// }
 	// return results, nil
 	// @end
@@ -82,14 +102,14 @@ func TestFetchAllConcurrentAndCancel(t *testing.T) {
 	ids := []int{10, 20, 30, 40, 50}
 	start := time.Now()
 	got, err := FetchAll(context.Background(), ids, func(ctx context.Context, id int) (string, error) {
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(time.Duration(60-id) * time.Millisecond)
 		return fmt.Sprintf("u-%d", id), nil
 	})
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
-	if time.Since(start) >= 100*time.Millisecond {
-		t.Fatalf("expected concurrent execution (<100ms), took %v", time.Since(start))
+	if time.Since(start) >= 120*time.Millisecond {
+		t.Fatalf("expected concurrent execution (<120ms), took %v", time.Since(start))
 	}
 	want := []string{"u-10", "u-20", "u-30", "u-40", "u-50"}
 	if !reflect.DeepEqual(got, want) {
@@ -367,12 +387,12 @@ func TestTTLMapHeapAndOverwrite(t *testing.T) {
 **思路**
 
 用 `map` + `container/heap` 实现 TTL 缓存时，最巧妙的设计就是**引入单调递增的更新序号 `ver`**：
-- 每次 `Set` 无需去堆里搜索修改旧节点（$O(N)$），而是直接递增 `m.seq` 压入一个带新 `ver` 的堆节点（$O(\log N)$）。
+- 每次 `Set` 无需去堆里搜索修改旧节点（`O(N)`），而是直接递增 `m.seq` 压入一个带新 `ver` 的堆节点（`O(log N)`）。
 - `Cleanup(now)` 循环查看堆顶 `m.h[0].expireAt <= now`：弹出堆顶后检查 `cur, ok := m.items[top.key]; ok && cur.ver == top.ver`。只有版本号对得上，才说明该 key 在那之后没有被重新续期覆盖过，此时安全执行 `delete(m.items, top.key)`。
 
 **代码讲解**
 
-1. 查看堆顶直接访问切片首元素 `m.h[0]`（$O(1)$），只有确认过期时才调用 `heap.Pop(&m.h)`（$O(\log N)$）。
+1. 查看堆顶直接访问切片首元素 `m.h[0]`（`O(1)`），只有确认过期时才调用 `heap.Pop(&m.h)`（`O(log N)`）。
 2. `Get` 采用惰性检查：若 `now >= it.expireAt` 直接视为未命中返回 `("", false)`。
 
 **易错点**

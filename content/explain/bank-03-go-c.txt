@@ -245,7 +245,7 @@
 
 **代码讲解**
 
-1. `ID int64 \`json:"id,string"\``：前端 JavaScript 的 Number 只能精确表示 2⁵³ 以内的整数，大 ID 必须用字符串传输。
+1. ``ID int64 `json:"id,string"` ``：前端 JavaScript 的 Number 只能精确表示 2⁵³ 以内的整数，大 ID 必须用字符串传输。
 2. `Email ... omitempty`、`Password ... "-"`。
 3. `MarshalUser(u User)` 参数是值拷贝，`u.Tags = []string{}` 不会修改调用方的数据。
 4. `json.Marshal(u)` 返回 `([]byte, error)`。
